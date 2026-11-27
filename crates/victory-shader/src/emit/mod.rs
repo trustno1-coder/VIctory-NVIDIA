@@ -112,6 +112,8 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(all(test, windows))]
+mod wide_approx_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -687,6 +689,34 @@ pub fn emit(
                         let again = widen(c, native, base, why, driver_loop, wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {
+                            record_form("wave-wide branches");
+                            return again.map(|(shader, _)| shader);
+                        }
+                    }
+                }
+                // `VICTORY_WAVE_WIDE_APPROX=1` (opt-in; off by default): what is left below is
+                // approximate (each host wave its own wave: a tile-wide count, ballot or lane read
+                // becomes two half-tile ones). The wave-wide form is exact, so try it first,
+                // guarded by `lower::watch_loop_barriers` (refusing any shader where a translator
+                // barrier lands in a loop, keeping `ptfx_CS_lightAtlas_Sprite/_Trail` safe).
+                if wide_before_approximate() && !(wide_on || driver_loop) && wide_option.as_ref().is_none_or(|v| v != "0") {
+                    let bases = [forms[1].1.as_ref().map(|f| &f.0), forms[0].1.as_ref().map(|f| &f.0), Some(p)];
+                    if let Some(base) = bases.into_iter().flatten().next() {
+                        let (again, looped) = lower::watch_loop_barriers(|| widen(c, native, base, why, false, false));
+                        report("wave-wide branches", &again);
+                        if why {
+                            eprintln!(
+                                "WAVE64-WIDE-APPROX {}: {}",
+                                digest_hex(c),
+                                match (&again, looped) {
+                                    (_, true) => "a barrier in a loop, not taken",
+                                    (Ok(_), false) if done(&again) => "taken",
+                                    _ => "did not translate",
+                                }
+                            );
+                        }
+                        if done(&again) && !looped {
+                            record_form("wave-wide branches");
                             return again.map(|(shader, _)| shader);
                         }
                     }
@@ -702,17 +732,21 @@ pub fn emit(
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
                 {
+                    let label = format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" });
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                    report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
+                    report(&label, &local);
                     if done(&local) {
+                        record_form(&label);
                         return local.map(|(shader, _)| shader);
                     }
                 }
             }
             if idiom(p, st) == exact {
+                let label = if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" };
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
+                report(label, &local);
                 if done(&local) {
+                    record_form(label);
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -722,9 +756,11 @@ pub fn emit(
             if !strict {
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
+                        let label = format!("local waves (APPROXIMATE, any mask), {name}");
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
-                        report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
+                        report(&label, &local);
                         if done(&local) {
+                            record_form(&label);
                             return local.map(|(shader, _)| shader);
                         }
                     }
@@ -732,6 +768,7 @@ pub fn emit(
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
+                    record_form("local waves (APPROXIMATE, any mask)");
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -781,6 +818,45 @@ pub fn emit(
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The form the last [`emit`] on this thread returned ([`record_form`]).
+    static CHOSEN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// A test's choice for [`wide_before_approximate`], for its thread only.
+    pub(super) static TEST_WIDE_APPROX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn record_form(label: &str) {
+    #[cfg(test)]
+    CHOSEN.with_borrow_mut(|l| {
+        l.clear();
+        l.push_str(label);
+    });
+    #[cfg(not(test))]
+    let _ = label;
+}
+
+/// The form of the program the last [`emit`] on this thread returned.
+#[cfg(test)]
+pub(super) fn last_form() -> String {
+    CHOSEN.with_borrow(Clone::clone)
+}
+
+/// The container's own digest (`Container::digest`, bytes 4..20 of the DXBC header) in hex.
+fn digest_hex(c: &Container) -> String {
+    c.digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `VICTORY_WAVE_WIDE_APPROX=1`: try the wave-wide form before the approximate local-wave
+/// forms ([`emit`]).
+fn wide_before_approximate() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WIDE_APPROX.get() {
+        return on;
+    }
+    std::env::var_os("VICTORY_WAVE_WIDE_APPROX").is_some_and(|v| v == "1")
+}
+
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
@@ -824,6 +900,7 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
+        lower::reset_loop_barriers();
         let r = if pairs {
             lower::with_pair_meetings(|| emit_program(c, native, p, &st, &io, &res))
         } else {

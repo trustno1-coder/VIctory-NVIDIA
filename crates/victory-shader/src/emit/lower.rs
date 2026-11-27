@@ -1219,6 +1219,55 @@ thread_local! {
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_pair_meetings`].
     static PAIR_MEETINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`watch_loop_barriers`]: `None` while nobody watches, then whether a barrier went
+    /// into a loop.
+    static LOOP_BARRIER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` (lowerings) and says whether the last lowering in it put a group barrier of the
+/// translator's own (a half-wave exchange, a split-LDS or LDS meeting) into a block of a loop:
+/// two host waves that leave such a loop on different iterations wait there for threads that
+/// never come, which lost the card on `ptfx_CS_lightAtlas_Sprite/_Trail`.
+/// [`reset_loop_barriers`] starts each lowering afresh.
+pub(super) fn watch_loop_barriers<R>(f: impl FnOnce() -> R) -> (R, bool) {
+    let was = LOOP_BARRIER.replace(Some(false));
+    let r = f();
+    let looped = LOOP_BARRIER.replace(was).unwrap_or(false);
+    (r, looped)
+}
+
+/// Inside [`watch_loop_barriers`]: forgets what an earlier lowering put where.
+pub(super) fn reset_loop_barriers() {
+    if LOOP_BARRIER.get().is_some() {
+        LOOP_BARRIER.set(Some(false));
+    }
+}
+
+/// Whether block `b` lies on a cycle of `st`'s control flow.
+fn in_cycle(st: &Structured, b: usize) -> bool {
+    let n = st.exits.len();
+    let succ = |x: usize| -> Vec<usize> {
+        match st.exits[x] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    if b >= n {
+        return false;
+    }
+    let mut seen = vec![false; n];
+    let mut stack = succ(b);
+    while let Some(x) = stack.pop() {
+        if x == b {
+            return true;
+        }
+        if x < n && !seen[x] {
+            seen[x] = true;
+            stack.extend(succ(x));
+        }
+    }
+    false
 }
 
 /// LDS dwords a host thread group has (D3D12: 32 KiB).
@@ -4638,8 +4687,24 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// For [`watch_loop_barriers`]: a group barrier of the translator's own goes into DXIL block
+    /// `block`, which is the end of an earlier IR block (a ballot taken where its mask is
+    /// written) or a block of the one being lowered.
+    fn note_barrier(&self, block: usize) {
+        if LOOP_BARRIER.get() != Some(false) {
+            return;
+        }
+        let ir = (0..self.tail.len())
+            .find(|&d| d != self.cur_ir && self.tail[d] == Some(block))
+            .unwrap_or(self.cur_ir);
+        if in_cycle(self.x.st, ir) {
+            LOOP_BARRIER.set(Some(true));
+        }
+    }
+
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        self.note_barrier(block);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
