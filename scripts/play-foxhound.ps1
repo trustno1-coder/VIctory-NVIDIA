@@ -13,7 +13,8 @@
 # delete that file to go back to them.
 #
 # Build first (README). Run from a normal window, not as administrator. Each run writes a log to
-# %LOCALAPPDATA%\victory\logs. Every VICTORY_... switch is described in a comment where the code reads it.
+# %LOCALAPPDATA%\victory\logs (the game writes into it itself; this window shows it as it grows). Every VICTORY_...
+# switch is described in a comment where the code reads it.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [ValidateSet('diag', 'release')][string]$Build = 'release',
@@ -188,5 +189,40 @@ try {
 }
 finally { Pop-Location }
 Push-Location $repo
-try { & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line } }
-finally { Pop-Location; $writer.Dispose() }
+try {
+    # The game writes its output into the log itself: cmd's redirection hands it the file, so no line of it goes
+    # through a pipe that this window has to drain (through PowerShell, a line the game could not write at once held
+    # the thread that wrote it, a frame's own among them). The window shows the log as it grows, from a reader the
+    # game never waits for. (A path with a % in it is not for cmd: keep the repository and the title out of such.)
+    $writer.Dispose(); $writer = $null
+    $shown = (Get-Item -LiteralPath $log).Length
+    $run = "`"$victory`" run `"$Exe`" --console $console --execute"
+    $game = Start-Process -FilePath $env:ComSpec -ArgumentList "/d /s /c `"$run >>`"$log`" 2>&1`"" -NoNewWindow -PassThru
+    $null = $game.Handle   # (keeps the exit code once it has ended)
+    # Opened after the game's own handle, sharing everything, so that it can never keep the game from its log.
+    $reader = $null
+    try {
+        $tail = [IO.FileStream]::new($log, 'Open', 'Read', 'ReadWrite, Delete')
+        $null = $tail.Seek($shown, 'Begin')
+        $reader = [IO.StreamReader]::new($tail, [Text.UTF8Encoding]::new($false))
+    } catch { Write-Host "The log cannot be shown while the game runs ($($_.Exception.Message)); it is in $log." }
+    $part = ''
+    while ($true) {
+        $ended = $game.HasExited
+        if ($reader) {
+            $part += $reader.ReadToEnd()
+            $lines = $part -split "`r?`n"
+            $part = $lines[-1]
+            if ($lines.Count -gt 1) { $lines[0..($lines.Count - 2)] }
+        }
+        if ($ended) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($part) { $part }
+    if ($reader) { $reader.Dispose() }
+    # As after `& $victory run`: whoever started this script reads the game's exit code (the F1 menu's restart does).
+    $global:LASTEXITCODE = $game.ExitCode
+    if ($game.ExitCode) { Write-Host "victory run ended with $($game.ExitCode)." }
+    Write-Host "Log: $log"
+}
+finally { Pop-Location; if ($writer) { $writer.Dispose() } }
