@@ -22,7 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,11 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// The worker thread making it now (its Windows thread id, and `1 << 32`
+    /// for a worker of passes over the screen alone; 0: none), and how many
+    /// draws are waiting for it this moment ([`boost`]).
+    maker: AtomicU64,
+    waiters: AtomicU32,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -172,6 +177,8 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            maker: AtomicU64::new(0),
+            waiters: AtomicU32::new(0),
         }
     }
 
@@ -330,6 +337,61 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Workers raised to the title's priority for a waiting draw, since the start.
+static BOOSTED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the worker making a pipeline a draw waits for runs at the title's
+/// own priority while the draw waits. Workers run at the lowest priority
+/// (`VICTORY_PIPELINE_LOWEST`), below every title thread: at world entry the
+/// title keeps every core busy, and a recording thread waiting for a
+/// pipeline (up to `VICTORY_PIPELINE_WAIT_MS` of its frame) can stall behind
+/// a starved worker for what a library load does in milliseconds. The waiting
+/// thread does nothing meanwhile, so the worker takes its share; the priority
+/// goes back when the wait ends, or at the worker's next pipeline. On by
+/// default; `VICTORY_PIPELINE_BOOST=0`: as before.
+fn boosting() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOST").is_none_or(|v| v != "0"))
+}
+
+/// A worker's own priority between boosts.
+fn base_priority(screens_only: bool) -> i32 {
+    use windows_sys::Win32::System::Threading::{THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST};
+    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+    if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL }
+}
+
+/// Sets the priority of the worker making `p`, if one is: the title's own
+/// (`up`) or the worker's base again.
+fn boost(p: &Pending, up: bool) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION,
+    };
+    if !boosting() {
+        return;
+    }
+    let maker = p.maker.load(Ordering::SeqCst);
+    if maker == 0 {
+        return;
+    }
+    let (id, screens_only) = (maker as u32, maker >> 32 != 0);
+    // SAFETY: a thread of this process by id; the handle is closed here. A
+    // worker that moved on meanwhile takes its base again at its next
+    // pipeline.
+    unsafe {
+        let thread = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, id);
+        if thread.is_null() {
+            return;
+        }
+        let priority = if up { THREAD_PRIORITY_NORMAL } else { base_priority(screens_only) };
+        if SetThreadPriority(thread, priority) != 0 && up {
+            BOOSTED.fetch_add(1, Ordering::Relaxed);
+        }
+        CloseHandle(thread);
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -357,6 +419,11 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let started = Instant::now();
+    // A draw waits: the worker making it runs at the title's priority
+    // meanwhile ([`boost`]).
+    if p.waiters.fetch_add(1, Ordering::SeqCst) == 0 {
+        boost(p, true);
+    }
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -367,6 +434,9 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    if p.waiters.fetch_sub(1, Ordering::SeqCst) == 1 && p.made.get().is_none() {
+        boost(p, false);
+    }
     let waited = started.elapsed().min(left);
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
@@ -407,15 +477,44 @@ const MAKING: u8 = 3;
 /// the first minute and a half of the world ran at 0.5 to 1.6 s a frame,
 /// dropping up to 2,900 draws a frame (run shaders-1).
 /// `VICTORY_PIPELINE_SLOW=0`: in the order the title creates them, as before.
+///
+/// Not while a warm library serves the run ([`serving`]): the slow list only
+/// grows (a pipeline once slow to make stays on it), and from a library the
+/// slow ones load as quickly as the others. Keeping them throttled at a
+/// quarter of the workers and lowest priority lets hundreds of cached early
+/// pipelines spill into world entry, where draws wait up to 500 ms for them.
+/// The limit still holds for cold starts (no library or rejected library),
+/// until the library is open, and while the run makes many pipelines afresh.
+/// `VICTORY_PIPELINE_SLOW=1`: the limit with a warm library too, as before.
 fn slow_limit() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
-            usize::MAX
-        } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
-        }
-    })
+    static COLD: OnceLock<usize> = OnceLock::new();
+    let cold = *COLD.get_or_init(|| (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1));
+    static ASKED: OnceLock<Option<bool>> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| match std::env::var_os("VICTORY_PIPELINE_SLOW") {
+        Some(v) if v == "0" => Some(false),
+        Some(v) if v == "1" => Some(true),
+        _ => None,
+    });
+    slow_limit_for(asked, serving(), cold)
+}
+
+/// Whether a warm library serves this run: it is one an earlier run saved
+/// and the host took, and at most one pipeline in four of those that came in
+/// so far was made afresh by the driver.
+fn serving() -> bool {
+    use super::library::{LOADED, MADE};
+    super::library::warm() && MADE.load(Ordering::Relaxed) * 4 <= LOADED.load(Ordering::Relaxed)
+}
+
+/// [`slow_limit`] for the switch (`Some(false)`: no limit, `Some(true)`: the
+/// limit always), a warm library or not, and the limit of a cold start.
+fn slow_limit_for(asked: Option<bool>, warm: bool, cold: usize) -> usize {
+    match asked {
+        Some(false) => usize::MAX,
+        Some(true) => cold,
+        None if warm => usize::MAX,
+        None => cold,
+    }
 }
 
 struct Queue {
@@ -560,19 +659,31 @@ fn workers() -> bool {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
+                    use windows_sys::Win32::System::Threading::{
+                        GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_NORMAL,
+                    };
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
+                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before),
+                    // except while a draw waits ([`boost`]).
+                    let base = base_priority(screens_only);
+                    // SAFETY: plain calls on our own thread.
+                    let me = unsafe { u64::from(GetCurrentThreadId()) } | (u64::from(screens_only) << 32);
                     loop {
                         let p = next(screens_only);
+                        // Set at every pipeline: a waiting draw may have
+                        // raised this thread during the last one ([`boost`]).
+                        p.maker.store(me, Ordering::SeqCst);
+                        let priority = if boosting() && p.waiters.load(Ordering::SeqCst) > 0 {
+                            BOOSTED.fetch_add(1, Ordering::Relaxed);
+                            THREAD_PRIORITY_NORMAL
+                        } else {
+                            base
+                        };
+                        // SAFETY: as above.
+                        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
                         p.make();
+                        p.maker.store(0, Ordering::SeqCst);
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
@@ -607,6 +718,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            boosted = BOOSTED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
@@ -616,6 +728,63 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The slow limit is lifted once a warm library serves the run, unless
+    /// forced on (`VICTORY_PIPELINE_SLOW=1`).
+    #[test]
+    fn the_slow_limit_is_lifted_with_a_warm_library() {
+        assert_eq!(slow_limit_for(None, false, 3), 3, "cold: a quarter of the workers");
+        assert_eq!(slow_limit_for(None, true, 3), usize::MAX, "warm: no limit");
+        assert_eq!(slow_limit_for(Some(true), true, 3), 3, "VICTORY_PIPELINE_SLOW=1: as before");
+        assert_eq!(slow_limit_for(Some(false), false, 3), usize::MAX, "VICTORY_PIPELINE_SLOW=0: none");
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (a, b) = (new(), new());
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_as(&a, EARLY, true), Some(true));
+        assert_eq!(queue.push_as(&b, EARLY, true), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(false, usize::MAX).unwrap(), &a));
+        assert!(Arc::ptr_eq(&queue.pop(false, usize::MAX).unwrap(), &b));
+    }
+
+    /// A draw waiting for a pipeline raises the worker making it to normal
+    /// priority, and the end of the wait lowers it again.
+    #[test]
+    fn a_waiting_draw_raises_the_worker_making_its_pipeline() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetCurrentThreadId, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_LOWEST,
+            THREAD_PRIORITY_NORMAL,
+        };
+        if !boosting() {
+            return;
+        }
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let (to_test, from_worker) = std::sync::mpsc::channel::<i32>();
+        let (to_worker, from_test) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            // SAFETY: plain calls on this thread.
+            unsafe {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                to_test.send(GetCurrentThreadId() as i32).unwrap();
+                for () in from_test {
+                    to_test.send(GetThreadPriority(GetCurrentThread())).unwrap();
+                }
+            }
+        });
+        let id = from_worker.recv().unwrap() as u32;
+        let ask = || {
+            to_worker.send(()).unwrap();
+            from_worker.recv().unwrap()
+        };
+        boost(&p, true);
+        assert_eq!(ask(), THREAD_PRIORITY_LOWEST);
+        p.maker.store(u64::from(id), Ordering::SeqCst);
+        boost(&p, true);
+        assert_eq!(ask(), THREAD_PRIORITY_NORMAL, "raised while a draw waits");
+        boost(&p, false);
+        assert_eq!(ask(), base_priority(false), "its own again after the wait");
+        drop(to_worker);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

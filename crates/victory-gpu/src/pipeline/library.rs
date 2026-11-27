@@ -455,6 +455,8 @@ struct Library {
     /// Stores share it and a save takes it alone: the size the library
     /// asks for must still be its size when it is written out.
     saving: RwLock<()>,
+    /// Made from a saved library the host took ([`warm`]).
+    warm: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises
@@ -501,6 +503,7 @@ fn library() -> Option<&'static Library> {
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
+            OPENED.store(if library.as_ref().is_some_and(|l| l.warm) { 2 } else { 1 }, Ordering::Relaxed);
             library
         })
         .as_ref()
@@ -531,6 +534,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     _blob: blob,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
+                    warm: true,
                 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -547,7 +551,21 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         _blob: Blob::None,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
+        warm: false,
     })
+}
+
+/// This run's library: not open yet (0), new or refused (1), made from one
+/// an earlier run saved that the host took (2: [`warm`]).
+static OPENED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether this run's library was made from one an earlier run saved, which
+/// the host took (same adapter and driver): the pipelines earlier runs made
+/// load from it in milliseconds, those once slow to make too. False until
+/// the library is open (at the first pipeline a worker makes); it does not
+/// open it.
+pub(crate) fn warm() -> bool {
+    OPENED.load(Ordering::Relaxed) == 2
 }
 
 /// A pipeline's name in the library: the hash of what its host
