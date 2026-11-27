@@ -12,7 +12,17 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
     // SAFETY: the API initializes the fields of a correctly sized structure.
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+    // The free RAM the memory bench tells (`crate::host::FREE_RAM_SAID`).
+    #[cfg(test)]
+    if let Some(said) = crate::host::FREE_RAM_SAID
+        .load(Ordering::Relaxed)
+        .checked_sub(1)
+    {
+        status.ullAvailPhys = said;
+    }
+    ok.then_some(status)
 }
 
 // The texture sweep may run for seconds inside a single submitted frame.

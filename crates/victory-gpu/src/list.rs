@@ -149,7 +149,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
     with_state_on(host_list(this), this, f);
 }
 
@@ -278,6 +281,12 @@ impl Detached {
     pub(crate) fn release_tables(&mut self) {
         self._state.tables_done();
     }
+
+    /// Gives the list's scratch chunks to the next lists once its submission has landed
+    /// ([`crate::host::HostList::release_scratch`]), like [`Self::release_tables`].
+    pub(crate) fn release_scratch(&self) {
+        self.host.release_scratch();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
@@ -308,6 +317,14 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+
+/// For the memory bench (`crate::host::membench`): the host lists idle in
+/// [`IDLE`] and the scratch bytes they keep.
+#[cfg(all(windows, test))]
+pub(crate) fn idle() -> (usize, u64) {
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    (idle.0.len(), idle.1)
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
