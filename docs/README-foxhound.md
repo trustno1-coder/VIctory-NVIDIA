@@ -133,6 +133,7 @@ Every `VICTORY_...` switch is described in a comment where the code reads it. Th
 | `VICTORY_DLSS`, `VICTORY_DLSS_MODE` | `quality` | DLSS Super Resolution through the title's FidelityFX dispatch |
 | `VICTORY_FRAMEGEN` | off (`-FrameGen`) | DLSS Frame Generation, with the picture before the HUD tagged |
 | `VICTORY_NATIVE_1440P` | on | Series X renders and outputs 2560x1440 (image patched) |
+| `VICTORY_RENDER_1080P`, `VICTORY_RENDER_720P` | off (`-Res 1080to1440`; none) | the scene at 1920x1080 or 1280x720 under the same 2560x1440 output, scaled up by the title |
 | `VICTORY_SOFT_VIEWS` | `copies` | the title's tiled-heap page mappings kept without Windows views: no freezes at scene cuts |
 | `VICTORY_WC_NO_BACK`, `_MIN_KB` | `1`, `1024` | shader writes into big write-combined copies are not copied back |
 | `VICTORY_AMBIENT`, `VICTORY_AMBIENT_SPECULAR` | `0.8`, `1` | estimates of indirect light and of reflections (no ray tracing) |

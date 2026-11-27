@@ -95,14 +95,15 @@ pub fn run(
 
     // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
     // patched image goes to a folder of its own, beside the stock one.
-    let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
-    let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
-    let images = if native_1440p {
+    // The scene under it: the output's size, or 1920x1080
+    // (`VICTORY_RENDER_1080P=1`), or 1280x720 (`VICTORY_RENDER_720P=1`).
+    let images = if let Some(scene) = native_1440p::Scene::from_env() {
+        use native_1440p::Scene;
         anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
-        if upscaler.is_some() && render_1080p {
-            println!("display        VICTORY_RENDER_1080P is left out: VICTORY_DLSS_MODE sets the scene's size");
+        if upscaler.is_some() && scene != Scene::Native {
+            println!("display        {} is left out: VICTORY_DLSS_MODE sets the scene's size", scene.switch());
         }
-        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())?;
+        let (w, h) = native_1440p::prepare(&mut prepared, if upscaler.is_none() { scene } else { Scene::Native })?;
         // SAFETY: nothing else runs yet; the title and the display mode list
         // read these later.
         unsafe {
@@ -125,7 +126,7 @@ pub fn run(
                     println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
                 }
                 println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
-                cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+                cfg.cache_subdir(scene.cache_name())?
             }
         }
     } else if let Some(mode) = upscaler {
