@@ -100,6 +100,10 @@
   it): DLSS, frame generation, frame rate cap and more.
 - **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
   memory numbers).
+- **LANGUAGE** in F1 controls both panels and the FPS line.
+  **Auto (Windows)** uses the first preferred Windows display language,
+  with English as the fallback. You can choose English, 简体中文 or 繁體中文
+  at any time. The change is immediate and is saved with the other F1 settings.
 
 **Building it yourself instead**
 

@@ -20,6 +20,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::font::{CELL, Script, colours, painted, text_width};
+use super::i18n::{self, Language};
 use super::{Host, HostList, transition};
 
 /// How often the numbers change.
@@ -136,37 +137,56 @@ fn process_memory() -> (u64, u64) {
 }
 
 /// The frame generation line: `per` frames shown for each one rendered.
-fn generated(fps: f64, per: u32) -> String {
+fn generated(language: Language, fps: f64, per: u32) -> String {
     match per {
-        0 | 1 => "FRAME GEN OFF".to_owned(),
-        per => format!("FRAME GEN {per}X  SHOWN {:.1} FPS", fps * f64::from(per)),
+        0 | 1 => language.text(["FRAME GEN OFF", "插帧关闭", "補幀關閉"]).to_owned(),
+        per => {
+            let name = language.text(["FRAME GEN", "插帧", "補幀"]);
+            let shown = language.text(["SHOWN", "显示", "顯示"]);
+            format!("{name} {per}X  {shown} {:.1} FPS", fps * f64::from(per))
+        }
     }
 }
 
-/// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
-/// longest frame's, `cost` what this takes of a frame, in microseconds.
-fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
-    let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let (working, private) = process_memory();
-    let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
-    let idle = (c[1] / 1e3).min(ms);
-    let fps = 1e3 / ms.max(0.001);
-    vec![
-        format!("FPS {fps:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}"),
-        generated(fps, crate::streamline::shown_per_frame()),
-        format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
-        format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
-        format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
-        if cfg!(feature = "diagnostics") {
-            format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3)
-        } else {
-            format!("COPY BACK {:.1} MS", c[5] / 1e3)
-        },
-        format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
-        format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
-        format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
-        format!("THIS PANEL {:.0} US A FRAME", cost),
-    ]
+/// Keep the last sample so changing language can redraw it immediately.
+struct Sample {
+    counters: [f64; COUNTERS],
+    ms: f64,
+    worst: f64,
+    cost: f64,
+    memory: (u64, u64),
+    video_memory: [u64; 4],
+    shown_per_frame: u32,
+}
+
+impl Sample {
+    fn lines(&self, language: Language) -> Vec<String> {
+        let t = |label| language.text(label);
+        let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        let (c, ms, worst, cost) = (&self.counters, self.ms, self.worst, self.cost);
+        let (working, private) = self.memory;
+        let [budget, used, _, shared] = self.video_memory;
+        let idle = (c[1] / 1e3).min(ms);
+        let fps = 1e3 / ms.max(0.001);
+        let back = t(["COPY BACK", "回读", "回讀"]);
+        let units = t(["GB", "GiB", "GiB"]);
+        vec![
+            format!("{} {fps:.1}  {} {ms:.1} MS  {} {worst:.0}", t(["FPS", "帧率", "幀率"]), t(["FRAME", "帧时", "幀時間"]), t(["LONGEST", "最长", "最長"])),
+            generated(language, fps, self.shown_per_frame),
+            format!("{} {:.0}  {} {:.0}", t(["DRAWS", "绘制调用", "繪製呼叫"]), c[10], t(["DROPPED", "跳过", "略過"]), c[8]),
+            format!("{} {:.1}  {} {:.1}", t(["SUBMIT BUSY", "提交处理", "提交處理"]), c[0] / 1e3, t(["WAITS FOR GPU", "等待 GPU", "等待 GPU"]), c[3] / 1e3),
+            format!("{} {:.1}  {} {:.1}", t(["GPU BUSY", "GPU 忙碌", "GPU 忙碌"]), ms - idle, t(["IDLE BEHIND US", "提交侧空档", "提交端空檔"]), c[2] / 1e3),
+            if cfg!(feature = "diagnostics") {
+                format!("{} {:.0} MS  {back} {:.1}", t(["RECORDING", "录制", "錄製"]), c[9] / 1e6, c[5] / 1e3)
+            } else {
+                format!("{back} {:.1} MS", c[5] / 1e3)
+            },
+            format!("{} {:.0}  {} {:.0}  {} {:.0}", t(["MB UP", "MB 上传", "MB 上傳"]), c[7] / 1e6, t(["TEXTURES", "贴图", "紋理"]), c[4] / 1e6, t(["BACK", "回读", "回讀"]), c[6] / 1e6),
+            format!("{} {:.1} {units}  {} {:.1}", t(["RAM", "内存提交", "記憶體認可"]), gb(private), t(["IN MEMORY", "工作集", "工作集"]), gb(working)),
+            format!("{} {:.1}/{:.1} {units}  {} {:.1}", t(["VRAM", "显存", "顯示記憶體"]), gb(used), gb(budget), t(["SHARED", "共享", "共用"]), gb(shared)),
+            format!("{} {cost:.0} {}", t(["THIS PANEL", "面板开销", "面板負荷"]), t(["US A FRAME", "US/帧", "US/幀"])),
+        ]
+    }
 }
 
 /// The buffers of a box that size and format.
@@ -216,9 +236,9 @@ impl Buffers {
         Some(Buffers { shape, format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
     }
 
-    fn write(&mut self, lines: &[String]) {
+    fn write(&mut self, lines: &[String], script: Script) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, size(self.shape, self.scale), self.scale, RIM, Script::Simplified, colours, self.pitch as usize);
+        let picture = painted(lines, size(self.shape, self.scale), self.scale, RIM, script, colours, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -274,7 +294,8 @@ pub(super) struct Panel {
     /// What this took since the last text.
     cost: Duration,
     before: Counters,
-    lines: Vec<String>,
+    sample: Option<Sample>,
+    language: Option<Language>,
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
@@ -290,7 +311,8 @@ impl Panel {
             worst: 0.0,
             cost: Duration::ZERO,
             before: Counters::default(),
-            lines: Vec::new(),
+            sample: None,
+            language: None,
             changed: false,
             buffers: None,
             failed: false,
@@ -326,7 +348,15 @@ impl Panel {
         let c = counters.since(self.before, frames);
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
-        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
+        self.sample = Some(Sample {
+            counters: c,
+            ms: elapsed.as_secs_f64() * 1e3 / frames,
+            worst: self.worst,
+            cost,
+            memory: process_memory(),
+            video_memory: host.video_memory().unwrap_or_default(),
+            shown_per_frame: crate::streamline::shown_per_frame(),
+        });
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
@@ -342,9 +372,10 @@ impl Panel {
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
     ) {
-        if !shown().load(Ordering::Relaxed) || self.lines.is_empty() || self.failed {
+        if !shown().load(Ordering::Relaxed) || self.failed {
             return;
         }
+        let Some(sample) = &self.sample else { return };
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
         #[cfg(feature = "diagnostics")]
@@ -358,8 +389,10 @@ impl Panel {
             self.changed = true;
         }
         let Some(buffers) = &mut self.buffers else { return };
-        if std::mem::take(&mut self.changed) {
-            buffers.write(&self.lines);
+        let language = i18n::current();
+        if std::mem::take(&mut self.changed) || self.language != Some(language) {
+            buffers.write(&sample.lines(language), language.script());
+            self.language = Some(language);
         }
         buffers.copy(&list.list, back, (0, 0), (width, height));
         self.cost += began.elapsed();
@@ -421,7 +454,7 @@ impl Notice {
         }
         let Some(buffers) = &mut self.buffers else { return };
         if !std::mem::replace(&mut self.written, true) {
-            buffers.write(&self.lines);
+            buffers.write(&self.lines, Script::Simplified);
         }
         let (w, _) = size(self.shape, scale);
         let at = (width.saturating_sub(w) / 2, (CELL.1 + 8) * scale);
@@ -436,9 +469,26 @@ mod tests {
     /// The frame generation line fits the box and says what is shown.
     #[test]
     fn generated_frames_are_told() {
-        assert_eq!(generated(27.5, 1), "FRAME GEN OFF");
-        assert_eq!(generated(27.5, 6), "FRAME GEN 6X  SHOWN 165.0 FPS");
-        assert!(text_width(&generated(999.9, 6)) <= COLUMNS);
+        assert_eq!(generated(Language::English, 27.5, 1), "FRAME GEN OFF");
+        assert_eq!(generated(Language::English, 27.5, 6), "FRAME GEN 6X  SHOWN 165.0 FPS");
+        assert_eq!(generated(Language::Simplified, 27.5, 2), "插帧 2X  显示 55.0 FPS");
+        assert_eq!(generated(Language::Traditional, 27.5, 2), "補幀 2X  顯示 55.0 FPS");
+    }
+
+    #[test]
+    fn statistics_fit_in_each_language() {
+        let giga = 1 << 30;
+        let sample = Sample {
+            counters: [1_234_567.0; COUNTERS], ms: 110.0, worst: 180.0, cost: 120.0,
+            memory: (24 * giga, 26 * giga), video_memory: [8 * giga, 7 * giga, 0, giga], shown_per_frame: 2,
+        };
+        for language in [Language::English, Language::Simplified, Language::Traditional] {
+            let lines = sample.lines(language);
+            assert_eq!(lines.len(), LINES as usize);
+            for line in &lines {
+                assert!(text_width(line) <= COLUMNS, "{language:?}: {line}");
+            }
+        }
     }
 
     #[test]

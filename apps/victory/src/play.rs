@@ -902,6 +902,19 @@ pub(crate) fn hold_window() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reloads_overlay_language_without_changing_play_settings() {
+        let options = options();
+        let (defaults, default_console) = settings(&options, &[], None);
+        for language in ["auto", "en", "zh-Hans", "zh-Hant"] {
+            let saved = parse_menu(&format!("VICTORY_UI_LANGUAGE={language}\r\n"));
+            let (mut switches, console) = settings(&options, &saved, None);
+            assert_eq!(switches.remove("VICTORY_UI_LANGUAGE").as_deref(), Some(language));
+            assert_eq!(defaults, switches);
+            assert_eq!(default_console, console);
+        }
+    }
+
     fn options() -> Play {
         Play {
             exe: None,

@@ -4150,6 +4150,7 @@ pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
 mod font;
+mod i18n;
 mod menu;
 mod panel;
 mod place;
