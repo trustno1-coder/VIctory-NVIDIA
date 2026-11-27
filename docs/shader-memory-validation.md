@@ -1,5 +1,7 @@
 # Synthetic shader correctness and pressure reclamation
 
+**Pending revalidation:** upstream advanced to `64d4931b3dd90305134512b805fc98f04119fb6e` after the results below. Its allocator/list trimming, prelude pooling and shader changes have been merged, preserving both sets of changes. The new merge is being pushed before testing at the owner's request; results below apply only to the older pinned revisions. Upstream age-based idle trimming remains available; the new pressure-only path also increments its trim counter.
+
 This work supplements existing upstream fixes with four shader corrections and pressure-only reclamation of idle host lists and oversized fetch buffers. The new shader/memory tests use original synthetic fixtures; no game, captured asset, shader dump, game offset or private runtime log was supplied. Existing repository test data and its licensing caveats are unchanged; these commits add or modify no binary/table blob. No real-game correctness or FPS claim is made.
 
 ## Revisions and attribution
