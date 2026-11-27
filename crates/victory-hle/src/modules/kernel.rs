@@ -434,6 +434,166 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// How the title's thread affinities are applied (`VICTORY_TITLE_AFFINITY`):
+/// `fast` (the default) maps the title's processor numbers onto the host's
+/// fastest processors first, `free` leaves the title's threads to the host's
+/// scheduler, `keep` applies them as asked.
+///
+/// The title pins its threads by processor number, as on the console's eight
+/// cores that are all alike: its busiest workers (at "highest") to 0-7, one
+/// thread at "time critical" to 13 alone. On a processor with two kinds of
+/// core those numbers are a mix: on an Intel Core Ultra 7 265K the fast
+/// cores are 0, 1, 6-9, 18 and 19, so 0-7 held four slow ones and 13 is a
+/// slow one (thread dump in the prison cell, 2026-11-27). With `fast` the
+/// title's 0-7 are the eight fast cores there; where all cores are alike the
+/// order is the host's own and nothing changes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TitleAffinity {
+    Fast,
+    Free,
+    Keep,
+}
+
+fn title_affinity() -> TitleAffinity {
+    static MODE: std::sync::OnceLock<TitleAffinity> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("VICTORY_TITLE_AFFINITY")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("free") => TitleAffinity::Free,
+            Some("keep") => TitleAffinity::Keep,
+            _ => TitleAffinity::Fast,
+        }
+    })
+}
+
+/// The host's logical processors of group 0, fastest first: by efficiency
+/// class (higher is faster), then by number. `None` if they could not be
+/// read.
+#[cfg(windows)]
+fn fast_first() -> Option<&'static [u8]> {
+    static ORDER: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    ORDER
+        .get_or_init(|| {
+            use windows_sys::Win32::System::SystemInformation::{
+                GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
+            };
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let mut bytes = 0u32;
+            // SAFETY: a size query, then the call into a buffer of that size.
+            unsafe {
+                GetSystemCpuSetInformation(
+                    std::ptr::null_mut(),
+                    0,
+                    &mut bytes,
+                    GetCurrentProcess(),
+                    0,
+                )
+            };
+            let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+            // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
+            let ok = unsafe {
+                GetSystemCpuSetInformation(
+                    buffer.as_mut_ptr().cast(),
+                    bytes,
+                    &mut bytes,
+                    GetCurrentProcess(),
+                    0,
+                )
+            };
+            if ok == 0 {
+                return None;
+            }
+            let mut cores = Vec::new();
+            let mut at = 0usize;
+            while at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
+                // SAFETY: a record inside the buffer; each says its own size.
+                let info = unsafe {
+                    &*(buffer
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(at)
+                        .cast::<SYSTEM_CPU_SET_INFORMATION>())
+                };
+                if info.Size == 0 {
+                    break;
+                }
+                // SAFETY: the record's type is CpuSet (the only one there is).
+                let set = unsafe { &info.Anonymous.CpuSet };
+                if set.Group == 0 {
+                    cores.push((set.LogicalProcessorIndex, set.EfficiencyClass));
+                }
+                at += info.Size as usize;
+            }
+            Some(order_fast_first(&cores))
+        })
+        .as_deref()
+}
+
+/// Logical processor numbers ordered fastest first (stable by number), from
+/// `(number, efficiency class)` pairs.
+fn order_fast_first(cores: &[(u8, u8)]) -> Vec<u8> {
+    let mut cores = cores.to_vec();
+    cores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    cores.into_iter().map(|c| c.0).collect()
+}
+
+/// The title's processor mask with its processor `i` taken as the `i`-th of
+/// `order`; bits past `order` stay as they are.
+fn remap_mask(mask: usize, order: &[u8]) -> usize {
+    let mut out = 0usize;
+    for i in 0..usize::BITS as usize {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let to = order.get(i).map_or(i, |&p| p as usize);
+        if to < usize::BITS as usize {
+            out |= 1 << to;
+        }
+    }
+    out
+}
+
+/// [`title_affinity`].
+#[cfg(windows)]
+pub extern "system" fn SetThreadGroupAffinity(
+    thread: *mut c_void,
+    affinity: *const windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY,
+    previous: *mut windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY,
+) -> i32 {
+    use windows_sys::Win32::System::Threading::{
+        GetThreadGroupAffinity, SetThreadGroupAffinity as host_set,
+    };
+    let mode = title_affinity();
+    if affinity.is_null() || mode == TitleAffinity::Keep {
+        // SAFETY: the title's arguments, as given.
+        return unsafe { host_set(thread, affinity, previous) };
+    }
+    if mode == TitleAffinity::Free {
+        // As if it were done: the thread keeps what it has, and the title is
+        // told that as before.
+        if !previous.is_null() {
+            // SAFETY: the title's thread handle and its out pointer.
+            return unsafe { GetThreadGroupAffinity(thread, previous) };
+        }
+        return 1;
+    }
+    // SAFETY: the title passes a valid affinity to read.
+    let mut asked = unsafe { *affinity };
+    if asked.Group == 0
+        && let Some(order) = fast_first()
+    {
+        let mapped = remap_mask(asked.Mask, order);
+        if mapped != 0 {
+            asked.Mask = mapped;
+        }
+    }
+    // SAFETY: the title's thread handle and out pointer, our copy of its affinity.
+    unsafe { host_set(thread, &asked, previous) }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -442,6 +602,7 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-processtopology-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
@@ -469,6 +630,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            #[cfg(windows)]
+            hle_export!(SetThreadGroupAffinity),
         ],
     }
 }
@@ -682,6 +845,34 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On a Core Ultra 7 265K (fast cores 0, 1, 6-9, 18, 19) the title's
+    /// processors 0-7 become the eight fast cores and its 13 a slow one;
+    /// where all cores are alike nothing moves.
+    #[test]
+    fn the_titles_low_processors_are_the_fast_cores() {
+        let fast = [0u8, 1, 6, 7, 8, 9, 18, 19];
+        let cores: Vec<(u8, u8)> = (0..20u8)
+            .map(|p| (p, u8::from(fast.contains(&p))))
+            .collect();
+        let order = order_fast_first(&cores);
+        assert_eq!(
+            order,
+            [
+                0, 1, 6, 7, 8, 9, 18, 19, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15, 16, 17
+            ]
+        );
+        assert_eq!(remap_mask(0xFF, &order), 0b1100_0000_0011_1100_0011);
+        assert_eq!(remap_mask(1 << 13, &order), 1 << 11);
+        assert_eq!(remap_mask(0xF_FFFF, &order), 0xF_FFFF);
+        let alike: Vec<(u8, u8)> = (0..16u8).map(|p| (p, 0)).collect();
+        let order = order_fast_first(&alike);
+        for mask in [0x1, 0xFF, 0x1F00, 0x2000, 0xFFFF] {
+            assert_eq!(remap_mask(mask, &order), mask);
+        }
+        // Past the host's processors a bit stays where it is.
+        assert_eq!(remap_mask(1 << 40, &order), 1 << 40);
+    }
 
     /// The title's idle and lowest threads run below normal; the others as
     /// it sets them.
