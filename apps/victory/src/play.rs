@@ -839,10 +839,7 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     println!("Log: {}", log.display());
     s.insert("VICTORY_LOG_FILE".to_owned(), log.to_string_lossy().into_owned());
 
-    let leftover: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .filter(|k| k.starts_with("VICTORY_") && !KEPT.contains(&k.as_str()))
-        .collect();
+    let leftover = leftovers(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()));
     // SAFETY: the first thing this process does: no other thread of ours runs yet.
     unsafe {
         for k in leftover {
@@ -853,6 +850,19 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         }
     }
     Ok(Ready { exe, series_s })
+}
+
+/// The `VICTORY_...` variables to clear: every one but the kept paths.
+/// Names compare without case, as Windows reads them: a differently cased
+/// leftover would survive the clearing and still answer the settings'
+/// lookups.
+fn leftovers(names: impl Iterator<Item = String>) -> Vec<String> {
+    names
+        .filter(|k| {
+            k.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("VICTORY_"))
+                && !KEPT.iter().any(|kept| kept.eq_ignore_ascii_case(k))
+        })
+        .collect()
 }
 
 /// After a start that went wrong in a window of its own (a double click):
@@ -882,6 +892,26 @@ mod tests {
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    /// The clearing takes every `VICTORY_...` variable however it is
+    /// cased, and leaves the kept paths: Windows reads the names without
+    /// case, so `victory_framegen` would answer a `VICTORY_FRAMEGEN`
+    /// lookup and survive the settings.
+    #[test]
+    fn a_differently_cased_victory_leftover_is_cleared_too() {
+        let names = [
+            "victory_framegen",
+            "Victory_Fps",
+            "VICTORY_GAME_DIR",
+            "OTHER_VICTORY",
+            "victory_lowercase",
+        ];
+        let gone = leftovers(names.into_iter().map(String::from));
+        assert_eq!(
+            gone,
+            ["victory_framegen", "Victory_Fps", "victory_lowercase"]
+        );
     }
 
     #[test]
