@@ -1014,6 +1014,15 @@ impl Memory {
     }
 
     /// Another arena's pages.
+    ///
+    /// After one that could not be made, no other is tried before
+    /// the next frame. `ready` asks for one at every dispatch of the builder
+    /// while the spares are low (thousands a frame); once the reservation
+    /// failed every ask searched the address range again under this lock,
+    /// and frames took 30 s until the title's watchdog ended the run (RTX
+    /// 4090, 11-27: 19 arenas for minutes, the recording threads 70 % in
+    /// the kernel under `upload::reserve`). A reservation whose copy could
+    /// not be made is given back, not left behind.
     fn another(&mut self) -> bool {
         // One that could not be had is not asked for again at once: every
         // builder dispatch comes through here, a thousand and more a frame,

@@ -22,8 +22,9 @@ clap.workspace = true
 walkdir.workspace = true
 
 [features]
-# The Windows 10 build: loads Microsoft's D3D12 Agility SDK from a `D3D12`
-# folder next to the exe (src/agility.rs). Never for the plain build.
+# Kept so the release steps that build victory-win10.exe with it still work.
+# Every build now asks Windows for the D3D12 runtime in a `D3D12` folder beside
+# the exe, at that file's version, or for Windows' own without one (main.rs).
 agility = []
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.

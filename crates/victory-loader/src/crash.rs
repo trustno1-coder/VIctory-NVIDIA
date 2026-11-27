@@ -169,11 +169,18 @@ fn leave_crash_files(text: &str, info: *const EXCEPTION_POINTERS) {
         append_to_log(text);
         return;
     };
-    // Named after the run's log (`play-<time>-<process>` becomes
-    // `crash-<time>-<process>`), so the two are matched at a glance.
+    // Named after the run's log (`victory-nvidia-play-<time>-<process>`, or
+    // `play-<time>-<process>` before, becomes `crash-<time>-<process>`), so
+    // the two are matched at a glance, and the launchers' `crash-*` finds it.
     let stem = run_log
         .and_then(|l| l.file_stem())
-        .map(|s| s.to_string_lossy().replacen("play-", "crash-", 1))
+        .map(|s| {
+            let s = s.to_string_lossy();
+            match s.find("play-") {
+                Some(at) => format!("crash-{}", &s[at + "play-".len()..]),
+                None => format!("crash-{s}"),
+            }
+        })
         .unwrap_or_else(|| format!("crash-{}", std::process::id()));
     let (log_copy, dump) = (dir.join(format!("{stem}.log")), dir.join(format!("{stem}.dmp")));
     let note = format!(
