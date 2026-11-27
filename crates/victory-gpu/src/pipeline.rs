@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -723,6 +723,11 @@ pub(crate) extern "system" fn create_loose_compute(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    // `VICTORY_LOOSE_COMPUTE=0`: as before, the title goes without these pipelines.
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_LOOSE_COMPUTE").is_none_or(|v| v != "0")) {
+        return E_NOTIMPL;
+    }
     // SAFETY: the title passes a description (null is tolerated); its pairs
     // name its own mapped bytes.
     let container = unsafe { desc.as_ref().and_then(|desc| loose_compute(desc)) };
