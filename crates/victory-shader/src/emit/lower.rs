@@ -6485,6 +6485,15 @@ impl<'a> Lower<'a> {
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
             }
+            "s_pack_ll_b32_b16" => {
+                // low half of the first source, then the low half of the second
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let low = self.s.m.i32(0xFFFF);
+                let k16 = self.s.m.i32(16);
+                let a = self.s.m.bin(c, Bin::And, a, low);
+                let b = self.s.m.bin(c, Bin::Shl, b, k16);
+                (self.s.m.bin(c, Bin::Or, a, b), None)
+            }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k31 = self.s.m.i32(31);
@@ -11493,12 +11502,15 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            // One channel goes into a view the program also counts in.
+            // shortcut: stores are taken to write a float format (the console
+            // converts by the view's format). One channel goes into a view
+            // the program also counts in.
             let counter = *dmask == 1 && self.is_counter(src);
-            if *dmask != 0xF && !counter {
-                return Err("an image store of some channels");
+            if !counter && *dmask == 0 {
+                return Err("an image store of no channels");
+            }
+            if !counter && *dmask != 0xF && self.is_counter(src) {
+                return Err("an image store of some channels into a view the program counts in");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -11536,14 +11548,24 @@ impl<'a> Lower<'a> {
                 self.end_guarded(at, &[]);
                 return Ok(());
             }
+            // the console writes the channels the mask leaves out as zero, not
+            // their old values, so no read of the texel is needed and no other
+            // lane's write is lost. The enabled channels sit in consecutive
+            // registers (d16: two to a register, low half first), `n` counts
+            // them.
             let mut vals = Vec::new();
+            let mut n = 0u8;
             for k in 0..4u8 {
-                // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                if (*dmask >> k) & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
+                let r = if *d16 { n / 2 } else { n };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
+                n += 1;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if (n - 1) % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -12602,15 +12624,19 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                // shortcut: typed stores are taken to write a float format.
+                if *offen || *offset != 0 {
+                    return Err("a typed buffer store at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
                     args.push(self.as_float(x));
+                }
+                // the console writes the channels past the instruction's last
+                // as zero; the view drops those it lacks.
+                for _ in count..4 {
+                    args.push(self.s.m.f32(0));
                 }
                 (69, "bufferStore.f32")
             } else {

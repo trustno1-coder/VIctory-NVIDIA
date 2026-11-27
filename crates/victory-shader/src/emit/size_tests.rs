@@ -369,3 +369,55 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
         assert_eq!(got[..2], [0, 6], "{label}");
     }
 }
+
+/// A store that leaves channels out of its mask writes them as zero: the
+/// console clears them, it does not keep the texel's old value.
+#[test]
+fn a_store_of_some_channels_writes_zero_to_the_rest() {
+    // v_mov_b32 v<n>, src
+    let mov = |n: u32, src: u32| 0x7E00_0200 | n << 17 | src;
+    let program = |setup: &[u32], store: [u32; 2]| {
+        let words = [
+            0xF40C_0201u32, // s_load_dwordx8 s[8:15], s[2:3], 0
+            0xFA00_0000,
+            0x7E00_0280,    // v_mov_b32 v0, 0
+            0x7E02_0280,    // v_mov_b32 v1, 0
+            mov(2, 242),    // v2 = 1.0
+            mov(3, 244),    // v3 = 2.0
+            mov(4, 246),    // v4 = 4.0
+            mov(5, 243),    // v5 = -1.0
+            0xF020_1F08,    // image_store v[2:5], v[0:1], s[8:15] dmask:0xf 2D
+            0x0002_0200,
+        ];
+        let words = [&words[..], setup, &store, &[0xBE84_0380, 0xBE85_0380]].concat();
+        build(&[TABLE, &words, STORE].concat(), (8, 0)).expect("translates")
+    };
+    let cases: [(&str, Vec<u32>, [u32; 2], [u32; 4]); 3] = [
+        (
+            "dmask 0x9",
+            vec![mov(6, 245), mov(7, 240)], // v6 = -2.0, v7 = 0.5
+            [0xF020_1908, 0x0002_0600],
+            [0xC000_0000, 0, 0, 0x3F00_0000],
+        ),
+        (
+            "d16 dmask 0x1",
+            vec![mov(8, 255), 0x4500],
+            [0xF020_1108, 0x8002_0800],
+            [0x40A0_0000, 0, 0, 0],
+        ),
+        (
+            "d16 dmask 0x7",
+            vec![mov(8, 255), 0x4000_3C00, mov(9, 255), 0x4400],
+            [0xF020_1708, 0x8002_0800],
+            [0x3F80_0000, 0x4000_0000, 0x4080_0000, 0],
+        ),
+    ];
+    for (name, setup, store, want) in cases {
+        let shader = program(&setup, store);
+        let texel = [[0.0; 4]; 1];
+        let views = [View::TextureUav(1, 1), View::Texture(1, 1, &texel), View::RawUav(2)];
+        for (label, got) in run(&shader, &views) {
+            assert_eq!(got[..4], want, "{label}: {name}");
+        }
+    }
+}
