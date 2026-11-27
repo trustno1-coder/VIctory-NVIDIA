@@ -57,6 +57,11 @@ pub(super) trait Work: Send {
     type Ask;
     fn ask(&self) -> Option<Self::Ask>;
     fn met(ask: &Self::Ask) -> bool;
+    /// Lab: what kind of thing `ask` waits for, for the count of what the
+    /// line stood at (0 a fence, 1 a memory value, 2 lists being translated).
+    fn kind(_ask: &Self::Ask) -> usize {
+        3
+    }
     /// Whether it is a present: everything before it goes first, met or not.
     fn shows(&self) -> bool;
     /// Whether it is a submission.
@@ -274,13 +279,17 @@ impl<W: Work> Lane<W> {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
                         crate::lab::SERVE[0].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                     } else {
+                        // (Lab: what the oldest entry waits for.)
+                        let kind = state.items.front().and_then(|e| e.what.ask()).map_or(3, |ask| W::kind(&ask));
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
-                        crate::lab::SERVE[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+                        let us = began.elapsed().as_micros() as u64;
+                        crate::lab::SERVE[1].fetch_add(us, Relaxed);
                         crate::lab::SERVE[2].fetch_add(1, Relaxed);
+                        crate::lab::SERVE[3 + kind.min(3)].fetch_add(us, Relaxed);
                         if out.timed_out() {
                             break;
                         }
@@ -540,6 +549,14 @@ impl Work for Job {
 
     fn marked(&mut self, mark: u64) {
         crate::heap_marks::set_mark(mark);
+    }
+
+    fn kind(ask: &Ask) -> usize {
+        match ask {
+            Ask::Wait(..) => 0,
+            Ask::Value(_) => 1,
+            Ask::Lists(_) => 2,
+        }
     }
 
     fn met(ask: &Ask) -> bool {

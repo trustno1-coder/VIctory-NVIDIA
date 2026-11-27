@@ -4158,6 +4158,7 @@ fn relay_worker() {
     };
     let mut fetch: Option<RelayFetch> = None;
     loop {
+        crate::lab::priority(crate::lab::H);
         let next = {
             let mut line = line();
             loop {

@@ -307,6 +307,7 @@ fn start() {
             crate::cores::keep_many_on_fast_cores("victory-list");
             crate::queue::no_drain_here();
             loop {
+                crate::lab::priority(crate::lab::G);
                 let recording = {
                     let mut ready = held(&READY);
                     loop {

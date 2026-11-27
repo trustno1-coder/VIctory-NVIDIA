@@ -27,10 +27,15 @@ pub(crate) const C: usize = 4;
 pub(crate) const D: usize = 5;
 pub(crate) const E: usize = 6;
 pub(crate) const F: usize = 7;
+/// The priority of the threads that translate lists, and of the one that
+/// lands flights ([`priority`]).
+pub(crate) const G: usize = 8;
+pub(crate) const H: usize = 9;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 8] = [("reuse", 1), ("zero", 1), ("a", 0), ("b", 0), ("c", 0), ("d", 0), ("e", 0), ("f", 0)];
-static VALUES: [AtomicI64; 8] = [const { AtomicI64::new(0) }; 8];
+const KNOBS: [(&str, i64); 10] =
+    [("reuse", 1), ("zero", 1), ("a", 0), ("b", 0), ("c", 0), ("d", 0), ("e", 0), ("f", 0), ("g", 0), ("h", 0)];
+static VALUES: [AtomicI64; 10] = [const { AtomicI64::new(0) }; 10];
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -75,6 +80,23 @@ pub(crate) fn burn(which: usize) {
     while (began.elapsed().as_micros() as i64) < us {
         std::hint::spin_loop();
     }
+}
+
+/// Gives this thread the priority switch `which` says: 0 normal (as it was
+/// made), 1 above normal, 2 highest, -1 below normal. Asks the system only
+/// when the switch has changed.
+pub(crate) fn priority(which: usize) {
+    thread_local! {
+        static APPLIED: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    }
+    let want = knob(which).clamp(-2, 2);
+    if APPLIED.get() == want {
+        return;
+    }
+    APPLIED.set(want);
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+    // SAFETY: this thread's own priority.
+    unsafe { SetThreadPriority(GetCurrentThread(), want as i32) };
 }
 
 fn read(path: &std::ffi::OsString, last: &mut String) {
@@ -164,9 +186,10 @@ fn tagged(buffer: &ID3D12Resource) -> Option<(usize, u64)> {
 /// the time a frame took).
 pub(crate) static DRAWN: AtomicU64 = AtomicU64::new(0);
 /// The submitting thread's line since then, in microseconds: waiting with
-/// nothing in it, standing at something not met; and the looks that found
-/// it standing so.
-pub(crate) static SERVE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// nothing in it, standing at something not met; the looks that found it
+/// standing so; and the standing by what its oldest entry waited for: a
+/// fence, a memory value, lists being translated, something else.
+pub(crate) static SERVE: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// A buffer of `kind` and exactly `size` bytes that nothing holds, mapped
 /// (and zeroed if `zero`, as a new one is): the one let go last.
@@ -266,12 +289,16 @@ pub(crate) fn log(frames: f64) {
     let switches: Vec<String> = KNOBS.iter().zip(&VALUES).map(|((name, _), v)| format!("{name}={}", v.load(Relaxed))).collect();
     let serve: Vec<f64> = SERVE.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "lab: {frames:.0} frames in {ms:.0} ms, {:.2} ms a frame, {:.0} draws a frame; the submitting thread's line per frame: {:.2} ms \
-         with nothing in it, {:.2} ms standing at something not met ({:.1} looks); switches: {}",
+        "lab: {frames:.0} frames in {ms:.0} ms, {:.2} ms a frame, {:.0} draws a frame; line: empty {:.2} ms, standing {:.2} ms \
+         (fence {:.2}, value {:.2}, lists {:.2}, other {:.2}; {:.1} looks); switches: {}",
         ms / frames,
         DRAWN.swap(0, Relaxed) as f64 / frames,
         serve[0] / 1000.0,
         serve[1] / 1000.0,
+        serve[3] / 1000.0,
+        serve[4] / 1000.0,
+        serve[5] / 1000.0,
+        serve[6] / 1000.0,
         serve[2],
         switches.join(" ")
     );
