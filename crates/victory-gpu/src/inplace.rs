@@ -273,50 +273,30 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 // census needs them to say which view memory is one run of a section (one
 // placed buffer could show it) and which is scattered pages.
 
-struct Views {
-    /// By address: bytes, the section's handle, the offset in it.
-    views: BTreeMap<usize, (usize, usize, u64)>,
-    /// By section and byte offset of a 64 KiB page: the address of that
-    /// page in every view that shows it. A write through one view of a
-    /// page is a write of the bytes every other view shows
-    /// (`crate::watch` guards them all).
-    pages: BTreeMap<(usize, u64), Vec<usize>>,
-    /// Of those, how many are shown more than once.
-    pages_twice: usize,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
-    /// Our own view of a whole section, by its handle (0: the host gave
-    /// none), made when first asked for ([`beside`]) and kept.
-    whole: Vec<(usize, usize)>,
+// Identity bindings and the existing reverse-alias/cached-window indexes are
+// one transaction. Keeping another census lock here would let them disagree
+// during remap, section-handle reuse or a concurrent physical write.
+fn views() -> std::sync::MutexGuard<'static, crate::storage::Registry> {
+    crate::storage::registry()
 }
 
-/// Read by many threads at once (write faults, landings), changed when the
-/// runtime maps or unmaps.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
-    views: BTreeMap::new(),
-    pages: BTreeMap::new(),
-    pages_twice: 0,
-    sections: Vec::new(),
-    whole: Vec::new(),
-});
-
-fn views() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
-}
-
-fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+fn views_mut() -> std::sync::MutexGuard<'static, crate::storage::Registry> {
+    crate::storage::registry()
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views_mut();
-    v.sections.retain(|s| s.0 != section);
-    // A handle's number given out again: the view was of the section that
-    // had it before (it stays mapped: someone may be writing through it).
-    v.whole.retain(|w| w.0 != section);
-    v.sections.push((section, bytes, committed));
+    let _ = title_memory_section_created(section, bytes, committed);
+}
+
+/// Called once for actual native section creation, never for another alias.
+pub fn title_memory_section_created(
+    section: usize,
+    bytes: u64,
+    committed: bool,
+) -> crate::storage::BackingToken {
+    views_mut().section(section, bytes, committed)
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
@@ -324,33 +304,56 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 pub fn title_memory_section_gone(section: usize) {
     let whole = {
         let mut v = views_mut();
-        let at = v.whole.iter().position(|w| w.0 == section);
-        at.map(|i| v.whole.swap_remove(i).1)
+        v.token_for_section(section)
+            .and_then(|token| v.release_section(token))
     };
     if let Some(base) = whole.filter(|&base| base != 0) {
         // SAFETY: a view of ours. Who writes through it found the section
         // in a view the title saw and holds off its unmapping
         // (`crate::watch::title_memory_reading`), which came before this.
-        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }) };
+        unsafe {
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: base as *mut c_void,
+            })
+        };
+    }
+}
+
+/// Token-aware release cannot retire a new section that reused a raw handle.
+pub fn title_memory_section_released(token: crate::storage::BackingToken) {
+    let whole = views_mut().release_section(token);
+    if let Some(base) = whole.filter(|&base| base != 0) {
+        // SAFETY: this is this section generation's cached view, detached
+        // under the registry lock. Mapping readers exclude native unmapping.
+        unsafe {
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: base as *mut c_void,
+            })
+        };
     }
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    {
-        let mut v = views_mut();
-        v.views.insert(at, (len, section, offset));
-        for k in 0..len.div_ceil(K64) {
-            let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
-            shown.push(at + k * K64);
-            let twice = shown.len() == 2;
-            v.pages_twice += usize::from(twice);
-        }
-    }
+    views_mut().view(at, len, section, offset, None);
     // This view is writable from now on: a guard over the same bytes at
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
+    crate::watch::views_mapped(section, offset, len);
+}
+
+/// A mapping notification with the identity created for its pinned section.
+/// This is metadata after exposure; it does not establish GPU ownership or
+/// claim to prevent native CPU accesses during a future publication protocol.
+pub fn title_memory_view_backing(
+    at: usize,
+    len: usize,
+    section: usize,
+    offset: u64,
+    token: crate::storage::BackingToken,
+) {
+    views_mut().view(at, len, section, offset, Some(token));
     crate::watch::views_mapped(section, offset, len);
 }
 
@@ -358,31 +361,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
-    let mut v = views_mut();
-    if v.views.is_empty() {
-        return;
-    }
-    let end = at.saturating_add(len);
-    let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
-    let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
-    for base in gone {
-        let Some((bytes, section, offset)) = v.views.remove(&base) else {
-            continue;
-        };
-        for k in 0..bytes.div_ceil(K64) {
-            let key = (section, offset + (k * K64) as u64);
-            if let Some(pages) = v.pages.get_mut(&key) {
-                let page = base + k * K64;
-                let before = pages.len();
-                pages.retain(|&shown| shown != page);
-                let after = pages.len();
-                if after == 0 {
-                    v.pages.remove(&key);
-                }
-                v.pages_twice = v.pages_twice.saturating_sub(usize::from(before >= 2 && after < 2));
-            }
-        }
-    }
+    views_mut().forget(at, len);
 }
 
 /// The 64 KiB pages of `[start, end)` that the title shows at other

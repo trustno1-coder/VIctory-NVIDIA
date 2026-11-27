@@ -84,6 +84,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod storage;
+#[cfg(windows)]
 mod tiles;
 pub mod signature;
 #[cfg(windows)]
@@ -131,6 +133,10 @@ pub fn frames_begun() -> u64 {
 }
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+#[cfg(windows)]
+pub use inplace::{title_memory_section_created, title_memory_section_released, title_memory_view_backing};
+#[cfg(windows)]
+pub use storage::{BackingToken, title_memory_backing_reincarnated, title_memory_backing_written};
 #[cfg(windows)]
 pub use shadow::title_memory_write_combined;
 #[cfg(windows)]

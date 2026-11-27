@@ -604,6 +604,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    crate::storage::cpu_written(at, len);
     let mut j = journal_mut();
     if !j.kept || len == 0 {
         return;
@@ -2248,6 +2249,12 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     false
 }
 
+#[cfg(test)]
+pub(crate) fn protect_storage_fixture(at: usize) -> bool {
+    install();
+    protect_alias(&mut guards(), at / BLOCK)
+}
+
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
@@ -2414,6 +2421,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    crate::storage::cpu_written(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2443,6 +2451,7 @@ pub struct KernelWrite(usize, usize);
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     // The kernel's write does not fault into the handler.
     materialize(at, len);
+    crate::storage::cpu_written(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -2472,6 +2481,10 @@ impl Drop for KernelWrite {
         if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
             g.kernel.swap_remove(i);
         }
+        drop(g);
+        // The native write can complete after a snapshot observed its start.
+        // Publish a second observed version without holding the guards lock.
+        crate::storage::cpu_written(self.0 * BLOCK, (self.1 - self.0) * BLOCK);
     }
 }
 
@@ -2526,6 +2539,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    crate::storage::cpu_written(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -2622,7 +2636,12 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping {
+    // Release the existing native mapping exclusion before its outer
+    // generation/lifecycle writer, in the reverse of acquisition order.
+    _mapping: std::sync::RwLockWriteGuard<'static, ()>,
+    _storage: crate::storage::Mutation,
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -2769,6 +2788,10 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    // No GPU wait or native VM operation occurs under the registry lock.
+    // This only brackets observed mapping generations; it does not grant
+    // GPU ownership or authorize omitting refresh/publication.
+    let storage = crate::storage::mutation();
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -2782,7 +2805,7 @@ pub fn title_memory_remapping() -> Remapping {
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping { _mapping: changing, _storage: storage }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -2852,6 +2875,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    crate::storage::releasing(at, len);
     crate::shadow::write_combined_freed(at, len);
     let mut g = guards();
     let first = at / BLOCK;
@@ -3102,6 +3126,11 @@ pub(crate) fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
+        if PROTECTED.any(block, block + 1) {
+            // The VEH must never wait for the registry. The bounded journal
+            // conservatively invalidates observations on overflow or remap.
+            crate::storage::faulted(at);
+        }
         if ours.is_none()
             && PROTECTED.any(block, block + 1)
             // SAFETY: the context the system passes, to go on from.

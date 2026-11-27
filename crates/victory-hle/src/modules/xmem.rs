@@ -402,6 +402,8 @@ const PAGE: usize = 64 << 10;
 
 struct Section {
     handle: HANDLE,
+    /// Created once for the native section, never inferred from a reused handle.
+    backing: victory_gpu::BackingToken,
     pages: usize,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
@@ -504,7 +506,7 @@ impl Drop for Section {
                 })
             };
         }
-        victory_gpu::title_memory_section_gone(self.handle as usize);
+        victory_gpu::title_memory_section_released(self.backing);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
     }
@@ -723,9 +725,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    let backing = victory_gpu::title_memory_section_created(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section {
         handle,
+        backing,
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
@@ -762,10 +765,19 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     }
     // SAFETY: the title passes `n` page numbers.
     let numbers = unsafe { std::slice::from_raw_parts(pages, n) }.to_vec();
+    // Copy guest input before taking the writer: reading it may fault into a
+    // lazy mapping. PFN retirement and its incarnation notifications are one
+    // lifecycle change, including the final native section/window release.
+    let _changing = victory_gpu::title_memory_remapping();
     let mut table = page_table_mut();
     // Dropped without the lock: the last page of a section unmaps its window.
     let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
     drop(table);
+    for slice in &gone {
+        // A delayed observation of this logical page must not survive its
+        // retirement, even while an old native alias keeps the section alive.
+        victory_gpu::title_memory_backing_reincarnated(slice.section.backing, (slice.index * PAGE) as u64, PAGE);
+    }
     drop(gone);
     1
 }
@@ -892,6 +904,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
             };
             view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         }
+        // Include unmapped physical pages: no guest-VA write watcher can see
+        // this privileged section-window/temporary-view write.
+        victory_gpu::title_memory_backing_written(slice.section.backing, (slice.index * PAGE + within) as u64, k);
         (within, done) = (0, done + k);
     }
     true
@@ -904,6 +919,9 @@ pub(crate) struct PageWindow {
     view: Window,
     within: usize,
     len: usize,
+    /// Keep the creation identity live even for a temporary native view.
+    section: Arc<Section>,
+    offset: u64,
 }
 
 enum Window {
@@ -925,6 +943,15 @@ impl PageWindow {
     }
 }
 
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        // The mutable window may have been filled directly by a decoder. Mark
+        // its pinned backing rather than looking up potentially reused PFNs.
+        // An unused/partly filled window may conservatively dirty its full span.
+        victory_gpu::title_memory_backing_written(self.section.backing, self.offset, self.len);
+    }
+}
+
 /// A window on bytes `[offset, offset + len)` of `pages` when they are
 /// consecutive pages of one allocation (how titles usually hand them out);
 /// `None` otherwise (pages of several allocations, out of order, or
@@ -943,6 +970,8 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view,
         within: offset % PAGE,
         len,
+        section: slice.section.clone(),
+        offset: (slice.index * PAGE + offset % PAGE) as u64,
     })
 }
 
@@ -997,6 +1026,14 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
 pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     if len == 0 {
         return;
+    }
+    if let Some(runs) = runs(pages, offset, len) {
+        let (mut within, mut done) = (offset % PAGE, 0);
+        for (slice, count) in runs {
+            let bytes = (count * PAGE - within).min(len - done);
+            victory_gpu::title_memory_backing_written(slice.section.backing, (slice.index * PAGE + within) as u64, bytes);
+            (within, done) = (0, done + bytes);
+        }
     }
     for (at, bytes) in shown_at(pages, offset, len) {
         if stream_notice() {
@@ -1220,6 +1257,10 @@ fn arrange(base: usize, pages: &[usize]) {
             ARRANGED[1].fetch_add(1, Ordering::Relaxed);
             continue;
         }
+        // Preserve the existing PFN arrangement policy; only invalidate
+        // observations of the two physical slices whose assignment changes.
+        victory_gpu::title_memory_backing_reincarnated(section.backing, (have * PAGE) as u64, PAGE);
+        victory_gpu::title_memory_backing_reincarnated(section.backing, (want * PAGE) as u64, PAGE);
         if let Some(other) = owner.get(&want).copied()
             && let Some(slice) = table.pages.get_mut(&other)
         {
@@ -1263,6 +1304,10 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize, lazy: bool) ->
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
+    // Start before optional physical-slice rearrangement as well as mapping.
+    // Guest input has already been copied, so its reads cannot recursively
+    // fault into the mapping writer. This writer is not acquired again below.
+    let _changing = victory_gpu::title_memory_remapping();
     if port_on()
         && let Some(pages) = &pages
     {
@@ -1277,7 +1322,6 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize, lazy: bool) ->
     // into that gap (`victory_gpu::title_memory_remapping`). Taken before
     // the views, as everywhere: a reader that holds it may fault into a
     // lazy view and need the views to make it real ([`materialize`]).
-    let _changing = victory_gpu::title_memory_remapping();
     let mut physical = physical();
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;
@@ -1804,7 +1848,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 // As in `map`.
                 shown_mut().note(op.at, PAGE, &slice);
                 victory_gpu::title_memory_remapped(op.at, PAGE);
-                victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
+                victory_gpu::title_memory_view_backing(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64, slice.section.backing);
                 physical.views.insert(op.at, (PAGE, slice));
             }
             None if op.had && done => {
@@ -1955,7 +1999,7 @@ fn map_as(physical: &mut Physical, base: usize, len: usize, slice: Slice, quiet:
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view_backing(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64, slice.section.backing);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -2476,7 +2520,7 @@ fn map_lazy(physical: &mut Physical, base: usize, len: usize, slice: Slice, who:
     }
     shown_mut().note(base, len, &slice);
     victory_gpu::title_memory_remapped(base, len);
-    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view_backing(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64, slice.section.backing);
     physical.views.insert(base, (len, slice));
     if let Some(who) = who {
         count(Soft::Noted, 1);
@@ -3688,6 +3732,53 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_temporary_page_window_pins_its_section_identity_after_pfn_free() {
+        let pages = allocate(1);
+        let slice = page_table().pages.get(&pages[0]).cloned().unwrap();
+        let weak = Arc::downgrade(&slice.section);
+        // Exercise the temporary-view path independently of SECTION_WINDOW's
+        // process-wide setting. The raw view alone does not pin Rust identity.
+        let mut window = PageWindow {
+            view: Window::Own(View::map(&slice, 1).unwrap()),
+            within: 7,
+            len: 4,
+            section: slice.section.clone(),
+            offset: (slice.index * PAGE + 7) as u64,
+        };
+        let token = slice.section.backing;
+        drop(slice);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert_eq!(weak.upgrade().unwrap().backing, token);
+        window.bytes().copy_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(window.bytes(), &[1, 2, 3, 4]);
+        drop(window);
+        assert!(weak.upgrade().is_none(), "window released its section after the write notice");
+    }
+
+    #[test]
+    fn physical_page_retirement_waits_for_native_mapping_readers() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let pages = allocate(1);
+        let reading = victory_gpu::title_memory_reading();
+        let (started, began) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let number = pages[0];
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = XMemFreePhysicalPages(1, &number);
+            finished.send(result).unwrap();
+        });
+        began.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(done.recv_timeout(Duration::from_millis(25)).is_err(), "PFNs retired while a native mapping reader still held them");
+        assert!(pages_known(&pages, 0, PAGE));
+        drop(reading);
+        assert_eq!(done.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        worker.join().unwrap();
+        assert!(!pages_known(&pages, 0, PAGE));
     }
 
     /// Pages say where the title has them mapped, byte for byte (after
