@@ -1,7 +1,7 @@
 # One-click GTA VI on trustno1-coder/VIctory-NVIDIA (foxhound base): DLSS Super Resolution + DLSS frame generation.
 # PLAY_FRAMEGEN.cmd runs this. What it does, in order:
 #   1. finds the game folder (game_dir.txt in the repository folder, else a search of every drive)
-#   2. backs up the saves (%LOCALAPPDATA%\victory\data\7952987A) and checks every file by SHA-256
+#   2. backs up the saves (7952987A in the configured data directory) and checks every file by SHA-256
 #   3. gets NVIDIA's DLSS files once (scripts\get-nvidia-sdks.ps1, from github.com/NVIDIA-RTX/Streamline)
 #   4. starts scripts\play-foxhound.ps1, which builds the layer the first time (a few minutes)
 # Modes: 1 Series X 1440p + DLSS Quality + frame generation 2x (default)
@@ -77,18 +77,33 @@ if (Get-Process victory -ErrorAction SilentlyContinue) { Write-Host 'The game is
 
 # 2. Saves backup, verified file by file.
 if (-not $NoBackup) {
-    $src = Join-Path $env:LOCALAPPDATA 'victory\data\7952987A'
-    if (Test-Path $src) {
+    # Ask the runner in the same working directory as play-foxhound so path overrides
+    # and victory.toml select the same saves for backup and play.
+    Push-Location $repo
+    $encoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        $config = if (Test-Path $victory) { & $victory config }
+                  else { cargo run --quiet --locked --release -p victory -- config }
+        $dataLine = $config | Select-String '^data_dir\s+: (.+)$'
+        if ($LASTEXITCODE -ne 0 -or -not $dataLine) { throw 'Could not determine the save directory for backup.' }
+        $src = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+            (Join-Path $dataLine.Matches[0].Groups[1].Value '7952987A'))
+    } finally {
+        [Console]::OutputEncoding = $encoding
+        Pop-Location
+    }
+    if (Test-Path -LiteralPath $src) {
         $root = if (Test-Path 'D:\') { 'D:\victory-save-backups' } else { Join-Path $env:USERPROFILE 'victory-save-backups' }
         $dst = Join-Path $root ('7952987A-{0:yyyyMMdd-HHmmss}-before-nvidia' -f (Get-Date))
         New-Item -ItemType Directory -Force $root | Out-Null
-        Copy-Item $src $dst -Recurse -Force
-        $files = @(Get-ChildItem $src -Recurse -File)
+        Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force
+        $files = @(Get-ChildItem -LiteralPath $src -Recurse -File)
         $bad = 0
         foreach ($f in $files) {
             $t = Join-Path $dst $f.FullName.Substring($src.Length)
             try {
-                if (-not (Test-Path $t) -or (Get-FileHash $f.FullName).Hash -ne (Get-FileHash $t).Hash) { $bad++ }
+                if (-not (Test-Path -LiteralPath $t) -or (Get-FileHash -LiteralPath $f.FullName).Hash -ne (Get-FileHash -LiteralPath $t).Hash) { $bad++ }
             } catch { $bad++ }
         }
         if ($bad) { Write-Host "Save backup check failed ($bad of $($files.Count) files). Not starting."; exit 1 }

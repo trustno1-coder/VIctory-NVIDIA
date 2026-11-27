@@ -114,6 +114,7 @@ const SETTINGS: &[(&str, &str)] = &[
 /// `VICTORY_...` variable is cleared before the settings are put in (a
 /// restart from the menu inherits the last run's).
 const KEPT: &[&str] = &[
+    "VICTORY_HOME",
     "VICTORY_CONFIG",
     "VICTORY_GAME_DIR",
     "VICTORY_CACHE_DIR",
@@ -122,6 +123,10 @@ const KEPT: &[&str] = &[
     "VICTORY_FIDELITYFX_DIR",
     "VICTORY_LOG",
 ];
+
+fn stale_switch(name: &str) -> bool {
+    name.starts_with("VICTORY_") && !KEPT.iter().any(|kept| name.eq_ignore_ascii_case(kept))
+}
 
 const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
 
@@ -874,7 +879,7 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
 
     let leftover: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
-        .filter(|k| k.starts_with("VICTORY_") && !KEPT.contains(&k.as_str()))
+        .filter(|k| stale_switch(k))
         .collect();
     // SAFETY: the first thing this process does: no other thread of ours runs yet.
     unsafe {
@@ -915,6 +920,15 @@ mod tests {
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    #[test]
+    fn play_keeps_the_storage_paths_when_resetting_switches() {
+        for name in ["VICTORY_HOME", "VICTORY_Home", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"] {
+            assert!(!stale_switch(name), "{name}");
+        }
+        assert!(stale_switch("VICTORY_PRELOAD"));
+        assert!(stale_switch("VICTORY_LOG_FILE"));
     }
 
     #[test]

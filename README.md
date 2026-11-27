@@ -2,7 +2,8 @@
 
 > **Reporting a problem?** Please attach **both** logs from the run that went
 > wrong. Without them we can only guess. Paste `%LOCALAPPDATA%` into the address
-> bar of File Explorer to get there.
+> bar of File Explorer for the default paths below. With `VICTORY_HOME` set,
+> look for `logs` there. `victory.exe config` shows the active `data_dir` for crash logs.
 >
 > 1. **The play log**, in `%LOCALAPPDATA%\victory\logs\`: the newest
 >    `victory-nvidia-play-<date>-<time>-<number>.log` (from `victory.exe`) or
@@ -65,11 +66,18 @@
   there, for example from a repack or another guide (1.618, 1.620), is used
   at the version of its `D3D12Core.dll`. Before v2026.11.27.4 that version
   had to be 1.614, or Windows refused Direct3D 12 with `0x887E0003`.
-- C: drive full? Set `VICTORY_HOME` to another folder, once, in a command
-  prompt: `setx VICTORY_HOME D:\victory`. Then start victory.exe from a new
-  window. Settings, saves, caches, logs and the downloads all go there
-  instead of `%LOCALAPPDATA%\victory`. To keep what you have, move that
-  folder's contents there first.
+- To use another drive, set `$env:VICTORY_HOME = 'E:\VIctory Data'` in
+  PowerShell, then run `.\victory.exe config` in that window to check the cache
+  and save directories. For future launches, run `setx VICTORY_HOME "E:\VIctory Data"`
+  and open a fresh terminal from Start. Use an absolute path outside the repository.
+  VIctory creates missing directories. Existing files stay in their original location.
+  To keep using existing saves, copy the `data` folder with the game closed or
+  point `VICTORY_DATA_DIR` at the existing folder.
+- `VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR` each override the corresponding
+  `[paths]` entry in `victory.toml`. Those entries take precedence over the
+  `cache` and `data` defaults under `VICTORY_HOME`. The Pareto launcher uses
+  `cache-pareto` unless `VICTORY_CACHE_DIR` is set. GPU drivers and third-party
+  SDKs manage their own internal caches separately.
 - You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA
   GeForce RTX card with a recent driver. This repository and its releases
   contain no game files.
@@ -337,10 +345,11 @@ fork has always had; its options:
 | `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
 | `-More @{VICTORY_X='1'}` | add or override any switch |
 
-What the F1 menu saved (`victory-settings.txt`) goes over these at every start;
-delete that file to go back to them. Full screen: start the game, then run
-`.\scripts\fullscreen.ps1` in another window. Logs go to
-`%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
+The script reads F1 settings from `victory-settings.txt` in `VICTORY_HOME`
+when set, or in the repository folder by default. Rename that file to restore
+the script defaults. To switch to full screen, start the game and run
+`.\scripts\fullscreen.ps1` in another window. The launcher prints its
+log path at startup. Run `victory.exe config` to see the active save directory.
 
 ## How it works, and the findings
 

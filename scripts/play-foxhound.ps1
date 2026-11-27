@@ -9,11 +9,11 @@
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
 #
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
-# victory-settings.txt in the repository's folder and is applied here at every start, over the options above;
-# delete that file to go back to them.
+# victory-settings.txt under VICTORY_HOME, or in the repository folder by default. The script reads it at each start.
 #
 # Build first (README). Run from a normal window, not as administrator. Each run writes a log to
-# %LOCALAPPDATA%\victory\logs. Every VICTORY_... switch is described in a comment where the code reads it.
+# the logs folder under VICTORY_HOME (default %LOCALAPPDATA%\victory).
+# Every VICTORY_... switch is described in a comment where the code reads it.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [ValidateSet('diag', 'release')][string]$Build = 'release',
@@ -49,7 +49,9 @@ $repo = Split-Path $PSScriptRoot -Parent
 $preload = $Preload -or $env:VICTORY_PRELOAD -eq '1'
 # What the F1 menu saved: its own choices (VICTORY_MENU_...) stand in for this script's options, and its
 # switches go over the settings below. An empty value unsets a switch.
-$menuFile = Join-Path $repo 'victory-settings.txt'
+$homeDir = if ($env:VICTORY_HOME) { $env:VICTORY_HOME } else { Join-Path $env:LOCALAPPDATA 'victory' }
+$menuDir = if ($env:VICTORY_HOME) { $homeDir } else { $repo }
+$menuFile = Join-Path $menuDir 'victory-settings.txt'
 $menu = [ordered]@{}
 if (Test-Path -LiteralPath $menuFile) {
     foreach ($line in Get-Content -LiteralPath $menuFile) {
@@ -164,11 +166,11 @@ if (-not (Test-Path $victory)) {
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
+$paths = 'VICTORY_HOME', 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
-$logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
+$logs = Join-Path $homeDir 'logs'; New-Item -ItemType Directory -Force $logs | Out-Null
 $log = Join-Path $logs ('victory-nvidia-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
 $writer = [IO.StreamWriter]::new($log, $false, [Text.UTF8Encoding]::new($false)); $writer.AutoFlush = $true
 $writer.WriteLine("# console=$console build=$Build preload=$preload switches: " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '))

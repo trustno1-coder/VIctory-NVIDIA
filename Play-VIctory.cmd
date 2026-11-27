@@ -16,6 +16,7 @@ if not exist "%runner%" (
   exit /b 2
 )
 if not defined VICTORY_AMBIENT_AIR set "VICTORY_AMBIENT_AIR=1.5"
+if not defined VICTORY_CACHE_DIR if defined VICTORY_HOME set "VICTORY_CACHE_DIR=%VICTORY_HOME%\cache-pareto"
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-pareto"
 if not defined VICTORY_TEXTURE_NO_WAIT set "VICTORY_TEXTURE_NO_WAIT=1"
 if not defined VICTORY_RELAY set "VICTORY_RELAY=2"
