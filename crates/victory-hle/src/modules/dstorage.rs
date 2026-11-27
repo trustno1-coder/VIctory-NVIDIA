@@ -629,16 +629,45 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
-            .filter(|i| {
-                std::thread::Builder::new()
-                    .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
-                    .is_ok()
-            })
-            .count();
+        let all = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // `VICTORY_DSTORAGE_WORKERS=<n>`: fewer workers than the CPU's threads (at most that many;
+        // the file handles stay one a CPU thread). On a Ryzen 7 5700X the title stopped itself
+        // at the start after a batch of reads whenever all sixteen ran freely.
+        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .map_or(all, |n| n.min(all));
+        let spawn = move |i: usize| {
+            std::thread::Builder::new()
+                .name(format!("dstorage {i}"))
+                .spawn(move || work(scheduler))
+                .is_ok()
+        };
+        let started = (0..workers).filter(|&i| spawn(i)).count();
         tracing::info!(workers = started, "dstorage: workers");
+        // `VICTORY_DSTORAGE_WORKERS_AFTER=<seconds>`: with fewer workers asked for, the rest of
+        // them (one a CPU thread) are started that long after the first read, past the start,
+        // so that streaming in play is not left to the few.
+        let after = std::env::var("VICTORY_DSTORAGE_WORKERS_AFTER")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|s| s.is_finite() && *s >= 0.0);
+        if let Some(after) = after
+            && workers < all
+        {
+            let _ = std::thread::Builder::new()
+                .name("dstorage grow".to_owned())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs_f32(after));
+                    let more = (workers..all).filter(|&i| spawn(i)).count();
+                    tracing::info!(
+                        workers = workers + more,
+                        after,
+                        "dstorage: workers, the rest started"
+                    );
+                });
+        }
     });
     Some(scheduler)
 }
