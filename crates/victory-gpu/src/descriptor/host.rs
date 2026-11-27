@@ -123,6 +123,12 @@ impl Made {
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Whether a descriptor is copied as bytes (`VICTORY_DESC_MEMCPY=1`).
+fn memcpy_descriptors() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DESC_MEMCPY").is_some_and(|v| v == "1"))
+}
+
 pub(crate) struct HostHeap {
     /// Identity of this host heap instance, checked by [`release`] so a stale
     /// list resetting after a title heap was replaced at the same address does
@@ -3514,6 +3520,19 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        // A descriptor is `step` bytes of CPU-visible memory; copying it
+        // straight is the same write `CopyDescriptorsSimple` makes, without
+        // the call, which the world's draws pay tens of thousands of times a
+        // frame. `VICTORY_DESC_MEMCPY=1`; off by default.
+        if memcpy_descriptors() && !self.sampler {
+            // SAFETY: slot `to` of our heap and `from` a slot of this
+            // thread's heap, `step` bytes each; the card does not read the
+            // heap while a list is being made for it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(from.ptr as *const u8, self.cpu(to).ptr as *mut u8, self.step as usize)
+            };
+            return;
         }
         let Some(host) = host() else { return };
         // SAFETY: a slot of our heap, and one of this thread's heap.
