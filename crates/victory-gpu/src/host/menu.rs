@@ -28,11 +28,17 @@ use std::time::Duration;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
 };
+/// Q and E: the previous and next tab.
+const VK_Q: u16 = 0x51;
+const VK_E: u16 = 0x45;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::font::{colours, glyph};
+
+#[path = "menu_look.rs"]
+mod look;
 use super::{Host, HostList, transition};
 
 const GLYPH: (u32, u32) = (5, 7);
@@ -201,6 +207,85 @@ const ACTIONS: [&str; 7] = [
     "CLOSE",
 ];
 
+/// The menu's tabs, and the tab of each setting (the rest are under ADVANCED).
+const TABS: [&str; 5] = ["DISPLAY", "GRAPHICS", "PERFORMANCE", "CONTROLS", "ADVANCED"];
+fn tab_of(var: &str) -> usize {
+    match var {
+        "VICTORY_FULLSCREEN" | "VICTORY_MENU_CONSOLE" | "VICTORY_MENU_RES" | "VICTORY_MENU_S_RES" | "VICTORY_FPS_LINE" | "VICTORY_PANEL" => 0,
+        "VICTORY_MENU_DLSS" | "VICTORY_DLSS_PRESET" | "VICTORY_AMBIENT" | "VICTORY_AMBIENT_SPECULAR" | "VICTORY_AMBIENT_AIR" | "VICTORY_BVH_BUILDER"
+        | "VICTORY_WATER_LIGHT" | "VICTORY_LEAVE_OUT" => 1,
+        "VICTORY_MENU_FRAMEGEN" | "VICTORY_MENU_FG_TYPE" | MFG | "VICTORY_MENU_FPS" | "VICTORY_EARLY_DEPTH" | "VICTORY_WC_NO_BACK" | "VICTORY_SOFT_VIEWS"
+        | "VICTORY_TEXTURE_NO_WAIT" => 2,
+        "VICTORY_MOUSE_CAPTURE" | "VICTORY_IME_ENGLISH" => 3,
+        _ => 4,
+    }
+}
+
+/// The settings of `tab`, by their index in `ITEMS`.
+fn tab_items(tab: usize) -> Vec<usize> {
+    (0..ITEMS.len()).filter(|&i| tab_of(ITEMS[i].var) == tab).collect()
+}
+
+/// Upper-case menu words as a title has them ("FRAME RATE CAP" -> "Frame Rate Cap"),
+/// with names and sizes left as they are (DLSS, RTX; 3440X1440 -> 3440x1440).
+fn pretty(text: &str) -> String {
+    const KEEP: [&str; 15] = ["DLSS", "DLAA", "FPS", "FG", "MFG", "RTX", "FSR", "AMD", "KB", "F1", "F3", "X", "S", "UI", "GPU"];
+    text.split(' ')
+        .map(|word| {
+            let core: String = word.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            if KEEP.contains(&core.as_str()) {
+                word.to_owned()
+            } else if word.chars().any(|c| c.is_ascii_digit()) {
+                word.replace('X', "x")
+            } else {
+                let mut first = true;
+                word.chars()
+                    .map(|c| {
+                        if c.is_ascii_alphabetic() {
+                            let out = if first { c } else { c.to_ascii_lowercase() };
+                            first = false;
+                            out
+                        } else {
+                            c
+                        }
+                    })
+                    .collect()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The actions' short names on their buttons.
+fn action_label(action: &str) -> &str {
+    match action {
+        "SAVE AND RESTART NOW" => "SAVE AND RESTART",
+        "SAVE FOR NEXT START" => "SAVE",
+        "PRELOAD SHADERS (RESTARTS THE GAME)" => "PRELOAD SHADERS",
+        "RESET ALL TO PLAY DEFAULTS" => "RESET",
+        "EXPORT SAVE (TO SAVES IN THE GAME FOLDER)" => "EXPORT SAVE",
+        "IMPORT SAVE (PICK FROM SAVES)" => "IMPORT SAVE",
+        other => other,
+    }
+}
+
+/// An upper-case sentence as a sentence ("TAKES A WHILE." -> "Takes a while."), names kept.
+fn pretty_sentence(text: &str) -> String {
+    let words = pretty(text);
+    let mut out = String::new();
+    let mut start = true;
+    for word in words.split(' ') {
+        let keep = word.chars().filter(|c| c.is_ascii_uppercase()).count() > 1 || word.chars().any(|c| c.is_ascii_digit());
+        let w = if start || keep { word.to_owned() } else { word.to_ascii_lowercase() };
+        start = word.ends_with('.') || word.ends_with(':');
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&w);
+    }
+    out
+}
+
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
 }
@@ -348,7 +433,7 @@ fn keys() -> &'static Mutex<Vec<u16>> {
     static KEYS: OnceLock<Mutex<Vec<u16>>> = OnceLock::new();
     KEYS.get_or_init(|| {
         let _ = std::thread::Builder::new().name("settings menu keys".into()).spawn(|| {
-            const WATCHED: [u16; 7] = [VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE];
+            const WATCHED: [u16; 10] = [VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE, VK_Q, VK_E, VK_TAB];
             let mut was = [false; WATCHED.len()];
             loop {
                 std::thread::sleep(Duration::from_millis(10));
@@ -388,10 +473,42 @@ fn lit(lines: &[String], x: u32, y: u32) -> bool {
     (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
 }
 
-fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
+/// `rgb` (sRGB, 0 to 1) in the swap chain's `format`, into `out` (its bytes).
+fn encode(format: DXGI_FORMAT, rgb: [f32; 3], out: &mut [u8]) {
+    let unorm = |c: f32, max: f32| (c.clamp(0.0, 1.0) * max).round() as u32;
+    match format {
+        DXGI_FORMAT_R8G8B8A8_UNORM => out.copy_from_slice(&[unorm(rgb[0], 255.0) as u8, unorm(rgb[1], 255.0) as u8, unorm(rgb[2], 255.0) as u8, 0xFF]),
+        DXGI_FORMAT_B8G8R8A8_UNORM => out.copy_from_slice(&[unorm(rgb[2], 255.0) as u8, unorm(rgb[1], 255.0) as u8, unorm(rgb[0], 255.0) as u8, 0xFF]),
+        DXGI_FORMAT_R10G10B10A2_UNORM => {
+            let word = unorm(rgb[0], 1023.0) | unorm(rgb[1], 1023.0) << 10 | unorm(rgb[2], 1023.0) << 20 | 3 << 30;
+            out.copy_from_slice(&word.to_le_bytes());
+        }
+        // Linear light (scRGB), as halves.
+        DXGI_FORMAT_R16G16B16A16_FLOAT => {
+            let linear = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+            for (i, c) in [linear(rgb[0]), linear(rgb[1]), linear(rgb[2]), 1.0].into_iter().enumerate() {
+                out[2 * i..2 * i + 2].copy_from_slice(&half(c).to_le_bytes());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `value` (0 to 1) as a half float.
+fn half(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let exponent = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+    if value <= 0.0 || exponent <= 0 {
+        return 0;
+    }
+    ((exponent as u32) << 10 | (bits >> 13) & 0x3FF) as u16
+}
+
+/// The frame-rate line: white text on black, in the corner.
+fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize, rows: usize) -> Vec<u8> {
     let (width, height) = size(scale);
     let bytes = colours[0].len();
-    let mut out = vec![0; pitch * height as usize];
+    let mut out = vec![0; pitch * rows];
     for y in 0..height / scale {
         let top = pitch * (y * scale) as usize;
         for x in 0..width / scale {
@@ -408,9 +525,33 @@ fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> V
     out
 }
 
+/// The menu's picture (0x00RRGGBB, `width` a row) in the swap chain's format, rows `pitch` apart.
+fn converted(pixels: &[u32], width: usize, format: DXGI_FORMAT, bytes: usize, pitch: usize, rows: usize) -> Vec<u8> {
+    let mut out = vec![0; pitch * rows];
+    let mut cache: Option<(u32, [u8; 8])> = None;
+    for (y, row) in pixels.chunks(width).enumerate() {
+        for (x, &p) in row.iter().enumerate() {
+            let at = y * pitch + x * bytes;
+            let encoded = match cache {
+                Some((q, e)) if q == p => e,
+                _ => {
+                    let rgb = [(p >> 16 & 0xFF) as f32 / 255.0, (p >> 8 & 0xFF) as f32 / 255.0, (p & 0xFF) as f32 / 255.0];
+                    let mut e = [0u8; 8];
+                    encode(format, rgb, &mut e[..bytes]);
+                    cache = Some((p, e));
+                    e
+                }
+            };
+            out[at..at + bytes].copy_from_slice(&encoded[..bytes]);
+        }
+    }
+    out
+}
+
 struct Buffers {
     format: DXGI_FORMAT,
-    scale: u32,
+    /// The size held: the menu's picture or the frame-rate line, whichever is larger.
+    size: (u32, u32),
     pitch: u32,
     uploads: Vec<(ID3D12Resource, *mut u8)>,
     card: ID3D12Resource,
@@ -425,8 +566,7 @@ struct Buffers {
 unsafe impl Send for Buffers {}
 
 impl Buffers {
-    fn new(host: &Host, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
-        let (width, height) = size(scale);
+    fn new(host: &Host, format: DXGI_FORMAT, (width, height): (u32, u32)) -> Option<Buffers> {
         let pitch = (width * colours(format)?[0].len() as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
         let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
@@ -448,12 +588,10 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, used: false })
+        Some(Buffers { format, size: (width, height), pitch, uploads, card: card?, turn: 0, fresh: false, used: false })
     }
 
-    fn write(&mut self, lines: &[String]) {
-        let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.scale, colours, self.pitch as usize);
+    fn write(&mut self, picture: Vec<u8>) {
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read frames ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -480,6 +618,8 @@ pub(super) struct Menu {
     imports: Vec<String>,
     import_at: usize,
     picking: bool,
+    /// The tab shown.
+    tab: usize,
 }
 
 impl Menu {
@@ -491,7 +631,7 @@ impl Menu {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false }
+        Menu { started: values.clone(), values, at: tab_items(0)[0], note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 }
     }
 
     fn open() -> bool {
@@ -510,20 +650,13 @@ impl Menu {
     }
 
     /// The rows shown, settings then actions.
+    #[cfg(test)]
     fn rows(&self) -> Vec<usize> {
         (0..ITEMS.len() + ACTIONS.len()).filter(|r| !self.hidden(*r)).collect()
     }
 
-    /// The row shown `step` (+1 / -1) from the one picked, round the ends.
-    fn step(&self, step: isize) -> usize {
-        let rows = self.rows();
-        let n = rows.len() as isize;
-        match rows.iter().position(|r| *r == self.at) {
-            Some(p) => rows[(p as isize + step).rem_euclid(n) as usize],
-            None => rows.iter().copied().find(|r| *r > self.at).unwrap_or(rows[0]),
-        }
-    }
-
+    /// The menu as lines of text (its words, checked by the tests; the picture is `picture`).
+    #[cfg(test)]
     fn lines(&self) -> Vec<String> {
         if self.picking {
             return self.pick_lines();
@@ -582,6 +715,7 @@ impl Menu {
     }
 
     /// The list IMPORT SAVE opens, in the box's lines.
+    #[cfg(test)]
     fn pick_lines(&self) -> Vec<String> {
         let mut out = vec![PICK_TITLE.to_owned(), PICK_HELP.to_owned(), String::new()];
         if self.imports.is_empty() {
@@ -847,6 +981,111 @@ impl Menu {
         }
     }
 
+    /// The settings of `tab` shown now (the picture row of the console not picked is left out).
+    fn shown_items(&self, tab: usize) -> Vec<usize> {
+        tab_items(tab).into_iter().filter(|&i| !self.hidden(i)).collect()
+    }
+
+    fn open_tab(&mut self, tab: usize) {
+        self.tab = tab % TABS.len();
+        self.at = self.shown_items(self.tab).first().copied().unwrap_or(ITEMS.len());
+    }
+
+    /// Up (-1) or down (+1) through the tab's settings, then its actions (one row).
+    fn step(&mut self, by: isize) {
+        let mut rows = self.shown_items(self.tab);
+        rows.push(ITEMS.len());
+        let here = if self.at >= ITEMS.len() { rows.len() - 1 } else { rows.iter().position(|&r| r == self.at).unwrap_or(0) };
+        let next = (here as isize + by).rem_euclid(rows.len() as isize) as usize;
+        // Onto the actions: the first one (or the one already picked).
+        self.at = if rows[next] == ITEMS.len() && self.at >= ITEMS.len() { self.at } else { rows[next] };
+    }
+
+    /// What the picture shows now: the rows, the first shown, the action picked, and the description.
+    fn page_parts(&self) -> (Vec<look::Row>, usize, Option<usize>, String, Vec<String>) {
+        let items = self.shown_items(self.tab);
+        let rows: Vec<look::Row> = items
+            .iter()
+            .map(|&i| {
+                let item = &ITEMS[i];
+                let value = &self.values[i];
+                let toggle = item.values.len() == 2 && item.values.iter().all(|(_, l)| *l == "ON" || *l == "OFF");
+                let value = if toggle {
+                    look::Value::Toggle(shown_value(item, value) == "ON")
+                } else {
+                    let at = index_of(item, value).map_or(item.values.len(), |x| x + 1);
+                    look::Value::Pick(pretty(&shown_value(item, value)), at, item.values.len())
+                };
+                look::Row { label: pretty(item.label), value, picked: i == self.at, changed: self.values[i] != self.started[i] }
+            })
+            .collect();
+        let picked = items.iter().position(|&i| i == self.at).unwrap_or(0);
+        let first = picked.saturating_sub(look::ROWS - 1).min(rows.len().saturating_sub(look::ROWS));
+        let action = self.at.checked_sub(ITEMS.len());
+        let sentence = |lines: &[&str]| vec![pretty_sentence(&lines.join(" "))];
+        let (heading, about) = match (ITEMS.get(self.at), action) {
+            (Some(item), _) => {
+                let value = self.values[self.at].as_str();
+                let mut about = if item.var == MFG {
+                    sentence(&ABOUT_MFG)
+                } else if item.var == S_RES {
+                    sentence(&ABOUT_S_RES)
+                } else if item.var == DLSS && !matches!(value, "" | "off") && std::env::var_os("VICTORY_STREAMLINE_DIR").is_none() {
+                    sentence(&ABOUT_NO_DLSS)
+                } else if item.var == FRAMEGEN && !live(item) && !matches!(value, "" | "0") {
+                    sentence(&ABOUT_FRAMEGEN_RESTART)
+                } else {
+                    Vec::new()
+                };
+                about.push(if live(item) { "Changes right away.".to_owned() } else { "Applies at the next start: pick Save And Restart.".to_owned() });
+                about.push(format!("Now: {}", pretty(&shown_value(item, &self.values[self.at]))));
+                (pretty(item.label), about)
+            }
+            (None, Some(PRELOAD)) => (pretty(action_label(ACTIONS[PRELOAD])), sentence(&ABOUT_PRELOAD)),
+            (None, Some(EXPORT)) => (pretty(action_label(ACTIONS[EXPORT])), sentence(&ABOUT_EXPORT)),
+            (None, Some(IMPORT)) => (pretty(action_label(ACTIONS[IMPORT])), sentence(&ABOUT_IMPORT)),
+            (None, Some(a)) => (pretty(action_label(ACTIONS[a])), Vec::new()),
+            (None, None) => (String::new(), Vec::new()),
+        };
+        (rows, first, action, heading, about)
+    }
+
+    /// The list IMPORT SAVE opens, as the picture's rows: the saves, then the way back.
+    fn pick_parts(&self) -> (Vec<look::Row>, usize, String, Vec<String>) {
+        let mut rows: Vec<look::Row> = self
+            .imports
+            .iter()
+            .enumerate()
+            .map(|(n, name)| look::Row { label: name.clone(), value: look::Value::Plain, picked: n == self.import_at, changed: false })
+            .collect();
+        rows.push(look::Row { label: pretty(PICK_BACK), value: look::Value::Plain, picked: self.import_at >= self.imports.len(), changed: false });
+        let first = self.import_at.saturating_sub(look::ROWS - 1).min(rows.len().saturating_sub(look::ROWS));
+        let mut about = vec![pretty_sentence(&ABOUT_PICK.join(" "))];
+        if self.imports.is_empty() {
+            about.push(pretty_sentence(PICK_NONE.trim()));
+        }
+        about.push(pretty_sentence(PICK_HELP));
+        (rows, first, pretty(PICK_TITLE.split("  ").next().unwrap_or("IMPORT SAVE")), about)
+    }
+
+    fn picture(&self, s: f32) -> Option<Vec<u32>> {
+        let (rows, first, action, heading, about) = if self.picking {
+            let (rows, first, heading, about) = self.pick_parts();
+            (rows, first, None, heading, about)
+        } else {
+            self.page_parts()
+        };
+        let actions: Vec<String> = ACTIONS.iter().map(|a| pretty(action_label(a))).collect();
+        let actions: Vec<&str> = actions.iter().map(String::as_str).collect();
+        let note = if self.note.is_empty() {
+            "* Changed: applies at the next start, unless it changes right away".to_owned()
+        } else {
+            pretty_sentence(&self.note)
+        };
+        let page = look::Page { tabs: &TABS, tab: self.tab, rows: &rows, first, actions: &actions, action, heading, about, note, link: &REPO.to_ascii_lowercase() };
+        look::draw(&page, s)
+    }
+
     /// Removes the settings file: the launcher's own settings at the next start.
     fn reset(&mut self) {
         if let Some(path) = settings_file() {
@@ -912,10 +1151,15 @@ impl Menu {
                 continue;
             }
             match vk {
-                VK_UP => self.at = self.step(-1),
-                VK_DOWN => self.at = self.step(1),
+                VK_Q => self.open_tab(self.tab + TABS.len() - 1),
+                VK_E | VK_TAB => self.open_tab(self.tab + 1),
+                VK_UP => self.step(-1),
+                VK_DOWN => self.step(1),
                 VK_LEFT if self.at < ITEMS.len() => self.change_and_save(self.at, -1),
                 VK_RIGHT if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
+                // On the actions, left and right go from one to the next.
+                VK_LEFT => self.at = ITEMS.len() + (self.at - ITEMS.len() + ACTIONS.len() - 1) % ACTIONS.len(),
+                VK_RIGHT => self.at = ITEMS.len() + (self.at - ITEMS.len() + 1) % ACTIONS.len(),
                 VK_RETURN if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
                 VK_RETURN => match self.at - ITEMS.len() {
                     0 => {
@@ -962,9 +1206,13 @@ impl Menu {
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = (height / 540).max(1);
-        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+        // The menu's scale: 1 at 1080 lines, smaller where the picture is narrow.
+        let s = (height as f32 / 1080.0).min(width as f32 / 1240.0).max(0.5);
+        let menu = look::size(s);
+        let held = (menu.0.max(size(scale).0), menu.1.max(size(scale).1));
+        if self.buffers.as_ref().is_none_or(|b| (b.format, b.size) != (format, held)) {
             std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, format, scale);
+            self.buffers = Buffers::new(host, format, held);
             self.failed = self.buffers.is_none();
             self.changed = true;
         }
@@ -972,16 +1220,28 @@ impl Menu {
             self.painted = line.clone();
             self.changed = true;
         }
-        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(), |l| vec![l.clone()])) } else { None };
+        let Some(colours) = colours(format) else { return };
+        let bytes = colours[0].len();
+        let picture = if !self.changed {
+            None
+        } else if let Some(l) = &line {
+            let pitch = self.buffers.as_ref().map_or(0, |b| b.pitch as usize);
+            Some(painted(std::slice::from_ref(l), scale, colours, pitch, held.1 as usize))
+        } else {
+            let pitch = self.buffers.as_ref().map_or(0, |b| b.pitch as usize);
+            self.picture(s).map(|pixels| converted(&pixels, menu.0 as usize, format, bytes, pitch, held.1 as usize))
+        };
         let Some(buffers) = &mut self.buffers else { return };
-        if let Some(lines) = lines {
+        if self.changed {
             self.changed = false;
-            buffers.write(&lines);
+            if let Some(picture) = picture {
+                buffers.write(picture);
+            }
         }
         // The whole box in the middle, or of it the first line's part in the corner.
         let (w, h) = match &line {
             Some(l) => ((l.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
-            None => size(scale),
+            None => menu,
         };
         let (w, h) = (w.min(width), h.min(height));
         let (x, y) = if line.is_some() { (0, 0) } else { ((width - w) / 2, (height - h) / 2) };
@@ -1001,7 +1261,7 @@ impl Menu {
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                         Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: size(scale).0, Height: size(scale).1, Depth: 1, RowPitch: buffers.pitch },
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: buffers.size.0, Height: buffers.size.1, Depth: 1, RowPitch: buffers.pitch },
                     },
                 },
             };
@@ -1042,7 +1302,7 @@ mod tests {
             std::env::remove_var("VICTORY_MENU_FILE");
             std::env::set_var("VICTORY_HOME", &home);
         }
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
         menu.started = menu.values.clone();
         let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
         menu.change_and_save(dlss, 1);
@@ -1059,7 +1319,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;
@@ -1074,7 +1334,7 @@ mod tests {
 
     #[test]
     fn the_link_is_always_right_under_the_note() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
         menu.started = menu.values.clone();
         for note in ["", "SAVED"] {
             menu.note = note.to_owned();
@@ -1146,7 +1406,7 @@ mod tests {
 
     #[test]
     fn the_picture_line_is_the_consoles() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
         menu.started = menu.values.clone();
         let at = |var: &str| ITEMS.iter().position(|i| i.var == var).expect("in the menu");
         let (console, x, s, dlss) = (at(CONSOLE), at(X_RES), at(S_RES), at(DLSS));
@@ -1155,12 +1415,17 @@ mod tests {
         assert!(shown(&menu, "SERIES X PICTURE") && !shown(&menu, "SERIES S PICTURE"));
         // down from the console: the Series X line, never the hidden one
         menu.at = console;
-        assert_eq!(menu.step(1), x);
-        assert!(!menu.rows().contains(&s));
+        menu.step(1);
+        assert_eq!(menu.at, x);
+        assert!(!menu.rows().contains(&s) && !menu.shown_items(0).contains(&s));
         "series-s".clone_into(&mut menu.values[console]);
         assert!(shown(&menu, "SERIES S PICTURE") && !shown(&menu, "SERIES X PICTURE"));
-        assert_eq!(menu.step(1), s);
-        assert_eq!(menu.step(-1), console - 1);
+        assert!(!menu.shown_items(0).contains(&x));
+        menu.at = console;
+        menu.step(1);
+        assert_eq!(menu.at, s);
+        menu.step(-1);
+        assert_eq!(menu.at, console);
         // the size and DLSS's mode follow each other on Series S
         "quality".clone_into(&mut menu.values[dlss]);
         "720".clone_into(&mut menu.values[s]);
@@ -1189,8 +1454,68 @@ mod tests {
     }
 
     #[test]
+    fn the_picture_has_tabs_rows_and_a_fading_bar() {
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
+        menu.started = menu.values.clone();
+        menu.open_tab(1);
+        let (w, h) = look::size(1.0);
+        let pixels = menu.picture(1.0).expect("GDI draws");
+        assert_eq!(pixels.len(), (w * h) as usize);
+        let at = |x: u32, y: u32| pixels[(y * w + x) as usize];
+        // The picked row's bar: white at its left, fading to the right.
+        let row_y = 138 + 23;
+        let left = at(30, row_y);
+        let right = at(750, row_y);
+        assert!(left & 0xFF > 0xF0, "{left:x}");
+        assert!(right & 0xFF < left & 0xFF, "{right:x}");
+        // Every tab has rows, and stepping goes through them and onto the actions.
+        for tab in 0..TABS.len() {
+            menu.open_tab(tab);
+            assert!(menu.at < ITEMS.len());
+            for _ in 0..menu.shown_items(tab).len() {
+                menu.step(1);
+            }
+            assert_eq!(menu.at, ITEMS.len());
+        }
+        assert_eq!(pretty("FRAME RATE CAP"), "Frame Rate Cap");
+        assert_eq!(pretty("3440X1440 (21:9)"), "3440x1440 (21:9)");
+        assert_eq!(pretty("DLSS MODEL"), "DLSS Model");
+        assert_eq!(half(1.0), 0x3C00);
+    }
+
+    /// `VICTORY_MENU_PREVIEW=<file.bmp>`: the picture of each tab written out, to look at without the game.
+    #[test]
+    fn preview() {
+        let Some(path) = std::env::var_os("VICTORY_MENU_PREVIEW") else { return };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
+        menu.started = menu.values.clone();
+        menu.values[tab_items(1)[1]] = ITEMS[tab_items(1)[1]].values[1].0.to_owned();
+        for tab in 0..TABS.len() {
+            menu.open_tab(tab);
+            menu.step(1);
+            let (w, h) = look::size(1.0);
+            let pixels = menu.picture(1.0).unwrap();
+            let mut bmp = Vec::new();
+            let size = 54 + pixels.len() as u32 * 4;
+            bmp.extend(b"BM");
+            for v in [size, 0, 54, 40, w, (h as i32).wrapping_neg() as u32] {
+                bmp.extend(v.to_le_bytes());
+            }
+            bmp.extend(1u16.to_le_bytes());
+            bmp.extend(32u16.to_le_bytes());
+            bmp.extend([0u8; 24]);
+            for p in &pixels {
+                bmp.extend(p.to_le_bytes());
+            }
+            let mut out = std::path::PathBuf::from(&path);
+            out.set_extension(format!("{tab}.bmp"));
+            std::fs::write(out, bmp).unwrap();
+        }
+    }
+
+    #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
         menu.started = menu.values.clone();
         let n = ITEMS[0].values.len();
         for _ in 0..n {
@@ -1204,7 +1529,7 @@ mod tests {
     #[test]
     fn a_shared_save_name_is_shown_in_letters_the_menu_has() {
         let names = vec!["save 2026-11-27 23-45-10.zip".to_owned(), "Jason's boat ~ 100% [\u{e9}] and a very long name that goes on and on.zip".to_owned()];
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true, tab: 0 };
         menu.started = menu.values.clone();
         let check = |menu: &Menu| {
             let lines = menu.lines();
