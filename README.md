@@ -31,7 +31,7 @@ Put them next to your own `game_scarlett_master.exe` and double-click `PLAY.cmd`
 
 Enter starts with the recommended settings, or with your last ones. **C** walks through ten choices:
 
-1. **Resolution:** 2560x1440, 1920x1080 upscaled to 1440, 3840x2160, **5120x1440 (32:9)**, **3440x1440 (21:9)**, 2560x1080, or any width x height.
+1. **Resolution:** 2560x1440, 1920x1080 upscaled to 1440, 3840x2160, **5120x1440 (32:9)**, **3440x1440 (21:9)**, or any width from 2560 to 7680 at 1440 high. (The game's output can only be patched at 1440 high so far: 16:10 and 2560x1080 are not possible yet.)
 2. **Window:** fullscreen with no border (default) or in a window.
 3. **Console profile:** Series X, the default and the one to use. Series S (1280x720 inside, much softer) is only for weaker cards.
 4. **DLSS:** Quality, Balanced, Performance, DLAA or off.

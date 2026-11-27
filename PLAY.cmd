@@ -63,8 +63,7 @@ echo   2. 1920x1080 rendered, upscaled to 2560x1440
 echo   3. 3840x2160  16:9  (4K)
 echo   4. 5120x1440  32:9  super ultrawide
 echo   5. 3440x1440  21:9  ultrawide
-echo   6. 2560x1080  21:9  ultrawide
-echo   7. other width x height
+echo   6. other width, 1440 high (2560 to 7680, in steps of 8)
 set "A="
 set /p A=Choice [1]:
 if "%A%"=="" set A=1
@@ -74,11 +73,12 @@ if "%A%"=="2" set "C_RES=1080to1440"
 if "%A%"=="3" set "C_RES=4k"
 if "%A%"=="4" set "C_RES=wide"
 if "%A%"=="5" set "C_RES=1440" & set "C_WIDE=3440x1440"
-if "%A%"=="6" set "C_RES=1440" & set "C_WIDE=2560x1080"
-if "%A%"=="7" (
+if "%A%"=="6" (
   set "C_RES=1440"
-  set /p C_WIDE=Width x height, for example 3840x1600:
+  set "C_W="
+  set /p C_W=Width, for example 3840:
 )
+if "%A%"=="6" set "C_WIDE=!C_W!x1440"
 
 rem ---- 2. window ----
 cls
