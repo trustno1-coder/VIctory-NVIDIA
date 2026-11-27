@@ -3,6 +3,8 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(agility_sdk)]
+mod agility;
 mod census;
 mod inspect;
 #[cfg(windows)]
@@ -209,6 +211,8 @@ fn main() -> Result<()> {
     // Started with nothing after its name (a double click): play.
     let bare = std::env::args_os().len() == 1;
     let cli = if bare && cfg!(windows) { Cli::parse_from(["victory", "play"]) } else { Cli::parse() };
+    #[cfg(agility_sdk)]
+    agility::check_runtime()?;
     // Play puts its settings into the environment and names its log file
     // before anything else is set up.
     #[cfg(windows)]
