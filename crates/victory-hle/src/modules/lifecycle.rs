@@ -96,28 +96,164 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
+/// An owned black backdrop window placed behind an aspect-fitted fullscreen window.
+const BACKDROP_PROP: PCWSTR = w!("victory.backdrop");
 
 /// Fullscreen, the English keyboard and the mouse capture are asked for
 /// (`=1`, or the F1 menu): left unset, the window and input stay as before.
 pub(super) fn enabled(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|v| v == "1")
+    std::env::var_os(name).is_some_and(|v| v == "1" || (name == "VICTORY_FULLSCREEN" && v == "stretch"))
 }
 
-fn fullscreen(hwnd: HWND) {
+/// Opts the process into Per-Monitor V2 DPI awareness (`VICTORY_DPI_AWARE=0`
+/// leaves Windows virtualization on) so high-DPI 4K and ultrawide displays
+/// report physical pixels instead of DWM-scaled coordinates.
+fn ensure_dpi_aware() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("VICTORY_DPI_AWARE").is_some_and(|v| v == "0") {
+            return;
+        }
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (DPI_AWARENESS_CONTEXT)-4
+        const PER_MONITOR_AWARE_V2: isize = -4;
+        // SAFETY: `user32.dll` is loaded in GUI processes; signature matches Win32 ABI.
+        unsafe {
+            let user32 = GetModuleHandleW(w!("user32.dll"));
+            if !user32.is_null()
+                && let Some(proc) = GetProcAddress(user32, c"SetProcessDpiAwarenessContext".as_ptr().cast())
+            {
+                let set_dpi: unsafe extern "system" fn(isize) -> i32 = std::mem::transmute(proc);
+                let ok = set_dpi(PER_MONITOR_AWARE_V2);
+                tracing::info!(ok = ok != 0, "per-monitor v2 DPI awareness requested");
+            }
+        }
+    });
+}
+
+/// Computes the centred `(x, y, w, h)` box for `content_w` x `content_h`
+/// inside `screen_w` x `screen_h`, preserving proportions unless `stretch`.
+fn fullscreen_box(
+    screen_w: i32,
+    screen_h: i32,
+    content_w: i32,
+    content_h: i32,
+    stretch: bool,
+) -> (i32, i32, i32, i32) {
+    if stretch || content_w <= 0 || content_h <= 0 || screen_w <= 0 || screen_h <= 0 {
+        return (0, 0, screen_w, screen_h);
+    }
+    let scale = f64::min(
+        f64::from(screen_w) / f64::from(content_w),
+        f64::from(screen_h) / f64::from(content_h),
+    );
+    let w = ((f64::from(content_w) * scale).round() as i32).clamp(1, screen_w);
+    let h = ((f64::from(content_h) * scale).round() as i32).clamp(1, screen_h);
+    ((screen_w - w) / 2, (screen_h - h) / 2, w, h)
+}
+
+fn spawn_backdrop(hwnd: HWND, screen_w: i32, screen_h: i32) {
+    use windows_sys::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    static CLASS: std::sync::Once = std::sync::Once::new();
+    const CLASS_NAME: PCWSTR = w!("VictoryBackdrop");
+    // SAFETY: registers a minimal black-background class once and creates a disabled,
+    // non-activating tool window placed directly behind `hwnd` in Z-order.
+    unsafe {
+        CLASS.call_once(|| {
+            let wc = wm::WNDCLASSEXW {
+                cbSize: size_of::<wm::WNDCLASSEXW>() as u32,
+                style: 0,
+                lpfnWndProc: Some(wm::DefWindowProcW),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: GetModuleHandleW(std::ptr::null()),
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: GetStockObject(BLACK_BRUSH),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: CLASS_NAME,
+                hIconSm: std::ptr::null_mut(),
+            };
+            let _ = wm::RegisterClassExW(&wc);
+        });
+        let backdrop = wm::CreateWindowExW(
+            wm::WS_EX_TOOLWINDOW | wm::WS_EX_NOACTIVATE,
+            CLASS_NAME,
+            w!(""),
+            wm::WS_POPUP | wm::WS_DISABLED,
+            0,
+            0,
+            screen_w,
+            screen_h,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        );
+        if !backdrop.is_null() {
+            wm::SetPropW(hwnd, BACKDROP_PROP, backdrop);
+            wm::SetWindowPos(
+                backdrop,
+                hwnd,
+                0,
+                0,
+                screen_w,
+                screen_h,
+                wm::SWP_NOACTIVATE | wm::SWP_SHOWWINDOW,
+            );
+        }
+    }
+}
+
+fn fullscreen(hwnd: HWND, orig_w: i32, orig_h: i32) {
     if !enabled("VICTORY_FULLSCREEN") {
         return;
     }
+    ensure_dpi_aware();
+    let stretch = std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "stretch");
     // SAFETY: this thread owns the newly created top-level window.
     unsafe {
-        let (width, height) = std::env::var("VICTORY_FULLSCREEN_RES")
-            .ok().as_deref().and_then(parse_window_limit)
+        let (cw, ch) = if orig_w > 0 && orig_h > 0 {
+            (orig_w, orig_h)
+        } else {
+            let mut client = RECT::default();
+            if wm::GetClientRect(hwnd, &mut client) != 0 {
+                (client.right - client.left, client.bottom - client.top)
+            } else {
+                (0, 0)
+            }
+        };
+        let (sw, sh) = std::env::var("VICTORY_FULLSCREEN_RES")
+            .ok()
+            .as_deref()
+            .and_then(parse_window_limit)
             .unwrap_or_else(|| (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)));
+        let (x, y, width, height) = fullscreen_box(sw, sh, cw, ch, stretch);
         let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32;
         let ex = wm::GetWindowLongW(hwnd, wm::GWL_EXSTYLE) as u32;
         wm::SetWindowLongW(hwnd, wm::GWL_STYLE, ((style & !wm::WS_OVERLAPPEDWINDOW) | wm::WS_POPUP) as i32);
         wm::SetWindowLongW(hwnd, wm::GWL_EXSTYLE, (ex & !(wm::WS_EX_CLIENTEDGE | wm::WS_EX_WINDOWEDGE | wm::WS_EX_DLGMODALFRAME | wm::WS_EX_STATICEDGE)) as i32);
-        wm::SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, width, height,
-            wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE);
+        wm::SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            width,
+            height,
+            wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+        );
+        let bars = std::env::var_os("VICTORY_FULLSCREEN_BARS").is_none_or(|v| v != "0");
+        if bars && cw >= 320 && ch >= 200 && (width < sw || height < sh) {
+            spawn_backdrop(hwnd, sw, sh);
+        }
+        tracing::info!(
+            screen = ?(sw, sh),
+            content = ?(cw, ch),
+            placed = ?(x, y, width, height),
+            stretch,
+            "borderless fullscreen applied"
+        );
     }
 }
 
@@ -220,6 +356,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
+    let (orig_w, orig_h) = (width, height);
     let (x, y, width, height) = fit(parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
@@ -227,7 +364,7 @@ pub extern "system" fn CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
-    hook(hwnd);
+    hook(hwnd, orig_w, orig_h);
     hwnd
 }
 
@@ -246,6 +383,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
+    let (orig_w, orig_h) = (width, height);
     let (x, y, width, height) = fit(parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
@@ -253,7 +391,7 @@ pub extern "system" fn CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
-    hook(hwnd);
+    hook(hwnd, orig_w, orig_h);
     hwnd
 }
 
@@ -264,13 +402,24 @@ pub extern "system" fn CreateWindowExA(
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    if parent.is_null() && width >= 320 && height >= 200 {
+        ensure_dpi_aware();
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
     let limit = window_limit();
     let fitted = fit_with_limit(&area, width, height, limit);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
+    if !parent.is_null() || known == 0 {
+        return (x, y, width, height);
+    }
+    if fitted == (width, height) {
+        if x == 0 && y == 0 && width >= 320 && height >= 200 {
+            let left = area.left + (area.right - area.left - width) / 2;
+            let top = area.top + (area.bottom - area.top - height) / 2;
+            return (left, top, width, height);
+        }
         return (x, y, width, height);
     }
     tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
@@ -337,7 +486,7 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
 }
 
 /// Puts our procedure in front of the title's.
-fn hook(hwnd: HWND) {
+fn hook(hwnd: HWND, orig_w: i32, orig_h: i32) {
     if hwnd.is_null() {
         return;
     }
@@ -348,7 +497,7 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
         if wm::GetParent(hwnd).is_null() {
-            fullscreen(hwnd);
+            fullscreen(hwnd, orig_w, orig_h);
             english_input();
             capture_mouse(hwnd, true);
         }
@@ -366,7 +515,27 @@ extern "system" fn window_proc(
     }
     match message {
         wm::WM_KILLFOCUS | wm::WM_NCDESTROY => capture_mouse(hwnd, false),
-        wm::WM_ACTIVATE => capture_mouse(hwnd, wparam & 0xffff != wm::WA_INACTIVE as usize),
+        wm::WM_ACTIVATE => {
+            let active = wparam & 0xffff != wm::WA_INACTIVE as usize;
+            capture_mouse(hwnd, active);
+            if active {
+                // SAFETY: `backdrop` was stored by `spawn_backdrop` for this window.
+                unsafe {
+                    let backdrop = wm::GetPropW(hwnd, BACKDROP_PROP);
+                    if !backdrop.is_null() {
+                        wm::SetWindowPos(
+                            backdrop,
+                            hwnd,
+                            0,
+                            0,
+                            0,
+                            0,
+                            wm::SWP_NOMOVE | wm::SWP_NOSIZE | wm::SWP_NOACTIVATE,
+                        );
+                    }
+                }
+            }
+        }
         wm::WM_SETFOCUS | wm::WM_MOVE | wm::WM_SIZE => capture_mouse(hwnd, true),
         _ => {}
     }
@@ -389,6 +558,10 @@ extern "system" fn window_proc(
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
         if message == wm::WM_NCDESTROY {
+            let backdrop = wm::RemovePropW(hwnd, BACKDROP_PROP);
+            if !backdrop.is_null() {
+                wm::DestroyWindow(backdrop);
+            }
             wm::RemovePropW(hwnd, TITLE_PROC);
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
@@ -666,6 +839,20 @@ mod tests {
         ] {
             assert_eq!(parse_window_limit(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn fullscreen_box_preserves_aspect_on_ultrawide_and_tall_screens() {
+        // 4K 16:9 on a 5120x2160 (21:9) display: native 1:1 3840x2160 centred with 640px bars.
+        assert_eq!(fullscreen_box(5120, 2160, 3840, 2160, false), (640, 0, 3840, 2160));
+        // 1440p 16:9 on a 5120x2160 (21:9) display: scaled 1.5x to 3840x2160 centred.
+        assert_eq!(fullscreen_box(5120, 2160, 2560, 1440, false), (640, 0, 3840, 2160));
+        // 1440p 16:9 on a 5120x1440 (32:9) display: 2560x1440 centred with 1280px bars.
+        assert_eq!(fullscreen_box(5120, 1440, 2560, 1440, false), (1280, 0, 2560, 1440));
+        // 16:9 on a 16:10 (2560x1600) display: letterboxed vertically at 2560x1440.
+        assert_eq!(fullscreen_box(2560, 1600, 2560, 1440, false), (0, 80, 2560, 1440));
+        // Explicit stretch fills the screen.
+        assert_eq!(fullscreen_box(5120, 2160, 3840, 2160, true), (0, 0, 5120, 2160));
     }
 
     #[test]
