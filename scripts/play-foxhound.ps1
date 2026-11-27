@@ -163,6 +163,20 @@ if (-not (Test-Path $victory)) {
     if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
+# Every translated shader is SM 6.6. Windows 10's own Direct3D 12 stops at 6.5, and with no D3D12\D3D12Core.dll
+# beside victory.exe it makes no device at all ("none"); `victory get-d3d12` fetches Microsoft's newer runtime
+# there, as `victory play` does. Asked only while that folder is missing; nothing is fetched at 6.6 or above.
+if (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $victory) 'D3D12\D3D12Core.dll'))) {
+    $model = "$(& $victory shader-model 2>$null | Select-Object -Last 1)".Trim()
+    if ($model -notmatch '^\d+\.\d+$' -or [version]$model -lt [version]'6.6') {
+        Write-Host "Direct3D 12 here runs shader model $(if ($model -match '^\d+\.\d+$') { $model } else { 'none (no device)' }); the game's translated shaders need 6.6."
+        & $victory get-d3d12
+        if ($LASTEXITCODE -ne 0 -and $model -match '^\d+\.\d+$') {
+            Write-Host "Microsoft's Direct3D 12 runtime did not arrive: every shader would be refused. ``$victory get-d3d12`` tries again."
+            return
+        }
+    }
+}
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }

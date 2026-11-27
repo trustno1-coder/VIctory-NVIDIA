@@ -59,7 +59,9 @@
   6.6 the game shows a black screen and closes within seconds. So the first start
   there offers to fetch Microsoft's newer Direct3D 12 runtime (the D3D12 Agility
   SDK, `D3D12Core.dll`, about 22 MB from nuget.org). It goes into a `D3D12`
-  folder beside `victory.exe`. `victory.exe get-d3d12` does the same by hand.
+  folder beside `victory.exe`. `victory.exe get-d3d12` does the same by hand,
+  and `scripts\play-foxhound.ps1` (with `play-nvidia.ps1` and `PLAY_FRAMEGEN.cmd`)
+  runs it when that folder is missing and no device runs shader model 6.6.
   The file is checked against Microsoft's signature and the tested SHA-256.
   Windows 11 keeps using its own runtime.
 - You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA

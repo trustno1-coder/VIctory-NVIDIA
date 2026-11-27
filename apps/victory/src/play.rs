@@ -659,14 +659,25 @@ pub(crate) fn get_d3d12() -> Result<()> {
 /// so a start that still cannot run it stops here, saying why.
 fn check_shader_model() -> Result<()> {
     let needed = victory_hle::streamline::SHADER_MODEL_NEEDED;
-    let Some(found) = shader_model() else { return Ok(()) };
-    if found >= needed {
+    let found = shader_model();
+    if found.is_some_and(|found| found >= needed) {
         return Ok(());
     }
     let to = d3d12_dir()?;
     let had = to.join("D3D12Core.dll").is_file();
     if !had {
-        println!("This PC's Direct3D 12 runs shader model {}.{}, and the game's translated shaders need 6.6.", found.0, found.1);
+        match found {
+            Some(found) => println!(
+                "This PC's Direct3D 12 runs shader model {}.{}, and the game's translated shaders need 6.6.",
+                found.0, found.1
+            ),
+            // Windows 10 22H2 (2026-11-28): with main.rs's D3D12SDKVersion and no D3D12\ beside
+            // victory.exe, no device is made at all, so there is no shader model to answer.
+            None => println!(
+                "No Direct3D 12 device could be made with this PC's own runtime, and the game's translated \
+                 shaders need shader model 6.6."
+            ),
+        }
         println!("Windows 10's own Direct3D 12 stops at 6.5; Microsoft's newer runtime (the D3D12 Agility SDK)");
         println!("runs 6.6. It is Microsoft's own, under Microsoft's licence, from nuget.org (about 22 MB, once),");
         println!("and goes into {}.", to.display());
@@ -686,16 +697,20 @@ fn check_shader_model() -> Result<()> {
                         println!("Shader model {}.{} with Microsoft's runtime. Starting the game.", now.0, now.1);
                         return Ok(());
                     }
-                    now => {
-                        let now = now.unwrap_or(found);
+                    Some(now) => {
                         println!("With Microsoft's runtime the GPU still runs shader model {}.{}.", now.0, now.1);
                     }
+                    None => println!("With Microsoft's runtime still no Direct3D 12 device could be made."),
                 },
                 Err(e) => println!("{e:#}"),
             }
         }
     }
-    let now = shader_model().unwrap_or(found);
+    // No answer either way: the start goes on, as it always did, and the host's log says why.
+    let Some(now) = shader_model().or(found) else { return Ok(()) };
+    if now >= needed {
+        return Ok(());
+    }
     anyhow::bail!(
         "this PC's Direct3D 12 runs shader model {}.{}, and the game needs 6.6: every shader would be \
          refused and the game would close at once. {}",
