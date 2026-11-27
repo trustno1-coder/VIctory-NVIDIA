@@ -36,6 +36,8 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// Taken by a worker from the resolves' own line ([`Queue::resolves`]).
+    as_resolve: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -48,7 +50,16 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// A per-material ray-tracing resolve (`*:CS_RaytracingResolve`): while it
+    /// is being made its dispatches are dropped at once, never waited for.
+    /// There are about a thousand of these programs and the card's driver
+    /// takes seconds for one.
+    no_wait: bool,
 }
+
+/// Dispatches dropped because their resolve was still being made
+/// ([`Pending::no_wait`]), since the start.
+static NOT_WAITED: AtomicU64 = AtomicU64::new(0);
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
@@ -161,14 +172,17 @@ impl Pending {
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
         let left_out = left_out(&shaders);
+        let no_wait = named(&shaders, b"CS_RaytracingResolve");
         Pending {
             screen,
             scene_input,
             left_out,
+            no_wait,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            as_resolve: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -289,7 +303,18 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.no_wait {
+            let n = NOT_WAITED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(
+                    n,
+                    being_made = WAITING.load(Ordering::Relaxed),
+                    "ray-tracing resolves dropped while their pipeline is being made, not waited for"
+                );
+            }
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -368,6 +393,25 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if waited >= Duration::from_millis(50) {
+        // Which pipeline a frame's wait went on, in every build.
+        static LONG: AtomicU64 = AtomicU64::new(0);
+        static LONG_MS: AtomicU64 = AtomicU64::new(0);
+        let ms = waited.as_millis() as u64;
+        let all_ms = LONG_MS.fetch_add(ms, Ordering::Relaxed) + ms;
+        let n = LONG.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n.is_multiple_of(64) {
+            tracing::info!(
+                n,
+                all_ms,
+                ms,
+                made = p.made.get().is_some(),
+                being_made = WAITING.load(Ordering::Relaxed),
+                shaders = ?p.shaders,
+                "a host pipeline was waited for 50 ms or more"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -418,6 +462,17 @@ fn slow_limit() -> usize {
     })
 }
 
+/// How many workers may make ray-tracing resolves at once: all but a quarter
+/// of them, which stay free for the pipelines draws ask for.
+fn resolve_limit_for(workers: usize) -> usize {
+    (workers - workers / 4).max(1)
+}
+
+fn resolve_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| resolve_limit_for(active_worker_count()))
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
@@ -428,6 +483,13 @@ struct Queue {
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// Requested per-material ray-tracing resolves ([`Pending::no_wait`]), and
+    /// how many are being made ([`resolve_limit`]). They are hundreds at once
+    /// and take seconds each: in the one line of requested pipelines every
+    /// other pipeline a draw asked for stood behind them, and the frame's wait
+    /// budget went on that one each frame.
+    resolves: VecDeque<Arc<Pending>>,
+    resolves_now: usize,
 }
 
 impl Queue {
@@ -438,6 +500,8 @@ impl Queue {
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            resolves: VecDeque::new(),
+            resolves_now: 0,
         }
     }
 
@@ -455,6 +519,8 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
+        } else if priority == REQUESTED && p.no_wait {
+            self.resolves.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
@@ -466,13 +532,27 @@ impl Queue {
     }
 
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
+        self.pop_with(screens_only, slow_limit, resolve_limit())
+    }
+
+    fn pop_with(&mut self, screens_only: bool, slow_limit: usize, resolve_limit: usize) -> Option<Arc<Pending>> {
         // An early entry can have been promoted and claimed already.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self.requested.pop_front();
+            if p.is_none() && self.resolves_now < resolve_limit {
+                p = self.resolves.pop_front();
+                if let Some(p) = &p {
+                    p.as_resolve.store(true, Ordering::Relaxed);
+                    self.resolves_now += 1;
+                }
+            }
+            if p.is_none() {
+                p = unclaimed(&mut self.early);
+            }
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -541,18 +621,22 @@ fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) 
     }
 }
 
+fn active_worker_count() -> usize {
+    worker_count_for(
+        std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok()),
+        std::thread::available_parallelism().map_or(2, |n| n.get()),
+        crate::residency::limited_host_ram(),
+    )
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count_for(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
-            crate::residency::limited_host_ram(),
-        );
+        let workers = active_worker_count();
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
@@ -576,6 +660,11 @@ fn workers() -> bool {
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
+                            AVAILABLE.notify_all();
+                        }
+                        if p.as_resolve.load(Ordering::Relaxed) {
+                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                            queue.resolves_now -= 1;
                             AVAILABLE.notify_all();
                         }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
@@ -739,5 +828,53 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn resolves_queue_behind_draws_and_leave_workers_free() {
+        let of = |no_wait| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.no_wait = no_wait;
+            Arc::new(p)
+        };
+        let (r1, r2, r3, draw1, draw2) = (of(true), of(true), of(true), of(false), of(false));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&r1, REQUESTED), Some(true));
+        assert_eq!(queue.push(&r2, REQUESTED), Some(true));
+        assert_eq!(queue.push(&r3, REQUESTED), Some(true));
+        assert_eq!(queue.push(&draw1, REQUESTED), Some(true));
+
+        // Regular draw pipelines jump ahead of queued resolves.
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &draw1));
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &r1));
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &r2));
+        assert!(r1.as_resolve.load(Ordering::Relaxed));
+        assert!(r2.as_resolve.load(Ordering::Relaxed));
+        assert_eq!(queue.resolves_now, 2);
+
+        // Once resolve_limit is reached, r3 waits so workers stay free for draws.
+        assert!(queue.pop_with(false, 1, 2).is_none());
+        assert_eq!(queue.push(&draw2, REQUESTED), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &draw2));
+
+        // Finishing one resolve frees a slot for r3.
+        queue.resolves_now -= 1;
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &r3));
+        assert_eq!(resolve_limit_for(16), 12);
+        assert_eq!(resolve_limit_for(8), 6);
+        assert_eq!(resolve_limit_for(1), 1);
+    }
+
+    #[test]
+    fn no_wait_resolve_is_dropped_without_waiting() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.no_wait = true;
+        // Pretend a worker already claimed it so ready() cannot finish inline.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let p = Arc::new(p);
+        let before = NOT_WAITED.load(Ordering::Relaxed);
+        assert!(ready(&p).is_none());
+        assert!(p.made.get().is_none());
+        assert_eq!(NOT_WAITED.load(Ordering::Relaxed), before + 1);
     }
 }
