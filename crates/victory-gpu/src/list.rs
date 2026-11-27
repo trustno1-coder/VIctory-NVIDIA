@@ -334,16 +334,11 @@ pub(crate) fn trim_idle(now: u64) {
     const REST_MS: u64 = 2_000;
     let retired = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let count = idle.0.len();
-        let mut retired = Vec::new();
-        for (i, entry) in std::mem::take(&mut idle.0).into_iter().enumerate() {
-            if count - i > WARM && now.saturating_sub(entry.2) >= REST_MS {
-                idle.1 -= entry.1;
-                retired.push(entry);
-            } else {
-                idle.0.push(entry);
-            }
-        }
+        // Share the upstream age calculation; pressure adds a warm reserve.
+        let n = stale(idle.0.iter().map(|entry| entry.2), now, REST_MS)
+            .min(idle.0.len().saturating_sub(WARM));
+        let retired: Vec<Idle> = idle.0.drain(..n).collect();
+        idle.1 -= retired.iter().map(|entry| entry.1).sum::<u64>();
         retired
     };
     TRIMMED_LISTS.fetch_add(retired.len() as u64, std::sync::atomic::Ordering::Relaxed);
