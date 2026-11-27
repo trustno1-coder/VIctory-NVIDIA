@@ -217,6 +217,11 @@ static ASKING: (Mutex<Vec<(usize, usize)>>, Condvar) = (Mutex::new(Vec::new()), 
 /// Pages `[first, last)` held in [`ASKING`] until dropped.
 struct Asking(usize, usize);
 
+/// Multiple page ranges held in [`ASKING`] atomically until dropped, so
+/// unrelated memory (e.g. shader-visible descriptor heaps in `sync_heaps`)
+/// is not blocked while `ask_once` queries write-watched buffers.
+struct AskingMany(Vec<(usize, usize)>);
+
 impl Asking {
     fn hold(first: usize, last: usize) -> Asking {
         let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -237,6 +242,27 @@ impl Asking {
     fn hold_all() -> Asking {
         Asking::hold(0, usize::MAX)
     }
+
+    /// Atomically holds every range in `ranges` in [`ASKING`].
+    fn hold_many(ranges: Vec<(usize, usize)>) -> AskingMany {
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        let overlaps = |held: &[(usize, usize)]| {
+            ranges
+                .iter()
+                .any(|&(first, last)| held.iter().any(|&(a, b)| a < last && first < b))
+        };
+        if overlaps(&held) {
+            held = waited(0, || {
+                let mut held = held;
+                while overlaps(&held) {
+                    held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
+                }
+                held
+            });
+        }
+        held.extend_from_slice(&ranges);
+        AskingMany(ranges)
+    }
 }
 
 impl Drop for Asking {
@@ -244,6 +270,19 @@ impl Drop for Asking {
         let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(i) = held.iter().position(|&r| r == (self.0, self.1)) {
             held.swap_remove(i);
+        }
+        drop(held);
+        ASKING.1.notify_all();
+    }
+}
+
+impl Drop for AskingMany {
+    fn drop(&mut self) {
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        for &range in &self.0 {
+            if let Some(i) = held.iter().position(|&r| r == range) {
+                held.swap_remove(i);
+            }
         }
         drop(held);
         ASKING.1.notify_all();
@@ -316,6 +355,20 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
+
+/// Gap threshold in 64 KiB pages for merging `GetWriteWatch` ranges
+/// (`VICTORY_AHEAD_GAP_KB`, default 8192 KiB = 8 MiB; smaller values such as
+/// 256 avoid walking megabytes of unused pages under Wine's `virtual.c` lock).
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_AHEAD_GAP_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|kb| (kb << 10) / PAGE)
+            .unwrap_or(AHEAD_GAP)
+    })
+}
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -330,7 +383,12 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
         // asking (and, asked together with others, theirs).
-        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        .filter(|r| {
+            r.0 < r.1
+                && !published(r.0, r.1)
+                && !KNOWN_VIEW.any(r.0 / BLOCK, r.1.div_ceil(BLOCK))
+                && !SINGLE_NOT_WATCHED.any(r.0 / BLOCK, r.1.div_ceil(BLOCK))
+        })
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
@@ -343,6 +401,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     let _all = Asking::hold_all();
+    let gap = ahead_gap();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
@@ -350,7 +409,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + gap
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
@@ -538,56 +597,83 @@ pub(crate) fn once() -> bool {
 }
 
 /// With [`once`]: asks about `ranges` (everything a submission's lists
-/// refresh) as [`ask_ahead`] does, and lets that asking stand until
-/// [`ask_once_end`].
+/// refresh) in a single fused pass, grouping only within the same
+/// `VirtualAlloc` reservation and holding only the queried spans in [`ASKING`]
+/// so unrelated memory (such as descriptor heaps in `sync_heaps`) is not
+/// blocked while `GetWriteWatch` runs.
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
     ask_once_end();
-    ask_ahead(ranges);
-    ask_rest(ranges);
-}
-
-/// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
-/// asking stands.
-fn ask_rest(ranges: &[(usize, usize)]) {
-    let _all = Asking::hold_all();
-    let mut ahead = {
-        let mut j = journal_mut();
-        std::mem::take(&mut j.ahead)
-    };
-    // `ask_ahead` leaves a range that lies alone to `writes`, which asks
-    // once per flush: with one asking for the submission that was every
-    // such range asked again at each of its 70 flushes (run 76: 2,300
-    // askings a frame with the switch on, as without it). They are asked
-    // here, once; what is not write-watched stays with `writes`.
-    let mut written = Vec::new();
-    for &(start, end) in ranges {
-        if start >= end || published(start, end) {
-            continue;
-        }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| {
+            r.0 < r.1
+                && !published(r.0, r.1)
+                && !KNOWN_VIEW.any(r.0 / BLOCK, r.1.div_ceil(BLOCK))
+                && !SINGLE_NOT_WATCHED.any(r.0 / BLOCK, r.1.div_ceil(BLOCK))
+        })
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    if pieces.is_empty() {
+        return;
+    }
+    pieces.sort_unstable();
+    let gap = ahead_gap();
+    let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let res = reservation_of(first);
+        let mut k = i + 1;
+        while k < pieces.len()
+            && pieces[k].0 <= last + gap
+            && last.max(pieces[k].1) - first <= AHEAD_MAX
+            && res.is_some_and(|(ra, rb)| pieces[k].0 >= ra && pieces[k].1 <= rb)
         {
-            written.extend(pages);
-            ahead.push((first, last));
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        groups.push((i, k, first, last));
+        spans.push((first, last));
+        i = k;
+    }
+    let _held = Asking::hold_many(spans);
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    for (gi, gk, first, last) in groups {
+        if gk - gi == 1 {
+            if let Some(pages) = kernel_written(first, last) {
+                written.extend(pages);
+                asked.push((first, last));
+            } else if last - first == 1 {
+                SINGLE_NOT_WATCHED.set(first);
+            }
+        } else {
+            ask_run(&pieces[gi..gk], &mut asked, &mut written);
+            for &(p0, p1) in &pieces[gi..gk] {
+                if !asked.iter().any(|&(a, b)| a <= p0 && p1 <= b) {
+                    if let Some(pages) = kernel_written(p0, p1) {
+                        written.extend(pages);
+                        asked.push((p0, p1));
+                    } else if p1 - p0 == 1 {
+                        SINGLE_NOT_WATCHED.set(p0);
+                    }
+                }
+            }
         }
     }
     note_hot(&written);
     let mut j = journal_mut();
-    // A number of its own, and the one this asking stands under: between
-    // the two parts another thread may have asked about a range of the
-    // second, copied it, and the title written it since. Under the first
-    // part's number that write was older than the copy, and never copied.
     let now = next_asking();
     j.ahead_asked = now;
     for (page, parts) in written {
         j.note(page, parts, now);
     }
-    j.kept = !ahead.is_empty();
-    j.ahead = ahead;
+    j.kept = !asked.is_empty();
+    j.ahead = asked;
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -695,6 +781,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let j = journal();
         return Some((next_asking(), of(&j)));
     }
+    if !guarded && (KNOWN_VIEW.any(first, last) || SINGLE_NOT_WATCHED.any(first, last)) {
+        return None;
+    }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
@@ -702,8 +791,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         return Some(known);
     }
     let mut guards_asked = false;
-    // (View memory read-only by our hand: the kernel would refuse.)
-    let refused = guarded && light() && PROTECTED.any(first, last);
+    // (View memory previously confirmed as `MEM_MAPPED` or read-only by our
+    // hand: `GetWriteWatch` always refuses it.)
+    let refused = KNOWN_VIEW.any(first, last)
+        || SINGLE_NOT_WATCHED.any(first, last)
+        || (guarded && light() && PROTECTED.any(first, last));
     let pages = match if refused { None } else { kernel_written(first, last) } {
         Some(pages) => pages,
         None => {
@@ -999,6 +1091,75 @@ static PUBLISHED: Bits = Bits::new();
 /// again. Who finds none set has no guard to open and need not wait for the
 /// lock ([`writing`]): some 700 pieces a frame are landed in memory that is
 /// no view.
+/// Blocks proven to be `MEM_MAPPED` view memory (set inside `protect_here`
+/// once guarded). Cleared on `title_memory_allocated`, `title_memory_remapped`,
+/// `title_memory_unmapping`, `title_memory_freed` and `g.foreign`.
+static KNOWN_VIEW: Bits = Bits::new();
+
+/// Single 64 KiB blocks individually proven NOT `MEM_WRITE_WATCH` (an isolated
+/// `GetWriteWatch(b, b+1)` failed on that exact block). Cleared on every
+/// `title_memory_*` change.
+static SINGLE_NOT_WATCHED: Bits = Bits::new();
+
+/// Cached `VirtualAlloc` reservation spans `(first_page, last_page)` so
+/// `ask_once` merges ranges ONLY within the same reservation (zero failed
+/// cross-reservation `GetWriteWatch` calls, zero binary splits).
+static RESERVATIONS: RwLock<Vec<(usize, usize)>> = RwLock::new(Vec::new());
+
+fn reservation_of(page: usize) -> Option<(usize, usize)> {
+    {
+        let r = RESERVATIONS.read().unwrap_or_else(|e| e.into_inner());
+        let idx = r.partition_point(|&(a, _)| a <= page);
+        if idx > 0 {
+            let (a, b) = r[idx - 1];
+            if page < b {
+                return Some((a, b));
+            }
+        }
+    }
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) } == 0
+        || info.State == MEM_FREE
+        || info.AllocationBase.is_null()
+    {
+        return None;
+    }
+    let alloc_base = info.AllocationBase as usize;
+    let mut cur = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+    while cur > alloc_base {
+        let mut next: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(cur as *const _, &mut next, size_of_val(&next)) } == 0
+            || next.AllocationBase as usize != alloc_base
+            || next.RegionSize == 0
+        {
+            break;
+        }
+        let next_cur = (next.BaseAddress as usize).saturating_add(next.RegionSize);
+        if next_cur <= cur {
+            break;
+        }
+        cur = next_cur;
+    }
+    let span = (alloc_base / PAGE, cur.div_ceil(PAGE));
+    if span.0 < span.1 {
+        let mut r = RESERVATIONS.write().unwrap_or_else(|e| e.into_inner());
+        let idx = r.partition_point(|&(a, _)| a < span.0);
+        if r.get(idx).is_none_or(|&s| s != span) {
+            r.insert(idx, span);
+        }
+        Some(span)
+    } else {
+        None
+    }
+}
+
+fn forget_reservations(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut r = RESERVATIONS.write().unwrap_or_else(|e| e.into_inner());
+    r.retain(|&(a, b)| b <= first || a >= last);
+}
+
 static PROTECTED: Bits = Bits::new();
 
 /// The blocks the title's bytes were put in beside their guards
@@ -1372,13 +1533,32 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    if status >= 0 {
+        return region.region_type & PLACEHOLDER_RESERVATION != 0;
+    }
+    // Wine/Proton does not implement `NtQueryVirtualMemory(class = 7)` and
+    // returns `STATUS_INVALID_INFO_CLASS` (`0xC0000003`); fall back to
+    // `VirtualQuery` checking for a `MEM_RESERVE` + `PAGE_NOACCESS` region.
+    use windows_sys::Win32::System::Memory::{
+        MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_RESERVE && info.AllocationProtect == PAGE_NOACCESS
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
-    if len == 0 || !known_holes() {
+    if len == 0 {
+        return;
+    }
+    for block in at / BLOCK..at.saturating_add(len).div_ceil(BLOCK) {
+        KNOWN_VIEW.clear(block);
+        SINGLE_NOT_WATCHED.clear(block);
+    }
+    forget_reservations(at, len);
+    if !known_holes() {
         return;
     }
     let mut g = guards();
@@ -2021,6 +2201,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     for &(block, view) in &came {
         if g.absent.remove(block) && !view {
             g.foreign.insert(block);
+            KNOWN_VIEW.clear(block);
         }
     }
     // The range's blocks that are neither clean nor known to be holes. A
@@ -2281,6 +2462,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert_all(from..to);
         g.clean.insert_all(from..to);
+        for block in from..to {
+            KNOWN_VIEW.set(block);
+        }
     };
     // Ahead of the protection (`PROTECTED`).
     (from..to).for_each(|block| PROTECTED.set(block));
@@ -2819,6 +3003,13 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
+    if len != 0 {
+        for block in at / BLOCK..at.saturating_add(len).div_ceil(BLOCK) {
+            KNOWN_VIEW.clear(block);
+            SINGLE_NOT_WATCHED.clear(block);
+        }
+        forget_reservations(at, len);
+    }
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
 
@@ -2838,6 +3029,10 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
             _ => g.changing.push((first, last)),
         }
     }
+    for block in at / BLOCK..at.saturating_add(len).div_ceil(BLOCK) {
+        KNOWN_VIEW.clear(block);
+        SINGLE_NOT_WATCHED.clear(block);
+    }
     let blocks: Vec<usize> = g.protected.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
     for block in blocks {
         g.protected.remove(block);
@@ -2845,6 +3040,8 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
         PUBLISHED.clear(block);
         PROTECTED.clear(block);
     }
+    drop(g);
+    forget_reservations(at, len);
 }
 
 /// The title is about to free or decommit memory of its own,
@@ -2853,8 +3050,20 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
     crate::shadow::write_combined_freed(at, len);
-    let mut g = guards();
     let first = at / BLOCK;
+    let clear_end = if len != 0 {
+        at.saturating_add(len).div_ceil(BLOCK)
+    } else {
+        allocation_end(at, at).div_ceil(BLOCK)
+    };
+    if clear_end > first {
+        for block in first..clear_end {
+            KNOWN_VIEW.clear(block);
+            SINGLE_NOT_WATCHED.clear(block);
+        }
+        forget_reservations(at, clear_end.saturating_sub(first) * BLOCK);
+    }
+    let mut g = guards();
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
@@ -2897,6 +3106,9 @@ fn allocation_end(at: usize, inside: usize) -> usize {
     let mut end = at;
     let mut next = ask(inside.max(at));
     while let Some(to) = next {
+        if to <= end {
+            break;
+        }
         end = to;
         next = ask(to);
     }

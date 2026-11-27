@@ -699,7 +699,21 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Passes after which every buffer slot of the heap was looked at again.
+#[cfg(test)]
 const HEAP_ROUND: u64 = 16;
+
+/// Full buffer-heap rescan cadence (default 16, configurable via
+/// `VICTORY_HEAP_RESCAN_FRAMES`, e.g. 64 to spread the 66k-slot rescan 4x thinner).
+fn heap_round() -> u64 {
+    static ROUND: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ROUND.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_RESCAN_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&n: &u64| n > 0)
+            .unwrap_or(16)
+    })
+}
 
 /// Whether the slots looked at again for no write are a part of them at
 /// every pass, each slot at every sixteenth (`VICTORY_HEAP_SPREAD=0`: all of
@@ -1172,13 +1186,14 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
     let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
-    let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+    let round = heap_round();
+    let all = *passes == 0 || (*passes % round == 0 && !heap_spread());
     let slots = if all {
         ranges.0.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
-        let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
+        let (part, parts) = ((*passes % round) as u32, round as u32);
         ranges.forget_part(part, parts);
         let mut slots = host.buffer_slots_of(part, parts);
         slots.extend(changed);
