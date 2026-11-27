@@ -3367,8 +3367,11 @@ impl Shadow {
         self.forward(address, len, |before, address, len| before.refresh(list, address, len));
     }
 
-    /// With [`grow`]: `f` for each window this one took the place of that
-    /// is still held, with the part of `[address, address + len)` it holds.
+    /// With [`grow`]: `f` for each window this one took the place of that a
+    /// descriptor slot still shows, with the part of `[address, address +
+    /// len)` it holds. Only those: [`TAKEN_OVER`] holds each until it is let
+    /// go, and forwarding to one no slot shows would put it in this list
+    /// too, so that one in use every frame would keep it for good.
     fn forward(&self, address: u64, len: u64, f: impl Fn(&Arc<Shadow>, u64, u64)) {
         if !grow() {
             return;
@@ -3379,7 +3382,11 @@ impl Shadow {
                 return;
             }
             before.retain(|w| w.strong_count() > 0);
-            before.iter().filter_map(std::sync::Weak::upgrade).collect()
+            before
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .filter(|s| crate::host::references(&s.buffer) > 1)
+                .collect()
         };
         for shadow in before {
             let from = address.max(shadow.start);
@@ -5962,10 +5969,14 @@ fn grown(address: u64, end: u64, unsized_ask: bool, note: &dyn Fn(&Shadow)) -> O
     let (cell, _) = window_of(address, end, WINDOW);
     // An ask without a length reads from its address to its cell's end.
     let reach = if unsized_ask { end.max(cell + WINDOW) } else { end };
-    // A window that begins in the cell, or in the one below and reaches this
-    // far, and holds the ask.
+    // The window that begins in the cell, if it holds the ask. Not one of
+    // the cell below that reaches this far: `find` would give that one until
+    // the cell has a window of its own and this one from then on, and a slot
+    // made on the first would show a window nothing brings up to date (it
+    // was not taken over). One window per cell, changed only by a takeover;
+    // memory at a cell's line may be in two windows.
     let holding = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
-        map.range((cell.saturating_sub(WINDOW), 0)..=(address, u64::MAX))
+        map.range((cell, 0)..=(address, u64::MAX))
             .rev()
             .find(|&(&(start, len), _)| start <= address && start + len >= reach)
             .map(|(_, shadow)| shadow.clone())
@@ -5987,7 +5998,9 @@ fn grown(address: u64, end: u64, unsized_ask: bool, note: &dyn Fn(&Shadow)) -> O
     if let Some((key, old)) = now {
         use windows::core::Interface;
         map.remove(&key);
-        let mut before = std::mem::take(&mut *old.before_me.lock().unwrap_or_else(|e| e.into_inner()));
+        // A copy, not taken: a thread that got `old` from `find` before
+        // this may still bring it up to date, and must forward to them.
+        let mut before = old.before_me.lock().unwrap_or_else(|e| e.into_inner()).clone();
         before.retain(|w| w.strong_count() > 0);
         before.push(Arc::downgrade(&old));
         *shadow.before_me.lock().unwrap_or_else(|e| e.into_inner()) = before;
