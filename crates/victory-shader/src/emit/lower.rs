@@ -1857,6 +1857,15 @@ impl<'a> Lower<'a> {
             s.flags |= flags::EARLY_DEPTH_STENCIL;
         }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+        // A group of at most 32 threads fits one host wave; first-lane reads alone
+        // do not require a fixed wave size there.
+        // Descriptor waterfall reads are deliberately lowered to each lane's
+        // own descriptor, so they need no wave layout or cross-half exchange.
+        let first_lane_crosses = |i: &Inst| {
+            i.name() == "v_readfirstlane_b32"
+                && matches!(x.native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 32)
+                && !i.writes.first().is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+        };
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
@@ -1892,7 +1901,8 @@ impl<'a> Lower<'a> {
                     || n.contains("permute")
                     || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readfirstlane_b32" | "v_readlane_b32" | "v_writelane_b32")
+                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || first_lane_crosses(i)
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
@@ -1913,7 +1923,8 @@ impl<'a> Lower<'a> {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
-                        || matches!(n, "v_readfirstlane_b32" | "v_readlane_b32" | "v_writelane_b32")
+                        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        || first_lane_crosses(i)
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
@@ -13490,6 +13501,10 @@ impl<'a> Lower<'a> {
             };
             work.extend(self.read_phis.iter().copied().filter(sgpr));
         }
+        // A mask read as data may reach the read through a loop-header and
+        // another uniform join. Its intermediate phi is live even without a
+        // lane-divergent region; otherwise it silently becomes zero.
+        work.extend(self.read_phis.iter().copied().filter(|v| st.masks.contains_key(v) || st.highs.contains_key(v)));
         while let Some(v) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;

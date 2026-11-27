@@ -2180,3 +2180,35 @@ fn oracle_writelane_reaches_inactive_destinations() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[test]
+fn oracle_uniform_loop_keeps_mask_values_through_joins() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let gpu = Gpu { host };
+    let mut failures = Vec::new();
+    for wave64 in [false, true] {
+        for n in [1, 2, 3] {
+            let (seeds, branch) = if wave64 {
+                ([0x527f0a9b, 0x20, 0xaf39930b, 0x6d43f8ea], Item::UIf {
+                    cmp: Cmp::Gt, signed: true, a: 27, b: Src::S(3),
+                    body: vec![Item::I(Inst::Cmp { cmp: Cmp::Lt, signed: false, a: Src::V(11), b: 12 })],
+                })
+            } else {
+                ([0x4f9947c8, 0x21, 0x839a5044, 0], Item::UIf {
+                    cmp: Cmp::Eq, signed: false, a: 22, b: Src::S(21),
+                    body: vec![Item::I(Inst::Cmp { cmp: Cmp::Le, signed: false, a: Src::S(23), b: 3 })],
+                })
+            };
+            let p = Prog { wave64, seeds, body: vec![Item::Loop { n, body: vec![branch] }], raw_masks: true };
+            let outcome = check(&gpu, &p);
+            if !matches!(outcome, Outcome::Same) {
+                failures.push(format!("wave64={wave64} iterations={n}: {outcome:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
