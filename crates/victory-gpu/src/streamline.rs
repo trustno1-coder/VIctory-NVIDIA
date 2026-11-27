@@ -627,13 +627,46 @@ pub fn adapter_name() -> Option<String> {
     default_adapter().map(|a| a.0)
 }
 
-/// Whether a card of this name runs DLSS Frame Generation: a GeForce RTX of
-/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU").
-pub fn dlss_framegen_card(name: &str) -> bool {
+/// An NVIDIA RTX card's generation, read from its name, as the GeForce
+/// series of the same architecture (20 Turing, 30 Ampere, 40 Ada, 50
+/// Blackwell), and whether it is a workstation card. `None`: no RTX name.
+///
+/// The workstation cards are named apart from the GeForce ones, and their
+/// numbers say nothing of the generation: "Quadro RTX 5000" is Turing,
+/// "NVIDIA RTX A4500" Ampere, "NVIDIA RTX 2000 Ada Generation" Ada and
+/// "NVIDIA RTX PRO 4000 Blackwell SFF Edition" Blackwell (#312).
+pub fn rtx_generation(name: &str) -> Option<(u32, bool)> {
     let name = name.to_ascii_uppercase();
-    let Some(at) = name.find("RTX") else { return false };
-    let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
-    model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
+    let words: Vec<&str> = name.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let at = words.iter().position(|w| *w == "RTX")?;
+    let has = |w: &str| words.contains(&w);
+    if has("BLACKWELL") || words.get(at + 1) == Some(&"PRO") {
+        return Some((50, true));
+    }
+    if has("ADA") {
+        return Some((40, true));
+    }
+    let next = words.get(at + 1)?;
+    if let Some(digits) = next.strip_prefix('A')
+        && digits.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return Some((30, true));
+    }
+    let model: String = next.chars().take_while(char::is_ascii_digit).collect();
+    if model.len() != 4 {
+        return None;
+    }
+    if has("QUADRO") {
+        return Some((20, true));
+    }
+    Some((model[..2].parse().ok()?, false))
+}
+
+/// Whether a card of this name runs DLSS Frame Generation: an RTX of the
+/// Ada generation or later ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090
+/// Laptop GPU", "NVIDIA RTX 4000 Ada Generation", "NVIDIA RTX PRO 6000 Blackwell").
+pub fn dlss_framegen_card(name: &str) -> bool {
+    rtx_generation(name).is_some_and(|(series, _)| series >= 40)
 }
 
 /// The card the host device is made on (`hardware_adapter`; else the first

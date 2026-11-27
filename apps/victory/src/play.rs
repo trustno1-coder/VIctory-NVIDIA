@@ -511,12 +511,10 @@ fn mfg_home() -> Result<PathBuf> {
 }
 
 /// A GeForce RTX of the 20 or 30 series ("NVIDIA GeForce RTX 3080", "... RTX 2060 SUPER"): DLSS
-/// runs, DLSS Frame Generation only with MFG Unlocker.
+/// runs, DLSS Frame Generation only with MFG Unlocker. Not the workstation cards: an "RTX 2000
+/// Ada Generation" runs DLSS Frame Generation itself (#312).
 fn older_rtx(name: &str) -> bool {
-    let name = name.to_ascii_uppercase();
-    let Some(at) = name.find("RTX") else { return false };
-    let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
-    model.len() == 4 && (model.starts_with("20") || model.starts_with("30"))
+    victory_hle::streamline::rtx_generation(name).is_some_and(|(series, workstation)| !workstation && matches!(series, 20 | 30))
 }
 
 /// Runs the fetcher: MFG Unlocker from its author's GitHub release into `to`.
@@ -1007,6 +1005,22 @@ mod tests {
         assert!(fg("NVIDIA GeForce RTX 5070") && fg("NVIDIA GeForce RTX 4070 SUPER") && fg("NVIDIA GeForce RTX 5090 Laptop GPU"));
         assert!(!fg("NVIDIA GeForce RTX 3080 Ti") && !fg("NVIDIA GeForce RTX 2060") && !fg("NVIDIA GeForce GTX 1080"));
         assert!(!fg("AMD Radeon RX 7900 XTX") && !fg("Intel(R) Arc(TM) A770 Graphics") && !fg(""));
+        // Workstation cards: the name says the generation, not the number (#312).
+        assert!(fg("NVIDIA RTX PRO 4000 Blackwell SFF Edition") && fg("NVIDIA RTX PRO 6000 Blackwell Workstation Edition"));
+        assert!(fg("NVIDIA RTX 2000 Ada Generation") && fg("NVIDIA RTX 6000 Ada Generation") && fg("NVIDIA RTX 3500 Ada Generation Laptop GPU"));
+        assert!(!fg("Quadro RTX 5000") && !fg("NVIDIA Quadro RTX 4000") && !fg("NVIDIA RTX A4500") && !fg("NVIDIA RTX A500 Laptop GPU"));
+    }
+
+    #[test]
+    fn rtx_generations_from_names() {
+        use victory_hle::streamline::rtx_generation as rg;
+        assert_eq!(rg("NVIDIA GeForce RTX 3070"), Some((30, false)));
+        assert_eq!(rg("NVIDIA GeForce RTX 5090 Laptop GPU"), Some((50, false)));
+        assert_eq!(rg("NVIDIA RTX PRO 4000 Blackwell SFF Edition"), Some((50, true)));
+        assert_eq!(rg("NVIDIA RTX 2000E Ada Generation"), Some((40, true)));
+        assert_eq!(rg("NVIDIA RTX A2000 12GB"), Some((30, true)));
+        assert_eq!(rg("Quadro RTX 8000"), Some((20, true)));
+        assert_eq!((rg("NVIDIA GeForce GTX 1080"), rg("AMD Radeon RX 7900 XTX"), rg("")), (None, None, None));
     }
 
     /// MFG Unlocker is offered only to RTX 20 and 30 cards.
@@ -1015,6 +1029,8 @@ mod tests {
         assert!(older_rtx("NVIDIA GeForce RTX 3080 Ti") && older_rtx("NVIDIA GeForce RTX 2060 SUPER") && older_rtx("NVIDIA GeForce RTX 3050 Laptop GPU"));
         assert!(!older_rtx("NVIDIA GeForce RTX 5070") && !older_rtx("NVIDIA GeForce RTX 4090") && !older_rtx("NVIDIA GeForce GTX 1080"));
         assert!(!older_rtx("NVIDIA RTX A2000") && !older_rtx("AMD Radeon RX 7900 XTX") && !older_rtx(""));
+        assert!(!older_rtx("NVIDIA RTX 2000 Ada Generation") && !older_rtx("NVIDIA RTX 3500 Ada Generation Laptop GPU"));
+        assert!(!older_rtx("NVIDIA RTX PRO 2000 Blackwell") && !older_rtx("Quadro RTX 5000"));
     }
 
     #[test]
