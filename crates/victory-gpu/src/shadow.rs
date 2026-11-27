@@ -1359,13 +1359,22 @@ fn snapshots_kept() -> usize {
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
+    // An explicit LowSpec cap is strict, including the largest idle snapshot.
+    // Without it the original retention rule (including one oversized buffer) remains.
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let cap = *CAP.get_or_init(|| {
+        std::env::var("VICTORY_LOWSPEC_SNAPSHOT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|mb| mb.min(512) << 20)
+    });
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if cap.map_or(kept > 0 && total > KEPT, |cap| total > cap) {
             break;
         }
         kept += 1;
