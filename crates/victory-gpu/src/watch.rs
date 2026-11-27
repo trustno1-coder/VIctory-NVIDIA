@@ -270,6 +270,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         let mut granularity = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        let began = std::time::Instant::now();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
@@ -281,6 +282,8 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
                 &mut granularity,
             )
         } != 0;
+        // (Lab: what the askings are and cost, in every build.)
+        crate::lab::asked((last - first) * (PAGE >> 10), if failed { 0 } else { count }, began);
         #[cfg(feature = "diagnostics")]
         {
             tally(10, u64::from(failed));

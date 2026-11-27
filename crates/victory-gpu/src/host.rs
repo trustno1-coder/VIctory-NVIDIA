@@ -4205,6 +4205,7 @@ fn relay_worker() {
                 // SAFETY: the host's fence and this thread's event.
                 unsafe { wait_host_fence(&host.fence, target, event, "relay") };
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                crate::lab::note_since("the landing thread waited for the card (the fence value)", waiting, target, 0);
             }
         }
     }
@@ -5659,6 +5660,7 @@ impl Host {
         }
         // In the order given: what tells the title the card is done.
         stage.next("landing: read-backs, telling the title");
+        crate::lab::note_since("a landing: what shaders wrote is copied back", landing, items.len() as u64, 0);
         let mut last = 0;
         let mut landed = Vec::new();
         let mut telling = std::time::Instant::now();
@@ -5683,6 +5685,8 @@ impl Host {
                 }
                 Late::Write(at, what, bytes) => {
                     what.write(at as *mut u8, bytes);
+                    crate::lab::note("a value is written behind a flight (where, bytes)", at as u64, bytes as u64);
+                    crate::lab::told();
                     // Lab: the submitting thread's line is told at once (it
                     // stood at such a value 10 ms a frame, looking again
                     // every millisecond, until the helper thread had reset
@@ -5709,6 +5713,7 @@ impl Host {
         self.log_messages();
         crate::land::spent(crate::land::stat::REST, telling);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::lab::note_since("a landing in all (the last flight's number)", landing, last, 0);
         {
             let mut line = line();
             let Line {
@@ -5945,6 +5950,7 @@ impl Host {
             return;
         };
         let after = std::time::Instant::now();
+        crate::lab::note("a flight is sent to the card (its number, its fence value)", sent.number, *submitted);
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {

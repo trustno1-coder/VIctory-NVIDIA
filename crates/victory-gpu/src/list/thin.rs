@@ -257,6 +257,7 @@ impl Recording {
                 drop(inner);
                 give_back(kept);
                 STATS[2].fetch_add(1, Relaxed);
+                crate::lab::note("a list is translated to its end", std::ptr::from_ref(self) as u64, 0);
                 crate::queue::line_moved();
             }
         }

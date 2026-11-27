@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::Location;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Mutex, MutexGuard, Once};
 use std::time::{Duration, Instant};
 
@@ -31,11 +31,33 @@ pub(crate) const F: usize = 7;
 /// lands flights ([`priority`]).
 pub(crate) const G: usize = 8;
 pub(crate) const H: usize = 9;
+/// The title's waits for what the card tells it are woken when it is told
+/// (1), not polled as the title's code has it here ([`import`]).
+pub(crate) const W: usize = 10;
+/// How many presents may be in the line when a present of the title's
+/// returns (0: as the environment says, one).
+pub(crate) const FRAMES: usize = 11;
+/// So many frames of what the line, the flights and the title's waits do
+/// are written to the log, from the next present on ([`trace_frame`]).
+pub(crate) const T: usize = 12;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 10] =
-    [("reuse", 1), ("zero", 1), ("a", 0), ("b", 0), ("c", 0), ("d", 0), ("e", 0), ("f", 0), ("g", 0), ("h", 0)];
-static VALUES: [AtomicI64; 10] = [const { AtomicI64::new(0) }; 10];
+const KNOBS: [(&str, i64); 13] = [
+    ("reuse", 1),
+    ("zero", 1),
+    ("a", 0),
+    ("b", 0),
+    ("c", 0),
+    ("d", 0),
+    ("e", 0),
+    ("f", 0),
+    ("g", 0),
+    ("h", 0),
+    ("w", 0),
+    ("frames", 0),
+    ("t", 0),
+];
+static VALUES: [AtomicI64; 13] = [const { AtomicI64::new(0) }; 13];
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -280,6 +302,290 @@ pub(crate) fn trim() {
     }
 }
 
+/// The host's own `Sleep` and `SleepEx`, as the title imports them.
+static SLEEPS: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+/// Since the last frame-rate line, the title's sleeps (calls, microseconds):
+/// those of its waits for the card ([`wait_site`]), its others of no time,
+/// and its others of some.
+static SLEPT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Counted up whenever the card tells the title something ([`told`]).
+static TOLD: AtomicU32 = AtomicU32::new(0);
+
+/// What the title's import `name`, which the host has at `address`, is bound
+/// to: its sleeps come through here.
+///
+/// The title waits for a fence of ours by looking at the fence's value in
+/// memory: `monitorx` on its address, `mwaitx`, and between two looks
+/// `Sleep(0)` (or `Sleep(1)`, in the wait that does not hurry). The console's
+/// processor sleeps in `mwaitx` until the value is written. A PC's Intel
+/// processor has neither instruction, they are a pause here, and so the
+/// title's render thread goes round that loop for as long as it waits, most
+/// of a frame (profile of run 39: 89 % of its samples there, a third of a
+/// processor), giving its time slice away at each turn and getting to look
+/// again when the scheduler next has a processor for it. With switch `w` the
+/// sleep of such a loop waits until a fence is set or a value written behind
+/// a flight ([`told`]), a millisecond at most.
+pub fn import(name: &str, address: usize) -> usize {
+    let (which, ours) = match name {
+        "Sleep" => (0, title_sleep as *const () as usize),
+        "SleepEx" => (1, title_sleep_ex as *const () as usize),
+        _ => return address,
+    };
+    SLEEPS[which].store(address, Relaxed);
+    ours
+}
+
+/// The title's `Sleep`: on to [`sleep_from`], with the address it returns to.
+#[unsafe(naked)]
+unsafe extern "system" fn title_sleep(_ms: u32) {
+    core::arch::naked_asm!("mov rdx, [rsp]", "jmp {inner}", inner = sym sleep_from)
+}
+
+/// The title's `SleepEx`: on to [`sleep_ex_from`], likewise.
+#[unsafe(naked)]
+unsafe extern "system" fn title_sleep_ex(_ms: u32, _alertable: i32) -> u32 {
+    core::arch::naked_asm!("mov r8, [rsp]", "jmp {inner}", inner = sym sleep_ex_from)
+}
+
+extern "system" fn sleep_from(ms: u32, from: usize) {
+    let real = SLEEPS[0].load(Relaxed);
+    // SAFETY: the host's `Sleep`, which the title asked for.
+    title_slept(ms, from, || unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(u32)>(real)(ms) });
+}
+
+extern "system" fn sleep_ex_from(ms: u32, alertable: i32, from: usize) -> u32 {
+    let real = SLEEPS[1].load(Relaxed);
+    // SAFETY: the host's `SleepEx`, which the title asked for.
+    let real = unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(u32, i32) -> u32>(real) };
+    if alertable != 0 {
+        // (Its own business: what is queued for the thread runs in it.)
+        // SAFETY: the caller's own call.
+        return unsafe { real(ms, alertable) };
+    }
+    let mut result = 0;
+    // SAFETY: the caller's own call.
+    title_slept(ms, from, || result = unsafe { real(ms, alertable) });
+    result
+}
+
+/// A sleep of the title's for `ms`, called from just before `from`.
+fn title_slept(ms: u32, from: usize, real: impl FnOnce()) {
+    let waits = ms <= 1 && wait_site(from);
+    let began = crate::host::now_us();
+    if waits && knob(W) != 0 {
+        wait_told();
+    } else {
+        real();
+    }
+    let us = crate::host::now_us().saturating_sub(began);
+    let which = if waits {
+        0
+    } else if ms == 0 {
+        2
+    } else {
+        4
+    };
+    SLEPT[which].fetch_add(1, Relaxed);
+    SLEPT[which + 1].fetch_add(us, Relaxed);
+    if waits && traced() {
+        waited(from, began, us);
+    }
+}
+
+/// Whether the sleep called from just before `from` is one of a loop that
+/// waits with `mwaitx` (as the title's code has it, or as the loader left
+/// it: `pause` and a no-op): that instruction stands shortly before the call.
+fn wait_site(from: usize) -> bool {
+    thread_local! {
+        static SITES: std::cell::Cell<[(usize, bool); 4]> = const { std::cell::Cell::new([(0, false); 4]) };
+    }
+    let mut sites = SITES.get();
+    if let Some(site) = sites.iter().find(|s| s.0 == from) {
+        return site.1;
+    }
+    const BACK: usize = 128;
+    let waits = from > (1 << 16) && {
+        // (Not past the start of the call's page: what is before may not be there.)
+        let start = (from - BACK).max((from - 1) & !0xfff);
+        // SAFETY: code of the caller's on the page its call is on, which is
+        // being run.
+        let code = unsafe { std::slice::from_raw_parts(start as *const u8, from - start) };
+        code.windows(3).any(|w| w == [0x0f, 0x01, 0xfb] || w == [0xf3, 0x90, 0x90])
+    };
+    sites.rotate_right(1);
+    sites[0] = (from, waits);
+    SITES.set(sites);
+    waits
+}
+
+/// The card told the title something: a fence was set, a value written
+/// behind a flight. Whoever waits for that looks now ([`wait_told`]).
+pub(crate) fn told() {
+    TOLD.fetch_add(1, std::sync::atomic::Ordering::Release);
+    // SAFETY: wakes those waiting on the counter, if any.
+    unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const TOLD).cast()) };
+}
+
+/// Waits until the card tells the title something, a millisecond at most
+/// (what was told between the title's last look and this call is waited out
+/// so long, no longer).
+fn wait_told() {
+    let seen = TOLD.load(std::sync::atomic::Ordering::Acquire);
+    // SAFETY: waits on the counter while it is what was just seen.
+    unsafe { windows_sys::Win32::System::Threading::WaitOnAddress((&raw const TOLD).cast(), (&raw const seen).cast(), 4, 1) };
+}
+
+thread_local! {
+    /// This is the thread that prepares and sends submissions.
+    pub(crate) static SUBMITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread's wait of the title's being noted for the trace: the
+    /// trace, the place, when it began and when it last ended, its sleeps
+    /// and their microseconds.
+    static WAIT: std::cell::Cell<(u64, usize, u64, u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0, 0, 0, 0)) };
+}
+
+/// Since the last frame-rate line, the kernel's write watch asked: by the
+/// submitting thread and by the others, each the askings, the kilobytes
+/// asked about, the 4 KiB pages found written and the nanoseconds.
+static ASKS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// One asking of the kernel's write watch, begun at `began`, about `kb`
+/// kilobytes, which found `found` pages written.
+pub(crate) fn asked(kb: usize, found: usize, began: Instant) {
+    let at = if SUBMITS.get() { 0 } else { 4 };
+    ASKS[at].fetch_add(1, Relaxed);
+    ASKS[at + 1].fetch_add(kb as u64, Relaxed);
+    ASKS[at + 2].fetch_add(found as u64, Relaxed);
+    ASKS[at + 3].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+}
+
+/// Since the last frame-rate line, the microseconds the submitting thread's
+/// line stood, by what the first entries of its queues were: a bit each for
+/// a wait for a fence (1), for a memory value (2), lists being translated
+/// (4), another wait (8), a present (16), anything else (32).
+pub(crate) static STOOD: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+/// One thing noted for the trace: when (microseconds of the host's clock),
+/// for how long, by which thread, what, and two numbers that say which.
+struct Noted {
+    at: u64,
+    took: u64,
+    thread: u32,
+    what: &'static str,
+    a: u64,
+    b: u64,
+}
+
+/// What a trace has noted, and the threads that noted it with their names.
+static TRACE: Mutex<(Vec<Noted>, Vec<(u32, String)>)> = Mutex::new((Vec::new(), Vec::new()));
+static TRACING: AtomicBool = AtomicBool::new(false);
+/// When the trace began (the host's clock), and which trace it is.
+static TRACE_BEGAN: AtomicU64 = AtomicU64::new(0);
+static TRACE_NUMBER: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a trace is being taken.
+pub(crate) fn traced() -> bool {
+    TRACING.load(Relaxed)
+}
+
+/// Notes for the trace that `what` happens now.
+pub(crate) fn note(what: &'static str, a: u64, b: u64) {
+    if traced() {
+        noted(crate::host::now_us(), 0, what, a, b);
+    }
+}
+
+/// Notes for the trace `what`, which began at `began` and ends now.
+pub(crate) fn note_since(what: &'static str, began: Instant, a: u64, b: u64) {
+    if traced() {
+        let took = began.elapsed().as_micros() as u64;
+        noted(crate::host::now_us().saturating_sub(took), took, what, a, b);
+    }
+}
+
+fn noted(at: u64, took: u64, what: &'static str, a: u64, b: u64) {
+    let thread = crate::host::thread_id();
+    let mut trace = lock(&TRACE);
+    if trace.0.len() >= 60_000 {
+        return;
+    }
+    if !trace.1.iter().any(|t| t.0 == thread) {
+        let name = std::thread::current().name().unwrap_or("a thread of the title's").to_string();
+        trace.1.push((thread, name));
+    }
+    trace.0.push(Noted { at, took, thread, what, a, b });
+}
+
+/// A sleep of a wait of the title's ([`wait_site`]) for the trace: the
+/// sleeps of one wait are noted as one thing, cut every two milliseconds.
+fn waited(from: usize, began: u64, us: u64) {
+    let number = TRACE_NUMBER.load(Relaxed);
+    let mut w = WAIT.get();
+    if w.4 > 0 && (w.0 != number || w.1 != from || began > w.3 + 200 || began + us > w.2 + 2000) {
+        if w.0 == number {
+            noted(w.2, w.3 - w.2, "the title waited for the card (sleeps, their microseconds)", w.4, w.5);
+        }
+        w.4 = 0;
+    }
+    if w.4 == 0 {
+        w = (number, from, began, began, 0, 0);
+    }
+    w.3 = began + us;
+    w.4 += 1;
+    w.5 += us;
+    WAIT.set(w);
+}
+
+/// At each present of the title's: a trace begins when switch `t` has a new
+/// number (of frames), and ends, written to the log, that many presents
+/// later.
+pub(crate) fn trace_frame() {
+    static ASKED: AtomicI64 = AtomicI64::new(0);
+    static LEFT: AtomicI64 = AtomicI64::new(0);
+    let want = knob(T);
+    if traced() {
+        if LEFT.fetch_sub(1, Relaxed) <= 1 {
+            TRACING.store(false, Relaxed);
+            trace_out();
+        }
+        return;
+    }
+    if want <= 0 {
+        ASKED.store(0, Relaxed);
+    } else if ASKED.swap(want, Relaxed) != want {
+        {
+            let mut trace = lock(&TRACE);
+            trace.0.clear();
+            trace.1.clear();
+        }
+        TRACE_NUMBER.fetch_add(1, Relaxed);
+        TRACE_BEGAN.store(crate::host::now_us(), Relaxed);
+        LEFT.store(want.min(30), Relaxed);
+        TRACING.store(true, Relaxed);
+    }
+}
+
+fn trace_out() {
+    let (mut noted, threads) = std::mem::take(&mut *lock(&TRACE));
+    let (number, began) = (TRACE_NUMBER.load(Relaxed), TRACE_BEGAN.load(Relaxed));
+    noted.sort_by_key(|n| n.at);
+    for (thread, name) in &threads {
+        tracing::info!("lab trace {number}: thread {thread} is {name}");
+    }
+    for n in &noted {
+        tracing::info!(
+            "lab trace {number}: +{} us, {} us, thread {}, {}, {:#x}, {}",
+            n.at as i64 - began as i64,
+            n.took,
+            n.thread,
+            n.what,
+            n.a,
+            n.b
+        );
+    }
+    tracing::info!("lab trace {number}: end, {} things noted", noted.len());
+}
+
 /// For the frame-rate line.
 pub(crate) fn log(frames: f64) {
     static BEFORE: Mutex<Option<Instant>> = Mutex::new(None);
@@ -302,6 +608,48 @@ pub(crate) fn log(frames: f64) {
         serve[2],
         switches.join(" ")
     );
+    let s: Vec<f64> = SLEPT.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    if s[0] + s[2] + s[4] > 0.0 {
+        tracing::info!(
+            "the title's sleeps per frame (lab): {:.1} in its waits for the card {:.2} ms (switch w=1: woken when the card tells it, \
+             now {}), {:.1} others of no time {:.2} ms, {:.1} others of some time {:.2} ms",
+            s[0],
+            s[1] / 1000.0,
+            if knob(W) != 0 { "on" } else { "off" },
+            s[2],
+            s[3] / 1000.0,
+            s[4],
+            s[5] / 1000.0
+        );
+    }
+    let a: Vec<f64> = ASKS.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    if a[0] + a[4] > 0.0 {
+        tracing::info!(
+            "the write watch asked per frame (lab): by the submitting thread {:.1} askings over {:.1} MB, {:.0} pages of 4 KiB found \
+             written, {:.2} ms; by the other threads {:.1} askings over {:.1} MB, {:.0} pages found written, {:.2} ms",
+            a[0],
+            a[1] / 1024.0,
+            a[2],
+            a[3] / 1e6,
+            a[4],
+            a[5] / 1024.0,
+            a[6],
+            a[7] / 1e6
+        );
+    }
+    let stood: Vec<String> = STOOD
+        .iter()
+        .enumerate()
+        .filter_map(|(heads, us)| {
+            let ms = us.swap(0, Relaxed) as f64 / 1000.0 / frames;
+            let names = ["a fence", "a value", "lists", "another wait", "a present", "something free"];
+            let what: Vec<&str> = names.iter().enumerate().filter(|(bit, _)| heads >> bit & 1 != 0).map(|(_, n)| *n).collect();
+            (ms >= 0.005).then(|| format!("{} {ms:.2} ms", what.join(" and ")))
+        })
+        .collect();
+    if !stood.is_empty() {
+        tracing::info!("the line stood per frame (lab), by what its queues' first entries were: {}", stood.join("; "));
+    }
     let mut sites = std::mem::take(&mut *lock(&SITES));
     if !sites.is_empty() {
         sites.sort_by_key(|s| std::cmp::Reverse(s.1[2]));

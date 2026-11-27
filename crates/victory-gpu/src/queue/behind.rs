@@ -66,6 +66,10 @@ pub(super) trait Work: Send {
     fn shows(&self) -> bool;
     /// Whether it is a submission.
     fn runs(&self) -> bool;
+    /// Lab: what it is, for the trace.
+    fn name(&self) -> &'static str {
+        "the line does something"
+    }
     /// Whether it stands for other work, which takes its place in the line
     /// once it is free to go ([`Work::unfold`]).
     fn folded(&self) -> bool {
@@ -278,9 +282,25 @@ impl<W: Work> Lane<W> {
                     if state.items.is_empty() {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
                         crate::lab::SERVE[0].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+                        crate::lab::note_since("the line was empty", began, 0, 0);
                     } else {
                         // (Lab: what the oldest entry waits for.)
                         let kind = state.items.front().and_then(|e| e.what.ask()).map_or(3, |ask| W::kind(&ask));
+                        // (And what the first entry of each queue is: a bit each.)
+                        let (mut queues, mut heads) = ([usize::MAX; 8], 0usize);
+                        for e in state.items.iter() {
+                            if queues.contains(&e.queue) {
+                                continue;
+                            }
+                            if let Some(free) = queues.iter_mut().find(|q| **q == usize::MAX) {
+                                *free = e.queue;
+                            }
+                            heads |= match e.what.ask() {
+                                Some(ask) => 1 << W::kind(&ask).min(3),
+                                None if e.what.shows() => 16,
+                                None => 32,
+                            };
+                        }
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
@@ -290,6 +310,8 @@ impl<W: Work> Lane<W> {
                         crate::lab::SERVE[1].fetch_add(us, Relaxed);
                         crate::lab::SERVE[2].fetch_add(1, Relaxed);
                         crate::lab::SERVE[3 + kind.min(3)].fetch_add(us, Relaxed);
+                        crate::lab::STOOD[heads.min(63)].fetch_add(us, Relaxed);
+                        crate::lab::note_since("the line stood (its queues' first entries, the oldest's kind)", began, heads as u64, kind as u64);
                         if out.timed_out() {
                             break;
                         }
@@ -391,6 +413,7 @@ impl<W: Work> Lane<W> {
             let mut state = self.lock();
             state.running = None;
             let at = state.items.iter().position(|e| e.number > entry.number).unwrap_or(state.items.len());
+            crate::lab::note("the line takes translated lists", entry.number, 0);
             Self::unfold(&mut state, at, entry);
             drop(state);
             self.moved.notify_all();
@@ -439,7 +462,9 @@ impl<W: Work> Lane<W> {
             let floor = self.lock().floor(entry.queue);
             entry.what.marked(mark.max(floor));
         }
+        let (name, began) = (entry.what.name(), Instant::now());
         entry.what.go(forced);
+        crate::lab::note_since(name, began, number, runs as u64);
         {
             let mut state = self.lock();
             state.running = None;
@@ -573,6 +598,18 @@ impl Work for Job {
 
     fn runs(&self) -> bool {
         matches!(self, Job::Run(..) | Job::Joined(..) | Job::Lists(..))
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Job::Wait(..) => "the line passes a wait for a fence",
+            Job::Value(..) => "the line passes a wait for a value",
+            Job::Run(..) => "the line prepares and sends a submission",
+            Job::Lists(..) => "the line has lists",
+            Job::Joined(..) => "the line prepares and sends submissions joined",
+            Job::Signal(..) => "the line does a signal",
+            Job::Present(..) => "the line does a present",
+        }
     }
 
     fn take_along(&mut self, next: Job) -> Result<bool, Job> {
@@ -756,7 +793,11 @@ fn runs_most() -> usize {
 /// 0: both are).
 fn frames_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(1))
+    // (Lab: switch `frames` gives it while the title runs.)
+    match crate::lab::knob(crate::lab::FRAMES) {
+        n if n > 0 => n as usize,
+        _ => *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(1)),
+    }
 }
 
 fn number(name: &str) -> Option<usize> {
@@ -805,6 +846,7 @@ fn started() -> bool {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
             crate::cores::keep_on_fast_cores("victory-submit");
             OURS.set(true);
+            crate::lab::SUBMITS.set(true);
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LANE.serve()));
             if ended.is_err() {
                 // Nothing would ever be sent again, and the title's thread
@@ -861,6 +903,7 @@ pub(super) fn drain() {
 /// A submission of `lists` to queue `this`.
 pub(super) fn submit(this: This, lists: &[This]) {
     let queue = this as usize;
+    crate::lab::note("the title submits lists (its queue, how many)", queue as u64, lists.len() as u64);
     if crate::list::thin::on() {
         let recordings = crate::list::thin::submitted(lists);
         if recordings.is_empty() {
@@ -931,6 +974,7 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
 /// nothing, behind the flights in the air, or now.
 pub(super) fn signal(this: This, fence: This, value: u64) {
     let fence = fence as usize;
+    crate::lab::note("the title signals a fence (the fence, its value)", fence as u64, value);
     LANE.push_behind(this as usize, false, Job::Signal(fence, value), || {
         if !crate::host::late_signal(fence, value) {
             crate::fence::set(fence as This, value);
@@ -941,6 +985,7 @@ pub(super) fn signal(this: This, fence: This, value: u64) {
 /// Queue `this` waits for `fence`: nothing if it has nothing in the line and
 /// the fence is there already.
 pub(super) fn wait(this: This, fence: This, value: u64) {
+    crate::lab::note("the title has its queue wait for a fence (the fence, its value)", fence as u64, value);
     let always = crate::fence::completed(fence) < value;
     LANE.push_behind(this as usize, always, Job::Wait(fence as usize, value), || {});
 }
@@ -954,6 +999,8 @@ pub(super) fn present(
     shown: super::Shown,
 ) {
     crate::lab::burn(crate::lab::E);
+    crate::lab::trace_frame();
+    crate::lab::note("the title presents", this as u64, 0);
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
     LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
@@ -961,6 +1008,7 @@ pub(super) fn present(
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    crate::lab::note_since("the title's present waited for the line", began, 0, 0);
 }
 
 /// For the frame-rate line.

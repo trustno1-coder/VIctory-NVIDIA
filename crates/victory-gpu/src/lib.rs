@@ -115,6 +115,10 @@ pub use host::on_failure;
 #[cfg(windows)]
 pub use upload::reserve_space as reserve_upload_space;
 
+/// Lab: what a title import is bound to (its sleeps: `lab::import`).
+#[cfg(windows)]
+pub use lab::import as lab_import;
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(all(windows, feature = "diagnostics"))]
