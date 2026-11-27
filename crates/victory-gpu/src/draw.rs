@@ -5419,16 +5419,43 @@ mod thread_tests {
     }
 }
 
+/// Lock-free wrapper for immutable D3D12 command signatures.
+struct SyncSignature(ID3D12CommandSignature);
+
+// SAFETY: `ID3D12CommandSignature` is immutable and free-threaded in D3D12.
+unsafe impl Send for SyncSignature {}
+unsafe impl Sync for SyncSignature {}
+
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+    static FAST: [std::sync::OnceLock<Option<SyncSignature>>; 4] = [const { std::sync::OnceLock::new() }; 4];
+    let fast_slot = match (kind, stride) {
+        (0, 16) => Some(0),  // Draw
+        (1, 20) => Some(1),  // DrawIndexed
+        (2, 12) => Some(2),  // Dispatch
+        (10, 12) => Some(3), // DispatchMesh
+        _ => None,
+    };
+    if let Some(slot) = fast_slot {
+        return FAST[slot]
+            .get_or_init(|| make_host_signature(kind, stride).map(SyncSignature))
+            .as_ref()
+            .map(|s| s.0.clone());
+    }
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
         return Some(s.clone());
     }
+    let signature = make_host_signature(kind, stride)?;
+    made.push(((kind, stride), signature.clone()));
+    Some(signature)
+}
+
+fn make_host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
         ..Default::default()
@@ -5452,9 +5479,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    signature
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
