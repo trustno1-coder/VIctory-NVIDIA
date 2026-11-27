@@ -19,8 +19,9 @@ $repo = Split-Path $PSScriptRoot -Parent
 
 # A game folder holds the executable and its data (a lone copy of the exe does not count).
 function Test-GameDir([string]$d) {
-    if (-not $d -or -not (Test-Path (Join-Path $d 'game_scarlett_master.exe'))) { return $false }
-    return (Test-Path (Join-Path $d 'shaders.rpf')) -or (Test-Path (Join-Path $d 'MicrosoftGame.config'))
+    # -LiteralPath: folder names with [ ] (common in downloads) are not wildcard patterns.
+    if (-not $d -or -not (Test-Path -LiteralPath (Join-Path $d 'game_scarlett_master.exe'))) { return $false }
+    return (Test-Path -LiteralPath (Join-Path $d 'shaders.rpf')) -or (Test-Path -LiteralPath (Join-Path $d 'MicrosoftGame.config'))
 }
 function Find-GameDir {
     $txt = Join-Path $repo 'game_dir.txt'
@@ -30,7 +31,7 @@ function Find-GameDir {
     }
     foreach ($drive in (Get-PSDrive -PSProvider FileSystem | Where-Object { $null -ne $_.Free })) {
         $cands = @(Get-ChildItem $drive.Root -Directory -ErrorAction SilentlyContinue)
-        $cands += @($cands | ForEach-Object { Get-ChildItem $_.FullName -Directory -ErrorAction SilentlyContinue })
+        $cands += @($cands | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Directory -ErrorAction SilentlyContinue })
         foreach ($c in $cands) { if (Test-GameDir $c.FullName) { return $c.FullName } }
     }
     return $null
