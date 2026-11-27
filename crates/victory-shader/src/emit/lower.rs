@@ -649,6 +649,37 @@ fn lane_uniform(
     same
 }
 
+/// With each host wave a wave of its own ([`with_local_waves`]), a program whose own LDS
+/// leaves no room for the translation's dwords (`CS_CollectTriangles_Meshlets`: all 32 KiB):
+/// its host waves exchange nothing, and in a one-dimensional group each host wave is a
+/// 32-aligned run of flat ids on the hosts of 32-lane waves, so neither the exchange dwords
+/// nor `wave_base`'s counter is made. (A two- or three-dimensional group keeps them: a host
+/// may give its waves other runs, #1243.)
+fn tight_lds(cs: &crate::native::ComputeIo, own: u32) -> bool {
+    LOCAL_WAVES.get()
+        && cs.threads[1] == 1
+        && cs.threads[2] == 1
+        && own + 2 * cs.threads[0].div_ceil(64) + 1 > HOST_LDS_DWORDS
+}
+
+/// The reduction an LDS atomic applies to its counter (with or without the old value
+/// returned), for [`wave_local`]'s reservations: `None` for any other DS instruction.
+fn lds_atomic(name: &str) -> Option<super::wave::Op> {
+    use super::wave::Op;
+    let base = name.strip_prefix("ds_")?.replace("_rtn", "");
+    Some(match base.as_str() {
+        "add_u32" => Op::AddU,
+        "min_u32" => Op::MinU,
+        "max_u32" => Op::MaxU,
+        "min_i32" => Op::MinI,
+        "max_i32" => Op::MaxI,
+        "or_b32" => Op::Or,
+        "and_b32" => Op::And,
+        "xor_b32" => Op::Xor,
+        _ => return None,
+    })
+}
+
 /// What a register value holds, for [`wave_local`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wave {
@@ -732,6 +763,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             Fields::Buffer { data, .. } if name.contains("_atomic_") || name.contains("_store_") => {
                 data.iter().copied().collect()
             }
+            // An LDS atomic's operand: a reservation on a counter the group shares (the
+            // address stays among what it reads, which must not depend on the wave).
+            Fields::Ds { data, gds: false, .. } if lds_atomic(name).is_some() => data.clone(),
             _ => Vec::new(),
         };
         let kinds: Vec<Wave> = ops.iter().map(|o| of(kind, val(o))).collect();
@@ -820,7 +854,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
             }
             // the reservation: the first lane adds its wave's total to a shared counter
-            (_, [Wave::Total(op)]) if name.contains("_atomic_") => {
+            (_, [Wave::Total(op)]) if name.contains("_atomic_") || lds_atomic(name).is_some() => {
                 let want = match op {
                     Op::AddU => "buffer_atomic_add",
                     Op::MinU => "buffer_atomic_umin",
@@ -832,7 +866,11 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                     Op::Xor => "buffer_atomic_xor",
                     _ => "",
                 };
-                if name != want || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                // (or the same operation on an LDS counter: the group's waves share it, so
+                // each host wave's first lane reserves its own wave's slots as the console's
+                // reserved the whole wave's, `CS_CollectTriangles_Meshlets`' `ds_add_rtn_u32`)
+                let lds = lds_atomic(name).is_some_and(|o| o == *op);
+                if (name != want && !lds) || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
                     return Err(TOTAL);
                 }
                 reserved = true;
@@ -844,7 +882,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     };
     let sections: Vec<_> = (0..p.blocks.len()).map(|b| super::wave::sections(p, b)).collect();
     let order = crate::ir::reverse_postorder(&p.blocks);
-    let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
+    // guarded writes over a wave-dependent value: the block and guard they were written under
+    type Stale = HashMap<Value, (usize, crate::structure::Bool)>;
+    let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, stale: &mut Stale, check: bool| -> Result<(), (usize, Why)> {
         for &b in &order {
             let block = &p.blocks[b];
             for phi in &block.phis {
@@ -891,7 +931,21 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if name.starts_with("s_cbranch") {
                     continue; // with the block's exit, below
                 }
-                let (k, reserved) = match step(inst, kind, firsts) {
+                // Values `stale` under this very guard in this block: the lanes that run it
+                // are the ones that wrote them, so they read only the new value.
+                let guard = st.guards[b][i];
+                let fresh: Vec<(Value, Wave)> = match guard {
+                    Some(g) => inst
+                        .reads
+                        .iter()
+                        .filter(|&&(_, v)| stale.get(&v) == Some(&(b, g)))
+                        .filter_map(|&(_, v)| kind.remove(&v).map(|k| (v, k)))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let stepped = step(inst, kind, firsts);
+                kind.extend(fresh);
+                let (k, reserved) = match stepped {
                     Ok(r) => r,
                     Err(why) if check => return Err((inst.machine.offset, why)),
                     Err(_) => (Wave::Mixed, false),
@@ -908,7 +962,6 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if check && effect && !reserved && first_mask(firsts, inst.read(Reg::S(EXEC))) {
                     return Err((inst.machine.offset, EFFECT));
                 }
-                let guarded = st.guards[b][i].is_some();
                 for &(r, w) in &inst.writes {
                     let mut kw = match r {
                         // "some lane is counted" keeps the count's kind; any other SCC is one bit of data
@@ -917,13 +970,18 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                         }
                         _ => k,
                     };
-                    // a guarded write leaves the old value in the lanes outside EXEC
-                    if guarded
+                    // a guarded write leaves the old value in the lanes outside EXEC: the
+                    // value is mixed, but not to a later read under the same guard
+                    if let Some(g) = guard
                         && matches!(r, Reg::V(_))
                         && kw == Wave::Plain
-                        && matches!(of(kind, inst.read(r)), Wave::First | Wave::Total(_) | Wave::Prefix)
+                        && inst.read(r).is_some_and(|old| {
+                            stale.contains_key(&old)
+                                || matches!(of(kind, Some(old)), Wave::First | Wave::Total(_) | Wave::Prefix)
+                        })
                     {
                         kw = Wave::Mixed;
+                        stale.insert(w, (b, g));
                     }
                     put(kind, w, kw);
                 }
@@ -947,12 +1005,13 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     };
     let mut kind: HashMap<Value, Wave> = HashMap::new();
     let mut firsts: HashSet<Value> = HashSet::new();
+    let mut stale: Stale = HashMap::new();
     // to a fixpoint (values carried around loops), then once more to say what is wrong
     let mut settled = false;
     for _ in 0..16 {
-        let before = (kind.clone(), firsts.len());
-        pass(&mut kind, &mut firsts, false)?;
-        if (&before.0, before.1) == (&kind, firsts.len()) {
+        let before = (kind.clone(), firsts.len(), stale.clone());
+        pass(&mut kind, &mut firsts, &mut stale, false)?;
+        if (&before.0, before.1, &before.2) == (&kind, firsts.len(), &stale) {
             settled = true;
             break;
         }
@@ -960,7 +1019,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     if !settled {
         return Err((0, MIXED));
     }
-    pass(&mut kind, &mut firsts, true)
+    pass(&mut kind, &mut firsts, &mut stale, true)
 }
 
 /// The mode of a group barrier the translation adds (host waves meeting):
@@ -1658,7 +1717,29 @@ impl<'a> Lower<'a> {
         let mut pairs: Option<u32> = None;
         let mut pair_waves = 0;
         // (and only around the LDS accesses whose order counts)
-        let lds_order = if PAIR_MEETINGS.get() { lds_order(p, x.st) } else { LdsOrder::default() };
+        // With local waves too, but only where the LDS accesses cannot be ordered without it
+        // (`CS_CollectTriangles(_Meshlets)`): the programs that translate without it keep
+        // their barriers as they were.
+        let local_order = || {
+            let StageIo::Cs(cs) = x.native.io else { return false };
+            let ds = |i: &Inst| {
+                matches!(i.fields, Fields::Ds { .. })
+                    && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+            };
+            cs.lds_bytes() > 0
+                && cs.threads.iter().product::<u32>() > 32
+                && all_lane_blocks(x.st).is_some_and(|all| {
+                    let spread = p.blocks.iter().enumerate().any(|(b, blk)| {
+                        !all.get(b).copied().unwrap_or(false) && blk.insts.iter().any(ds)
+                    });
+                    spread && lds_meetings(p, x.st, &all, &HashSet::new()).is_none()
+                })
+        };
+        let lds_order = if PAIR_MEETINGS.get() || LOCAL_WAVES.get() && local_order() {
+            lds_order(p, x.st)
+        } else {
+            LdsOrder::default()
+        };
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1743,7 +1824,11 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                // (each host wave on its own never exchanges: no room for it
+                                // where the program's own LDS fills the host's, [`tight_lds`])
+                                if !tight_lds(&cs, s.lds_dwords) {
+                                    s.lds_dwords += 2 * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -1789,8 +1874,12 @@ impl<'a> Lower<'a> {
             }
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+                if tight_lds(&cs, s.lds_dwords) && exchange.is_some() {
+                    // the flat id's runs are the host waves' (`thread_id`): no counter
+                } else {
+                    halves = Some(s.lds_dwords);
+                    s.lds_dwords += 1;
+                }
                 if PAIR_MEETINGS.get() && group > 64 && group % 64 == 0 && (split_lds || exchange.is_some()) {
                     // a counter per console wave, then two exchange buffers of four dwords each
                     pairs = Some(s.lds_dwords);
