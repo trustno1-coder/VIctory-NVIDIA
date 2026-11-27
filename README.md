@@ -14,6 +14,11 @@ Put them next to your own `game_scarlett_master.exe` and double-click `PLAY.cmd`
 | median | 11.8 fps | **21.9 fps** |
 | best | 18.3 fps | **31.9 fps** |
 
+## Bug ##
+1. If faces invisible restart game once
+2. If low FPS turn down DLSS, or turn off RT
+3. If crash post .dmp and .log
+
 ## The launcher, `PLAY.cmd`
 
 Enter starts with the recommended settings, or with your last ones. **C** walks through ten choices:
