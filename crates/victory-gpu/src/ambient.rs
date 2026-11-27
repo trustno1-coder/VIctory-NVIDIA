@@ -191,6 +191,63 @@ fn air() -> f32 {
     })
 }
 
+#[derive(Clone, Copy)]
+struct Settle {
+    ms: f32,
+    jump: f32,
+    fresh: f32,
+}
+
+/// Time constant in milliseconds, jump ratio (0 disables), fresh seconds.
+fn settle() -> Option<Settle> {
+    static SET: OnceLock<Option<Settle>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_SETTLE").ok()?;
+        let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0));
+        let ms = parts.next().flatten().filter(|v| *v > 0.0)?;
+        let jump = parts.next().flatten()?;
+        let fresh = match parts.next() { Some(value) => value?, None => 0.0 };
+        if parts.next().is_some() { return None; }
+        Some(Settle { ms, jump, fresh })
+    })
+}
+
+/// Sample once per Radiance dispatch. Treat startup and long pauses as a 33 ms frame.
+fn frame_ms() -> f32 {
+    static LAST: Mutex<Option<u64>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = crate::host::now_ms();
+    match last.replace(now).map(|t| now.saturating_sub(t)) {
+        Some(dt @ 0..=1000) => dt.max(1) as f32,
+        _ => 33.0,
+    }
+}
+
+/// Mean interpolation weight and elapsed seconds, from the same clock sample.
+fn follow(role: Role) -> (f32, f32) {
+    if role == Role::Radiance && let Some(settle) = settle() {
+        let dt = frame_ms();
+        return (-(-dt / settle.ms).exp_m1(), dt / 1000.0);
+    }
+    (0.04, 0.0)
+}
+
+/// Maximum luminance left by the title, as a multiple of the estimate.
+fn most() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(4.0)
+    })
+}
+
+/// Select the original magenta-only probe filter. Upstream's default
+/// additionally rejects blue outliers.
+fn magenta_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_MAGENTA").is_some_and(|s| s == "1"))
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -216,7 +273,13 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
+#if defined(SETTLE) && defined(KEEP)
+    float follow; float jump; float seconds; float once;
+#elif defined(SETTLE) && defined(RAISE)
+    float follow; float most; float fresh; float once;
+#else
     float follow; float most; float air; float once;
+#endif
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -263,7 +326,15 @@ void mean() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
+#ifdef SETTLE
+    float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
+    bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
+    // Bias the timer so zero still denotes an uninitialized mean.
+    float age = was.a > 0.0 && !jumped ? was.a + seconds : 0.001;
+    cells[CELLS] = float4(was.a > 0.0 && !jumped ? lerp(was.rgb, now, follow) : now, age);
+#else
     cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+#endif
 }
 #endif
 
@@ -469,10 +540,17 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // And the bluer kind of it (blue over 2.5x green and over red): left as
     // a faint violet by the line above. The sky's light keeps green above
     // 0.4x blue, sunsets keep blue low, so neither is touched.
+#ifndef MAGENTA_ONLY
     if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
+#endif
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
+#ifdef SETTLE
+    float bound = fresh > 0.0 ? lerp(min(1.0, most), most, saturate((cells[CELLS].a - 0.001) / fresh)) : most;
+    float top = max(dot(found, LUMA) * bound, 1e-6);
+#else
     float top = max(dot(found, LUMA) * most, 1e-6);
+#endif
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
     float3 now = max(was, found);
@@ -518,7 +596,9 @@ unsafe impl Sync for Pass {}
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let define = if settle().is_some() { "#define SETTLE\n" } else { "" };
+        let filter = if part == "RAISE" && magenta_only() { "#define MAGENTA_ONLY\n" } else { "" };
+        let code = crate::host::compile(&format!("#define {part}\n{define}{filter}{SOURCE}"), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
@@ -721,10 +801,21 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     }
     words[6] = views.depth_size[0];
     words[7] = views.depth_size[1];
-    words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    let (weight, seconds) = follow(role);
+    words[8] = weight.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
+    if let Some(settings) = settle() {
+        match role {
+            Role::Radiance => {
+                words[9] = settings.jump.to_bits();
+                words[10] = seconds.to_bits();
+            }
+            Role::Resolve => words[10] = settings.fresh.to_bits(),
+            Role::Air | Role::Miss => {}
+        }
+    }
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
