@@ -233,6 +233,10 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// The part of [`Self::lds_dwords`] the console program declares, in
+    /// dwords; the layer's own dwords (lane exchange, wave order) follow it.
+    /// LDS instructions reach only this part, as on the console.
+    pub lds_title_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -286,6 +290,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            lds_title_dwords: 0,
             lds: None,
             main,
             entry,

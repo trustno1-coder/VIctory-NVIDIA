@@ -2391,3 +2391,42 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
         }
     }
 }
+
+const DS_ADD_RTN_U32: u8 = 0x20;
+
+#[test]
+fn ds_past_the_program_lds_reads_zero_and_drops_writes() {
+    // 512 bytes of LDS (128 dwords). LDS[0] = v1; at the byte address v2:
+    // write v3, read it back into v6, add v3 with the old value into v7;
+    // v0 = LDS[0] + v6 + v7. In bounds that is v1 + 2 * v3 (the add returns
+    // what the write left); past the program's LDS the console reads 0,
+    // drops the write and the add, and returns 0 from the add: v1, with
+    // LDS[0] untouched.
+    let mut body = vec![vop1(0x001, 5, 0x80)]; // v_mov_b32 v5, 0
+    body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    body.extend(ds(DS_WRITE_B32, 0, 2, 3));
+    body.extend(ds(DS_READ_B32, 6, 2, 0));
+    body.extend(ds(DS_ADD_RTN_U32, 7, 2, 3));
+    body.extend(ds(DS_READ_B32, 0, 5, 0));
+    body.push(vop2(0x25, 0, vgpr(6), 0)); // v_add_nc_u32 v0, v6, v0
+    body.push(vop2(0x25, 0, vgpr(7), 0)); // v_add_nc_u32 v0, v7, v0
+    let shader = build_cs(&body, 1, 512);
+    let cases = [
+        [100, 4, 7, 0],
+        [100, 508, 7, 0],
+        [100, 512, 7, 0],
+        [100, 0x1_0000, 7, 0],
+        [100, 0xFFFF_FFFC, 7, 0],
+    ];
+    // One thread with LDS declares WaveSize(32), which WARP refuses.
+    run_cases_on(&shader, &cases, &[("hardware", false)], |backend, _, inp, got| {
+        let inside = inp[1] < 512;
+        let want = if inside { inp[0] + 2 * inp[2] } else { inp[0] };
+        assert_eq!(
+            got, want,
+            "{backend}: LDS access at byte {:#x} ({})",
+            inp[1],
+            if inside { "in bounds" } else { "past the program's LDS" },
+        );
+    });
+}
