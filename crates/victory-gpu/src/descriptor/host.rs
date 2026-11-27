@@ -4128,12 +4128,19 @@ impl HostHeap {
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
-    /// resource (diagnostics: a buffer view's slot must show the host copy
-    /// that is brought up to date for it).
-    #[cfg(feature = "diagnostics")]
+    /// resource (a buffer view's slot must show the host copy that is
+    /// brought up to date for it: with growing windows the pass over the
+    /// heap makes it again when it does not).
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let shown = self.kept_in(index)?;
-        Some(windows::core::Interface::as_raw(&shown) == windows::core::Interface::as_raw(buffer))
+        use windows::core::Interface;
+        let kept = self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner());
+        Some(kept.as_ref()?.as_raw() == buffer.as_raw())
+    }
+
+    /// What slot `index` views (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn shown(&self, index: u32) -> Option<ID3D12Resource> {
+        self.kept_in(index)
     }
 
     /// Whether host slot `index` shows a window of title memory that a longer
@@ -4422,6 +4429,16 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     }
     let shadow = crate::shadow::find(address, len)?;
     Some((view_home(shadow, address, len, view_elements(view)?), address, len))
+}
+
+/// Whether buffer view `view` begins outside the buffer it is of: [`make`]
+/// and [`buffer_copy`] then look the copy up differently (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn view_outside_buffer(view: &View) -> bool {
+    match (buffer_range(view), buffer_extent(view)) {
+        (Some((address, _)), Some((base, width))) => address < base || address - base >= width.max(1),
+        _ => false,
+    }
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.

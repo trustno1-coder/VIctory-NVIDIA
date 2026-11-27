@@ -950,7 +950,8 @@ fn log_memory() {
         "memory, windows: the {:.0} MB of windows lie over {:.0} MB of title memory (the rest is \
          memory that is in more than one window, and is copied once for each); host lists never \
          reset since they were made: {}; windows grown (VICTORY_WINDOW_GROW): {} since the start, \
-         {} taken over and still held {:.0} MB, {} slots of the heap moved to the longer one",
+         {} taken over and still held {:.0} MB, {} slots of the heap and {} of draws' tables moved \
+         to the longer one",
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
@@ -958,6 +959,46 @@ fn log_memory() {
         crate::shadow::taken_over_held().0,
         mb(crate::shadow::taken_over_held().1),
         crate::shadow::GROWN[1].load(Relaxed),
+        crate::shadow::GROWN[2].load(Relaxed),
+    );
+    if crate::shadow::grow() {
+        log_heap_elsewhere();
+    }
+}
+
+/// The memory line on the slots the pass over the heap found showing another
+/// copy than the one it brings up to date (`VICTORY_WINDOW_GROW`).
+fn log_heap_elsewhere() {
+    use crate::draw::{
+        HEAP_ELSEWHERE_OUTSIDE, HEAP_ELSEWHERE_SLOTS, HEAP_ELSEWHERE_WHY, HEAP_LOOKS, HEAP_MADE_AGAIN_NULL,
+        HEAP_VIEWS_ELSEWHERE, HEAP_VIEWS_STILL_ELSEWHERE,
+    };
+    // Shown kind by found kind (`crate::shadow::copy_kind`).
+    let w = |shown: usize, found: usize| HEAP_ELSEWHERE_WHY[shown * 5 + found].load(Relaxed);
+    let (looks, passes) = (HEAP_LOOKS[0].load(Relaxed), HEAP_LOOKS[1].load(Relaxed));
+    let elsewhere = HEAP_VIEWS_ELSEWHERE.load(Relaxed);
+    let named = [w(0, 1), w(1, 1), w(2, 1), w(1, 2), w(1, 3), w(3, 1), w(3, 3), (0..5).map(|f| w(4, f)).sum::<u64>()];
+    tracing::info!(
+        "memory, heap slots elsewhere: {elsewhere} in {looks} looks over {passes} passes ({:.3} a pass), \
+         {} distinct slots; still elsewhere after being made again {}; begin outside their buffer {}; \
+         shown -> found: taken over -> window {}, window -> window {}, own bytes -> window {}, \
+         window -> own bytes {}, window -> title buffer {}, title buffer -> window {}, \
+         title buffer -> title buffer {}, let go -> any {}, other {}; made again on the longer window \
+         and left null {}",
+        elsewhere as f64 / passes.max(1) as f64,
+        HEAP_ELSEWHERE_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        HEAP_VIEWS_STILL_ELSEWHERE.load(Relaxed),
+        HEAP_ELSEWHERE_OUTSIDE.load(Relaxed),
+        named[0],
+        named[1],
+        named[2],
+        named[3],
+        named[4],
+        named[5],
+        named[6],
+        named[7],
+        elsewhere.saturating_sub(named.iter().sum()),
+        HEAP_MADE_AGAIN_NULL.load(Relaxed),
     );
 }
 

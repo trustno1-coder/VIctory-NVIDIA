@@ -686,9 +686,33 @@ type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 /// the copy the pass brought up to date for them, since the start
 /// (diagnostics; for the memory line). It stays 0 while the pass and the
 /// slots agree; with `VICTORY_VIEW_EXTENT=0` it counts the views that were
-/// read stale.
+/// read stale. With growing windows (`crate::shadow::grow`) the pass then
+/// makes the slot again; what is counted is what it found before that.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+// The counters below are kept with growing windows only (diagnostics, for
+// the memory line "heap slots elsewhere").
+/// Of [`HEAP_VIEWS_ELSEWHERE`], the ones whose slot made again still showed
+/// another copy: `make` and `buffer_copy` look the copy up differently.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_VIEWS_STILL_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+/// The heap pass's slots that showed another copy, by (kind of the copy
+/// shown) * 5 + (kind of the copy found), `crate::shadow::copy_kind`.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_ELSEWHERE_WHY: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
+/// Of them, the views that begin outside their buffer.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_ELSEWHERE_OUTSIDE: AtomicU64 = AtomicU64::new(0);
+/// Slots made again on the longer window that show nothing since.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_MADE_AGAIN_NULL: AtomicU64 = AtomicU64::new(0);
+/// The distinct slots that showed another copy.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_ELSEWHERE_SLOTS: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+/// Slots looked at, and passes, since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_LOOKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
@@ -754,6 +778,15 @@ impl<T> HeapRanges<T> {
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
         self.0.iter().flatten()
     }
+
+    /// The slots whose kept copy `f` picks.
+    fn slots_where(&self, f: impl Fn(&T) -> bool) -> Vec<u32> {
+        self.0
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, range)| range.as_ref().filter(|(copy, ..)| f(copy)).map(|_| slot as u32))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -784,6 +817,22 @@ mod heap_range_tests {
         assert!(ranges.ranges().all(|r| r.1 != 0), "a slot not looked at in a round");
         ranges.set(3, None);
         assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize - 1);
+    }
+
+    /// The slots whose kept copy is a window taken over are found, and
+    /// those forgotten for this pass's part are not.
+    #[test]
+    fn the_slots_on_a_window_taken_over_are_found() {
+        let mut ranges = HeapRanges(Vec::new());
+        ranges.set(2, Some((false, 0, 1)));
+        ranges.set(5, Some((true, 0, 1)));
+        ranges.set(9, Some((true, 4, 8)));
+        ranges.set(12, None);
+        assert_eq!(ranges.slots_where(|&taken| taken), [5, 9]);
+        assert_eq!(ranges.slots_where(|&taken| !taken), [2]);
+        // Part 1 of 4 is 1, 5, 9: the pass looks at those anyway.
+        ranges.forget_part(1, 4);
+        assert!(ranges.slots_where(|&taken| taken).is_empty());
     }
 
     /// The spans of 4,400 copies from the ranges of 72,000 slots, as a pass
@@ -1173,7 +1222,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
-    let slots = if all {
+    let mut slots = if all {
         ranges.0.clear();
         host.buffer_slots()
     } else if heap_spread() {
@@ -1187,6 +1236,20 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         changed
     };
     *passes += 1;
+    #[cfg(feature = "diagnostics")]
+    if crate::shadow::grow() {
+        HEAP_LOOKS[1].fetch_add(1, Ordering::Relaxed);
+    }
+    // Slots kept on a window a longer one took the place of are looked at
+    // now, not at their turn in the round (up to HEAP_ROUND passes later):
+    // `look` makes them again on the longer one (`crate::shadow::grow`).
+    // Meanwhile what shaders write through the one is not in the other
+    // before the copy back and a refresh, a frame late.
+    if !all && crate::shadow::grow() && crate::shadow::any_taken_over() {
+        slots.extend(ranges.slots_where(|copy| copy.is_taken_over()));
+        slots.sort_unstable();
+        slots.dedup();
+    }
     // Whether the device was there before the pass: a view that removes
     // it is named below.
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1206,6 +1269,10 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // What a slot of the title's shows: its copy and range, and whether it is
     // an unordered view.
     let look = |index: u32| {
+        #[cfg(feature = "diagnostics")]
+        if crate::shadow::grow() {
+            HEAP_LOOKS[0].fetch_add(1, Ordering::Relaxed);
+        }
         // A draw's table's: the draw brings what it reads up to date.
         if host.copied_tabled(index, frame) {
             return None;
@@ -1217,13 +1284,42 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             host.make_again(index);
             view = host.mirror(index, heap.handle(index)?, true)?;
             crate::shadow::GROWN[1].fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            if host.shown(index).is_none() {
+                HEAP_MADE_AGAIN_NULL.fetch_add(1, Ordering::Relaxed);
+            }
         }
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
+        let (mut shadow, mut address, mut len) = crate::descriptor::host::buffer_copy(&view)?;
         #[cfg(feature = "diagnostics")]
         if host.shows(index, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+            if crate::shadow::grow() {
+                if let Some(shown) = host.shown(index) {
+                    let why = crate::shadow::copy_kind(&shown) * 5 + crate::shadow::copy_kind(&shadow.buffer);
+                    HEAP_ELSEWHERE_WHY[why].fetch_add(1, Ordering::Relaxed);
+                }
+                if crate::descriptor::host::view_outside_buffer(&view) {
+                    HEAP_ELSEWHERE_OUTSIDE.fetch_add(1, Ordering::Relaxed);
+                }
+                HEAP_ELSEWHERE_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
+            }
+        }
+        // With growing windows the slot may show another copy than the one
+        // brought up to date for it: a takeover between the look above and
+        // here, a view's own bytes whose window moved (`view_home` counts
+        // from the window's start), a title buffer made or let go since the
+        // slot was. Made again once, on what is found now; what it showed is
+        // retired by `keep`.
+        if crate::shadow::grow() && host.shows(index, &shadow.buffer) == Some(false) {
+            host.make_again(index);
+            view = host.mirror(index, heap.handle(index)?, true)?;
+            (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
+            #[cfg(feature = "diagnostics")]
+            if host.shows(index, &shadow.buffer) == Some(false) {
+                HEAP_VIEWS_STILL_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
         Some(((shadow, address, address + len), written))
@@ -4474,7 +4570,23 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        if let Some(mut view) = host.mirror(index, handle, true) {
+            // A slot made on a window a longer one took the place of is made
+            // again on the longer one here, as the pass over the heap does
+            // for the slots it looks at (`crate::shadow::grow`): the pass
+            // leaves a draw's table to the draw, and the slot would show the
+            // shorter window until the title wrote it again, while root
+            // views, vertex buffers and the slots made since use the longer
+            // one. What shaders write through the one is in the other only
+            // after the copy back and a refresh: a frame late.
+            if host.shows_taken_over(index) {
+                host.make_again(index);
+                match host.mirror(index, handle, true) {
+                    Some(again) => view = again,
+                    None => return,
+                }
+                crate::shadow::GROWN[2].fetch_add(1, Ordering::Relaxed);
+            }
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {

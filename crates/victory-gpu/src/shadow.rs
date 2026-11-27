@@ -3395,6 +3395,11 @@ impl Shadow {
         }
     }
 
+    /// With [`grow`]: whether a longer window took this one's place.
+    pub(crate) fn is_taken_over(&self) -> bool {
+        self.taken_over.load(Ordering::Relaxed)
+    }
+
     /// The bytes of the host buffer.
     pub(crate) fn width(&self) -> u64 {
         // SAFETY: a live buffer.
@@ -5669,9 +5674,11 @@ fn fine() -> bool {
 /// is brought up to date or written through the longer one is through it
 /// too ([`Shadow::forward`]).
 ///
-/// shortcut: a slot of a draw's table made on the shorter window keeps it
-/// until the title writes the slot again (it is brought up to date all the
-/// same).
+/// A slot of a draw's table made on the shorter window is made again by
+/// the next draw that reads it (`State::table_entry`), a slot the pass
+/// keeps by the next pass. Until then the two windows are two copies of the
+/// same bytes: what shaders write through one reaches the other a frame
+/// late (copy back, then refresh).
 pub(crate) fn grow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_GROW").is_some_and(|v| v == "1"))
@@ -5686,20 +5693,46 @@ const GROW_STEP: u64 = TAIL_STEP;
 /// A descriptor slot holds a window's buffer and not the copy: let go while
 /// a slot still showed it, the copy would be brought up to date no more,
 /// and the pass over the heap would not know the slot is to be made again.
-static TAKEN_OVER: Mutex<BTreeMap<usize, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// (Read by every slot of a draw's table while any is held: a reader's lock.)
+static TAKEN_OVER: RwLock<BTreeMap<usize, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 /// How many there are (asked by every slot the pass over the heap looks at).
 static TAKEN_OVER_N: AtomicU64 = AtomicU64::new(0);
 
-/// Windows grown since the start, and the slots of the heap moved to the
-/// longer window.
-pub(crate) static GROWN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Windows grown since the start, the slots the pass over the heap moved to
+/// the longer window, and the slots of draws' tables the draws moved.
+pub(crate) static GROWN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Whether `buffer` is a window's that a longer window took the place of.
 pub(crate) fn taken_over(buffer: &ID3D12Resource) -> bool {
     use windows::core::Interface;
     grow()
         && TAKEN_OVER_N.load(Ordering::Relaxed) > 0
-        && TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(buffer.as_raw() as usize))
+        && TAKEN_OVER.read().unwrap_or_else(|e| e.into_inner()).contains_key(&(buffer.as_raw() as usize))
+}
+
+/// Of what kind host copy `buffer` is (diagnostics, for the heap pass's slots
+/// that show another copy than the one brought up to date): 0 a window taken
+/// over, 1 a window of [`LOOSE`], 2 a copy of a view's own bytes ([`EXACT`]),
+/// 3 a title buffer's copy, 4 none of these (let go).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn copy_kind(buffer: &ID3D12Resource) -> usize {
+    use windows::core::Interface;
+    let raw = buffer.as_raw();
+    let is = |s: &Shadow| s.buffer.as_raw() == raw;
+    // (A lock at a time: each is let go before the next is taken.)
+    if TAKEN_OVER.read().unwrap_or_else(|e| e.into_inner()).values().any(|s| is(s)) {
+        return 0;
+    }
+    if LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().any(|s| is(s)) {
+        return 1;
+    }
+    if EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().any(|(s, _)| is(s)) {
+        return 2;
+    }
+    if buffers_read().values().any(|e| e.shadow.as_deref().is_some_and(is)) {
+        return 3;
+    }
+    4
 }
 
 /// Whether any window was taken over and is still held.
@@ -5715,7 +5748,7 @@ fn let_go_taken_over() {
         return;
     }
     let gone: Vec<Arc<Shadow>> = {
-        let mut map = TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = TAKEN_OVER.write().unwrap_or_else(|e| e.into_inner());
         let free: Vec<usize> = map
             .iter()
             .filter(|(_, s)| Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1)
@@ -5735,7 +5768,7 @@ fn let_go_taken_over() {
 /// For the memory line: windows taken over and still held, and their bytes.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn taken_over_held() -> (u64, u64) {
-    let map = TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner());
+    let map = TAKEN_OVER.read().unwrap_or_else(|e| e.into_inner());
     (map.len() as u64, map.values().map(|s| s.len).sum())
 }
 
@@ -6021,7 +6054,7 @@ fn grown(address: u64, end: u64, unsized_ask: bool, note: &dyn Fn(&Shadow)) -> O
         let before = chained(&old.before_me.lock().unwrap_or_else(|e| e.into_inner()), &old);
         *shadow.before_me.lock().unwrap_or_else(|e| e.into_inner()) = before;
         if !old.taken_over.swap(true, Ordering::Relaxed) {
-            let mut taken = TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner());
+            let mut taken = TAKEN_OVER.write().unwrap_or_else(|e| e.into_inner());
             taken.insert(old.buffer.as_raw() as usize, old.clone());
             TAKEN_OVER_N.store(taken.len() as u64, Ordering::Relaxed);
         }
