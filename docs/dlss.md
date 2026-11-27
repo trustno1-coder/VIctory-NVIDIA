@@ -1,5 +1,10 @@
 # DLSS and DLSS Frame Generation (NVIDIA Streamline)
 
+Frame generation now has a separate backend selector:
+`VICTORY_FRAMEGEN_BACKEND=dlss` (default) or `fsr`.
+See [FSR frame generation](fsr-framegen.md) for the RTX 30-compatible
+prototype. DLSS upscaling can be used with either backend.
+
 Two switches, both off by default:
 
 - `VICTORY_DLSS=1`: DLSS Super Resolution does the title's FidelityFX upscaling

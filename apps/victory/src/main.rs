@@ -165,7 +165,8 @@ enum Command {
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
-    /// Check NVIDIA Streamline, DLSS and DLSS Frame Generation on this PC
+    /// Check NVIDIA Streamline/DLSS, or FSR frame generation when
+    /// VICTORY_FRAMEGEN_BACKEND=fsr, on this PC
     /// without the title (`VICTORY_STREAMLINE_DIR`, `VICTORY_DLSS_MODE`,
     /// `VICTORY_DLSS_PRESET`): what loads and what this GPU supports; with
     /// --device, the host device handed over and DLSS run three times on
@@ -292,9 +293,12 @@ fn main() -> Result<()> {
                 .split_once(['x', 'X'])
                 .and_then(|(w, h)| Some([w.trim().parse().ok()?, h.trim().parse().ok()?]))
                 .ok_or_else(|| anyhow::anyhow!("--output {output}: not <width>x<height>"))?;
-            for line in victory_hle::streamline::check(size, device || present, present) {
+            let lines = victory_hle::streamline::check(size, device || present, present);
+            let failed = lines.iter().any(|line| line.starts_with("FAIL:"));
+            for line in lines {
                 println!("{line}");
             }
+            anyhow::ensure!(!failed, "upscaler check failed");
             Ok(())
         }
     }

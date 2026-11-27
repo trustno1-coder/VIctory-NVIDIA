@@ -60,6 +60,7 @@ const ITEMS: &[Item] = &[
     // The launcher's own choices.
     Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
     Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
+    Item { var: "VICTORY_FRAMEGEN_BACKEND", label: "FRAME GEN BACKEND (RESTART)", values: &[("dlss", "DLSS (RTX 40+)"), ("fsr", "FSR 3.1 (2X)")], live: false },
     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
     Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
@@ -313,7 +314,7 @@ impl Menu {
     /// Changes item `i` by `step` (+1 / -1) through its values.
     fn change(&mut self, i: usize, step: isize) {
         let item = &ITEMS[i];
-        let n = item.values.len() as isize;
+        let n = if item.var == "VICTORY_MENU_FRAMEGEN" && crate::fsr::selected() { 2 } else { item.values.len() as isize };
         let now = index_of(item, &self.values[i]).map_or(-1, |x| x as isize);
         let next = if now < 0 { if step > 0 { 0 } else { n - 1 } } else { (now + step).rem_euclid(n) };
         self.values[i] = item.values[next as usize].0.to_owned();

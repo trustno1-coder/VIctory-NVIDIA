@@ -37,6 +37,8 @@ pub mod dxgi;
 mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod fsr;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]

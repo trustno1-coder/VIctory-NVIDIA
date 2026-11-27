@@ -9993,6 +9993,12 @@ impl Host {
                 ));
                 list.ResourceBarrier(&post);
             }
+            crate::streamline::fsr_prepare(
+                &self.device, copy,
+                crate::streamline::Planes {
+                    base: (texture, state_u32), overlay: overlay.filter(|_| composed), size: [width, height],
+                }, format.0,
+            );
             copy.close();
             let flown = match slot {
                 Some(i) => {
@@ -10029,6 +10035,7 @@ impl Host {
             );
             let called = crate::streamline::present_called(&presenting);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::fsr::presented();
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
@@ -10048,6 +10055,7 @@ impl Host {
     /// down; nothing presents afterwards).
     pub(crate) fn drop_presenter(&self) {
         settle_now(WHY_SYNC);
+        crate::fsr::shutdown();
         *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
@@ -10085,7 +10093,16 @@ impl Host {
                     .CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None)
                     .and_then(|s| s.cast::<IDXGISwapChain3>())
             });
-            let swap_chain = match proxied {
+            let fsr_swap = if crate::fsr::ready() {
+                match crate::fsr::create_swap(&factory, &self.queue, hwnd, &desc) {
+                    Ok(s) => {
+                        let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                        Some(s)
+                    }
+                    Err(error) => { tracing::warn!(%error, "FSR unavailable; using ordinary presentation"); None }
+                }
+            } else { None };
+            let swap_chain = if let Some(s) = fsr_swap { s } else { match proxied {
                 Some(Ok(swap_chain)) => {
                     crate::streamline::swap_chain_made(true, None);
                     // Frame generation must be off across a change between
@@ -10105,7 +10122,7 @@ impl Host {
                 None => crate::streamline::present_hooked(
                     factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
                 ),
-            };
+            } };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -11489,4 +11506,3 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(None), 10_000);
     }
 }
-

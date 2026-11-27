@@ -25,6 +25,8 @@ param(
     [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance')][string]$Dlss = 'quality',
     # DLSS Frame Generation (RTX 40 or later, hardware-accelerated GPU scheduling on); needs DLSS.
     [switch]$FrameGen,
+    # Independent of DLSS upscaling. FSR 3.1 supports RTX 30 and is limited to 2x.
+    [ValidateSet('dlss', 'fsr')][string]$FrameGenBackend = 'dlss',
     # Frames shown for each one rendered with -FrameGen: 2 to 6 (more than 2 needs an RTX 50; the layer asks the
     # driver how many this card does and gives no more).
     [ValidateRange(2, 6)][int]$FrameGenX = 2,
@@ -51,6 +53,7 @@ if ($menu.Contains('VICTORY_MENU_CONSOLE')) { $SeriesS = $menu['VICTORY_MENU_CON
 if ($menu['VICTORY_MENU_RES'] -in '1440', '1080to1440', '4k') { $Res = $menu['VICTORY_MENU_RES'] }
 if ($menu['VICTORY_MENU_DLSS'] -in 'off', 'dlaa', 'quality', 'balanced', 'performance') { $Dlss = $menu['VICTORY_MENU_DLSS'] }
 $timesWanted = $FrameGenX
+if ($menu['VICTORY_FRAMEGEN_BACKEND'] -in 'dlss', 'fsr') { $FrameGenBackend = $menu['VICTORY_FRAMEGEN_BACKEND'] }
 if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
     # 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).
     $FrameGen = $menu['VICTORY_MENU_FRAMEGEN'] -match '^[1-6]$'
@@ -105,6 +108,20 @@ if ($Dlss -ne 'off') {
     }
 }
 if ($fpsWanted -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
+$settings.VICTORY_FRAMEGEN_BACKEND = $FrameGenBackend
+if ($FrameGenBackend -eq 'fsr') {
+    $fsr = if ($env:VICTORY_FSR_DIR) { $env:VICTORY_FSR_DIR } else { Join-Path $repo 'amd-sdk' }
+    $settings.VICTORY_FSR_DIR = $fsr
+    $settings.Remove('VICTORY_FRAMEGEN')
+    $settings.Remove('VICTORY_FRAMEGEN_X')
+    if (($FrameGen -or -not $NoFrameGenReady) -and (Test-Path (Join-Path $fsr 'amd_fidelityfx_dx12.dll'))) {
+        $settings.VICTORY_FRAMEGEN = '1'
+        $settings.VICTORY_FRAMEGEN_X = if ($FrameGen) { '2' } else { '0' }
+        $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' }
+    } elseif ($FrameGen) {
+        throw "FSR runtime missing in $fsr. Run Get-AMD-FSR.cmd first."
+    }
+}
 foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
@@ -120,7 +137,7 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build -FrameGenBackend $FrameGenBackend$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
@@ -136,7 +153,7 @@ if (-not (Test-Path $victory)) {
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FSR_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 

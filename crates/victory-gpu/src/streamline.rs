@@ -87,6 +87,11 @@ impl Asked {
         let var = |name: &str| std::env::var(name).ok();
         let on = |name: &str| var(name).is_some_and(|v| v.trim() == "1");
         let framegen = on("VICTORY_FRAMEGEN");
+        if let Some(backend) = var("VICTORY_FRAMEGEN_BACKEND")
+            && !matches!(backend.trim().to_ascii_lowercase().as_str(), "dlss" | "fsr")
+        {
+            return Err(format!("VICTORY_FRAMEGEN_BACKEND={backend}: expected dlss or fsr"));
+        }
         let mode = match var("VICTORY_DLSS_MODE") {
             Some(name) => Mode::from_name(&name).ok_or_else(|| {
                 format!("VICTORY_DLSS_MODE={name}: not one of dlaa, quality, balanced, performance, ultraperformance")
@@ -305,16 +310,27 @@ pub fn init(asked: &Asked) -> Available {
     if !asked.any() {
         return Available::default();
     }
-    match load_and_init(asked, true) {
+    let fsr = asked.framegen && crate::fsr::selected() && line_asked();
+    if asked.framegen && crate::fsr::selected() && !line_asked() {
+        tracing::warn!("FSR frame generation needs VICTORY_THIN=1 or VICTORY_ASYNC_SUBMIT=1");
+    }
+    if fsr && let Err(error) = crate::fsr::init() {
+        tracing::warn!(%error, "FSR frame generation unavailable");
+    }
+    let mut nvidia = asked.clone();
+    if crate::fsr::selected() { nvidia.framegen = false; nvidia.present_hook = false; }
+    let mut available = if nvidia.any() { match load_and_init(&nvidia, true) {
         Ok(available) => available,
         Err(why) => {
             tracing::warn!(
                 folder = %asked.dir.display(),
-                "Streamline: {why}; DLSS and frame generation stay off, the title's own upscaling and our present run"
+                "Streamline: {why}; NVIDIA features stay off"
             );
             Available::default()
         }
-    }
+    } } else { Available::default() };
+    available.framegen |= crate::fsr::ready();
+    available
 }
 
 fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String> {
@@ -561,7 +577,7 @@ fn load(path: &Path) -> Result<Sl, String> {
 /// Whether the title's FidelityFX calls are to be served (DLSS or frame
 /// generation is on): `victory_hle` then puts its own in front of them.
 pub fn serving() -> bool {
-    PLAN.get().is_some_and(|p| p.dlss || p.framegen)
+    PLAN.get().is_some_and(|p| p.dlss || p.framegen) || crate::fsr::ready()
 }
 
 /// Whether DLSS is to take the title's upscale dispatches (`VICTORY_DLSS=1`
@@ -748,6 +764,7 @@ pub(crate) fn swap_chain_made(proxied: bool, error: Option<&windows::core::Error
 /// it retired). `swap_chain` itself if the switch is off, frame generation
 /// owns the swap chain, or the upgrade fails.
 pub(crate) fn present_hooked(swap_chain: IDXGISwapChain3) -> IDXGISwapChain3 {
+    if crate::fsr::selected() { return swap_chain; }
     let (Some(plan), Some(sl)) = (PLAN.get(), SL.get()) else { return swap_chain };
     if !plan.asked.present_hook || !plan.dlss || !DLSS_READY.load(Acquire) || SWAP_CHAIN_PROXIED.load(Acquire) {
         return swap_chain;
@@ -782,11 +799,8 @@ fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
 /// its inputs are noted there for the present); the title's own runs
 /// otherwise.
 pub fn upscale(up: &Upscale) -> Taken {
-    let Some(plan) = PLAN.get() else {
-        return Taken::No("Streamline is not loaded");
-    };
-    let dlss = plan.dlss && DLSS_READY.load(Acquire);
-    let framegen = plan.framegen && FG_READY.load(Acquire);
+    let dlss = PLAN.get().is_some_and(|p| p.dlss) && DLSS_READY.load(Acquire);
+    let framegen = (PLAN.get().is_some_and(|p| p.framegen) && FG_READY.load(Acquire)) || crate::fsr::ready();
     if !dlss && !framegen {
         return Taken::No("Streamline has no device yet, or its features did not start");
     }
@@ -857,7 +871,7 @@ fn note(host: &crate::host::HostList, up: &Upscale, id: u64) {
     };
     let mut pending = pending();
     pending.retain(|n| id.saturating_sub(n.id) < 16);
-    pending.push(Noted { id, depth: Source::Host(depth), motion: Source::Host(motion), camera: up.camera });
+    pending.push(Noted { id, depth: Source::Host(depth), motion: Source::Host(motion), camera: up.camera, frame_ms: up.frame_ms });
     drop(pending);
     host.mark_upscale(id);
 }
@@ -868,6 +882,7 @@ struct Noted {
     depth: Source,
     motion: Source,
     camera: plan::Camera,
+    frame_ms: f32,
 }
 
 /// A texture frame generation reads at the present, and the state it is in
@@ -880,6 +895,12 @@ enum Source {
 }
 
 impl Source {
+    fn owned(&self) -> (ID3D12Resource, u32) {
+        match self {
+            Self::Host(t) => (t.texture.clone(), t.state.load(Relaxed)),
+            Self::Fixed(t, state) => (t.clone(), *state),
+        }
+    }
     fn tagged(&self) -> abi::Resource {
         match self {
             Source::Host(t) => abi::Resource::texture(t.texture.as_raw(), t.state.load(Relaxed)),
@@ -1123,7 +1144,7 @@ const INTERFACE_COMPOSITE: [&str; 2] = ["0602c2384acbb3b2", "a78d088fa55aa495"];
 /// generation runs on our swap chain and `VICTORY_FRAMEGEN_HUDLESS` is not 0.
 #[inline]
 pub(crate) fn hudless_wanted() -> bool {
-    HUDLESS_WANTED.load(Relaxed)
+    HUDLESS_WANTED.load(Relaxed) || crate::fsr::live()
 }
 
 static HUDLESS_WANTED: AtomicBool = AtomicBool::new(false);
@@ -1321,6 +1342,24 @@ fn hudless_for(shown: &ID3D12Resource) -> Option<ID3D12Resource> {
     let first = submitted.iter().position(|c| c.target == shown).map(|i| submitted.remove(i));
     submitted.retain(|c| c.target != shown);
     first.map(|c| c.texture)
+}
+
+/// FSR uses the same submitted input tracking and interface-free capture as DLSS.
+pub(crate) fn fsr_prepare(
+    device: &ID3D12Device, list: &crate::host::HostList,
+    planes: Planes<'_>, format: i32,
+) {
+    if !crate::fsr::live() { return; }
+    let fresh = lock(&SUBMITTED).as_ref()
+        .filter(|n| n.id > PRESENTED_ID.load(Relaxed))
+        .map(|n| {
+            PRESENTED_ID.store(n.id, Relaxed);
+            crate::fsr::Inputs { depth: n.depth.owned(), motion: n.motion.owned(), camera: n.camera, frame_ms: n.frame_ms }
+        });
+    let hudless = if planes.overlay.is_some() {
+        Some((planes.base.0.clone(), planes.base.1))
+    } else { hudless_for(planes.base.0).map(|t| (t, COPY_DEST)) };
+    crate::fsr::prepare(device, list, planes.size, format, fresh, hudless, framegen_wanted() != 0);
 }
 
 /// The planes a present shows (Series S: the scene and the interface over
@@ -1605,18 +1644,20 @@ fn framegen_wanted() -> u32 {
 /// Whether frame generation can be switched and changed while the title runs: it was planned
 /// at the start, so our swap chain is Streamline's proxy (the F1 menu asks).
 pub(crate) fn framegen_live() -> bool {
-    FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire)
+    (FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire)) || crate::fsr::live()
 }
 
 /// Asks frame generation off (0) or for `times` frames shown for each one rendered (2..6),
 /// from the next present on.
 pub(crate) fn set_framegen(times: u32) {
-    FG_WANTED.store(if times == 0 { 0 } else { times.clamp(2, 6) }, Relaxed);
-    tracing::info!(times, "DLSS Frame Generation: asked from the settings menu");
+    let times = if times == 0 { 0 } else if crate::fsr::selected() { 2 } else { times.clamp(2, 6) };
+    FG_WANTED.store(times, Relaxed);
+    tracing::info!(times, backend = if crate::fsr::selected() { "FSR" } else { "DLSS" }, "Frame Generation: asked from the settings menu");
 }
 
 /// For the frame-rate texts: frames shown for each one rendered (1 without frame generation).
 pub(crate) fn shown_per_frame() -> u32 {
+    if crate::fsr::live() { return crate::fsr::per_frame(); }
     FG_PER.load(Relaxed).max(1)
 }
 
@@ -1662,6 +1703,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
 /// Our swap chain's buffers are about to be made again: frame generation is
 /// off until the next present with an upscaling (Streamline asks so).
 pub(crate) fn resizing() {
+    crate::fsr::resizing();
     if !FG_READY.load(Acquire) || !SWAP_CHAIN_PROXIED.load(Acquire) {
         return;
     }
@@ -1688,6 +1730,7 @@ pub(crate) fn resizing() {
 /// stand-in depth and motion vectors tagged, frame generation on. The lines
 /// say what happened.
 pub fn check(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
+    if crate::fsr::selected() { return fsr_check(output, device, present); }
     let mut lines = check_run(output, device, present);
     lines.extend(shut_down());
     lines
@@ -1869,6 +1912,7 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
                 depth: Source::Fixed(depth.clone(), SHADER_READ),
                 motion: Source::Fixed(motion.clone(), SHADER_READ),
                 camera,
+                frame_ms: 16.667,
             });
             if let Some(copy) = &copy {
                 lock(&HUD_SUBMITTED).push(Copied { id: frame, target: base.as_raw() as usize, texture: copy.clone() });
@@ -1898,6 +1942,121 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
 const SHADER_READ: u32 = 0xc0;
 const UNORDERED: u32 = 0x8;
 const COPY_DEST: u32 = 0x400;
+
+/// Exercises the actual FSR swap chain without a title or NVIDIA runtime.
+fn fsr_check(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
+    if output[0] < 64 || output[1] < 64 || output[0] > 8192 || output[1] > 8192 {
+        return vec!["FAIL: FSR check output dimensions must be between 64 and 8192.".into()];
+    }
+    if let Err(e) = crate::fsr::init() { return vec![format!("FAIL: FSR unavailable: {e}")]; }
+    let mut lines = vec!["FSR API loaded; GPU support is established by context creation/dispatch.".into()];
+    if !device { return lines; }
+    let Some(host) = crate::host::host() else { return vec!["FAIL: No D3D12 device".into()]; };
+    if !present { lines.push("D3D12 device ready; use --present to exercise FSR.".into()); return lines; }
+    CHECKING.store(true, Relaxed);
+    set_framegen(2);
+    let before = crate::fsr::counts();
+    let presents_before = crate::fsr::presentation_counts();
+    // Exercise the low-FPS presenter with PresentMon without launching a title.
+    let check_frame_ms = std::env::var("VICTORY_FSR_CHECK_FRAME_MS").ok()
+        .and_then(|v| v.parse::<u64>().ok()).unwrap_or(16).clamp(4, 250);
+    let result = (|| -> windows::core::Result<()> {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let render = [output[0] / 2, output[1] / 2];
+        let depth = texture(&host.device, render, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 0x10)?;
+        let motion = texture(&host.device, render, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 4)?;
+        let rtv: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 3, ..Default::default()
+        })? };
+        let dsv: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, ..Default::default()
+        })? };
+        let rh = unsafe { rtv.GetCPUDescriptorHandleForHeapStart() };
+        let bh = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rh.ptr + unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) } as usize };
+        let uh = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: bh.ptr + (bh.ptr - rh.ptr) };
+        let dh = unsafe { dsv.GetCPUDescriptorHandleForHeapStart() };
+        unsafe {
+            host.device.CreateRenderTargetView(&motion, None, rh);
+            host.device.CreateDepthStencilView(&depth, None, dh);
+        }
+        let init = host.new_list()?;
+        unsafe {
+            init.list.ClearRenderTargetView(rh, &[0.0; 4], None);
+            init.list.ClearDepthStencilView(dh, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+            init.list.ResourceBarrier(&[
+                crate::host::transition(&motion, D3D12_RESOURCE_STATES(4), D3D12_RESOURCE_STATES(SHADER_READ as i32)),
+                crate::host::transition(&depth, D3D12_RESOURCE_STATES(0x10), D3D12_RESOURCE_STATES(SHADER_READ as i32)),
+            ]);
+        }
+        init.close();
+        host.execute_sync_internal(&init);
+        for phase in 0..2 {
+            let size = [output[0] + phase * 64, output[1]];
+            let base = texture(&host.device, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 4)?;
+            let hudless = texture(&host.device, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, COPY_DEST)?;
+            let ui = texture(&host.device, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 4)?;
+            unsafe {
+                host.device.CreateRenderTargetView(&base, None, bh);
+                host.device.CreateRenderTargetView(&ui, None, uh);
+            }
+            for n in 0..60 {
+                let frame = u64::from(phase * 60 + n + 1);
+                if n == 20 { set_framegen(0); }
+                if n == 0 || n == 25 { set_framegen(2); }
+                let list = host.new_list()?;
+                unsafe {
+                    list.list.ClearRenderTargetView(bh, &[0.02, 0.05, 0.1, 1.0], None);
+                    let x = (n * size[0] / 60) as i32;
+                    let rect = windows::Win32::Foundation::RECT { left: x, top: 0, right: (x + 64).min(size[0] as i32), bottom: size[1] as i32 };
+                    list.list.ClearRenderTargetView(bh, &[0.8, 0.25, 0.05, 1.0], Some(&[rect]));
+                    list.list.ResourceBarrier(&[crate::host::transition(&base, D3D12_RESOURCE_STATES(4), D3D12_RESOURCE_STATES(0x800))]);
+                    list.list.CopyResource(&hudless, &base);
+                    list.list.ResourceBarrier(&[crate::host::transition(&base, D3D12_RESOURCE_STATES(0x800), D3D12_RESOURCE_STATES(4))]);
+                    let rect = windows::Win32::Foundation::RECT { left: 20, top: 20, right: 160.min(size[0] as i32), bottom: 60 };
+                    list.list.ClearRenderTargetView(uh, &[0.0; 4], None);
+                    list.list.ClearRenderTargetView(if phase == 0 { bh } else { uh }, &[0.8, 0.8, 0.8, 0.8], Some(&[rect]));
+                }
+                list.close();
+                host.execute_sync_internal(&list);
+                if !(35..40).contains(&n) {
+                    let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
+                    *lock(&SUBMITTED) = Some(Noted {
+                        id, depth: Source::Fixed(depth.clone(), SHADER_READ), motion: Source::Fixed(motion.clone(), SHADER_READ),
+                        camera: plan::Camera {
+                            jitter: [0.0; 2], motion_scale: [render[0] as f32, render[1] as f32],
+                            render, output: size, near: 0.1, far: 1000.0, fov_y: 1.0, reset: n == 0, flags: 0,
+                        }, frame_ms: check_frame_ms as f32,
+                    });
+                }
+                if phase == 0 {
+                    lock(&HUD_SUBMITTED).push(Copied { id: frame, target: base.as_raw() as usize, texture: hudless.clone() });
+                }
+                if host.present_planes(&base, 4, (phase == 1).then_some((&ui, 4)), frame).is_none() {
+                    return Err(windows::core::Error::empty());
+                }
+                unsafe { host.device.GetDeviceRemovedReason()?; }
+                std::thread::sleep(std::time::Duration::from_millis(check_frame_ms));
+            }
+        }
+        Ok(())
+    })();
+    host.drop_presenter();
+    let after = crate::fsr::counts();
+    let presents_after = crate::fsr::presentation_counts();
+    let present_real = presents_after.0 - presents_before.0;
+    let present_generated = presents_after.1 - presents_before.1;
+    lines.push(format!("FSR check: 120 presents, off/on, missing-input frames, resize and teardown; {} generated-frame dispatches, {} errors.",
+        after.0 - before.0, after.1 - before.1));
+    lines.push(format!("FSR presenter: {present_real} real and {present_generated} generated callbacks (not scanouts), {check_frame_ms} ms simulated render interval."));
+    match result {
+        Err(e) => lines.push(format!("FAIL: {e}")),
+        Ok(()) if after.0 == before.0 || after.1 != before.1 => lines.push("FAIL: no interpolation or SDK errors; see log.".into()),
+        Ok(()) if present_real != 120 || present_generated != after.0 - before.0 =>
+            lines.push("FAIL: presentation callbacks did not cover every rendered/generated frame.".into()),
+        Ok(()) => lines.push("PASS: interpolation dispatched and device healthy. Inspect motion/UI quality in-game separately.".into()),
+    }
+    lines
+}
 
 /// A stand-in texture for [`check`] (its contents are whatever the memory held).
 fn texture(
@@ -1930,6 +2089,7 @@ fn texture(
 
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
+    crate::fsr::line();
     let Some(plan) = PLAN.get() else { return };
     let [done, failed, forwarded, on, off, shown] =
         [&EVALUATED, &FAILED, &FORWARDED, &FG_ON, &FG_OFF, &FG_SHOWN].map(|c| c.swap(0, Relaxed));
