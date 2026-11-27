@@ -135,7 +135,16 @@ foreach ($k in $menu.Keys) {
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 # For the menu: what it shows as the current choices, where it saves, and how it starts the game again
-# (-More is not carried over a restart from the menu).
+# (including -More overrides such as CPU worker-pool tuning from play-gta6-framegen.ps1).
+$moreArg = ''
+if ($More.Count -gt 0) {
+    $pairs = foreach ($k in ($More.Keys | Sort-Object)) {
+        $ek = ([string]$k) -replace "'", "''"
+        $ev = ([string]$More[$k]) -replace "'", "''"
+        "'$ek'='$ev'"
+    }
+    $moreArg = " -More @{$($pairs -join ';')}"
+}
 $settings.VICTORY_MENU_CONSOLE = $console
 $settings.VICTORY_MENU_RES = $Res
 $settings.VICTORY_MENU_DLSS = if ($settings.VICTORY_DLSS -eq '1') { $Dlss } else { 'off' }
@@ -144,7 +153,7 @@ $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$moreArg"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
