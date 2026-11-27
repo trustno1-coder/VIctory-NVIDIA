@@ -160,9 +160,17 @@ fn tagged(buffer: &ID3D12Resource) -> Option<(usize, u64)> {
     (len == 16 && tag[0] < 2).then_some((tag[0] as usize, tag[1]))
 }
 
+/// Draws since the last frame-rate line of ours (the scene's weight, beside
+/// the time a frame took).
+pub(crate) static DRAWN: AtomicU64 = AtomicU64::new(0);
+/// The submitting thread's line since then, in microseconds: waiting with
+/// nothing in it, standing at something not met; and the looks that found
+/// it standing so.
+pub(crate) static SERVE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// A buffer of `kind` and exactly `size` bytes that nothing holds, mapped
-/// (and zeroed, as a new one is): the one let go last.
-pub(crate) fn take(kind: usize, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+/// (and zeroed if `zero`, as a new one is): the one let go last.
+pub(crate) fn take(kind: usize, size: u64, zero: bool) -> Option<(ID3D12Resource, *mut u8)> {
     if knob(REUSE) == 0 {
         return None;
     }
@@ -175,7 +183,7 @@ pub(crate) fn take(kind: usize, size: u64) -> Option<(ID3D12Resource, *mut u8)> 
     if unsafe { buffer.Map(0, None, Some(&mut data)) }.is_err() || data.is_null() {
         return None;
     }
-    if knob(ZERO) != 0 {
+    if zero && knob(ZERO) != 0 {
         // SAFETY: the buffer's mapping, `size` bytes of it; nothing else
         // holds the buffer.
         unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, size as usize) };
@@ -256,7 +264,17 @@ pub(crate) fn log(frames: f64) {
     let ms = lock(&BEFORE).replace(now).map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64() * 1000.0);
     let frames = frames.max(1.0);
     let switches: Vec<String> = KNOBS.iter().zip(&VALUES).map(|((name, _), v)| format!("{name}={}", v.load(Relaxed))).collect();
-    tracing::info!("lab: {frames:.0} frames in {ms:.0} ms, {:.2} ms a frame; switches: {}", ms / frames, switches.join(" "));
+    let serve: Vec<f64> = SERVE.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "lab: {frames:.0} frames in {ms:.0} ms, {:.2} ms a frame, {:.0} draws a frame; the submitting thread's line per frame: {:.2} ms \
+         with nothing in it, {:.2} ms standing at something not met ({:.1} looks); switches: {}",
+        ms / frames,
+        DRAWN.swap(0, Relaxed) as f64 / frames,
+        serve[0] / 1000.0,
+        serve[1] / 1000.0,
+        serve[2],
+        switches.join(" ")
+    );
     let mut sites = std::mem::take(&mut *lock(&SITES));
     if !sites.is_empty() {
         sites.sort_by_key(|s| std::cmp::Reverse(s.1[2]));

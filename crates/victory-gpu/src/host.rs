@@ -2465,7 +2465,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = host.upload_buffer_unset(size)?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
@@ -4029,6 +4029,10 @@ fn late_helper() {
             }
         };
         let Some(target) = target else {
+            // (Lab: the queues first; resetting lists takes its time.)
+            if crate::lab::knob(crate::lab::F) == 0 {
+                crate::queue::release_held(false);
+            }
             let mut helping = crate::timeline::span("helper: landed lists reset and given back");
             land();
             helping.next("helper: looking at what queues hold");
@@ -5678,10 +5682,20 @@ impl Host {
                 }
                 Late::Write(at, what, bytes) => {
                     what.write(at as *mut u8, bytes);
+                    // Lab: the submitting thread's line is told at once (it
+                    // stood at such a value 10 ms a frame, looking again
+                    // every millisecond, until the helper thread had reset
+                    // the landed lists and told it). Switch `f`=1: as before.
+                    if crate::lab::knob(crate::lab::F) == 0 {
+                        crate::queue::wake_behind();
+                    }
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
                 Late::Signal(fence, value) => {
                     crate::fence::set(fence as crate::object::This, value);
+                    if crate::lab::knob(crate::lab::F) == 0 {
+                        crate::queue::wake_behind();
+                    }
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -7921,6 +7935,9 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
+        // (Lab: of a size that comes again, so that one let go is found: run
+        // 34 had three made per frame, 3.6 ms each, none of a size seen before.)
+        let size = size.max(64 << 10).next_power_of_two();
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
@@ -9774,8 +9791,21 @@ impl Host {
 
     #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.upload_buffer_as(size, true)
+    }
+
+    /// [`Self::upload_buffer`] for memory whose every byte read is written
+    /// first (a list's scratch): one used again comes as it was left, as a
+    /// chunk does that the lists' own spare ones give.
+    #[track_caller]
+    pub(crate) fn upload_buffer_unset(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.upload_buffer_as(size, false)
+    }
+
+    #[track_caller]
+    fn upload_buffer_as(&self, size: u64, zero: bool) -> Option<(ID3D12Resource, *mut u8)> {
         let (site, began) = (std::panic::Location::caller(), std::time::Instant::now());
-        if let Some(again) = crate::lab::take(0, size) {
+        if let Some(again) = crate::lab::take(0, size, zero) {
             crate::lab::made(site, size, began, true);
             return Some(again);
         }
@@ -11082,7 +11112,7 @@ impl Host {
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (site, began) = (std::panic::Location::caller(), std::time::Instant::now());
         // Lab: one kept for use again comes first.
-        if let Some(again) = crate::lab::take(1, size) {
+        if let Some(again) = crate::lab::take(1, size, true) {
             crate::lab::made(site, size, began, true);
             return Some(again);
         }

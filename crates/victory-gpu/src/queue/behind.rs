@@ -269,14 +269,18 @@ impl<W: Work> Lane<W> {
             let (asked, limit) = {
                 let mut state = self.lock();
                 while state.asked == state.served {
+                    let began = Instant::now();
                     if state.items.is_empty() {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                        crate::lab::SERVE[0].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                     } else {
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
+                        crate::lab::SERVE[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+                        crate::lab::SERVE[2].fetch_add(1, Relaxed);
                         if out.timed_out() {
                             break;
                         }
