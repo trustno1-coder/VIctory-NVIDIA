@@ -6247,6 +6247,7 @@ impl Host {
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         crate::lab::burn(crate::lab::B);
         crate::lab::own_core(0);
+        crate::lab::submitter_priority();
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();

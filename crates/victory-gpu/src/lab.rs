@@ -62,9 +62,14 @@ pub(crate) const LISTS: usize = 17;
 /// time for each part of its work (1), for the line [`on_line`] writes: some
 /// 1,200 questions to the system a frame ([`cycles`]).
 pub(crate) const CYC: usize = 18;
+/// The submitting thread runs at the priority "highest" (1), where the
+/// title's own threads are, and the threads it shares its work with as well
+/// (2: `crate::cores::Priority`); 0: as made, above normal
+/// ([`submitter_priority`]).
+pub(crate) const P: usize = 19;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 19] = [
+const KNOBS: [(&str, i64); 20] = [
     ("reuse", 1),
     ("zero", 1),
     ("a", 0),
@@ -84,8 +89,33 @@ const KNOBS: [(&str, i64); 19] = [
     ("wide", 0),
     ("lists", 0),
     ("cyc", 0),
+    ("p", 0),
 ];
-static VALUES: [AtomicI64; 19] = [const { AtomicI64::new(0) }; 19];
+static VALUES: [AtomicI64; 20] = [const { AtomicI64::new(0) }; 20];
+
+/// Switch `p`, asked by the submitting thread before each submission: its
+/// priority is "highest" with 1 or 2, "above normal" (as made) with 0. (The
+/// title asks "highest" for some twenty threads of its own and gets it; the
+/// PC is 89 % busy in the room, and the submitting thread is off a processor
+/// 15 ms of a 45 ms frame inside its work, 9.5 ms of it under no wait of ours
+/// that has a name: run 52.)
+pub(crate) fn submitter_priority() {
+    thread_local! {
+        static APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !SUBMITS.get() {
+        return;
+    }
+    let high = knob(P) >= 1;
+    if APPLIED.get() == high {
+        return;
+    }
+    APPLIED.set(high);
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST};
+    // SAFETY: this thread's own priority.
+    let set = unsafe { SetThreadPriority(GetCurrentThread(), if high { THREAD_PRIORITY_HIGHEST } else { THREAD_PRIORITY_ABOVE_NORMAL }) } != 0;
+    tracing::info!("lab switch p: the submitting thread's priority is {}: {set}", if high { "highest" } else { "above normal" });
+}
 
 /// Switch `own`, asked by the submitting thread (`role` 0) before each
 /// submission and by the thread that lands flights (`role` 1) before each

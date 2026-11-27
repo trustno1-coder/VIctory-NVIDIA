@@ -146,7 +146,8 @@ fn helpers_raised() -> bool {
 /// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
 /// each piece of work; it asks the system only when the switch has changed.
 pub(crate) struct Priority {
-    applied: Option<bool>,
+    /// Raised, and to "highest" (lab switch `p` at 2).
+    applied: Option<(bool, bool)>,
 }
 
 impl Priority {
@@ -158,16 +159,20 @@ impl Priority {
 
     pub(crate) fn keep(&mut self) {
         use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_NORMAL,
         };
-        let on = helpers_raised();
-        if self.applied == Some(on) {
+        let want = (helpers_raised(), crate::lab::peek(crate::lab::P) >= 2);
+        if self.applied == Some(want) {
             return;
         }
-        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        let priority = match want {
+            (_, true) => THREAD_PRIORITY_HIGHEST,
+            (true, false) => THREAD_PRIORITY_ABOVE_NORMAL,
+            (false, false) => THREAD_PRIORITY_NORMAL,
+        };
         // SAFETY: our own thread.
         unsafe { SetThreadPriority(GetCurrentThread(), priority) };
-        self.applied = Some(on);
+        self.applied = Some(want);
     }
 }
 
