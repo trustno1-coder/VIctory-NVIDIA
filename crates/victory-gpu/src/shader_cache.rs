@@ -95,6 +95,11 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
             bytes.push(0);
         }
+        // And the NaN scrub (`VICTORY_NAN_SCRUB=1`), only while it is on, as above.
+        if std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1") {
+            bytes.extend_from_slice(b"VICTORY_NAN_SCRUB=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes

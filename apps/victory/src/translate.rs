@@ -203,8 +203,15 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                                 counts[3].fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
+                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash.clone()) {
                                 continue;
+                            }
+                            // `VICTORY_SHADER_SAVE=<dir>` (outside the repository): each container asked for,
+                            // as `<hash>.cdxil`, for `shader-info --disasm` and `translate --list`.
+                            if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE")
+                                && victory_core::ensure_outside_repo(Path::new(&dir)).is_ok()
+                            {
+                                let _ = std::fs::write(Path::new(&dir).join(format!("{hash}.cdxil")), &bytes);
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(1000) {

@@ -47,7 +47,36 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || n == F9_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// The frame F9 asked for (with a capture folder): treated as listed.
+static F9_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// At the present of `frame`, with a capture folder: F9 pressed (our window in front) asks for
+/// frame + 2, the first one recorded wholly after the press.
+fn poll_f9(frame: u64) {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F9};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    if folder().is_none() {
+        return;
+    }
+    // SAFETY: a plain query.
+    let down = unsafe { GetAsyncKeyState(i32::from(VK_F9)) } < 0;
+    if DOWN.swap(down, Relaxed) || !down {
+        return;
+    }
+    let mut process = 0;
+    // SAFETY: plain queries; room for the answer.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
+    if process == std::process::id() {
+        F9_FRAME.store(frame + 2, Relaxed);
+        tracing::info!(frame = frame + 2, "F9: this frame and its targets are captured");
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -126,6 +155,7 @@ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    poll_f9(frame);
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
     if world_on()
@@ -462,11 +492,19 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
+        let name = format!(
+            "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+            d.Width, d.Height, d.Format.0
+        );
+        // `VICTORY_DUMP_RAW=1`: the rows as read back too (`<name>-pitch<p>.raw`), for the values the
+        // PNG's normalization hides; targets up to 1500 texels wide.
+        if f.Width <= 1500
+            && std::env::var_os("VICTORY_DUMP_RAW").is_some_and(|v| v == "1")
+            && let Some(folder) = folder()
+        {
+            let _ = std::fs::write(folder.join(format!("{name}-pitch{pitch}.raw")), rows);
+        }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");

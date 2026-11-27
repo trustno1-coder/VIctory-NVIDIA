@@ -3718,6 +3718,9 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if self.sky_miss_left_out(p) {
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3764,6 +3767,34 @@ impl State {
         }
     }
 
+    /// Which surfaces a dispatch of the reflections' miss program (`CS_RayMiss`) is of: its first
+    /// root constant (`crate::ambient::MISS_OPAQUE`, `MISS_ALPHA`, then water's); `u32::MAX` if unknown.
+    fn miss_layer(&self, p: &HostPipeline) -> u32 {
+        p.stages
+            .first()
+            .map(|s| s.translated())
+            .and_then(|t| t.used.iter().find(|u| u.root == RootType::Constants))
+            .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                Some(Root::Constants(c)) => c.first().copied(),
+                _ => None,
+            })
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Whether this dispatch of `p` is the reflections' miss program for opaque or transparent
+    /// surfaces, which is left out (`VICTORY_RAYMISS_KEEP=1`: run, as before). Without the
+    /// ray-tracing structures nearly every ray the screen-space march does not resolve reaches it,
+    /// and it gives each the sky's light: on floors seen at a grazing angle, a white grain the
+    /// title's denoiser cannot smooth (play session 2026-11-27, the house's parquet). Left out,
+    /// those rays keep what the screen-space passes found. Water's are kept: without them its
+    /// reflections hold earlier frames' bytes.
+    fn sky_miss_left_out(&self, p: &HostPipeline) -> bool {
+        static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        !*KEEP.get_or_init(|| crate::switch::on("VICTORY_RAYMISS_KEEP"))
+            && p.stages.first().and_then(|s| s.shader.ambient) == Some(crate::ambient::Role::Miss)
+            && matches!(self.miss_layer(p), crate::ambient::MISS_OPAQUE | crate::ambient::MISS_ALPHA)
+    }
+
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
@@ -3775,15 +3806,7 @@ impl State {
         // constant): water's reflections are left as they are (the depth
         // here is of what lies under it).
         let layer = match role {
-            Role::Miss => t
-                .used
-                .iter()
-                .find(|u| u.root == RootType::Constants)
-                .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
-                    Some(Root::Constants(c)) => c.first().copied(),
-                    _ => None,
-                })
-                .unwrap_or(u32::MAX),
+            Role::Miss => self.miss_layer(p),
             _ => 0,
         };
         // The alpha layer only with VICTORY_AMBIENT_SPECULAR_ALPHA=1: its pixels
@@ -5088,6 +5111,10 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
+        if kind == DISPATCH && self.sky_miss_left_out(p) {
+            once!("reflections' miss program left out for opaque and transparent surfaces (VICTORY_RAYMISS_KEEP=1 runs it)");
+            return false;
+        }
         // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the
@@ -5628,6 +5655,18 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // `VICTORY_DUMP_READS=1`: textures shaders read are dumped with the targets too
+            // (a pass's input written in an earlier frame, which no pass of the frame writes).
+            #[cfg(feature = "diagnostics")]
+            {
+                static READS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                // Only textures the card writes (targets, depth, unordered access), not materials.
+                if *READS.get_or_init(|| crate::switch::on("VICTORY_DUMP_READS"))
+                    && crate::resource::host_copy(*resource as This).is_some_and(|t| t.flags() & 0x7 != 0)
+                {
+                    crate::capture::note_target(*resource as This);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             if tracing::enabled!(tracing::Level::DEBUG)
                 && let Some(t) = crate::resource::host_resource(*resource as This)

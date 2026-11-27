@@ -1750,8 +1750,9 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         // `VICTORY_FRAMEGEN_X=2..6`: frames shown for each one rendered (2 unless set), no more
         // than this card and driver generate (the state says how many: 5 on an RTX 50).
         let mut generated = wanted.max(2) - 1;
-        if on
-            && generated > 1
+        // Off too: Streamline refuses an off with more frames than the card makes ("invalid state"), and
+        // it was asked again at every present (711 times in a run with the menu's 4X on an RTX 40).
+        if generated > 1
             && let Some(get_state) = functions.dlssg_get_state
         {
             let mut state = abi::DlssgState::default();
