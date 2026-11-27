@@ -18,6 +18,14 @@ Put them next to your own `game_scarlett_master.exe` and double-click `PLAY.cmd`
 1. If faces invisible restart game once
 2. If low FPS turn down DLSS, or turn off RT
 3. If crash post .dmp and .log
+4. If the crash says `DXGI_ERROR_...` (device removed, device hung, driver reset), the card stopped answering.
+   This layer pushes the GPU harder and longer than most games do, so:
+   - **Take off any GPU overclock or undervolt first** (MSI Afterburner, the NVIDIA app's auto-tune). Settings that
+     are stable in other games often aren't here. Test at stock clocks.
+   - **Give Windows more time before it resets the GPU (TDR).** Long shader and BVH work can pass Windows' 2-second
+     limit. In `regedit`, open `HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`, add a
+     `DWORD (32-bit)` named `TdrDelay` with the value `10` (decimal), and reboot. Delete it to go back.
+   - Still crashing at stock clocks with `TdrDelay`? Post the `.dmp` and `.log` as an issue.
 
 ## The launcher, `PLAY.cmd`
 
