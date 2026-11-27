@@ -32,6 +32,8 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Made once, from the command line: its size does not matter.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {

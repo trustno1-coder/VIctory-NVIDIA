@@ -306,7 +306,7 @@ fn rest() -> u32 {
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     #[cfg(feature = "diagnostics")]
-    let batched = source == batch::SOURCE;
+    let _batched = source == batch::SOURCE;
     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -2675,6 +2675,15 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         let _ = host.log_messages();
         let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        // The clamp as with `VICTORY_INDIRECT_REST=1` (off by default since
+        // 545f890): a record that does not fit takes the rest of the budget,
+        // so what the big records spend shows in the small one after them.
+        let rest = make_from(&host.device, &SOURCE.replace("REST ?", "true ?")).expect("the clamp must compile");
+        let bound = |src: (&ID3D12Resource, u64), spec: (u32, u32, u32)| {
+            let bytes = validate_layout(spec, src.1, None)?;
+            let (budget, dst) = (list.budget()?, list.indirect_scratch(bytes)?);
+            clamp_into(&list, &rest, &dst, budget, src, None, spec, false).then_some(dst)
+        };
         const KIND_DISPATCH: u32 = 2;
         const STRIDE: u32 = 12;
         let signature = {
@@ -2724,8 +2733,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
-            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+            bound((&big, 0), (KIND_DISPATCH, STRIDE, 3)).unwrap();
+            let scratch = bound((&small, 0), (KIND_DISPATCH, STRIDE, 1)).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
             unsafe {
@@ -2746,7 +2755,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         }
         // A recording with only the small record: the budget is empty
         // again, so it runs.
-        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        let scratch = bound((&small, 0), (KIND_DISPATCH, STRIDE, 1)).unwrap();
         // SAFETY: as above.
         unsafe {
             list.list.SetComputeRootSignature(&worker.root);
@@ -3153,7 +3162,10 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        // A record that does not fit takes the rest (`VICTORY_INDIRECT_REST=1`,
+        // off by default since 545f890): the budget this test charges.
+        let source = batch::SOURCE.replace("REST ?", "true ?");
+        let pass = make_from(&warp.device, &source).expect("the batched clamp must compile on WARP");
         const BUDGET: u32 = 1 << 27;
         // 2^26 vertices each, as much as a draw is let run: two fill it.
         for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
@@ -3530,6 +3542,7 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
+        #[allow(dead_code)]
         depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
