@@ -289,9 +289,94 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        // A compute pipeline with `compute_waits`: made here, or waited for
+        // while a worker makes it. The first 600 frames (loading) make
+        // theirs whatever it costs; later frames only while under `compute_cap`.
+        let frame = crate::frame::current();
+        let early = frame < 600;
+        if p.graphics.is_none() && compute_waits() && (early || compute_room(frame)) {
+            let began = std::time::Instant::now();
+            p.make();
+            if !early {
+                compute_spent(frame, began.elapsed());
+            }
+        } else {
+            wait(p, frame);
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once, when a scene changes
+/// (a buffer reset or cleared), and what they leave is read for as long as
+/// the scene lasts. In the prison corridor a compute program met for the
+/// first time took 4.4 s to make on a 16 GB machine; its one dispatch was
+/// dropped after the half second of budget, and the windows of the room
+/// before stayed blended over the whole picture for minutes (run 195).
+/// A wait of seconds once (the pipeline library has it on the next run)
+/// against a picture wrong until the scene ends.
+/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as
+/// before.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// The most a frame waits for compute pipelines made at their dispatch
+/// ([`compute_waits`]), over all threads, before its later dispatches go
+/// back to the frame's budget ([`wait`]). With a new cache the first
+/// cutscene met 457 compute programs in one frame at about a second each:
+/// the frame did not end for over 30 s and the title's own hang watchdog
+/// stored to address 0. Capped, the frame ends and the rest are made by
+/// the workers and waited for within the budget, as before
+/// [`compute_waits`]. The check comes before a make, so a frame can run
+/// over by the makes already started on other threads (seconds each):
+/// `VICTORY_PIPELINE_COMPUTE_WAIT_MS`, 8,000 by default, leaves room for
+/// that under the watchdog's 30 s.
+fn compute_cap() -> std::time::Duration {
+    static MS: OnceLock<u64> = OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(8_000)
+    }))
+}
+
+/// The frame whose compute waits are counted, and the microseconds counted.
+static COMPUTE_WAITED: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
+/// Whether frame `frame` may still wait for a compute pipeline ([`compute_cap`]).
+fn compute_room(frame: u64) -> bool {
+    let mut w = COMPUTE_WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    if w.0 != frame {
+        *w = (frame, 0);
+    }
+    let room = u128::from(w.1) < compute_cap().as_micros();
+    if !room {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                frame,
+                cap_ms = u64::try_from(compute_cap().as_millis()).unwrap_or(u64::MAX),
+                "a frame waited its cap for compute pipelines; the rest wait within its budget (said once)"
+            );
+        }
+    }
+    room
+}
+
+/// Counts a compute wait to `frame`, if that is still the frame counted.
+fn compute_spent(frame: u64, took: std::time::Duration) {
+    let mut w = COMPUTE_WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    if w.0 == frame {
+        w.1 = w.1.saturating_add(u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
