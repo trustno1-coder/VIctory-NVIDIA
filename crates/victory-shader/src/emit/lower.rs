@@ -720,7 +720,13 @@ pub(super) fn scalar_splits(p: &Program, st: &Structured) -> Option<Vec<usize>> 
                 differ && through
             })
         });
-        if mixes {
+        // WRITELANE ignores EXEC, including for its selected destination lane.
+        // Execute the containing branch wave-wide so that an inactive target lane
+        // is present. Keep the branch's wave-any test: an empty branch does not run.
+        let writes_lane = p.blocks.iter().enumerate().any(|(b, block)| {
+            region[b] && block.insts.iter().any(|inst| inst.name() == "v_writelane_b32")
+        });
+        if mixes || writes_lane {
             out.push(d);
         }
     }
@@ -1591,6 +1597,17 @@ pub(super) fn wave_wide_on() -> bool {
     THREAD_WAVE_WIDE.get() || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
 }
 
+/// Correct scalar/mask state in a single complete guest-wave group by default.
+/// All threads share its decision, so the existing group barriers are valid.
+/// Larger groups still need the explicit paired-wave policy; an explicit 0
+/// retains the upstream opt-out.
+pub(super) fn wave_state_wide_on(native: &NativeProgram) -> bool {
+    wave_wide_on()
+        || (std::env::var_os("VICTORY_WAVE_WIDE").is_none()
+            && native.wave64
+            && matches!(native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64))
+}
+
 thread_local! {
     pub(super) static THREAD_WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1864,6 +1881,8 @@ impl<'a> Lower<'a> {
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            // A first-lane read also needs the guest wave: two host halves may have
+            // different first values even when no readlane or mask-as-data is present.
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -1873,7 +1892,7 @@ impl<'a> Lower<'a> {
                     || n.contains("permute")
                     || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || matches!(n, "v_readfirstlane_b32" | "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
@@ -1894,7 +1913,7 @@ impl<'a> Lower<'a> {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
-                        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        || matches!(n, "v_readfirstlane_b32" | "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
@@ -8466,7 +8485,9 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        let mut guard = self.guard(b, i)?;
+        // Unlike ordinary VALU writes, WRITELANE writes its selected lane
+        // regardless of EXEC. scalar_splits keeps that lane in the host branch.
+        let mut guard = if name == "v_writelane_b32" { None } else { self.guard(b, i)? };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d)?;
             guard = match (guard, enable) {
@@ -13395,14 +13416,15 @@ impl<'a> Lower<'a> {
     /// `emit`'s retry, which takes the branch wave-wide. Compute programs (console lanes), not
     /// with each host wave on its own, not with `VICTORY_WAVE_WIDE=0` (no such retry) nor in
     /// [`with_per_lane_compare_joins`]; a console wave run as two host waves only with
-    /// `VICTORY_WAVE_WIDE=1`, as its wave-wide branches need group barriers.
+    /// `VICTORY_WAVE_WIDE=1`, or a single complete guest-wave group where those
+    /// group barriers synchronize exactly the guest wave.
     fn compare_zeros(&self) -> bool {
         self.mask_data == MaskData::Console
             && !LOCAL_WAVES.get()
             && !LOCAL_ANY.get()
             && !PER_LANE_COMPARE_JOINS.get()
             && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0")
-            && (!(self.x.native.wave64 && host_max_wave() == 32) || wave_wide_on())
+            && (!(self.x.native.wave64 && host_max_wave() == 32) || wave_state_wide_on(self.x.native))
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {

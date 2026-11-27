@@ -2089,3 +2089,94 @@ fn widen_takes_scalar_splits_only_when_asked() {
     // data, retried later on the full path)
     assert!(!matches!(&off, Ok(d) if *d == on), "with the switch off the branch is not taken for its scalar: {off:?}");
 }
+
+/// A standalone first-lane read must exchange the two halves of a guest wave64,
+/// even when no other instruction needs a cross-lane operation.
+#[test]
+fn oracle_standalone_firstlane_uses_the_whole_guest_wave() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let gpu = Gpu { host };
+    let mut failures = Vec::new();
+    for wave64 in [false, true] {
+        for raw_masks in [false, true] {
+            for v in [0, 2, 5, 6] {
+                let p = Prog {
+                    wave64,
+                    seeds: [0xafbc4671, 0xb3a03bb2, 0x64f94275, 0x16b77dd8],
+                    body: vec![Item::I(Inst::FirstLane { dst: 20, v })],
+                    raw_masks,
+                };
+                let outcome = check(&gpu, &p);
+                if !matches!(outcome, Outcome::Same) {
+                    failures.push(format!("wave64={wave64} raw_masks={raw_masks} v={v}: {outcome:?}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The default path must preserve scalar and mask state across a divergent branch
+/// when one compute group is exactly one guest wave.
+#[test]
+fn oracle_single_wave_branch_state_is_correct_by_default() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let gpu = Gpu { host };
+    let mut failures = Vec::new();
+    for wave64 in [false, true] {
+        for s0 in [9, 40] {
+            for raw_masks in [false, true] {
+                for body in [
+                    vec![lane_split(vec![], Some(vec![Item::I(Inst::Cmp {
+                        cmp: Cmp::Ge, signed: false, a: Src::V(7), b: 2,
+                    })]))],
+                    vec![lane_split(vec![mov_s(21, -3)], None)],
+                ] {
+                    let p = Prog { wave64, seeds: [s0, 3, 0x1234, 0x5678], body, raw_masks };
+                    let outcome = check(&gpu, &p);
+                    if !matches!(outcome, Outcome::Same) {
+                        failures.push(format!("wave64={wave64} s0={s0} raw_masks={raw_masks}: {outcome:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// WRITELANE updates its selected VGPR lane even if that lane is outside EXEC.
+/// The branch must still be skipped when no lane enters it.
+#[test]
+fn oracle_writelane_reaches_inactive_destinations() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let gpu = Gpu { host };
+    let mut failures = Vec::new();
+    for wave64 in [false, true] {
+        for s0 in [u32::MAX, 9, 40, 70] {
+            for lane in [0, 31, 32, 63, 95] {
+                for in_else in [false, true] {
+                    let write = Item::I(Inst::WriteLane { dst: 5, val: Src::Int(58), lane: Src::S(1) });
+                    let branch = if in_else { lane_split(vec![], Some(vec![write])) } else { lane_split(vec![write], None) };
+                    let p = Prog { wave64, seeds: [s0, lane, 0x1234, 0x5678], body: vec![branch], raw_masks: true };
+                    let outcome = check(&gpu, &p);
+                    if !matches!(outcome, Outcome::Same) {
+                        failures.push(format!("wave64={wave64} s0={s0} lane={lane} else={in_else}: {outcome:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

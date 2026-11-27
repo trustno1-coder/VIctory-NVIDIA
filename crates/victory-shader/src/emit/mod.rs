@@ -528,14 +528,15 @@ pub fn emit(
     // A scalar a per-lane branch's region writes and a join after it reads
     // (`lower::scalar_splits`): the console's wave runs that region once for every lane, so
     // those branches are taken wave-wide, as the console takes them. A console wave run as
-    // two host waves needs group barriers inside them (`VICTORY_WAVE_WIDE=1`, see below);
+    // two host waves needs group barriers inside them: automatic for one complete
+    // guest-wave group, otherwise `VICTORY_WAVE_WIDE=1` (see below);
     // without it, and wherever the branches cannot be widened, the per-lane form stays.
     // `VICTORY_SCALAR_SPLITS=0`: not looked for. (Found by the RDNA2 oracle, `oracle_tests`.)
     if native.stage == HwStage::Cs && lower::scalar_splits_on() {
         let splits = lower::scalar_splits(p, st).unwrap_or_default();
         let halves = native.wave64 && lower::host_max_wave() == 32;
         let wide_on = lower::wave_wide_on();
-        if !splits.is_empty() && (!halves || wide_on) {
+        if !splits.is_empty() && (!halves || lower::wave_state_wide_on(native)) {
             let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
             match widen(c, native, p, Some(&splits), why, false, wide_on) {
                 Ok((shader, wave)) if !(halves && wave == Some(64)) => {
