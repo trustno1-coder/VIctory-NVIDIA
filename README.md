@@ -129,6 +129,29 @@ tuned for **NVIDIA RTX** cards.
 > by the title's developer or publisher, nor by NVIDIA. See
 > [docs/asset-policy.md](docs/asset-policy.md).
 
+## Keyboard and mouse
+
+The title reads pads only, so keyboard and mouse reach it as a pad. The
+defaults follow the PC layout of the series; **F2** (or F1, KEYBOARD AND MOUSE)
+changes any of them, in use at once and saved.
+
+| On foot | Key | In a vehicle | Key |
+|---|---|---|---|
+| Move | W A S D | Accelerate / brake, reverse | W / S |
+| Enter vehicle, interact | F | Leave vehicle | F |
+| Jump, climb | Space | Steer | A / D |
+| Sprint | Shift | Handbrake | Space |
+| Crouch | Ctrl | Horn, nitro | E |
+| Take cover | Q | Headlights | H |
+| Aim / shoot | Right / left mouse button | Shoot | Left mouse button |
+| Melee | R | Lean (aircraft: nose) | Num 8 / Num 5 |
+
+Both: weapon wheel Tab, look behind C, map M, pause Esc or P, phone, radio and
+objective on the arrow keys, the mouse looks around. There is a profile for
+each, since the pad's controls differ: F switches it, Caps Lock too, and a key
+that only does something in the other profile (Shift after leaving a car)
+switches to that one. The frame rate line shows it (`KEYS: ON FOOT`).
+
 ## Built from many projects, and from running every one of them
 
 This repository did not come from one place, and the base it stands on today
