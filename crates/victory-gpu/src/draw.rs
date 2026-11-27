@@ -3941,10 +3941,27 @@ impl State {
             }),
             Role::Radiance | Role::Air => image,
         };
+        // The rays' image alone, for a miss program whose tables hold no depth
+        // of the picture (`crate::ambient::without_depth`).
+        let without_depth = |of: &D3D12_RESOURCE_DESC, image: D3D12_GPU_DESCRIPTOR_HANDLE| {
+            role == Role::Miss
+                && of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && of.Format.0 == 26
+                && crate::ambient::without_depth(list, &Views {
+                    image,
+                    depth: image,
+                    size: [of.Width as u32, of.Height],
+                    slices: 1,
+                    depth_size: [of.Width as u32, of.Height],
+                })
+        };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
+            // With the image and no depth: the light around, without a
+            // direction, if that is asked for.
+            let bound = image.is_some_and(|(of, image)| without_depth(&of, image));
             if role == Role::Miss {
-                crate::ambient::note_miss(MissNote::NotReady);
+                crate::ambient::note_miss(if bound { MissNote::Bound } else { MissNote::NotReady });
                 // Once per program: what its tables hold, so one run names
                 // the place of the rays' image and of the depth.
                 static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -3975,7 +3992,7 @@ impl State {
                     tracing::info!(program = %p.name, tables = %held.join("; "), "reflections stand-in: a miss program whose rays' image or depth was not found");
                 }
             }
-            return false;
+            return bound;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
@@ -4003,6 +4020,11 @@ impl State {
         };
         if of.Format.0 != format || !sizes || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            // The image is the rays', the depth found is not the picture's.
+            if without_depth(&of, image) {
+                crate::ambient::note_miss(MissNote::Bound);
+                return true;
+            }
             if role == Role::Miss {
                 crate::ambient::note_miss(MissNote::NotReady);
             }

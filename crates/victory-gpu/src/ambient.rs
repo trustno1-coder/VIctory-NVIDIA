@@ -388,6 +388,36 @@ void reflect_light(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef BOUND
+RWTexture2D<float3> reflected : register(u0);
+// The same image where the scene's depth was not among the program's tables
+// (no point, no normal, so no reflected direction): each texel takes the
+// light the points around the surface seen there hold, whatever its
+// direction, and the room's slow mean before any point was gathered
+// (`strength`: 1 once they were). `level` and `constant` as above.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void bound_light(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    reflected.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float3 found = cells[CELLS].rgb;
+    if (strength > 0.0) {
+        uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+        uint at0 = (q.y * PX + q.x) * 3;
+        float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        found = lerp(seen_there, found, 0.2);
+    }
+    found *= level;
+    found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
+    float3 was = reflected[at.xy];
+    was = any(isnan(was)) || any(isinf(was)) ? 0.0 : max(was, 0.0);
+    float has = dot(was, LUMA);
+    was *= min(1.0, dot(found, LUMA) / max(has, 1e-6));
+    reflected[at.xy] = lerp(found, was, constant);
+}
+#endif
+
 #ifdef RAISE
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
@@ -507,6 +537,8 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     reflect: ID3D12PipelineState,
+    /// `None`: it did not compile (the others stand all the same).
+    bound: Option<ID3D12PipelineState>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -539,6 +571,9 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let reflect = pipeline("REFLECT", s!("reflect_light"))?;
+    let bound = pipeline("BOUND", s!("bound_light"))
+        .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for reflections without the scene's depth"))
+        .ok();
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -549,6 +584,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         reflect,
+        bound,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -575,6 +611,25 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
 /// to begin with.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the points have been gathered once (by either stand-in): what
+/// [`without_depth`] may read of them.
+static GATHERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `VICTORY_AMBIENT_SPECULAR_BOUND=1` (off by default): a dispatch of the miss
+/// program whose tables hold the rays' image and no depth of the picture is
+/// followed all the same, by [`without_depth`].
+///
+/// Why: in the title's first minutes (the office of the opening, sessions
+/// 2026-11-28 00:37 and 00:45) the place of the depth held a 1x1 texture and
+/// no table entry was a depth of twice the image's size, so the stand-in ran
+/// in no frame for about three minutes: 241 to 570 dispatches every ten
+/// seconds left with the sky's light, in a room a hundred times darker. Skin,
+/// glasses and eyes mirrored the sky.
+fn bound_asked() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_SPECULAR_BOUND").is_some_and(|v| v == "1"))
+}
+
 /// What the passes read and write, as views in the heap the list has set.
 pub(crate) struct Views {
     /// The image the title's program just wrote.
@@ -597,6 +652,8 @@ struct Said {
     frames: AtomicU64,
     water: AtomicU64,
     not_ready: AtomicU64,
+    /// Those followed without a depth ([`without_depth`]).
+    bound: AtomicU64,
     last_frame: AtomicU64,
     /// Bit 0 opaque surfaces, 1 alpha, 2 water, 3 others.
     layers: AtomicU64,
@@ -607,6 +664,7 @@ static SAID_MISS: Said = Said {
     frames: AtomicU64::new(0),
     water: AtomicU64::new(0),
     not_ready: AtomicU64::new(0),
+    bound: AtomicU64::new(0),
     last_frame: AtomicU64::new(u64::MAX),
     layers: AtomicU64::new(0),
 };
@@ -617,6 +675,8 @@ pub(crate) enum MissNote {
     Ran(u32),
     Water,
     NotReady,
+    /// Followed without a depth ([`without_depth`]).
+    Bound,
 }
 
 /// Counts what came of a dispatch of the miss program; every ten seconds an
@@ -642,6 +702,9 @@ pub(crate) fn note_miss(note: MissNote) {
         MissNote::NotReady => {
             s.not_ready.fetch_add(1, Relaxed);
         }
+        MissNote::Bound => {
+            s.bound.fetch_add(1, Relaxed);
+        }
     }
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -665,14 +728,76 @@ pub(crate) fn note_miss(note: MissNote) {
         "a stand-in for reflections (VICTORY_AMBIENT_SPECULAR={share},{sky}) in the last {:.0} s: \
          {} frames, {} dispatches of CS_RayMiss followed (surfaces: {}), each by an estimate along \
          the reflected direction put in right after it (before CS_ResolveScreenSpace); {} of water or the alpha layer \
-         and {} before a frame's light was kept left as the title had them",
+         and {} before a frame's light was kept left as the title had them; {} without a depth among their tables \
+         given the light around instead, whatever its direction (VICTORY_AMBIENT_SPECULAR_BOUND=1: now {})",
         now.duration_since(since).as_secs_f32(),
         s.frames.swap(0, Relaxed),
         s.ran.swap(0, Relaxed),
         if named.is_empty() { "none".to_owned() } else { named.join(", ") },
         s.water.swap(0, Relaxed),
         s.not_ready.swap(0, Relaxed),
+        s.bound.swap(0, Relaxed),
+        if bound_asked() { "on" } else { "off" },
     );
+}
+
+/// After a dispatch of the miss program whose tables hold the rays' image
+/// (`views.image`) and no depth of the picture, in `list` with the program's
+/// view heap set ([`bound_asked`]). No point and no normal can be had, so no
+/// reflected direction: every texel takes the light the points gathered
+/// around the surface seen there (last frame's, by its place on screen), and
+/// the room's slow mean before any were gathered. The screen-space resolve
+/// that comes next still writes what it found over it, as after [`after`].
+/// Replaces the list's compute root signature and pipeline; false if it
+/// recorded nothing (the switch is off, or no frame's light was kept yet).
+pub(crate) fn without_depth(list: &HostList, views: &Views) -> bool {
+    use std::sync::atomic::Ordering;
+    let Some(Specular { share, sky }) = specular() else {
+        return false;
+    };
+    if !bound_asked() || !KEPT.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(pass) = pass() else {
+        return false;
+    };
+    let Some(bound) = &pass.bound else {
+        return false;
+    };
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::info!(
+            size = ?views.size,
+            share,
+            sky,
+            "a stand-in for reflections without the scene's depth (VICTORY_AMBIENT_SPECULAR_BOUND=1)"
+        );
+    });
+    list.keep(&pass.cells);
+    list.keep(&pass.points);
+    let gathered = if GATHERED.load(Ordering::Relaxed) { 1.0f32 } else { 0.0 };
+    let mut words = [0u32; 12];
+    for (to, v) in words.iter_mut().zip([share, sky, gathered]) {
+        *to = v.to_bits();
+    }
+    let l = &list.list;
+    // SAFETY: an open list with the heap of the view set; the title's program
+    // has just written the image through this view, so its texture is in the
+    // state the view needs; the pass reads no depth (the table is given the
+    // image's view, as the keep is: `draw.rs`); buffers the list keeps.
+    unsafe {
+        uav_barrier(l);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(1, views.image);
+        l.SetComputeRootDescriptorTable(2, views.image);
+        l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetPipelineState(bound);
+        l.Dispatch(views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+        uav_barrier(l);
+    }
+    true
 }
 
 /// After the title's program of that role, in `list` with the program's view
@@ -753,6 +878,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
+                    GATHERED.store(true, Ordering::Relaxed);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
@@ -761,6 +887,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 // stand-in makes them later in the frame.
                 run(&pass.place, 8, 9, 1);
                 run(&pass.gather, 20, 45, 1);
+                GATHERED.store(true, Ordering::Relaxed);
                 run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
@@ -771,6 +898,27 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every pass compiles: one that did not would take the stand-in away
+    /// at the first frame (and the one without a depth, itself alone).
+    #[test]
+    fn the_passes_compile() {
+        let passes = [
+            ("KEEP", s!("keep")),
+            ("KEEP", s!("mean")),
+            ("PLACE", s!("place")),
+            ("GATHER", s!("gather")),
+            ("RAISE", s!("raise")),
+            ("AIR", s!("clear_air")),
+            ("REFLECT", s!("reflect_light")),
+            ("BOUND", s!("bound_light")),
+        ];
+        for (part, entry) in passes {
+            let code = crate::host::compile(&format!("#define {part}
+{SOURCE}"), entry, s!("cs_5_1"));
+            assert!(code.is_ok(), "{part}: {:?}", code.err());
+        }
+    }
 
     #[test]
     fn settings() {
