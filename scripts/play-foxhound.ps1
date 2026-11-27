@@ -4,6 +4,8 @@
 #   .\scripts\play-foxhound.ps1 -Exe 'D:\MyDump\game_scarlett_master.exe'
 #   .\scripts\play-foxhound.ps1 -Exe ... -Dlss off            the title's own upscaling, no DLSS
 #   .\scripts\play-foxhound.ps1 -Exe ... -Dlss balanced -FrameGen
+#   .\scripts\play-foxhound.ps1 -Exe ... -Fsr3FrameGen       FSR 3 frame generation, 2x (RTX 30-series, e.g. 3080 Ti:
+#                                                      DLSS frame generation needs an RTX 40 or later)
 #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)
 #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
@@ -25,6 +27,11 @@ param(
     [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance')][string]$Dlss = 'quality',
     # DLSS Frame Generation (RTX 40 or later, hardware-accelerated GPU scheduling on); needs DLSS.
     [switch]$FrameGen,
+    # FSR 3 Frame Generation, 2x (RTX 30-series and most other GPUs; DLSS upscaling stays on, only DLSS frame
+    # generation stays off — the title's own upscaling cannot run at 1440p, its shipping FSR4 takes 1920x1080
+    # out at most). Never together with -FrameGen: one frame-generation swap chain at a time. Needs the bridge
+    # built by Get-FSR3.cmd (fsr3-sdk\fsr3_bridge.dll + AMD's amd_fidelityfx_dx12.dll).
+    [switch]$Fsr3FrameGen,
     # Frames shown for each one rendered with -FrameGen: 2 to 6 (more than 2 needs an RTX 50; the layer asks the
     # driver how many this card does and gives no more).
     [ValidateRange(2, 6)][int]$FrameGenX = 2,
@@ -55,6 +62,13 @@ if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
     # 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).
     $FrameGen = $menu['VICTORY_MENU_FRAMEGEN'] -match '^[1-6]$'
     if ($menu['VICTORY_MENU_FRAMEGEN'] -match '^[2-6]$') { $timesWanted = [int]$menu['VICTORY_MENU_FRAMEGEN'] }
+}
+# FSR 3 frame generation: the F1 menu's VICTORY_MENU_FSR3_FG (2: on, 0: off) stands in for -Fsr3FrameGen.
+$fsr3Wanted = $Fsr3FrameGen
+if ($menu.Contains('VICTORY_MENU_FSR3_FG')) { $fsr3Wanted = $menu['VICTORY_MENU_FSR3_FG'] -eq '2' }
+if ($fsr3Wanted -and $FrameGen) {
+    Write-Host "Both DLSS frame generation and FSR 3 frame generation were asked for: DLSS wins, FSR 3 off."
+    $fsr3Wanted = $false
 }
 if ($menu['VICTORY_MENU_FPS'] -match '^\d+$' -and [int]$menu['VICTORY_MENU_FPS'] -ge 1 -and [int]$menu['VICTORY_MENU_FPS'] -le 1000) { $fpsWanted = [int]$menu['VICTORY_MENU_FPS'] }
 $settings = @{
@@ -88,6 +102,22 @@ if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
 }
+if ($fsr3Wanted) {
+    if ($Dlss -ne 'off') { Write-Host "FSR 3 frame generation on (2x): DLSS upscaling stays on, DLSS frame generation stays off." }
+    else { Write-Host "FSR 3 frame generation on (2x) with DLSS off: the title's own upscaling runs, which cannot run at 1440p (its shipping FSR4 takes 1920x1080 out at most)." }
+    # FSR 3's bridge: where VICTORY_FSR3_DIR says, else where Get-FSR3.cmd puts it.
+    $fsr3dir = if ($env:VICTORY_FSR3_DIR) { $env:VICTORY_FSR3_DIR } else { Join-Path $repo 'fsr3-sdk' }
+    if (Test-Path (Join-Path $fsr3dir 'fsr3_bridge.dll')) {
+        $settings.VICTORY_FSR3_FG = '1'; $settings.VICTORY_FSR3_DIR = $fsr3dir
+        # Frame generation takes 1.5 to 2 GB of the card's memory, which the layer otherwise fills with textures:
+        # on from the start, it is left a fifth of the budget (on a 12 GB card it then ran out for DLSS FG).
+        $settings.VICTORY_TEXTURE_ROOM_PERCENT = '80'
+    } else {
+        Write-Host "No FSR 3 bridge in ${fsr3dir}: running without FSR 3 frame generation. Get-FSR3.cmd in the"
+        Write-Host "repository folder builds it from the FidelityFX SDK once; VICTORY_FSR3_DIR names another folder."
+        $fsr3Wanted = $false
+    }
+}
 if ($Dlss -ne 'off') {
     # NVIDIA's files: where VICTORY_STREAMLINE_DIR says, else where Get-NVIDIA-DLSS.cmd puts them.
     $sl = if ($env:VICTORY_STREAMLINE_DIR) { $env:VICTORY_STREAMLINE_DIR } else { Join-Path $repo 'nvidia-sdk\Streamline\bin\x64' }
@@ -97,8 +127,9 @@ if ($Dlss -ne 'off') {
         elseif (-not $NoFrameGenReady) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = '0' }   # ready, off
         # Frame generation takes 1.5 to 2 GB of the card's memory, which the layer otherwise fills with textures up
         # to nine tenths of its budget (on a 12 GB card it then ran out: no generated frames). On from the start, it
-        # is left a fifth of the budget; ready but off, a little less is held back.
-        if ($settings.VICTORY_FRAMEGEN -eq '1') { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }
+        # is left a fifth of the budget; ready but off, a little less is held back. FSR 3 frame generation already
+        # left a fifth (above), so this does not touch it.
+        if ($settings.VICTORY_FRAMEGEN -eq '1' -and -not $fsr3Wanted) { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }
     } else {
         Write-Host "No NVIDIA files in ${sl}: running without DLSS and frame generation. Get-NVIDIA-DLSS.cmd in the"
         Write-Host "repository folder fetches them from NVIDIA once (about 70 MB); VICTORY_STREAMLINE_DIR names another folder."
@@ -117,10 +148,11 @@ $settings.VICTORY_MENU_CONSOLE = $console
 $settings.VICTORY_MENU_RES = $Res
 $settings.VICTORY_MENU_DLSS = if ($settings.VICTORY_DLSS -eq '1') { $Dlss } else { 'off' }
 $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [string]$settings.VICTORY_FRAMEGEN_X } else { '0' }
+$settings.VICTORY_MENU_FSR3_FG = if ($settings.VICTORY_FSR3_FG -eq '1') { '2' } else { '0' }
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($fsr3Wanted) { ' -Fsr3FrameGen' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
@@ -136,7 +168,7 @@ if (-not (Test-Path $victory)) {
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FSR3_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 

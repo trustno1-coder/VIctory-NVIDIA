@@ -1,0 +1,2710 @@
+From 6b83963d01869599e25d38e207d7aa72d959d543 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Fri, 27 Nov 2026 04:44:35 -0500
+Subject: [PATCH] FSR 3 frame generation (2x) for RTX 30-series, via a C++
+ bridge to the FidelityFX API 3.1
+
+FG-only milestone, title's own upscaling, DLSS untouched. Rust never
+hand-mirrors AMD structs: it loads fsr3_bridge.dll over a minimal C ABI
+and the bridge, compiled against the real FidelityFX SDK 1.1.4 headers,
+loads amd_fidelityfx_dx12.dll, creates the FG context, wraps the swap
+chain, and runs the per-frame prepare/configure. The scaffold's
+ffx_fsr3.dll did not exist (FSR 3.0 is source-only; 3.1 is the single
+prebuilt signed DLL).
+
+- crates/victory-gpu/src/fsr3.rs: bridge loader, env (VICTORY_FSR3_FG /
+  VICTORY_FSR3_DIR / VICTORY_FSR3_QUALITY), lazy FG context, note of
+  depth/MV/camera from the title's upscale dispatch, present configure,
+  in-place context remake on resize (the wrapped chain stays alive),
+  mutual exclusion with DLSS FG, soft-fail everywhere.
+- tools/fsr3-bridge: the bridge (create/wrap/prepare/configure/
+  recreate/destroy) and its CMake build.
+- fidelityfx.rs: interpose when Streamline or FSR 3 serves; FSR path
+  notes the upscale and runs the title's own upscaler; the context
+  size clamp stays DLSS-only.
+- host.rs: device hand-over, submitted/resize hooks, swap-chain wrap
+  in presenter(), FSR configure around Present, FG-aware FPS texts.
+- run.rs / play.rs / play-foxhound.ps1 / menu.rs: init, -Fsr3FrameGen
+  / --fsr3-framegen, victory get-fsr3, F1 live toggle (OFF/2X).
+- Get-FSR3.cmd / scripts/get-fsr3.ps1: fetch SDK 1.1.4, build the
+  bridge, copy both DLLs into fsr3-sdk/ (git-ignored).
+- docs/FSR3_INTEGRATION.md: rewritten to describe what is built.
+
+Not verifiable on Linux: no Rust toolchain here, and the bridge needs
+Windows + MSVC + the SDK headers, then a 3080 Ti + the game for FG
+context creation, depth/MV tagging, pacing, VRAM headroom and resize
+behaviour.
+---
+ .gitignore                                   |   3 +
+ Get-FSR3.cmd                                 |  30 +-
+ README.md                                    |   1 +
+ apps/victory/src/main.rs                     |  10 +
+ apps/victory/src/play.rs                     | 159 +++-
+ apps/victory/src/run.rs                      |  24 +-
+ crates/victory-gpu/src/fsr3.rs               | 855 ++++++++++++++++++-
+ crates/victory-gpu/src/host.rs               |  45 +-
+ crates/victory-gpu/src/host/menu.rs          |  12 +-
+ crates/victory-gpu/src/host/panel.rs         |   2 +-
+ crates/victory-hle/src/lib.rs                |   4 +
+ crates/victory-hle/src/modules/fidelityfx.rs |  67 +-
+ docs/FSR3_INTEGRATION.md                     | 194 +++--
+ scripts/get-fsr3.ps1                         | 107 +++
+ scripts/play-foxhound.ps1                    |  35 +-
+ tools/fsr3-bridge/CMakeLists.txt             |  42 +
+ tools/fsr3-bridge/README.md                  |  67 ++
+ tools/fsr3-bridge/fsr3_bridge.cpp            | 389 +++++++++
+ tools/fsr3-bridge/fsr3_bridge.h              | 121 +++
+ 19 files changed, 2002 insertions(+), 165 deletions(-)
+ create mode 100644 scripts/get-fsr3.ps1
+ create mode 100644 tools/fsr3-bridge/CMakeLists.txt
+ create mode 100644 tools/fsr3-bridge/README.md
+ create mode 100644 tools/fsr3-bridge/fsr3_bridge.cpp
+ create mode 100644 tools/fsr3-bridge/fsr3_bridge.h
+
+diff --git a/.gitignore b/.gitignore
+index 1be7f5e..cbbb876 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -79,6 +79,9 @@ Thumbs.db
+ 
+ # NVIDIA's own files (Get-NVIDIA-DLSS.cmd fetches them from NVIDIA; never part of this repository)
+ /nvidia-sdk/
++# AMD's own files and FSR 3's bridge (Get-FSR3.cmd builds the bridge against the FidelityFX SDK
++# and fetches AMD's DLL; never part of this repository)
++/fsr3-sdk/
+ # What the F1 menu saved
+ /victory-settings.txt
+ /victory-settings.*.txt
+diff --git a/Get-FSR3.cmd b/Get-FSR3.cmd
+index 74246a0..143e887 100644
+--- a/Get-FSR3.cmd
++++ b/Get-FSR3.cmd
+@@ -1,27 +1,9 @@
+ @echo off
+-REM Downloads or prepares the FidelityFX FSR 3 native DX12 backend for VIctory.
+-REM Analogous to Get-NVIDIA-DLSS.cmd.
+-REM
+-REM After running, set:
+-REM   set VICTORY_FSR3_DIR=fsr3-sdk
+-REM   set VICTORY_FSR3_FG=1
+-REM before launching (especially useful on RTX 30-series / 3080 Ti).
+-REM
+-echo.
+-echo === FSR 3 SDK setup for VIctory (RTX 30-series Frame Generation) ===
+-echo.
+-echo 1. Clone or download the FidelityFX SDK FSR3 branch:
+-echo    https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+-echo    (use the fsr3-v3.x branch)
+-echo.
+-echo 2. Build the native DX12 backend (BuildFSRSolutionNative.bat or the CMake path).
+-echo.
+-echo 3. Copy the resulting DLLs / libs into a folder (e.g. fsr3-sdk\ next to this script).
+-echo.
+-echo 4. Set VICTORY_FSR3_DIR to that folder and VICTORY_FSR3_FG=1.
+-echo.
+-echo Current default lookup path is C:\dev\sdk\FidelityFX-SDK-FSR3
+-echo.
+-echo See docs/FSR3_INTEGRATION.md for the full design and remaining TODOs.
++rem Fetches AMD's FidelityFX SDK (1.1.4), builds FSR 3's bridge against it, and puts fsr3_bridge.dll
++rem with AMD's amd_fidelityfx_dx12.dll where the launcher looks for them (fsr3-sdk\ in this folder).
++rem Run it once. They are AMD's files under AMD's licences, which are saved beside them; this repository
++rem does not contain them. Without them the game still runs, with its own upscaling and no frame generation.
++rem CMake and Visual Studio with C++ are needed for the one-off build of the bridge.
++powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\get-fsr3.ps1" %*
+ echo.
+ pause
+diff --git a/README.md b/README.md
+index d48c2e9..052dbf7 100644
+--- a/README.md
++++ b/README.md
+@@ -255,6 +255,7 @@ fork has always had; its options:
+ |---|---|
+ | *(none)* | Series X profile, 2560x1440, DLSS Quality, no frame rate cap, frame generation ready but off |
+ | `-FrameGen`, `-FrameGenX 4` | frame generation on from the start, 2 to 6 frames shown for each one rendered |
++| `-Fsr3FrameGen` | FSR 3 frame generation on from the start, 2x, with the title's own upscaling — for RTX 30-series and other GPUs DLSS frame generation cannot run on (run `Get-FSR3.cmd` once first) |
+ | `-Dlss off` / `dlaa` / `balanced` / `performance` | the title's own upscaling, or another DLSS mode |
+ | `-Fps 60` | a frame rate cap (30 is the title's own) |
+ | `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+index b55ba11..3daa6b2 100644
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -139,6 +139,12 @@ enum Command {
+     /// (about 70 MB) to where `play` looks for them.
+     #[cfg(windows)]
+     GetDlss,
++    /// Build FSR 3's bridge against AMD's FidelityFX SDK (1.1.4 by
++    /// default) and put it with AMD's `amd_fidelityfx_dx12.dll` where
++    /// `play` looks for them, for FSR 3 frame generation on RTX 30-series
++    /// and other GPUs DLSS frame generation cannot run on.
++    #[cfg(windows)]
++    GetFsr3,
+     /// Prepare, map and bind a title executable; with --execute, run it.
+     Run {
+         exe: PathBuf,
+@@ -272,6 +278,7 @@ fn main() -> Result<()> {
+         Command::Play(_) => unreachable!("handled above"),
+         #[cfg(windows)]
+         Command::GetDlss => play::get_dlss(),
++        Command::GetFsr3 => play::get_fsr3(),
+         Command::Run {
+             exe,
+             unimplemented,
+@@ -295,6 +302,9 @@ fn main() -> Result<()> {
+             for line in victory_hle::streamline::check(size, device || present, present) {
+                 println!("{line}");
+             }
++            for line in victory_hle::fsr3::check() {
++                println!("{line}");
++            }
+             Ok(())
+         }
+     }
+diff --git a/apps/victory/src/play.rs b/apps/victory/src/play.rs
+index 92e7ca7..ae1b9a4 100644
+--- a/apps/victory/src/play.rs
++++ b/apps/victory/src/play.rs
+@@ -24,6 +24,13 @@ const GAME: &str = "game_scarlett_master.exe";
+ 
+ /// `scripts\get-nvidia-sdks.ps1`, run by Windows PowerShell.
+ const FETCH: &str = include_str!("../../../scripts/get-nvidia-sdks.ps1");
++/// `scripts\get-fsr3.ps1`, run by Windows PowerShell.
++const FETCH_FSR3: &str = include_str!("../../../scripts/get-fsr3.ps1");
++/// The bridge's sources, written beside the script when `get-fsr3` runs
++/// away from the repository (its `-BridgeDir` then names that folder).
++const FSR3_BRIDGE_H: &str = include_str!("../../../tools/fsr3-bridge/fsr3_bridge.h");
++const FSR3_BRIDGE_CPP: &str = include_str!("../../../tools/fsr3-bridge/fsr3_bridge.cpp");
++const FSR3_BRIDGE_CMAKE: &str = include_str!("../../../tools/fsr3-bridge/CMakeLists.txt");
+ 
+ /// The settings the title is started with (`scripts\play-foxhound.ps1` has
+ /// the same, with what each is for).
+@@ -88,6 +95,7 @@ const KEPT: &[&str] = &[
+     "VICTORY_CACHE_DIR",
+     "VICTORY_DATA_DIR",
+     "VICTORY_STREAMLINE_DIR",
++    "VICTORY_FSR3_DIR",
+     "VICTORY_LOG",
+ ];
+ 
+@@ -113,6 +121,12 @@ pub(crate) struct Play {
+     /// rendered, 2 to 6. Without it, it is ready and the F1 menu switches it.
+     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=6))]
+     framegen: Option<u32>,
++    /// FSR 3 frame generation on from the start, 2x (RTX 30-series and
++    /// most other GPUs; the title's own upscaling runs, no DLSS).
++    /// Never together with --framegen: one frame-generation swap
++    /// chain at a time. Needs the bridge built by `victory get-fsr3`.
++    #[arg(long)]
++    fsr3_framegen: bool,
+     /// Frame generation not made ready at the start.
+     #[arg(long)]
+     no_framegen_ready: bool,
+@@ -139,6 +153,20 @@ fn has_streamline(dir: &Path) -> bool {
+     dir.join("sl.interposer.dll").is_file()
+ }
+ 
++fn has_fsr3_bridge(dir: &Path) -> bool {
++    dir.join("fsr3_bridge.dll").is_file()
++}
++
++/// The folder with FSR 3's bridge: the one `VICTORY_FSR3_DIR` names,
++/// where `get-fsr3` puts it, or beside this program (a repository's
++/// `fsr3-sdk`, or the files themselves).
++fn fsr3_dir(here: &Path) -> Option<PathBuf> {
++    let named = std::env::var_os("VICTORY_FSR3_DIR").filter(|v| !v.is_empty()).map(PathBuf::from);
++    let ours = home().ok().map(|d| d.join("fsr3-sdk"));
++    let beside = [here.join("fsr3-sdk"), here.to_path_buf()];
++    named.into_iter().chain(ours).chain(beside).find(|d| has_fsr3_bridge(d))
++}
++
+ /// The folder with NVIDIA's files: the one `VICTORY_STREAMLINE_DIR` names,
+ /// where `get-dlss` puts them, or beside this program (a repository's
+ /// `nvidia-sdk`, or the files themselves).
+@@ -163,11 +191,22 @@ fn parse_menu(text: &str) -> Vec<(String, String)> {
+ /// The settings of a start and whether it is the Series S profile: the
+ /// options, what the menu saved over them (`menu`), `--set` over both.
+ /// `streamline`: the folder with NVIDIA's files, if there is one.
+-fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (BTreeMap<String, String>, bool) {
++/// `fsr3`: the folder with FSR 3's bridge, if there is one.
++fn settings(
++    o: &Play,
++    menu: &[(String, String)],
++    streamline: Option<&Path>,
++    fsr3: Option<&Path>,
++) -> (BTreeMap<String, String>, bool) {
+     let saved = |k: &str| menu.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+     let series_s = saved("VICTORY_MENU_CONSOLE").map_or(o.series_s, |c| c == "series-s");
+     let res = saved("VICTORY_MENU_RES").filter(|r| RESOLUTIONS.contains(r)).unwrap_or(&o.res);
+-    let dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
++    // FSR 3 frame generation: --fsr3-framegen, or the menu's
++    // VICTORY_MENU_FSR3_FG (2: on). Never together with DLSS frame
++    // generation: DLSS wins, FSR 3 off. FSR 3 FG-only runs with the
++    // title's own upscaling in this milestone, not DLSS.
++    let mut fsr3_wanted = o.fsr3_framegen || saved("VICTORY_MENU_FSR3_FG").is_some_and(|v| v == "2");
++    let mut dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
+     // 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).
+     let (mut framegen, mut times) = (o.framegen.is_some(), o.framegen.unwrap_or(2));
+     if let Some(saved) = saved("VICTORY_MENU_FRAMEGEN") {
+@@ -191,6 +230,14 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
+             _ => {}
+         }
+     }
++    if fsr3_wanted && framegen {
++        // DLSS frame generation wins; FSR 3 off.
++        fsr3_wanted = false;
++    }
++    if fsr3_wanted {
++        // FSR 3 FG-only: the title's own upscaling, not DLSS.
++        dlss = "off";
++    }
+     let (mut dlss_on, mut framegen_x) = (false, None);
+     if dlss != "off"
+         && let Some(dir) = streamline
+@@ -213,6 +260,18 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
+             set("VICTORY_TEXTURE_ROOM_PERCENT", if framegen { "80" } else { "86" });
+         }
+     }
++    let mut fsr3_on = false;
++    if fsr3_wanted
++        && let Some(dir) = fsr3
++    {
++        fsr3_on = true;
++        set("VICTORY_FSR3_FG", "1");
++        set("VICTORY_FSR3_DIR", &dir.to_string_lossy());
++        // Frame generation takes 1.5 to 2 GB of the card's memory, which
++        // the layer otherwise fills with textures: on from the start it
++        // is left a fifth of the budget.
++        set("VICTORY_TEXTURE_ROOM_PERCENT", "80");
++    }
+     set("VICTORY_FRAME_INTERVAL_US", &(1_000_000.0 / f64::from(fps)).round().to_string());
+     for (k, v) in menu.iter().filter(|(k, _)| !k.starts_with("VICTORY_MENU_")) {
+         if v.is_empty() {
+@@ -230,6 +289,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
+     set("VICTORY_MENU_RES", res);
+     set("VICTORY_MENU_DLSS", if dlss_on { dlss } else { "off" });
+     set("VICTORY_MENU_FRAMEGEN", &framegen_x.unwrap_or(0).to_string());
++    set("VICTORY_MENU_FSR3_FG", if fsr3_on { "2" } else { "0" });
+     set("VICTORY_MENU_FPS", &fps.to_string());
+     (s, series_s)
+ }
+@@ -297,6 +357,46 @@ pub(crate) fn get_dlss() -> Result<()> {
+     fetch(&to)
+ }
+ 
++/// `victory get-fsr3`: builds FSR 3's bridge against the FidelityFX
++/// SDK (1.1.4 by default) and puts `fsr3_bridge.dll` with AMD's
++/// `amd_fidelityfx_dx12.dll` where the launcher looks for them.
++pub(crate) fn get_fsr3() -> Result<()> {
++    let to = home()?.join("fsr3-sdk");
++    let script = to.join("get-fsr3.ps1");
++    std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
++    std::fs::write(&script, FETCH_FSR3).with_context(|| format!("writing {}", script.display()))?;
++    // The bridge's sources, for the build: this runs away from the
++    // repository, so the script's default (the repository's
++    // tools\fsr3-bridge) is not there.
++    let bridge = to.join("bridge");
++    std::fs::create_dir_all(&bridge).with_context(|| format!("creating {}", bridge.display()))?;
++    for (name, text) in [
++        ("fsr3_bridge.h", FSR3_BRIDGE_H),
++        ("fsr3_bridge.cpp", FSR3_BRIDGE_CPP),
++        ("CMakeLists.txt", FSR3_BRIDGE_CMAKE),
++    ] {
++        std::fs::write(bridge.join(name), text)
++            .with_context(|| format!("writing {}", bridge.join(name).display()))?;
++    }
++    let out = std::process::Command::new("powershell")
++        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
++        .arg(&script)
++        .arg("-InstallDir")
++        .arg(&to)
++        .arg("-BridgeDir")
++        .arg(&bridge)
++        .stdout(std::process::Stdio::inherit())
++        .stderr(std::process::Stdio::inherit())
++        .output()
++        .context("running get-fsr3.ps1: Windows PowerShell")?;
++    let _ = std::fs::remove_file(&script);
++    anyhow::ensure!(
++        out.status.success() && has_fsr3_bridge(&to),
++        "FSR 3's bridge did not arrive (see above); the title runs without FSR 3 frame generation"
++    );
++    Ok(())
++}
++
+ /// Asks once, at a start without NVIDIA's files, whether to fetch them.
+ fn offer_dlss() {
+     let Ok(to) = nvidia_home() else { return };
+@@ -360,15 +460,30 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
+     if wants_dlss && streamline_dir(&here).is_none() {
+         offer_dlss();
+     }
++    let wants_fsr3 = o.fsr3_framegen
++        || menu
++            .iter()
++            .rev()
++            .find(|(k, _)| k == "VICTORY_MENU_FSR3_FG")
++            .is_some_and(|(_, v)| v == "2");
+     let streamline = streamline_dir(&here);
+-    let (mut s, series_s) = settings(o, &menu, streamline.as_deref());
++    let fsr3 = fsr3_dir(&here);
++    if wants_fsr3 && fsr3.is_none() {
++        println!("No FSR 3 bridge: running without FSR 3 frame generation (`victory get-fsr3` builds it).");
++    }
++    let (mut s, series_s) = settings(o, &menu, streamline.as_deref(), fsr3.as_deref());
+     // Where the menu saves, and how it starts the title again (`--set` is not carried over).
+     let quoted = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "''"));
+     s.insert("VICTORY_MENU_FILE".to_owned(), menu_file.to_string_lossy().into_owned());
+     s.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
+     s.insert(
+         "VICTORY_MENU_ARGS".to_owned(),
+-        format!("play {}{}", quoted(&exe), if o.no_framegen_ready { " --no-framegen-ready" } else { "" }),
++        format!(
++            "play {}{}{}",
++            quoted(&exe),
++            if o.no_framegen_ready { " --no-framegen-ready" } else { "" },
++            if o.fsr3_framegen { " --fsr3-framegen" } else { "" }
++        ),
+     );
+     let log = log_file(&home.join("logs"))?;
+     let console = if series_s { "series-s" } else { "series-x" };
+@@ -415,6 +530,7 @@ mod tests {
+             res: "1440".to_owned(),
+             dlss: "quality".to_owned(),
+             framegen: None,
++            fsr3_framegen: false,
+             no_framegen_ready: false,
+             fps: 1000,
+             more: Vec::new(),
+@@ -424,7 +540,7 @@ mod tests {
+     #[test]
+     fn a_plain_start_is_the_launchers() {
+         let dir = Path::new(r"C:\nvidia");
+-        let (s, series_s) = settings(&options(), &[], Some(dir));
++        let (s, series_s) = settings(&options(), &[], Some(dir), None);
+         assert!(!series_s);
+         for (k, v) in SETTINGS {
+             assert_eq!(s.get(*k).map(String::as_str), Some(*v), "{k}");
+@@ -443,7 +559,7 @@ mod tests {
+ 
+     #[test]
+     fn without_nvidias_files_there_is_no_dlss() {
+-        let (s, _) = settings(&options(), &[], None);
++        let (s, _) = settings(&options(), &[], None, None);
+         assert!(!s.contains_key("VICTORY_DLSS") && !s.contains_key("VICTORY_FRAMEGEN"));
+         assert!(!s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT"));
+         assert_eq!(s.get("VICTORY_MENU_DLSS").map(String::as_str), Some("off"));
+@@ -456,7 +572,7 @@ mod tests {
+              VICTORY_MENU_DLSS=performance\r\nVICTORY_MENU_FPS=60\r\nVICTORY_BVH_BUILDER=\r\n\
+              VICTORY_AMBIENT=0.5\r\nVICTORY_EARLY_DEPTH=\r\nnot a setting=1\r\n",
+         );
+-        let (s, series_s) = settings(&options(), &menu, Some(Path::new("x")));
++        let (s, series_s) = settings(&options(), &menu, Some(Path::new("x")), None);
+         let get = |k: &str| s.get(k).map(String::as_str);
+         assert!(series_s);
+         // the Series S profile has no picture size of its own
+@@ -475,7 +591,7 @@ mod tests {
+         let mut o = options();
+         (o.res, o.dlss, o.framegen, o.fps) = ("1080to1440".to_owned(), "off".to_owned(), Some(4), 30);
+         o.more = vec!["VICTORY_AMBIENT=0".to_owned(), "VICTORY_NEW = 2".to_owned()];
+-        let (s, _) = settings(&o, &[], Some(Path::new("x")));
++        let (s, _) = settings(&o, &[], Some(Path::new("x")), None);
+         let get = |k: &str| s.get(k).map(String::as_str);
+         assert_eq!((get("VICTORY_RENDER_1080P"), get("VICTORY_NATIVE_1440P")), (Some("1"), None));
+         // no DLSS, so no frame generation either
+@@ -484,6 +600,33 @@ mod tests {
+         assert_eq!((get("VICTORY_AMBIENT"), get("VICTORY_NEW")), (Some("0"), Some("2")));
+     }
+ 
++    #[test]
++    fn fsr3_framegen_runs_with_the_titles_own_upscaling() {
++        let mut o = options();
++        o.fsr3_framegen = true;
++        let (s, _) = settings(&o, &[], None, Some(Path::new(r"C:\fsr3")));
++        let get = |k: &str| s.get(k).map(String::as_str);
++        assert_eq!(get("VICTORY_FSR3_FG"), Some("1"));
++        assert_eq!(get("VICTORY_FSR3_DIR"), Some(r"C:\fsr3"));
++        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("80"));
++        // No DLSS, no DLSS frame generation: the title's own upscaling runs.
++        assert_eq!((get("VICTORY_DLSS"), get("VICTORY_FRAMEGEN")), (None, None));
++        assert_eq!(get("VICTORY_MENU_FSR3_FG"), Some("2"));
++        assert_eq!(get("VICTORY_MENU_DLSS"), Some("off"));
++    }
++
++    #[test]
++    fn dlss_framegen_wins_over_fsr3() {
++        let mut o = options();
++        o.fsr3_framegen = true;
++        o.framegen = Some(2);
++        let (s, _) = settings(&o, &[], Some(Path::new("x")), Some(Path::new(r"C:\fsr3")));
++        let get = |k: &str| s.get(k).map(String::as_str);
++        assert_eq!((get("VICTORY_DLSS"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("2")));
++        assert_eq!(get("VICTORY_FSR3_FG"), None);
++        assert_eq!(get("VICTORY_MENU_FSR3_FG"), Some("0"));
++    }
++
+     #[test]
+     fn stamps_are_dates() {
+         assert_eq!(stamp(0), "19700101-000000");
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index d112872..6e0d046 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -62,12 +62,32 @@ pub fn run(
+     // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
+     let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+     let available = victory_hle::streamline::init(&asked);
++    // FSR 3 frame generation (`VICTORY_FSR3_FG=1`): the bridge is loaded
++    // before anything of the title or the host GPU, and fails soft.
++    // `fsr3::init` refuses it if DLSS frame generation is already
++    // available — never both proxy swap chains. FSR 3 FG-only needs
++    // the title's FidelityFX path at the native (DLAA) scale: the
++    // scene stays at the output's size and the title's own upscaling
++    // runs, with FSR 3 generating the extra frames.
++    let fsr_asked = victory_hle::fsr3::Asked::from_env().map_err(anyhow::Error::msg)?;
++    let fsr_available = victory_hle::fsr3::init(&fsr_asked);
++    if fsr_asked.any() {
++        println!(
++            "upscaling      FSR 3 frame generation {}{}",
++            if fsr_available.framegen { "on (2x, title's own upscaling)" } else { "asked, not available" },
++            if fsr_available.framegen { ", scene at the native scale" } else { "" }
++        );
++    }
+     // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
+     // scale with its own FidelityFX upscaling (no Streamline): DLSS's
+     // comparison, and on Series X what that path alone looks like.
+     let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
+-    let upscaler = (available.dlss || available.framegen || fsr_path).then_some(asked.mode);
+-    if fsr_path && !asked.any() {
++    let upscaler = if fsr_available.framegen {
++        Some(victory_hle::streamline::Mode::Dlaa)
++    } else {
++        (available.dlss || available.framegen || fsr_path).then_some(asked.mode)
++    };
++    if fsr_path && !asked.any() && !fsr_asked.any() {
+         println!("upscaling      the title's own FidelityFX at the {} scale (VICTORY_FSR_PATH=1)", asked.mode.name());
+     }
+     if asked.any() {
+diff --git a/crates/victory-gpu/src/fsr3.rs b/crates/victory-gpu/src/fsr3.rs
+index 3a5c37b..fa1620e 100644
+--- a/crates/victory-gpu/src/fsr3.rs
++++ b/crates/victory-gpu/src/fsr3.rs
+@@ -1 +1,854 @@
+-SEE_LOCAL_FILE
+\ No newline at end of file
++//! AMD FSR 3 Frame Generation through the FidelityFX API (FSR 3.1), for
++//! GPUs that cannot use DLSS Frame Generation — an RTX 3080 Ti (Ampere)
++//! in particular. Both off by default.
++//!
++//! - `VICTORY_FSR3_FG=1`: FSR 3 Frame Generation (2x) on our present, with
++//!   the title's own upscaling still doing the upscaling. This is the
++//!   milestone shipped here: upscaling stays the title's, frame generation
++//!   is FSR 3's.
++//! - `VICTORY_FSR3=1`: FSR 3 Super Resolution in place of the title's
++//!   upscaling. Accepted, but **not implemented in this milestone**:
++//!   `init` logs that and leaves it off, rather than pretending.
++//! - `VICTORY_FSR3_DIR`: the folder of `fsr3_bridge.dll` (default: the
++//!   `fsr3-sdk` folder beside this program, then
++//!   `%LOCALAPPDATA%\victory\fsr3-sdk`, then `fsr3-sdk` under the current
++//!   folder). `Get-FSR3.cmd` / `scripts/get-fsr3.ps1` build that bridge
++//!   from the FidelityFX SDK and fetch AMD's signed DLL there.
++//! - `VICTORY_FSR3_QUALITY`: quality, balanced, performance or dlaa.
++//!   Only recorded for now; frame generation uses the render size the
++//!   title already passes, not an upscaler mode.
++//!
++//! Why a bridge DLL, and not a direct `LoadLibrary` of an AMD DLL from
++//! Rust: there is no `ffx_fsr3.dll`. FSR 3.1 is the FidelityFX API, five
++//! functions (`ffxCreateContext`, `ffxDestroyContext`, `ffxDispatch`,
++//! `ffxQuery`, `ffxConfigure`) in one prebuilt signed DLL,
++//! `amd_fidelityfx_dx12.dll` (SDK 2.0 splits it into
++//! `amd_fidelityfx_loader_dx12.dll` + effect DLLs), and every argument
++//! is a descriptor struct whose layout lives in the SDK headers
++//! (`ffx-api/include`). Hand-mirroring those structs in Rust from memory
++//! would be guessing at the ABI. So all FidelityFX structs are built in
++//! the small C++ bridge in `tools/fsr3-bridge/`, compiled against the
++//! real SDK headers on Windows, and Rust talks to the bridge over a
++//! minimal C ABI defined here (`BRIDGE_ABI_VERSION = 1`): opaque
++//! pointers and scalars only, no AMD structs cross the boundary.
++//!
++//! The bridge, in turn, does the documented FSR 3.1 steps (GPUOpen,
++//! "AMD FSR Frame Generation API", "FSR 3.1 Integration Overview"):
++//! create a frame-generation context (`ffxCreateContextDescFrameGeneration`
++//! + `ffxCreateContextDescFrameGenerationVersion` + backend desc), wrap
++//! the swap chain (`ffxCreateContextDescFrameGenerationSwapChainWrapDX12`,
++//! type `0x30001`), configure it once per frame
++//! (`ffxConfigureDescFrameGeneration`, frame ID increments by exactly 1),
++//! and dispatch the prepare pass
++//! (`ffxDispatchDescFrameGenerationPrepareV2`) with the depth and motion
++//! vectors the title's upscale dispatch already gave us.
++//!
++//! Anything missing (the bridge, AMD's DLL, the device hand-over, the
++//! swap-chain wrap) leaves the title's own upscaling and our plain
++//! present as they were, with a warning in the log — the same soft-fail
++//! pattern as Streamline. FSR 3 frame generation and DLSS frame
++//! generation are mutually exclusive: never both proxy swap chains.
++//! `init` refuses FSR 3 if Streamline frame generation is already
++//! available, and the launchers refuse to ask for both.
++
++#![allow(clippy::not_unsafe_ptr_arg_deref)]
++
++use std::ffi::{c_void, CStr};
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
++use std::sync::{Mutex, OnceLock};
++
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::Win32::Graphics::Dxgi::*;
++use windows::core::Interface;
++
++use crate::streamline::{self, Taken, Upscale};
++
++/// The bridge DLL, built from `tools/fsr3-bridge/` against the
++/// FidelityFX SDK. It loads AMD's signed DLL itself.
++pub const BRIDGE_DLL: &str = "fsr3_bridge.dll";
++/// The bridge C ABI this file speaks. The bridge returns this from
++/// `fsr3_bridge_version()`; anything else is a build mismatch.
++pub const BRIDGE_ABI_VERSION: i32 = 1;
++/// AMD's signed FSR 3.1 DLL, which the bridge loads (SDK 2.0 loader
++/// as a fallback). Neither is committed to the repository.
++pub const AMD_DLL: &str = "amd_fidelityfx_dx12.dll";
++pub const AMD_LOADER_DLL: &str = "amd_fidelityfx_loader_dx12.dll";
++
++/// What the user asked for, read from the environment once.
++#[derive(Clone, Debug)]
++pub struct Asked {
++    pub framegen: bool,
++    /// Accepted, not implemented in this milestone (see the module docs).
++    pub fsr3_upscale: bool,
++    pub dir: PathBuf,
++    pub quality: String,
++}
++
++impl Asked {
++    pub fn from_env() -> Result<Self, String> {
++        let var = |name: &str| std::env::var(name).ok();
++        let on = |name: &str| var(name).is_some_and(|v| v.trim() == "1");
++        let quality = var("VICTORY_FSR3_QUALITY").unwrap_or_else(|| "quality".into());
++        if !["quality", "balanced", "performance", "dlaa"].contains(&quality.trim().to_ascii_lowercase().as_str()) {
++            return Err(format!(
++                "VICTORY_FSR3_QUALITY={quality}: not one of quality, balanced, performance, dlaa"
++            ));
++        }
++        Ok(Asked {
++            framegen: on("VICTORY_FSR3_FG"),
++            fsr3_upscale: on("VICTORY_FSR3"),
++            dir: var("VICTORY_FSR3_DIR").map(PathBuf::from).unwrap_or_else(default_dir),
++            quality: quality.trim().to_ascii_lowercase(),
++        })
++    }
++
++    pub fn any(&self) -> bool {
++        self.framegen
++    }
++}
++
++/// Where the bridge is looked for without `VICTORY_FSR3_DIR`: the
++/// `fsr3-sdk` folder beside this program (what `Get-FSR3.cmd` and
++/// `victory get-fsr3` populate), then `%LOCALAPPDATA%\victory\fsr3-sdk`,
++/// then `fsr3-sdk` under the current folder. The first that exists wins;
++/// otherwise the first candidate, so the error names a real place.
++fn default_dir() -> PathBuf {
++    let mut candidates = Vec::new();
++    if let Ok(exe) = std::env::current_exe() {
++        if let Some(dir) = exe.parent() {
++            candidates.push(dir.join("fsr3-sdk"));
++        }
++    }
++    if let Ok(local) = std::env::var("LOCALAPPDATA") {
++        candidates.push(PathBuf::from(local).join("victory").join("fsr3-sdk"));
++    }
++    candidates.push(PathBuf::from("fsr3-sdk"));
++    for c in &candidates {
++        if c.join(BRIDGE_DLL).is_file() {
++            return c.clone();
++        }
++    }
++    candidates.into_iter().next().unwrap_or_else(|| PathBuf::from("fsr3-sdk"))
++}
++
++/// What [`init`] made available.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct Available {
++    pub framegen: bool,
++}
++
++/// The bridge's exported functions. All return 0 on success, otherwise
++/// the FidelityFX return code (or -1 for a bridge-side failure).
++struct Bridge {
++    _library: Library,
++    version: unsafe extern "C" fn() -> i32,
++    create: unsafe extern "C" fn(
++        *mut c_void, // device (ID3D12Device*)
++        *mut c_void, // game queue (ID3D12CommandQueue*)
++        u32,         // display width
++        u32,         // display height
++        u32,         // render width
++        u32,         // render height
++        u32,         // back-buffer format (DXGI_FORMAT)
++        u32,         // flags (see fsr3_bridge.h)
++        *mut *mut c_void, // out: Fsr3Fg*
++    ) -> i32,
++    wrap_swapchain: unsafe extern "C" fn(
++        *mut c_void, // Fsr3Fg*
++        *mut *mut c_void, // in/out: IDXGISwapChain4*
++        *mut *mut c_void, // out: wrapped IDXGISwapChain4*
++    ) -> i32,
++    prepare: unsafe extern "C" fn(
++        *mut c_void, // Fsr3Fg*
++        *mut c_void, // command list (ID3D12GraphicsCommandList*)
++        *mut c_void, // depth (ID3D12Resource*)
++        u32,         // depth state (D3D12_RESOURCE_STATES)
++        *mut c_void, // motion vectors (ID3D12Resource*)
++        u32,         // motion-vector state
++        f32,         // jitter x
++        f32,         // jitter y
++        f32,         // motion-vector scale x
++        f32,         // motion-vector scale y
++        f32,         // frame time, ms
++        i32,         // reset (1 on a scene cut / first frame)
++        f32,         // camera near
++        f32,         // camera far
++        f32,         // camera vertical FOV, radians
++        u64,         // frame id (increments by exactly 1 per frame)
++    ) -> i32,
++    configure: unsafe extern "C" fn(
++        *mut c_void, // Fsr3Fg*
++        *mut c_void, // swap chain (IDXGISwapChain*)
++        *mut c_void, // hudless colour (ID3D12Resource*, may be null)
++        u32,         // hudless colour state
++        u64,         // frame id (same as the prepare's)
++        i32,         // frame generation enabled
++    ) -> i32,
++    destroy: unsafe extern "C" fn(*mut c_void),
++    /// Remake the frame-generation context in place at a new size,
++    /// keeping the wrapped swap chain alive (see `resizing`).
++    recreate: unsafe extern "C" fn(
++        *mut c_void, // Fsr3Fg*
++        u32,         // display width
++        u32,         // display height
++        u32,         // render width
++        u32,         // render height
++        u32,         // back-buffer format (DXGI_FORMAT)
++        u32,         // flags (see fsr3_bridge.h)
++    ) -> i32,
++}
++
++struct Library(windows_sys::Win32::Foundation::HMODULE);
++
++impl Drop for Library {
++    fn drop(&mut self) {
++        // SAFETY: this owns the reference LoadLibraryExW took.
++        unsafe { windows_sys::Win32::Foundation::FreeLibrary(self.0) };
++    }
++}
++
++// SAFETY: a module handle.
++unsafe impl Send for Library {}
++// SAFETY: as above.
++unsafe impl Sync for Library {}
++
++static BRIDGE: OnceLock<Bridge> = OnceLock::new();
++static ASKED: OnceLock<Asked> = OnceLock::new();
++static FG_READY: AtomicBool = AtomicBool::new(false);
++static SWAPCHAIN_WRAPPED: AtomicBool = AtomicBool::new(false);
++/// The frame-generation context the bridge made, if any. Created lazily
++/// on the first present, once the display size is known.
++static FG: Mutex<Option<*mut c_void>> = Mutex::new(None);
++// SAFETY: the bridge owns the context; it is only used on the presenting
++// thread and destroyed with it.
++unsafe impl Send for Bridge {}
++unsafe impl Sync for Bridge {}
++
++/// What is asked of frame generation now: 0 off, 2 frames shown for each
++/// one rendered; `u32::MAX`: not asked yet (then 2, on from the start).
++static FG_WANTED: AtomicU32 = AtomicU32::new(u32::MAX);
++/// Frames shown for each one rendered (1 while it is off). FSR 3 FG is
++/// 2x only in this milestone; the bridge does not yet report a measured
++/// count, so this is the asked count, not a measured one.
++static FG_PER: AtomicU32 = AtomicU32::new(1);
++
++/// The host device and direct queue, for the bridge's context creation.
++struct DeviceCtx {
++    device: ID3D12Device,
++    queue: ID3D12CommandQueue,
++}
++
++// SAFETY: D3D12 objects are free-threaded.
++unsafe impl Send for DeviceCtx {}
++unsafe impl Sync for DeviceCtx {}
++
++static DEVICE: OnceLock<DeviceCtx> = OnceLock::new();
++
++/// The latest upscaling submitted, for the next present.
++#[derive(Clone)]
++struct Noted {
++    id: u64,
++    depth: std::sync::Arc<crate::resource::HostTexture>,
++    motion: std::sync::Arc<crate::resource::HostTexture>,
++    camera: streamline::plan::Camera,
++    frame_ms: f32,
++}
++
++// SAFETY: host textures are free-threaded.
++unsafe impl Send for Noted {}
++
++static PENDING: Mutex<Vec<Noted>> = Mutex::new(Vec::new());
++static SUBMITTED: Mutex<Option<Noted>> = Mutex::new(None);
++static PRESENTED_ID: AtomicU64 = AtomicU64::new(0);
++static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++
++/// Flags passed to the bridge's create call. Bit 0: HDR colour.
++/// Bit 1: inverted depth. Bit 2: display-resolution motion vectors.
++/// Bit 3: motion vectors carry the jitter. Bit 4 (not set here):
++/// async workloads — off in this milestone, so the optical-flow and
++/// interpolation work runs on the graphics queue and cannot overlap
++/// the next frame's work in a way this layer does not order.
++const FLAG_HDR: u32 = 1 << 0;
++const FLAG_DEPTH_INVERTED: u32 = 1 << 1;
++const FLAG_DISPLAY_MV: u32 = 1 << 2;
++const FLAG_MV_JITTER: u32 = 1 << 3;
++
++fn flags_for(camera: &streamline::plan::Camera) -> u32 {
++    let mut flags = 0;
++    if camera.flags & streamline::plan::FFX_HIGH_DYNAMIC_RANGE != 0 {
++        flags |= FLAG_HDR;
++    }
++    if camera.depth_inverted() {
++        flags |= FLAG_DEPTH_INVERTED;
++    }
++    if camera.display_motion_vectors() {
++        flags |= FLAG_DISPLAY_MV;
++    }
++    if camera.flags & streamline::plan::FFX_MOTION_VECTORS_JITTER_CANCELLATION != 0 {
++        flags |= FLAG_MV_JITTER;
++    }
++    flags
++}
++
++fn wide(path: &Path) -> Vec<u16> {
++    use std::os::windows::ffi::OsStrExt;
++    path.as_os_str().encode_wide().chain([0]).collect()
++}
++
++fn load_bridge(dir: &Path) -> Result<Bridge, String> {
++    use windows_sys::Win32::System::LibraryLoader::{
++        GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
++    };
++    let path = std::path::absolute(dir.join(BRIDGE_DLL)).map_err(|e| e.to_string())?;
++    if !path.is_file() {
++        return Err(format!(
++            "no {BRIDGE_DLL} in that folder (VICTORY_FSR3_DIR); run Get-FSR3.cmd to build it from the FidelityFX SDK"
++        ));
++    }
++    let file = wide(&path);
++    // Its own folder and System32 only, never the current folder.
++    // SAFETY: a NUL-terminated full path.
++    let module = unsafe {
++        LoadLibraryExW(
++            file.as_ptr(),
++            std::ptr::null_mut(),
++            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
++        )
++    };
++    if module.is_null() {
++        return Err(format!("{BRIDGE_DLL} did not load ({})", std::io::Error::last_os_error()));
++    }
++    let library = Library(module);
++    let find = |name: &CStr| {
++        // SAFETY: a loaded module and a NUL-terminated name.
++        unsafe { GetProcAddress(module, name.as_ptr().cast()) }
++            .map(|f| f as *const c_void)
++            .ok_or_else(|| format!("{BRIDGE_DLL} has no {}", name.to_string_lossy()))
++    };
++    macro_rules! get {
++        ($name:literal, $t:ty) => {
++            // SAFETY: the export of that name has the bridge header's signature.
++            unsafe { std::mem::transmute::<*const c_void, $t>(find($name)?) }
++        };
++    }
++    let bridge = Bridge {
++        version: get!(c"fsr3_bridge_version", unsafe extern "C" fn() -> i32),
++        create: get!(
++            c"fsr3_fg_create",
++            unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32, u32, u32, *mut *mut c_void) -> i32
++        ),
++        wrap_swapchain: get!(
++            c"fsr3_fg_wrap_swapchain",
++            unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void) -> i32
++        ),
++        prepare: get!(
++            c"fsr3_fg_prepare",
++            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, *mut c_void, u32, f32, f32, f32, f32, f32, i32, f32, f32, f32, u64) -> i32
++        ),
++        configure: get!(
++            c"fsr3_fg_configure",
++            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u64, i32) -> i32
++        ),
++        destroy: get!(c"fsr3_fg_destroy", unsafe extern "C" fn(*mut c_void)),
++        recreate: get!(
++            c"fsr3_fg_recreate",
++            unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, u32) -> i32
++        ),
++        _library: library,
++    };
++    // SAFETY: the bridge's own version query.
++    let version = unsafe { (bridge.version)() };
++    if version != BRIDGE_ABI_VERSION {
++        return Err(format!(
++            "{BRIDGE_DLL} speaks ABI version {version}, this build speaks {BRIDGE_ABI_VERSION}: rebuild the bridge (Get-FSR3.cmd)"
++        ));
++    }
++    Ok(bridge)
++}
++
++/// Loads the bridge and asks for frame generation; call once, before
++/// the host device is made and before the title's imports are bound.
++/// Fails soft: what is not there is logged and left off.
++pub fn init(asked: &Asked) -> Available {
++    let _ = ASKED.set(asked.clone());
++    if asked.fsr3_upscale {
++        tracing::warn!(
++            "FSR 3 upscaling (VICTORY_FSR3=1) is not implemented in this milestone: the title's own upscaling runs; frame generation is the FSR 3 feature here"
++        );
++    }
++    if !asked.any() {
++        return Available::default();
++    }
++    // Mutual exclusion with DLSS frame generation: two proxy swap
++    // chains cannot both own the present. DLSS was initialised first
++    // (run.rs); if it offers frame generation, FSR 3 stays off.
++    if streamline::serving() {
++        tracing::warn!(
++            "FSR 3 frame generation and DLSS frame generation were both asked for: DLSS frame generation wins, FSR 3 stays off (set only one of VICTORY_FRAMEGEN / VICTORY_FSR3_FG)"
++        );
++        return Available::default();
++    }
++    match load_bridge(&asked.dir) {
++        Ok(bridge) => {
++            let _ = BRIDGE.set(bridge);
++            tracing::info!(
++                folder = %asked.dir.display(),
++                quality = asked.quality,
++                "FSR 3 frame generation: bridge loaded (AMD FidelityFX API 3.1); frame generation is made ready when the host device is"
++            );
++            Available { framegen: true }
++        }
++        Err(why) => {
++            tracing::warn!(
++                folder = %asked.dir.display(),
++                "FSR 3 frame generation: {why}; the title's own upscaling and our present run"
++            );
++            Available::default()
++        }
++    }
++}
++
++/// Whether the title's FidelityFX calls are to be served for FSR 3
++/// frame generation: `victory_hle` then puts its own in front of them.
++pub fn serving() -> bool {
++    BRIDGE.get().is_some() && ASKED.get().is_some_and(|a| a.framegen)
++}
++
++/// Whether FSR 3 frame generation is to note the title's upscale
++/// dispatches (the bridge is loaded and frame generation was asked).
++pub fn framegen_wanted() -> bool {
++    serving()
++}
++
++/// The host device is made: remember it and the direct queue for the
++/// bridge's frame-generation context, which is created lazily on the
++/// first present, once the display size is known. Returns whether the
++/// bridge is there to make it with.
++pub(crate) fn device_made(device: &ID3D12Device, queue: &ID3D12CommandQueue) -> bool {
++    if BRIDGE.get().is_none() {
++        return false;
++    }
++    let _ = DEVICE.set(DeviceCtx { device: device.clone(), queue: queue.clone() });
++    true
++}
++
++/// Create the bridge's frame-generation context for `display` /
++/// `render` / `format`, if it does not exist yet. `None` on failure
++/// (logged, frame generation stays off). The flags come from the
++/// latest noted upscaling's camera, if there is one yet; otherwise
++/// 0 (no HDR, no inverted depth), and the context is remade on
++/// resize if a later camera disagrees — in practice the first
++/// upscaling is noted before the first present.
++fn ensure_context(display: [u32; 2], render: [u32; 2], format: DXGI_FORMAT) -> Option<*mut c_void> {
++    {
++        let fg = FG.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(fg) = *fg {
++            return Some(fg);
++        }
++    }
++    let (bridge, device) = (BRIDGE.get()?, DEVICE.get()?);
++    let mut fg: *mut c_void = std::ptr::null_mut();
++    let flags = SUBMITTED
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .as_ref()
++        .map_or(0, |n| flags_for(&n.camera));
++    // SAFETY: live device and queue, sizes and format of the swap chain.
++    let code = unsafe {
++        (bridge.create)(
++            device.device.as_raw(),
++            device.queue.as_raw(),
++            display[0],
++            display[1],
++            render[0],
++            render[1],
++            format.0 as u32,
++            flags,
++            &mut fg,
++        )
++    };
++    if code != 0 || fg.is_null() {
++        tracing::warn!(code, "FSR 3 frame generation: the bridge did not make a frame-generation context ({code}); frame generation stays off");
++        return None;
++    }
++    *FG.lock().unwrap_or_else(|e| e.into_inner()) = Some(fg);
++    FG_READY.store(true, Release);
++    tracing::info!(display = ?display, render = ?render, "FSR 3 frame generation: context made");
++    Some(fg)
++}
++
++/// Wrap `swap_chain` in the bridge's frame-interpolation swap chain
++/// (FSR 3.1's proxy, `IDXGISwapChain4`). Returns the wrapped chain to
++/// present through, or the original on any failure — frame generation
++/// then stays off and the plain present runs.
++pub(crate) fn wrap_swapchain(
++    swap_chain: IDXGISwapChain3,
++    display: [u32; 2],
++    render: [u32; 2],
++    format: DXGI_FORMAT,
++) -> IDXGISwapChain3 {
++    let Some(fg) = ensure_context(display, render, format) else {
++        return swap_chain;
++    };
++    let Some(bridge) = BRIDGE.get() else {
++        return swap_chain;
++    };
++    let Ok(swap4) = swap_chain.cast::<IDXGISwapChain4>() else {
++        tracing::warn!("FSR 3 frame generation: the swap chain does not offer IDXGISwapChain4; frame generation stays off");
++        return swap_chain;
++    };
++    let mut raw: *mut c_void = swap4.as_raw();
++    let mut wrapped: *mut c_void = std::ptr::null_mut();
++    // SAFETY: a live swap chain; the bridge replaces it with its proxy
++    // and hands back a new reference to that proxy.
++    let code = unsafe { (bridge.wrap_swapchain)(fg, &mut raw, &mut wrapped) };
++    if code != 0 || wrapped.is_null() {
++        tracing::warn!(code, "FSR 3 frame generation: the swap chain was not wrapped ({code}); presenting as before, frame generation off");
++        return swap_chain;
++    }
++    SWAPCHAIN_WRAPPED.store(true, Release);
++    tracing::info!("FSR 3 frame generation: our swap chain is the frame-interpolation proxy; frame generation can run on its presents");
++    // SAFETY: the proxy's one reference, now ours; it implements the
++    // swap-chain interfaces up to IDXGISwapChain4 and holds the chain.
++    unsafe { IDXGISwapChain3::from_raw(wrapped) }
++}
++
++/// The upscaling `up` asked for on the title's thread: with FSR 3
++/// frame generation alone, its depth and motion vectors are noted
++/// (recorded into the title's list, for the present) and the title's
++/// own upscaling runs. The title's own runs otherwise.
++pub fn upscale(up: &Upscale) -> Taken {
++    if !serving() || (!FG_READY.load(Acquire) && DEVICE.get().is_none()) {
++        return Taken::No("FSR 3 frame generation is not loaded");
++    }
++    // The context is made lazily at the first present; until then the
++    // upscaling is still noted, so the first present has depth and
++    // motion vectors to tag.
++    if [streamline::COLOUR, streamline::DEPTH, streamline::MOTION, streamline::OUTPUT]
++        .iter()
++        .any(|&i| up.resources[i].0.is_null())
++    {
++        return Taken::No("a required texture (colour, depth, motion vectors, output) is missing");
++    }
++    if up.camera.render.contains(&0) || up.camera.output.contains(&0) {
++        return Taken::No("an empty render or output size");
++    }
++    let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
++    let up = *up;
++    let asked = crate::list::external(
++        up.list,
++        Box::new(move |host| {
++            note_prepare(host, &up, id);
++            true
++        }),
++    );
++    if !asked {
++        return Taken::No("the title's list records nowhere (no host list)");
++    }
++    Taken::Noted
++}
++
++/// Record the frame-generation prepare pass into `host` (where the
++/// title's list is now), and remember this upscaling for the present.
++/// The prepare needs depth and motion vectors as host textures, in
++/// the states the title gave; without them there is nothing to
++/// interpolate from, and the title's own upscaling runs alone.
++fn note_prepare(host: &crate::host::HostList, up: &Upscale, id: u64) {
++    let (Some(depth), Some(motion)) = (
++        crate::resource::host_copy(up.resources[streamline::DEPTH].0),
++        crate::resource::host_copy(up.resources[streamline::MOTION].0),
++    ) else {
++        return;
++    };
++    // The inputs as a compute shader's would be (aliased views, uploads
++    // of title-written textures), then in the states FSR 3 is told.
++    for i in [streamline::DEPTH, streamline::MOTION] {
++        if crate::external::prepare_input(host, up.resources[i].0).is_none() {
++            return;
++        }
++    }
++    let wanted = |state: u32| streamline::plan::input_state(state);
++    let (Some((depth_tex, depth_state)), Some((motion_tex, motion_state))) = (
++        crate::external::host_texture(host, up.resources[streamline::DEPTH].0, wanted(up.resources[streamline::DEPTH].1)),
++        crate::external::host_texture(host, up.resources[streamline::MOTION].0, wanted(up.resources[streamline::MOTION].1)),
++    ) else {
++        return;
++    };
++    // The bridge records the prepare dispatch into this open list.
++    // Until the context exists (first present), the dispatch is
++    // skipped and only the noting below happens.
++    if let (Some(bridge), Some(fg)) = (BRIDGE.get(), *FG.lock().unwrap_or_else(|e| e.into_inner())) {
++        let camera = up.camera;
++        let mv_scale = [
++            camera.motion_scale[0] / camera.render[0].max(1) as f32,
++            camera.motion_scale[1] / camera.render[1].max(1) as f32,
++        ];
++        // SAFETY: an open command list; live textures in the states given.
++        let code = unsafe {
++            (bridge.prepare)(
++                fg,
++                host.list.as_raw(),
++                depth_tex.as_raw(),
++                depth_state,
++                motion_tex.as_raw(),
++                motion_state,
++                camera.jitter[0],
++                camera.jitter[1],
++                mv_scale[0],
++                mv_scale[1],
++                up.frame_ms,
++                camera.reset as i32,
++                camera.near,
++                camera.far,
++                camera.fov_y,
++                id,
++            )
++        };
++        if code != 0 {
++            tracing::warn!(id, code, "FSR 3 frame generation: the prepare dispatch was not recorded ({code})");
++            return;
++        }
++    }
++    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
++    pending.retain(|n| id.saturating_sub(n.id) < 16);
++    pending.push(Noted { id, depth, motion, camera: up.camera, frame_ms: up.frame_ms });
++    drop(pending);
++    host.mark_upscale(id);
++}
++
++/// A host list that recorded upscaling `id` is submitted (in
++/// submission order, before the present that follows it).
++pub(crate) fn submitted(id: u64) {
++    let noted = {
++        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
++        let at = pending.iter().position(|n| n.id == id);
++        at.map(|i| pending.swap_remove(i))
++    };
++    if let Some(noted) = noted {
++        let mut latest = SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
++        if latest.as_ref().is_none_or(|l| l.id < noted.id) {
++            *latest = Some(noted);
++        }
++    }
++}
++
++/// What [`present_begins`] began, for [`present_ends`].
++pub(crate) struct Presenting {
++    frame: u64,
++    on: bool,
++}
++
++/// Before our swap chain's Present of title frame `frame`: configure
++/// FSR 3 frame generation for this frame (frame ID increments by
++/// exactly 1 per frame; any other step resets its logic), with the
++/// hudless colour if there is one. Returns `None` without frame
++/// generation (nothing is timed then, and the plain present runs).
++pub(crate) fn present_begins(
++    frame: u64,
++    hudless: Option<(&ID3D12Resource, u32)>,
++    display: [u32; 2],
++    swap_chain: &IDXGISwapChain3,
++) -> Option<Presenting> {
++    if !FG_READY.load(Acquire) || !SWAPCHAIN_WRAPPED.load(Acquire) {
++        // First present: make the context now that the size is known.
++        // `wrap_swapchain` already did this when the presenter was
++        // made; if it did not, there is nothing to begin here.
++        return None;
++    }
++    if !crate::queue::line_on() {
++        tracing::warn!("FSR 3 frame generation: the line of submissions did not start; frame generation stays off");
++        return None;
++    }
++    let fresh = {
++        let latest = SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
++        latest
++            .as_ref()
++            .filter(|n| n.id > PRESENTED_ID.load(Relaxed))
++            .map(|n| n.id)
++    };
++    let Some(id) = fresh else {
++        // No upscaling this frame (a menu, a load): frame generation
++        // stays off for it; the next present with an upscaling turns
++        // it back on.
++        return Some(Presenting { frame, on: false });
++    };
++    PRESENTED_ID.store(id, Relaxed);
++    let (bridge, fg) = (BRIDGE.get()?, *FG.lock().unwrap_or_else(|e| e.into_inner()));
++    let fg = fg?;
++    let wanted = framegen_wanted_times();
++    let on = wanted != 0;
++    let (hudless_tex, hudless_state) = hudless
++        .map(|(t, s)| (t.as_raw(), s))
++        .unwrap_or((std::ptr::null_mut(), 0));
++    // SAFETY: the swap chain and (if any) the hudless texture are live.
++    let code = unsafe { (bridge.configure)(fg, swap_chain.as_raw(), hudless_tex, hudless_state, id, on as i32) };
++    if code != 0 {
++        tracing::warn!(frame, code, "FSR 3 frame generation: configure failed ({code}); presenting as before");
++        return Some(Presenting { frame, on: false });
++    }
++    if on {
++        FG_PER.store(2, Relaxed);
++    } else {
++        FG_PER.store(1, Relaxed);
++    }
++    let _ = display;
++    Some(Presenting { frame, on })
++}
++
++/// After our swap chain's Present: nothing to time for FSR 3 (the
++/// bridge's swap chain reports its own state); kept for symmetry with
++/// Streamline's `present_ends`, so the host's present path reads the
++/// same either way.
++pub(crate) fn present_ends(_presenting: Option<Presenting>) {}
++
++/// Whether frame generation can be switched while the title runs: it
++/// was planned at the start, so our swap chain is the frame-
++/// interpolation proxy (the F1 menu asks).
++pub(crate) fn framegen_live() -> bool {
++    FG_READY.load(Acquire) && SWAPCHAIN_WRAPPED.load(Acquire)
++}
++
++/// Frames shown for each one rendered, as last asked: 2 with frame
++/// generation on, 0 ready but off; 1 without it.
++fn framegen_wanted_times() -> u32 {
++    match FG_WANTED.load(Relaxed) {
++        u32::MAX => 2,
++        n => n,
++    }
++}
++
++/// Asks frame generation off (0) or on (2 frames shown for each one
++/// rendered), from the next present on.
++pub(crate) fn set_framegen(times: u32) {
++    FG_WANTED.store(if times == 0 { 0 } else { 2 }, Relaxed);
++    tracing::info!(times, "FSR 3 frame generation: asked from the settings menu");
++}
++
++/// For the frame-rate texts: frames shown for each one rendered
++/// (1 without frame generation).
++pub(crate) fn shown_per_frame() -> u32 {
++    FG_PER.load(Relaxed).max(1)
++}
++
++/// Our swap chain's buffers are about to be made again at `display` /
++/// `format` (the host `ResizeBuffers` the chain right after this
++/// call): the frame-generation context is remade in place at the new
++/// size, and frame generation resumes on the next present.
++///
++/// The remake is in place on purpose. Destroying the whole bridge
++/// context here would destroy the swapchain context too, and the host
++/// would then be presenting (and `ResizeBuffers`ing) through a dead
++/// proxy. The wrapped chain stays alive — its swapchain context's
++/// callbacks point at the same bridge state — while only its
++/// frame-generation context is replaced, at the new size, with the
++/// render size of the latest noted upscaling (or the display size).
++/// On failure frame generation stays off and the proxy presents
++/// through as before.
++pub(crate) fn resizing(display: [u32; 2], format: DXGI_FORMAT) {
++    if !FG_READY.load(Acquire) {
++        return;
++    }
++    let Some(fg) = *FG.lock().unwrap_or_else(|e| e.into_inner()) else {
++        return;
++    };
++    let Some(bridge) = BRIDGE.get() else {
++        return;
++    };
++    let (render, flags) = SUBMITTED
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .as_ref()
++        .map(|n| (n.camera.render, flags_for(&n.camera)))
++        .unwrap_or((display, 0));
++    // SAFETY: a context the bridge made; the host has settled every
++    // submission, so nothing is in flight through it.
++    let code = unsafe {
++        (bridge.recreate)(fg, display[0], display[1], render[0], render[1], format.0 as u32, flags)
++    };
++    if code != 0 {
++        FG_READY.store(false, Release);
++        SWAPCHAIN_WRAPPED.store(false, Release);
++        FG_PER.store(1, Relaxed);
++        tracing::warn!(code, "FSR 3 frame generation: its context was not remade at the new size ({code}); frame generation stays off, presenting as before");
++        return;
++    }
++    tracing::info!(display = ?display, render = ?render, "FSR 3 frame generation: its context was remade at the new size");
++}
++
++/// A plain check, without the title: what is there for FSR 3 frame
++/// generation on this PC. Used by the log at start; a fuller check
++/// needs the game running (depth / motion vectors only exist there).
++pub fn check() -> Vec<String> {
++    let asked = Asked::from_env().unwrap_or(Asked {
++        framegen: false,
++        fsr3_upscale: false,
++        dir: default_dir(),
++        quality: "quality".into(),
++    });
++    let mut lines = vec![format!("FSR 3 frame generation: asked {}", asked.framegen)];
++    lines.push(format!("  folder: {}", asked.dir.display()));
++    lines.push(format!(
++        "  bridge: {}",
++        if asked.dir.join(BRIDGE_DLL).is_file() { "found" } else { "missing — run Get-FSR3.cmd" }
++    ));
++    lines.push(format!(
++        "  AMD DLL: {}",
++        if asked.dir.join(AMD_DLL).is_file() {
++            "amd_fidelityfx_dx12.dll found"
++        } else if asked.dir.join(AMD_LOADER_DLL).is_file() {
++            "amd_fidelityfx_loader_dx12.dll found (SDK 2.0 split)"
++        } else {
++            "missing — Get-FSR3.cmd fetches it from the FidelityFX SDK release"
++        }
++    ));
++    lines.push("  Note: frame generation itself can only be checked in the game (it needs the title's depth and motion vectors).".into());
++    lines
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn bridge_and_amd_dll_names_are_the_real_ones() {
++        // Not `ffx_fsr3.dll`: there is no such DLL. FSR 3.1 is the
++        // FidelityFX API in amd_fidelityfx_dx12.dll, reached here
++        // through the bridge built from the SDK.
++        assert_eq!(BRIDGE_ABI_VERSION, 1);
++        assert_eq!(BRIDGE_DLL, "fsr3_bridge.dll");
++        assert_eq!(AMD_DLL, "amd_fidelityfx_dx12.dll");
++        assert_eq!(AMD_LOADER_DLL, "amd_fidelityfx_loader_dx12.dll");
++    }
++
++    #[test]
++    fn flags_follow_the_cameras_ffx_flags() {
++        let camera = |flags: u32| streamline::plan::Camera {
++            jitter: [0.0, 0.0],
++            motion_scale: [1.0, 1.0],
++            render: [1280, 720],
++            output: [2560, 1440],
++            near: 0.1,
++            far: 5000.0,
++            fov_y: 0.9,
++            reset: false,
++            flags,
++        };
++        assert_eq!(flags_for(&camera(0)), 0);
++        assert_eq!(
++            flags_for(&camera(
++                streamline::plan::FFX_HIGH_DYNAMIC_RANGE | streamline::plan::FFX_DEPTH_INVERTED
++            )),
++            FLAG_HDR | FLAG_DEPTH_INVERTED
++        );
++    }
++
++    #[test]
++    fn framegen_is_two_times_only() {
++        FG_WANTED.store(6, Relaxed);
++        assert_eq!(framegen_wanted_times(), 2);
++        FG_WANTED.store(0, Relaxed);
++        assert_eq!(framegen_wanted_times(), 0);
++        FG_WANTED.store(u32::MAX, Relaxed);
++    }
++}
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index b4baed7..3ad3e95 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -964,6 +964,12 @@ fn create() -> windows::core::Result<Host> {
+                 ..Default::default()
+             })?,
+         };
++        // FSR 3 frame generation (`VICTORY_FSR3_FG`): the bridge is given
++        // the device and the direct queue, so it can make its context
++        // lazily on the first present, once the display size is known.
++        // A no-op when FSR 3 was not asked for, or when DLSS frame
++        // generation already owns the present (mutual exclusion).
++        let _ = crate::fsr3::device_made(&device, &queue);
+         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+         let event = CreateEventW(None, false, false, None)?;
+         let rtvs: ID3D12DescriptorHeap =
+@@ -5651,6 +5657,7 @@ impl Host {
+             let id = run.take_upscale();
+             if id != 0 {
+                 crate::streamline::submitted(id);
++                crate::fsr3::submitted(id);
+             }
+             let id = run.take_hudless();
+             if id != 0 {
+@@ -9700,7 +9707,7 @@ impl Meter {
+         }
+         let Some(caption) = &self.caption else { return };
+         // With frame generation showing more frames than are rendered, both rates.
+-        let text = match crate::streamline::shown_per_frame() {
++        let text = match crate::streamline::shown_per_frame().max(crate::fsr3::shown_per_frame()) {
+             1 => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+             per => format!(" | VIctory {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
+         };
+@@ -9797,6 +9804,7 @@ impl Host {
+             // Presents sent ahead hold back buffers until they have run.
+             settle_now(WHY_SYNC);
+             crate::streamline::resizing();
++            crate::fsr3::resizing([width, height], format);
+             // SAFETY: no back buffer is held; every submission was waited for.
+             let resized = unsafe {
+                 p.swap_chain
+@@ -10017,6 +10025,15 @@ impl Host {
+             crate::replay::record::present(texture, state);
+             let mut showing = crate::timeline::span("the host's Present");
+             // Frame generation: the frame's markers, constants and tags.
++            // FSR 3 first (it configures this frame with the scene
++            // texture — no host UI in it — as its hudless colour), then
++            // DLSS. Each is a no-op when its frame generation is off.
++            let fsr3_presenting = crate::fsr3::present_begins(
++                frame,
++                Some((texture, state_u32)),
++                [width, height],
++                &p.swap_chain,
++            );
+             let presenting = crate::streamline::present_begins(
+                 frame,
+                 crate::streamline::Planes {
+@@ -10029,6 +10046,7 @@ impl Host {
+             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+             crate::streamline::present_returned(called);
+             crate::streamline::present_ends(presenting);
++            crate::fsr3::present_ends(fsr3_presenting);
+             showing.next("the frame meter");
+             p.panel.frame(p.meter.line_due());
+             p.menu.frame();
+@@ -10098,11 +10116,26 @@ impl Host {
+                     crate::streamline::swap_chain_made(false, Some(&e));
+                     factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?
+                 }
+-                // (`VICTORY_STREAMLINE_PRESENT=1`, DLSS without frame
+-                // generation: Streamline's proxy of it, for its present hook.)
+-                None => crate::streamline::present_hooked(
+-                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
+-                ),
++                None => {
++                    let plain = factory
++                        .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
++                        .cast::<IDXGISwapChain3>()?;
++                    if crate::fsr3::serving() {
++                        // FSR 3 frame generation: wrap the plain chain in
++                        // the frame-interpolation proxy. The render size
++                        // is the display size here — the first noted
++                        // upscaling has not run yet, and FSR 3 takes a
++                        // render at or below the context's maximum, so
++                        // this is safe; the context is remade on resize.
++                        // On any failure the plain chain is returned and
++                        // frame generation stays off.
++                        crate::fsr3::wrap_swapchain(plain, [width, height], [width, height], format)
++                    } else {
++                        // (`VICTORY_STREAMLINE_PRESENT=1`, DLSS without frame
++                        // generation: Streamline's proxy of it, for its present hook.)
++                        crate::streamline::present_hooked(plain)
++                    }
++                }
+             };
+             let copy = self.new_list()?;
+             copy.close();
+diff --git a/crates/victory-gpu/src/host/menu.rs b/crates/victory-gpu/src/host/menu.rs
+index 087cd13..4ae47d2 100644
+--- a/crates/victory-gpu/src/host/menu.rs
++++ b/crates/victory-gpu/src/host/menu.rs
+@@ -60,6 +60,10 @@ const ITEMS: &[Item] = &[
+     // The launcher's own choices.
+     Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
+     Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
++    // FSR 3 frame generation (2x only, RTX 30-series): live only when
++    // this run started with it ready. Never on together with DLSS
++    // frame generation above — the launchers refuse to ask for both.
++    Item { var: "VICTORY_MENU_FSR3_FG", label: "FSR 3 FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X")], live: false },
+     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
+     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
+     Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
+@@ -96,7 +100,9 @@ fn get(var: &str) -> String {
+ /// Whether a change of `item` shows at once. Frame generation does when this run started with
+ /// it ready (the launcher asks for that whenever Streamline is there).
+ fn live(item: &Item) -> bool {
+-    item.live || (item.var == "VICTORY_MENU_FRAMEGEN" && crate::streamline::framegen_live())
++    item.live
++        || (item.var == "VICTORY_MENU_FRAMEGEN" && crate::streamline::framegen_live())
++        || (item.var == "VICTORY_MENU_FSR3_FG" && crate::fsr3::framegen_live())
+ }
+ 
+ /// Whether the frame-rate line is shown at the top while the menu is closed
+@@ -119,7 +125,7 @@ fn fps_line() -> Option<String> {
+     if fps <= 0.0 {
+         return None;
+     }
+-    Some(match crate::streamline::shown_per_frame() {
++    Some(match crate::streamline::shown_per_frame().max(crate::fsr3::shown_per_frame()) {
+         1 => format!("FPS: {fps:.1}"),
+         per => format!("FPS: {fps:.1}  FG: {:.1}", fps * f64::from(per)),
+     })
+@@ -339,6 +345,8 @@ impl Menu {
+         match var {
+             // Off (0) or the frames shown for each one rendered, from the next present on.
+             "VICTORY_MENU_FRAMEGEN" => crate::streamline::set_framegen(value.parse().unwrap_or(0)),
++            // FSR 3: off (0) or on (2x), from the next present on.
++            "VICTORY_MENU_FSR3_FG" => crate::fsr3::set_framegen(value.parse().unwrap_or(0)),
+             "VICTORY_FPS_LINE" => fps_line_on().store(value != "0", Ordering::Relaxed),
+             "VICTORY_PANEL" => super::panel::shown().store(value == "1", Ordering::Relaxed),
+             _ => {}
+diff --git a/crates/victory-gpu/src/host/panel.rs b/crates/victory-gpu/src/host/panel.rs
+index 02022f9..cd70641 100644
+--- a/crates/victory-gpu/src/host/panel.rs
++++ b/crates/victory-gpu/src/host/panel.rs
+@@ -181,7 +181,7 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
+     let fps = 1e3 / ms.max(0.001);
+     vec![
+         format!("FPS {fps:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}"),
+-        generated(fps, crate::streamline::shown_per_frame()),
++        generated(fps, crate::streamline::shown_per_frame().max(crate::fsr3::shown_per_frame())),
+         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
+         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
+         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
+diff --git a/crates/victory-hle/src/lib.rs b/crates/victory-hle/src/lib.rs
+index f3d70bf..1b6bc3d 100644
+--- a/crates/victory-hle/src/lib.rs
++++ b/crates/victory-hle/src/lib.rs
+@@ -27,6 +27,10 @@ pub use victory_gpu::console;
+ /// DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`).
+ #[cfg(windows)]
+ pub use victory_gpu::streamline;
++/// FSR 3 frame generation (`VICTORY_FSR3_FG`), for GPUs without DLSS
++/// frame generation.
++#[cfg(windows)]
++pub use victory_gpu::fsr3;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub use victory_gpu::replay;
+ 
+diff --git a/crates/victory-hle/src/modules/fidelityfx.rs b/crates/victory-hle/src/modules/fidelityfx.rs
+index fd89a79..7222419 100644
+--- a/crates/victory-hle/src/modules/fidelityfx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx.rs
+@@ -1,14 +1,22 @@
+ //! `amd_fidelityfx_loader_xbox.dll`: the title's FidelityFX API, five
+ //! functions over chains of descriptions, each starting with a type id and
+ //! the next one's address. With DLSS or frame generation on
+-//! (`victory_gpu::streamline`, `VICTORY_DLSS=1`, `VICTORY_FRAMEGEN=1`), the
+-//! title's imports of it are bound to the functions here ([`Interpose`]),
+-//! which call the title's own DLL for everything except an upscale dispatch
+-//! DLSS takes: DLSS then records the upscaling at that place of the title's
+-//! command list instead, from the same textures into the same output. With
+-//! frame generation alone the title's own upscaling runs and its depth and
+-//! motion vectors are noted for the present. Without either switch, or
+-//! without Streamline, the imports are bound as before.
++//! (`victory_gpu::streamline`, `VICTORY_DLSS=1`, `VICTORY_FRAMEGEN=1`), or
++//! with FSR 3 frame generation on (`victory_gpu::fsr3`,
++//! `VICTORY_FSR3_FG=1`), the title's imports of it are bound to the
++//! functions here ([`Interpose`]), which call the title's own DLL for
++//! everything except an upscale dispatch DLSS takes: DLSS then records
++//! the upscaling at that place of the title's command list instead,
++//! from the same textures into the same output. With frame generation
++//! alone — DLSS or FSR 3 — the title's own upscaling runs and its depth
++//! and motion vectors are noted for the present. Without either switch,
++//! or without Streamline / the FSR 3 bridge, the imports are bound as
++//! before.
++//!
++//! FSR 3 frame generation never clamps the title's upscaler context
++//! (that clamp is DLSS's, in `ffxCreateContext` below, and only when
++//! `streamline::upscaling()`): FSR 3 FG-only relies on the title's own
++//! upscaling running at the size the title asked for.
+ //!
+ //! The title's upscaler context stays the title's own (its FidelityFX makes
+ //! it), so the title's upscaling runs again on any frame DLSS does not take.
+@@ -25,6 +33,7 @@ use std::ffi::c_void;
+ use std::sync::Mutex;
+ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+ 
++use victory_gpu::fsr3;
+ use victory_gpu::object::Object;
+ use victory_gpu::streamline::{self, Taken, Upscale, plan::Camera};
+ use victory_loader::{ImportResolver, Provenance, Resolution};
+@@ -131,8 +140,9 @@ macro_rules! once {
+ }
+ 
+ /// Binds the title's imports of [`LOADER_DLL`] to the functions here when
+-/// DLSS or frame generation is on, keeping what `inner` binds them to (the
+-/// title's own DLL) for them to call; otherwise binds as `inner` does.
++/// DLSS or frame generation is on (Streamline, or FSR 3), keeping what
++/// `inner` binds them to (the title's own DLL) for them to call;
++/// otherwise binds as `inner` does.
+ pub struct Interpose<'a> {
+     pub inner: &'a dyn ImportResolver,
+ }
+@@ -140,7 +150,7 @@ pub struct Interpose<'a> {
+ impl ImportResolver for Interpose<'_> {
+     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+         let found = self.inner.resolve(dll, symbol);
+-        if !dll.eq_ignore_ascii_case(LOADER_DLL) || !streamline::serving() {
++        if !dll.eq_ignore_ascii_case(LOADER_DLL) || !(streamline::serving() || fsr3::serving()) {
+             return found;
+         }
+         match (&found, symbol) {
+@@ -235,12 +245,21 @@ extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, mem
+         // Frame generation without DLSS leaves the upscaling to the title's
+         // own FidelityFX, which is made for the Series S sizes only.
+         if code != OK && !streamline::upscaling() {
+-            tracing::error!(
+-                code,
+-                max_render = ?asked.max_render,
+-                max_output = ?asked.max_output,
+-                "FidelityFX: the title's own upscaler was not made at these sizes (its shipping FSR4 takes 1280x720 or 1920x1080 in, 1920x1080 out): with frame generation at another output size, set VICTORY_DLSS=1 as well; the title fails at its first upscaling without an upscaler"
+-            );
++            if fsr3::serving() {
++                tracing::error!(
++                    code,
++                    max_render = ?asked.max_render,
++                    max_output = ?asked.max_output,
++                    "FidelityFX: the title's own upscaler was not made at these sizes (its shipping FSR4 takes 1280x720 or 1920x1080 in, 1920x1080 out): FSR 3 frame generation relies on that upscaler, so frame generation cannot run at this size; the title fails at its first upscaling without an upscaler"
++                );
++            } else {
++                tracing::error!(
++                    code,
++                    max_render = ?asked.max_render,
++                    max_output = ?asked.max_output,
++                    "FidelityFX: the title's own upscaler was not made at these sizes (its shipping FSR4 takes 1280x720 or 1920x1080 in, 1920x1080 out): with frame generation at another output size, set VICTORY_DLSS=1 as well; the title fails at its first upscaling without an upscaler"
++                );
++            }
+         }
+         return code;
+     }
+@@ -313,7 +332,15 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+     let d = unsafe { desc.cast::<DispatchUpscale>().read() };
+     first_dispatch(&d, &created);
+     let up = upscale(&d, &created, handle);
+-    match streamline::upscale(&up) {
++    // Only one frame-generation path can be serving: Streamline's init
++    // refuses FSR 3 when DLSS frame generation is available, and the
++    // launchers refuse to ask for both. Streamline first, FSR 3 second.
++    let (taken, from_streamline) = if streamline::serving() {
++        (streamline::upscale(&up), true)
++    } else {
++        (fsr3::upscale(&up), false)
++    };
++    match taken {
+         Taken::Dlss => OK,
+         Taken::Noted => own(),
+         Taken::No(why) if created.clamped => {
+@@ -325,7 +352,9 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+             OK
+         }
+         Taken::No(why) => {
+-            streamline::forwarded();
++            if from_streamline {
++                streamline::forwarded();
++            }
+             refused(why);
+             own()
+         }
+diff --git a/docs/FSR3_INTEGRATION.md b/docs/FSR3_INTEGRATION.md
+index 0f54bd1..59ea4e5 100644
+--- a/docs/FSR3_INTEGRATION.md
++++ b/docs/FSR3_INTEGRATION.md
+@@ -1,4 +1,4 @@
+-# FSR 3 Frame Generation for VIctory-NVIDIA (RTX 30-series focus)
++# FSR 3 Frame Generation for VIctory (RTX 30-series focus)
+ 
+ ## Why this exists
+ 
+@@ -6,29 +6,28 @@ NVIDIA DLSS Frame Generation (Streamline / `sl.dlss_g`) is limited to RTX 40-ser
+ An RTX 3080 Ti (Ampere) cannot use it. AMD FSR 3 Frame Generation works on Ampere (and most other GPUs)
+ because it is a software optical-flow + interpolation solution with a proxy swap chain for pacing.
+ 
+-This document describes how to add FSR 3 FG (and optionally FSR 3 upscaling) by reusing the existing
+-FidelityFX interception path that already feeds DLSS.
++This document describes what is actually built (branch `fsr3-framegen-3080ti`), not a plan.
++Milestone: **frame generation only, 2x, with the title's own upscaling**. DLSS is untouched.
+ 
+-## Existing integration points (do not reinvent)
++## What FSR 3 actually is (the scaffold got this wrong)
+ 
+-| What | Where | Notes |
+-|------|-------|-------|
+-| Title's FidelityFX upscale dispatch | `crates/victory-hle/src/modules/fidelityfx.rs` | Intercepts `ffxDispatch` of upscale. Already hands color/depth/MV/exposure/reactive to Streamline when `VICTORY_DLSS` or `VICTORY_FRAMEGEN` is set. |
+-| Streamline / DLSS | `crates/victory-gpu/src/streamline.rs` + `streamline/` | Runtime load of `sl.interposer.dll`, resource tagging, present-path FG. |
+-| Depth + MV capture for FG | Same modules | Already noted for the present path. Reusable for FSR 3. |
+-| Settings / env | `VICTORY_DLSS`, `VICTORY_FRAMEGEN`, launcher scripts, F1 menu | Extend similarly. |
++- FSR 3.0 has **no prebuilt DLL**: it is source-only C++ in the FidelityFX SDK.
++  There is no `ffx_fsr3.dll` to load. Do not look for one.
++- FSR **3.1** is the FidelityFX API: **one prebuilt signed DLL, `amd_fidelityfx_dx12.dll`**,
++  in the SDK's `/PrebuiltSignedDLL`, exposing exactly five functions
++  (`ffxCreateContext`, `ffxDestroyContext`, `ffxDispatch`, `ffxQuery`, `ffxConfigure`).
++  Upscaling and frame generation are separate contexts; frame generation additionally needs
++  a frame-generation swap-chain context, a per-frame prepare dispatch, `ffxConfigure` for FG,
++  and a UI-composition callback. FG works with any upscaling technology, including the title's own.
++- SDK 2.0 (FSR 4) splits the API into several DLLs (`amd_fidelityfx_loader_dx12.dll`,
++  `amd_fidelityfx_framegeneration_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll`).
++  **Do not target 2.0 first.** This work pins SDK **1.1.4** (FSR 3.1).
+ 
+-## Recommended approach (minimal risk)
++## Architecture: Rust talks to a C++ bridge, never to AMD's structs
+ 
+-1. **Keep the existing Streamline path untouched** for RTX 40/50 users.
+-2. Add a parallel path activated by new env vars:
+-   - `VICTORY_FSR3=1` — enable FSR 3 upscaling (optional)
+-   - `VICTORY_FSR3_FG=1` — enable FSR 3 Frame Generation (the important one for 3080 Ti)
+-3. When FSR 3 FG is requested, **do not** load Streamline for frame gen. Use the FidelityFX SDK's
+-   `FrameInterpolationSwapChainDX12` instead.
+-4. Reuse the same resource extraction that `fidelityfx.rs` already does for DLSS.
+-
+-## High-level architecture
++Rust does **not** hand-mirror AMD's `ffx-api` structs. Guessing at that ABI would corrupt memory
++silently; instead all AMD structs and macros live only in the bridge, compiled on Windows against
++the real SDK 1.1.4 headers, so a wrong name fails the build loudly instead of at run time.
+ 
+ ```
+ Title ffxDispatch (upscale)
+@@ -36,95 +35,92 @@ Title ffxDispatch (upscale)
+         ▼
+ fidelityfx.rs interceptor
+         │
+-        ├── VICTORY_DLSS / VICTORY_FRAMEGEN → existing Streamline path
++        ├── VICTORY_DLSS / VICTORY_FRAMEGEN → existing Streamline path (untouched)
+         │
+-        └── VICTORY_FSR3_FG (or VICTORY_FSR3)
+-                │
+-                ▼
+-        fsr3.rs (new)
+-                │
+-                ├── Record color / depth / MV / exposure / reactive
+-                ├── (optional) run FSR 3 upscaler
+-                └── On present → FSR 3 Frame Interpolation SwapChain
++        └── VICTORY_FSR3_FG → fsr3.rs (FG-only: notes depth/MV/camera, title's upscaler runs)
++                        │
++                        ▼
++                fsr3_bridge.dll (C++ bridge, tools/fsr3-bridge)
++                        │
++                        ▼
++                amd_fidelityfx_dx12.dll (AMD, FSR 3.1 API)
++                        │
++                        ▼
++                FSR frame-generation swap chain (wraps the host's plain swap chain)
++```
++
++| What | Where | Notes |
++|------|-------|-------|
++| Bridge loader + state | `crates/victory-gpu/src/fsr3.rs` | Loads `fsr3_bridge.dll` only (never any AMD DLL directly), over a C ABI defined in `tools/fsr3-bridge/fsr3_bridge.h` (`BRIDGE_ABI_VERSION = 1`). |
++| C++ bridge | `tools/fsr3-bridge/` | `fsr3_bridge.cpp` + `CMakeLists.txt`. Loads `amd_fidelityfx_dx12.dll` from its own folder, creates the FG context, wraps the swap chain, prepare/configure per frame. |
++| Interceptor | `crates/victory-hle/src/modules/fidelityfx.rs` | Interposes only when `streamline::serving() \|\| fsr3::serving()`. FSR path notes the upscale and returns the title's own upscaler; the `ffxCreateContext` size clamp stays DLSS-only (clamping would break the title's own upscaler that FG-only relies on). |
++| Present path | `crates/victory-gpu/src/host.rs` | `presenter()` wraps the plain swap chain via `fsr3::wrap_swapchain` when Streamline did not proxy and FSR is serving; `present_planes()` runs `fsr3::present_begins` / `present_ends` around Streamline's. Every failure falls back to the plain swap chain and the title's own upscaling. |
++| Init | `apps/victory/src/run.rs` | `fsr3::init()` next to `streamline::init()`. Refuses to serve if Streamline is serving (mutual exclusion in code, not just launchers). |
++| Launchers | `scripts/play-foxhound.ps1`, `apps/victory/src/play.rs` | `-Fsr3FrameGen` / `victory play --fsr3-framegen` / `victory get-fsr3`. DLSS FG wins if both are asked; FSR FG-only forces DLSS off for the run. |
++| F1 menu | `crates/victory-gpu/src/host/menu.rs` | `VICTORY_MENU_FSR3_FG`: OFF / 2X, live when `fsr3::framegen_live()`. |
++| Fetcher | `scripts/get-fsr3.ps1`, `Get-FSR3.cmd` | Downloads SDK 1.1.4, builds the bridge, copies both DLLs into `fsr3-sdk\`. Fails loudly if the tag does not exist or the AMD DLL is not in the archive. |
++
++## Getting it (one-time, on Windows)
++
++```
++Get-FSR3.cmd
++```
++or `victory get-fsr3`. This downloads the FidelityFX SDK 1.1.4 source archive, builds
++`tools/fsr3-bridge` with CMake/MSVC against it, and puts `fsr3_bridge.dll` and
++`amd_fidelityfx_dx12.dll` into `fsr3-sdk\` (git-ignored; nothing AMD is committed, same policy
++as Streamline). CMake and Visual Studio with C++ are needed for the one-off build.
++`-SdkTag` names another SDK tag, but a 2.0+ SDK is not what the bridge expects and the build
++step says so. A pre-downloaded SDK checkout can be passed as `-SdkDir`.
++
++## Running it
++
++```
++.\scripts\play-foxhound.ps1 -Exe '<path>\game_scarlett_master.exe' -Fsr3FrameGen
+ ```
++or `victory play --fsr3-framegen` (after `victory get-fsr3`). `VICTORY_FSR3_FG=1` and
++`VICTORY_FSR3_DIR` are set by the launcher; `VICTORY_TEXTURE_ROOM_PERCENT=80` reserves a fifth
++of the texture budget for frame generation (same value DLSS FG uses; an estimate until measured
++on 12 GB). The F1 menu can turn it on/off live (`FSR 3 FRAME GENERATION`, 2X).
++`VICTORY_FSR3_QUALITY` (quality/balanced/performance/dlaa) is read for the FG context's render
++size; `VICTORY_FSR3` (upscaling) is accepted and logged as not implemented — this milestone is
++FG-only. Never set `VICTORY_FRAMEGEN` and `VICTORY_FSR3_FG` together.
+ 
+-## What must be supplied to FSR 3 Frame Generation
++## What is handed to FSR 3 per frame
+ 
+-From the existing `DispatchUpscale` layout in `fidelityfx.rs` (already parsed):
++From the existing `DispatchUpscale` layout in `fidelityfx.rs` (already parsed for DLSS):
+ 
+ - Color buffer (prefer hudless / without interface plane when available)
+-- Depth buffer
+-- Motion vectors
+-- Exposure / pre-exposure
+-- Reactive mask (optional but improves quality)
++- Depth buffer, motion vectors, exposure / pre-exposure
+ - Jitter, motion-vector scale, render size, output size
+-- Camera near/far/FOV
+-- Frame time delta
+-
+-These are already extracted for DLSS. The same extraction can be handed to FSR 3.
+-
+-## Implementation steps (ordered)
+-
+-### 1. SDK acquisition
+-- Download FidelityFX SDK FSR3 branch (e.g. `fsr3-v3.0.3` or later 3.1.x) from GPUOpen.
+-- Use the **native DirectX 12** backend (`BuildFSRSolutionNative.bat` / DLL route).
+-- Do **not** commit the SDK binaries (same policy as NVIDIA Streamline). Provide a `Get-FSR3.cmd` analogous to `Get-NVIDIA-DLSS.cmd`.
+-
+-### 2. New module: `crates/victory-gpu/src/fsr3.rs`
+-Mirror the structure of `streamline.rs`:
+-- Runtime load of the FSR 3 DLL / static link option.
+-- Context creation (`ffxFsr3ContextCreate` or the newer FSR API).
+-- Resource binding and dispatch.
+-- Proxy swap chain creation for frame interpolation (`ffxCreateFrameinterpolationSwapchainDX12` or equivalent).
+-- Env-var reading (`VICTORY_FSR3`, `VICTORY_FSR3_FG`, `VICTORY_FSR3_QUALITY`, etc.).
+-
+-### 3. Interceptor change (`fidelityfx.rs`)
+-In the `ffxDispatch` handler for upscale:
+-- If `VICTORY_FSR3_FG` (or `VICTORY_FSR3`) is set and FSR 3 loaded successfully,
+-  call the new FSR 3 path instead of (or in addition to) Streamline.
+-- Still fall back to the title's own upscaler if FSR 3 is unavailable.
+-
+-### 4. Present path
+-- When FSR 3 FG is active, the swap chain must be the FSR 3 proxy swap chain so that
+-  interpolation and frame pacing happen correctly.
+-- This is the most invasive part. Study the existing Streamline present hooking
+-  (`VICTORY_STREAMLINE_PRESENT`, device/factory upgrade) and replicate the pattern
+-  for FSR 3's `FrameInterpolationSwapChainDX12`.
+-
+-### 5. Settings / launcher
+-- Add env vars and F1 menu entries:
+-  - FSR 3 on/off
+-  - Quality mode (Quality / Balanced / Performance / Native AA)
+-  - Frame Generation on/off
+-  - Optional reactive mask toggle
+-- Update `scripts/play-nvidia.ps1` (or add `play-fsr3.ps1`) so a 3080 Ti user can
+-  start with `-Fsr3FrameGen` without touching NVIDIA Streamline.
+-
+-### 6. Testing checklist (must be done on real hardware + title)
+-- [ ] FSR 3 context creates on 3080 Ti
+-- [ ] Color / depth / MV correctly bound (no black or frozen frames)
+-- [ ] Frame generation produces ~2× visual rate while input latency stays at the real render rate
+-- [ ] No crashes on scene cuts, menu transitions, or resolution changes
+-- [ ] Coexistence: DLSS path still works when FSR 3 env vars are off
+-- [ ] VRAM budget (3080 Ti has 12 GB) — FSR 3 FG has its own memory cost
+-
+-## Quality / performance notes for 3080 Ti
+-
+-- FSR 3 FG quality is generally good but can show artifacts on fast motion, thin geometry, or UI.
+-- Prefer a hudless color buffer when possible (the codebase already has some interface-plane awareness).
+-- Start with Quality or Balanced mode; Performance mode is softer.
+-- Optical flow cost is non-trivial; on a 3080 Ti you should still see a clear net gain in visual smoothness.
++- Camera near/far/FOV, frame time delta, reset
++- `frameID` increments by exactly 1 each frame (the API requires it)
++
++## Known approximations (in the bridge header — read them before debugging)
++
++- Camera vectors are position (0,0,0), up (0,1,0), right (1,0,0), forward (0,0,-1):
++  the title gives no camera matrices (same as DLSS here).
++- UI is copied as-is, with the scene texture passed as HUDLessColor: **close the F1 menu
++  while FG is on**, or the menu lands in interpolated frames.
++- SDR only; async workloads off.
++- `shown_per_frame()` reports the asked count (2), not a measured count.
++
++## Testing checklist (must be done on real hardware + title; none of it is checkable on Linux)
++
++- [ ] `Get-FSR3.cmd` builds the bridge against SDK 1.1.4 headers (macro/type names in the bridge are compile-gated: a wrong one fails here, loudly)
++- [ ] `amd_fidelityfx_dx12.dll` loads and the FG context creates on a 3080 Ti (optical-flow support, driver, HAGS)
++- [ ] Color / depth / MV correctly bound (no black, frozen, or warped frames)
++- [ ] Frame generation produces ~2x visual rate while input latency stays at the real render rate
++- [ ] No crashes on scene cuts, menu transitions, resolution changes, or fullscreen switches
++- [ ] Coexistence: DLSS path still works when FSR 3 env vars are off; DLSS FG wins if both are asked
++- [ ] VRAM headroom on 12 GB (`VICTORY_TEXTURE_ROOM_PERCENT=80` is an estimate until measured)
++- [ ] F1 live toggle works; `victory fsr3-check`-style standalone check is still to be added
++      (`streamline::check()` is Streamline-specific)
+ 
+ ## Licensing
+ 
+-FidelityFX SDK FSR 3 source is MIT (see GPUOpen). Keep the same "download at runtime / do not commit binaries"
++FidelityFX SDK source is MIT (see GPUOpen). Keep the "download at runtime / do not commit binaries"
+ policy that the repo already uses for NVIDIA Streamline.
+ 
+-## Suggested first milestone
+-
+-Ship **FSR 3 Frame Generation only** (upscaling can stay on the title's own FSR or be added later).
+-This gives the 3080 Ti user the feature they actually need while minimizing risk to the existing DLSS path.
+-
+----
++## Suggested next milestone
+ 
+-*Generated as a starting point for VIctory-NVIDIA. The existing Streamline code in `streamline.rs` and the interceptor in `fidelityfx.rs` are the best templates.*
++FSR 3 upscaling (`VICTORY_FSR3`) as a separate FSR context, after FG-only is proven in-game.
+diff --git a/scripts/get-fsr3.ps1 b/scripts/get-fsr3.ps1
+new file mode 100644
+index 0000000..94a72b3
+--- /dev/null
++++ b/scripts/get-fsr3.ps1
+@@ -0,0 +1,107 @@
++# Fetches AMD's FidelityFX SDK, builds FSR 3's bridge (tools\fsr3-bridge)
++# against it, and puts fsr3_bridge.dll with AMD's amd_fidelityfx_dx12.dll
++# into fsr3-sdk\ here (git-ignored), where scripts\play-foxhound.ps1 and
++# `victory play` look for them. AMD's files are under AMD's licences
++# (saved beside them: read them); this repository does not and may not
++# carry them, so each person gets them from AMD directly. Get-FSR3.cmd in
++# the repository's folder runs this. Nothing of AMD's is needed to build
++# the layer: the bridge is loaded when the game runs, and the bridge in
++# turn loads AMD's DLL from its own folder.
++#
++# SDK 1.1.4 is the pinned version: FSR 3.1, the single-DLL FidelityFX API
++# (amd_fidelityfx_dx12.dll, five ffx* functions). A later SDK (2.0 and up)
++# splits the API into several DLLs and is NOT what the bridge expects:
++# if -SdkTag names one of those, the build step below fails and says so.
++# If the tag does not exist on GitHub, the download fails loudly here
++# rather than silently producing a half-built folder.
++param(
++    [string]$SdkTag = 'v1.1.4',
++    # Another folder for the DLLs than fsr3-sdk here (`victory get-fsr3`
++    # names one under %LOCALAPPDATA%\victory).
++    [string]$InstallDir = '',
++    # A FidelityFX SDK checkout already on this PC, instead of downloading
++    # the archive (its folder must contain ffx-api\include).
++    [string]$SdkDir = '',
++    # The bridge's sources (tools\fsr3-bridge), when they are not beside
++    # this script in the repository (`victory get-fsr3` writes them out).
++    [string]$BridgeDir = ''
++)
++$ErrorActionPreference = 'Stop'
++$ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest's progress bar makes it many times slower
++[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
++$repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
++$install = if ($InstallDir) { $InstallDir } else { Join-Path $repo 'fsr3-sdk' }
++New-Item -ItemType Directory -Force $install | Out-Null
++
++# One file from a URL, with curl's progress line where Windows has curl (it has since Windows 10 1803).
++function Get-File([string]$Url, [string]$To) {
++    New-Item -ItemType Directory -Force (Split-Path $To) | Out-Null
++    $part = "$To.part"
++    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
++        & curl.exe --location --fail --silent --show-error --progress-bar --output $part $Url
++        if ($LASTEXITCODE -ne 0) { Remove-Item $part -ErrorAction SilentlyContinue; throw "could not get $Url" }
++    } else {
++        Invoke-WebRequest -Uri $Url -OutFile $part -UseBasicParsing -ErrorAction Stop
++    }
++    Move-Item $part $To -Force
++}
++
++if ($SdkDir) {
++    $sdk = $SdkDir
++} else {
++    Write-Host "FidelityFX SDK $SdkTag, from github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK:"
++    $url = "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/archive/refs/tags/$SdkTag.zip"
++    $zip = Join-Path $install "fidelityfx-sdk-$SdkTag.zip"
++    try { Get-File $url $zip } catch {
++        throw "Could not download the FidelityFX SDK tag $SdkTag from $url. Check the tag exists (SDK 1.1.4 is the pinned one; -SdkTag names another): $($_.Exception.Message)"
++    }
++    $scratch = Join-Path $install 'sdk-src'
++    Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
++    Expand-Archive -Path $zip -DestinationPath $scratch -Force -ErrorAction Stop
++    Remove-Item $zip -Force
++    $sdk = Get-ChildItem $scratch -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'ffx-api') } | Select-Object -First 1
++    if (-not $sdk) { throw "The $SdkTag archive has no ffx-api folder; it is not the FidelityFX SDK this bridge expects." }
++    $sdk = $sdk.FullName
++}
++if (-not (Test-Path (Join-Path $sdk 'ffx-api\include\ffx_api.h'))) {
++    throw "No ffx-api\include\ffx_api.h in $sdk; that is not a FidelityFX SDK 1.1.4 checkout."
++}
++$amdDll = Get-ChildItem $sdk -Recurse -Filter 'amd_fidelityfx_dx12.dll' | Select-Object -First 1
++if (-not $amdDll) {
++    throw "No amd_fidelityfx_dx12.dll in $sdk (looked under PrebuiltSignedDLL). A later SDK splits the API into several DLLs; use SDK 1.1.4 (-SdkTag v1.1.4)."
++}
++Write-Host "  SDK: $sdk"
++Write-Host "  AMD's DLL: $($amdDll.FullName)"
++
++# Build the bridge. CMake and a C++ compiler (Visual Studio with the
++# Desktop development with C++ workload) must be installed; the build
++# fails loudly - and names the header or macro - if the SDK's API
++# differs from what tools/fsr3-bridge/fsr3_bridge.cpp expects.
++if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
++    throw 'cmake is not on PATH. Install CMake (and Visual Studio with C++), then run this again.'
++}
++$bridgeDir = if ($BridgeDir) { $BridgeDir } else { Join-Path $repo 'tools\fsr3-bridge' }
++if (-not (Test-Path (Join-Path $bridgeDir 'fsr3_bridge.cpp'))) {
++    throw "No fsr3_bridge.cpp in $bridgeDir; that is not the bridge's folder (tools\fsr3-bridge)."
++}
++$build = Join-Path $install 'build'
++Remove-Item $build -Recurse -Force -ErrorAction SilentlyContinue
++& cmake -S $bridgeDir -B $build -DFSR3_SDK_DIR="$sdk" -DCMAKE_BUILD_TYPE=Release
++if ($LASTEXITCODE -ne 0) { throw 'cmake configure failed (see above)' }
++& cmake --build $build --config Release
++if ($LASTEXITCODE -ne 0) { throw 'cmake build failed (see above): the bridge did not compile against this SDK' }
++$bridge = Get-ChildItem $build -Recurse -Filter 'fsr3_bridge.dll' | Select-Object -First 1
++if (-not $bridge) { throw 'The build produced no fsr3_bridge.dll.' }
++Copy-Item $bridge.FullName (Join-Path $install 'fsr3_bridge.dll') -Force
++Copy-Item $amdDll.FullName (Join-Path $install 'amd_fidelityfx_dx12.dll') -Force
++$license = Get-ChildItem $sdk -Filter 'LICENSE*' | Select-Object -First 1
++if ($license) { Copy-Item $license.FullName (Join-Path $install $license.Name) -Force }
++Remove-Item $build -Recurse -Force -ErrorAction SilentlyContinue
++if ($scratch) { Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue }
++
++$missing = @('fsr3_bridge.dll', 'amd_fidelityfx_dx12.dll') | Where-Object { -not (Test-Path (Join-Path $install $_)) }
++if ($missing) { throw "Not there after all: $($missing -join ', ')" }
++Write-Host ''
++Write-Host "Done. In $install : fsr3_bridge.dll, amd_fidelityfx_dx12.dll."
++Write-Host 'Next: .\scripts\play-foxhound.ps1 -Exe <path of your own copy''s executable> -Fsr3FrameGen'
++Write-Host '  (or: victory play --fsr3-framegen). FSR 3 frame generation, 2x, with the title''s own upscaling.'
+diff --git a/scripts/play-foxhound.ps1 b/scripts/play-foxhound.ps1
+index a93fe45..06bd4c3 100644
+--- a/scripts/play-foxhound.ps1
++++ b/scripts/play-foxhound.ps1
+@@ -4,6 +4,8 @@
+ #   .\scripts\play-foxhound.ps1 -Exe 'D:\MyDump\game_scarlett_master.exe'
+ #   .\scripts\play-foxhound.ps1 -Exe ... -Dlss off            the title's own upscaling, no DLSS
+ #   .\scripts\play-foxhound.ps1 -Exe ... -Dlss balanced -FrameGen
++#   .\scripts\play-foxhound.ps1 -Exe ... -Fsr3FrameGen       FSR 3 frame generation, 2x (RTX 30-series, e.g. 3080 Ti:
++#                                                      DLSS frame generation needs an RTX 40 or later)
+ #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)
+ #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
+ #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
+@@ -25,6 +27,10 @@ param(
+     [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance')][string]$Dlss = 'quality',
+     # DLSS Frame Generation (RTX 40 or later, hardware-accelerated GPU scheduling on); needs DLSS.
+     [switch]$FrameGen,
++    # FSR 3 Frame Generation, 2x (RTX 30-series and most other GPUs; the title's own upscaling runs, no DLSS).
++    # Never together with -FrameGen: one frame-generation swap chain at a time. Needs the bridge built by
++    # Get-FSR3.cmd (fsr3-sdk\fsr3_bridge.dll + AMD's amd_fidelityfx_dx12.dll).
++    [switch]$Fsr3FrameGen,
+     # Frames shown for each one rendered with -FrameGen: 2 to 6 (more than 2 needs an RTX 50; the layer asks the
+     # driver how many this card does and gives no more).
+     [ValidateRange(2, 6)][int]$FrameGenX = 2,
+@@ -56,6 +62,13 @@ if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
+     $FrameGen = $menu['VICTORY_MENU_FRAMEGEN'] -match '^[1-6]$'
+     if ($menu['VICTORY_MENU_FRAMEGEN'] -match '^[2-6]$') { $timesWanted = [int]$menu['VICTORY_MENU_FRAMEGEN'] }
+ }
++# FSR 3 frame generation: the F1 menu's VICTORY_MENU_FSR3_FG (2: on, 0: off) stands in for -Fsr3FrameGen.
++$fsr3Wanted = $Fsr3FrameGen
++if ($menu.Contains('VICTORY_MENU_FSR3_FG')) { $fsr3Wanted = $menu['VICTORY_MENU_FSR3_FG'] -eq '2' }
++if ($fsr3Wanted -and $FrameGen) {
++    Write-Host "Both DLSS frame generation and FSR 3 frame generation were asked for: DLSS wins, FSR 3 off."
++    $fsr3Wanted = $false
++}
+ if ($menu['VICTORY_MENU_FPS'] -match '^\d+$' -and [int]$menu['VICTORY_MENU_FPS'] -ge 1 -and [int]$menu['VICTORY_MENU_FPS'] -le 1000) { $fpsWanted = [int]$menu['VICTORY_MENU_FPS'] }
+ $settings = @{
+     # Submission and copy machinery
+@@ -88,7 +101,22 @@ if (-not $SeriesS) {
+     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
+     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
+ }
+-if ($Dlss -ne 'off') {
++if ($fsr3Wanted) {
++    if ($Dlss -ne 'off') { Write-Host "FSR 3 frame generation in this milestone runs with the title's own upscaling, not DLSS: DLSS off for this run."; $Dlss = 'off' }
++    # FSR 3's bridge: where VICTORY_FSR3_DIR says, else where Get-FSR3.cmd puts it.
++    $fsr3dir = if ($env:VICTORY_FSR3_DIR) { $env:VICTORY_FSR3_DIR } else { Join-Path $repo 'fsr3-sdk' }
++    if (Test-Path (Join-Path $fsr3dir 'fsr3_bridge.dll')) {
++        $settings.VICTORY_FSR3_FG = '1'; $settings.VICTORY_FSR3_DIR = $fsr3dir
++        # Frame generation takes 1.5 to 2 GB of the card's memory, which the layer otherwise fills with textures:
++        # on from the start, it is left a fifth of the budget (on a 12 GB card it then ran out for DLSS FG).
++        $settings.VICTORY_TEXTURE_ROOM_PERCENT = '80'
++    } else {
++        Write-Host "No FSR 3 bridge in ${fsr3dir}: running without FSR 3 frame generation. Get-FSR3.cmd in the"
++        Write-Host "repository folder builds it from the FidelityFX SDK once; VICTORY_FSR3_DIR names another folder."
++        $fsr3Wanted = $false
++    }
++}
++if (-not $fsr3Wanted -and $Dlss -ne 'off') {
+     # NVIDIA's files: where VICTORY_STREAMLINE_DIR says, else where Get-NVIDIA-DLSS.cmd puts them.
+     $sl = if ($env:VICTORY_STREAMLINE_DIR) { $env:VICTORY_STREAMLINE_DIR } else { Join-Path $repo 'nvidia-sdk\Streamline\bin\x64' }
+     if (Test-Path (Join-Path $sl 'sl.interposer.dll')) {
+@@ -117,10 +145,11 @@ $settings.VICTORY_MENU_CONSOLE = $console
+ $settings.VICTORY_MENU_RES = $Res
+ $settings.VICTORY_MENU_DLSS = if ($settings.VICTORY_DLSS -eq '1') { $Dlss } else { 'off' }
+ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [string]$settings.VICTORY_FRAMEGEN_X } else { '0' }
++$settings.VICTORY_MENU_FSR3_FG = if ($settings.VICTORY_FSR3_FG -eq '1') { '2' } else { '0' }
+ $settings.VICTORY_MENU_FPS = [string]$fpsWanted
+ $settings.VICTORY_MENU_FILE = $menuFile
+ $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
+-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
++$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($fsr3Wanted) { ' -Fsr3FrameGen' })"
+ 
+ $victory = Join-Path $repo "target\$Build\victory.exe"
+ if (-not (Test-Path $victory)) {
+@@ -136,7 +165,7 @@ if (-not (Test-Path $victory)) {
+ }
+ if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
+ # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
+-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR'
++$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FSR3_DIR'
+ Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
+ foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+ 
+diff --git a/tools/fsr3-bridge/CMakeLists.txt b/tools/fsr3-bridge/CMakeLists.txt
+new file mode 100644
+index 0000000..4a793e1
+--- /dev/null
++++ b/tools/fsr3-bridge/CMakeLists.txt
+@@ -0,0 +1,42 @@
++# Build fsr3_bridge.dll against the FidelityFX SDK (FSR 3.1).
++#
++#   cmake -S tools/fsr3-bridge -B build/fsr3-bridge ^
++#     -DFSR3_SDK_DIR=<path to FidelityFX-SDK checkout> ^
++#     -DCMAKE_BUILD_TYPE=Release
++#   cmake --build build/fsr3-bridge --config Release
++#
++# FSR3_SDK_DIR must contain ffx-api/include (the SDK headers) — see
++# scripts/get-fsr3.ps1, which fetches SDK 1.1.4 and runs this build.
++# The DLL is loaded at run time; nothing here is linked into victory.exe.
++# AMD's signed DLL (amd_fidelityfx_dx12.dll) is loaded by the bridge
++# itself, from the same folder as fsr3_bridge.dll, at run time.
++
++cmake_minimum_required(VERSION 3.20)
++project(fsr3_bridge CXX)
++
++if(NOT WIN32)
++  message(FATAL_ERROR "fsr3_bridge.dll is Windows-only (DirectX 12)")
++endif()
++
++if(NOT DEFINED FSR3_SDK_DIR)
++  message(FATAL_ERROR "FSR3_SDK_DIR is required: the FidelityFX SDK checkout (ffx-api/include)")
++endif()
++
++add_library(fsr3_bridge SHARED
++  fsr3_bridge.cpp
++  fsr3_bridge.h
++)
++
++target_include_directories(fsr3_bridge PRIVATE
++  "${FSR3_SDK_DIR}/ffx-api/include"
++)
++
++target_compile_features(fsr3_bridge PRIVATE cxx_std_17)
++target_compile_definitions(fsr3_bridge PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
++
++# The Windows SDK's d3d12 / dxgi headers, plus the bridge's own exports.
++target_link_libraries(fsr3_bridge PRIVATE d3d12 dxgi)
++
++# The DLL must land next to AMD's DLL, in fsr3-sdk\, not in a build dir.
++# get-fsr3.ps1 copies it there; a manual build can set the output dir:
++#   -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=<repo>/fsr3-sdk
+diff --git a/tools/fsr3-bridge/README.md b/tools/fsr3-bridge/README.md
+new file mode 100644
+index 0000000..d78c7e9
+--- /dev/null
++++ b/tools/fsr3-bridge/README.md
+@@ -0,0 +1,67 @@
++# FSR 3 bridge (`fsr3_bridge.dll`)
++
++The only place in this repository that knows AMD's FidelityFX API
++structs. Rust (`crates/victory-gpu/src/fsr3.rs`) talks to it over the
++minimal C ABI in `fsr3_bridge.h` — opaque pointers and scalars only —
++so no AMD struct layout is ever hand-mirrored in Rust.
++
++## What it does
++
++Per GPUOpen's FSR 3.1 docs ("AMD FSR Frame Generation API",
++"FSR 3.1 Integration Overview"):
++
++1. Loads AMD's signed DLL at run time
++   (`amd_fidelityfx_dx12.dll`, SDK 2.0 fallback
++   `amd_fidelityfx_loader_dx12.dll`) and resolves the five `ffx*`
++   functions with `GetProcAddress`.
++2. `fsr3_fg_create`: frame-generation context
++   (`ffxCreateContextDescFrameGeneration` + backend desc, version
++   struct chained when the SDK provides it).
++3. `fsr3_fg_wrap_swapchain`: wraps the swap chain in FSR 3's
++   frame-interpolation swap chain
++   (`ffxCreateContextDescFrameGenerationSwapChainWrapDX12`).
++4. `fsr3_fg_prepare`: prepare pass
++   (`ffxDispatchDescFrameGenerationPrepareV2`) from depth + motion
++   vectors, recorded into the caller's command list.
++5. `fsr3_fg_configure`: per-frame configure
++   (`ffxConfigureDescFrameGeneration`), with the frame-generation
++   callback (dispatches interpolation during Present) and the
++   present callback (copies the back buffer, UI included, to the
++   output buffer).
++6. `fsr3_fg_recreate`: on a resize, remakes only the
++   frame-generation context at the new size, in place — the wrapped
++   swap chain stays alive (its swapchain context's callbacks point
++   at the same state), because the host `ResizeBuffers` it and
++   keeps presenting through it.
++
++## Building
++
++Do not build by hand unless you need to — `Get-FSR3.cmd` in the
++repository root does the whole thing: fetches FidelityFX SDK 1.1.4
++(FSR 3.1), builds this bridge with MSVC/CMake, copies
++`fsr3_bridge.dll` and AMD's signed DLL into `fsr3-sdk\`.
++
++Manual build (Windows, MSVC, CMake, SDK checkout at
++`E:\sdk\FidelityFX-SDK`):
++
++```powershell
++cmake -S tools\fsr3-bridge -B build\fsr3-bridge -DFSR3_SDK_DIR=E:\sdk\FidelityFX-SDK
++cmake --build build\fsr3-bridge --config Release
++copy build\fsr3-bridge\Release\fsr3_bridge.dll fsr3-sdk\
++```
++
++If the build fails on a struct field or macro name, that is the
++system working: the SDK headers changed, and the bridge must be
++updated to the SDK's documented layout — do not rename fields to
++make it compile against a different SDK version without checking
++the GPUOpen docs for that version.
++
++## Known approximations
++
++- Camera vectors are (0,0,0) / up (0,1,0) / right (1,0,0) /
++  forward (0,0,-1): the title gives no camera matrices, same as
++  DLSS in this layer.
++- UI is copied as-is in the present callback; `HUDLessColor` (the
++  scene texture) is passed so FSR 3 can tell UI from scene. Close
++  the F1 menu while frame generation is on.
++- SDR only, async workloads off, 2x only.
+diff --git a/tools/fsr3-bridge/fsr3_bridge.cpp b/tools/fsr3-bridge/fsr3_bridge.cpp
+new file mode 100644
+index 0000000..22053c7
+--- /dev/null
++++ b/tools/fsr3-bridge/fsr3_bridge.cpp
+@@ -0,0 +1,389 @@
++// fsr3_bridge.cpp — FSR 3 frame generation for VIctory, via the
++// FidelityFX API (FSR 3.1, FidelityFX SDK 1.1.4).
++//
++// This is the ONLY file in the repository that knows AMD's FidelityFX
++// structs. It is compiled on Windows against the real SDK headers
++// (`ffx-api/include`), so a struct that changed in a newer SDK fails
++// the build here, loudly, instead of corrupting memory at run time
++// from a hand-mirrored layout in Rust.
++//
++// What it does, per GPUOpen ("AMD FSR Frame Generation API",
++// "FSR 3.1 Integration Overview", FSR 3.1.0):
++//   1. Loads AMD's signed DLL at run time (amd_fidelityfx_dx12.dll,
++//      SDK 2.0 fallback amd_fidelityfx_loader_dx12.dll) and resolves
++//      the five ffx* functions with GetProcAddress.
++//   2. fsr3_fg_create: creates a frame-generation context
++//      (ffxCreateContextDescFrameGeneration + backend desc, with the
++//      version struct chained when the SDK provides it).
++//   3. fsr3_fg_wrap_swapchain: wraps the game's swap chain in FSR 3's
++//      frame-interpolation swap chain
++//      (ffxCreateContextDescFrameGenerationSwapChainWrapDX12, type
++//      0x30001). Presents from then on go through the wrapped chain.
++//   4. fsr3_fg_prepare: dispatches the frame-generation prepare pass
++//      (ffxDispatchDescFrameGenerationPrepareV2) into the caller's
++//      command list, from depth + motion vectors.
++//   5. fsr3_fg_configure: configures frame generation once per frame
++//      (ffxConfigureDescFrameGeneration), registering the frame-
++//      generation callback (which dispatches the interpolation) and
++//      the present callback (which copies the back buffer, with the
++//      UI already in it, into the output buffer).
++//   6. fsr3_fg_recreate: on a resize, remakes only the frame-
++//      generation context at the new size, in place — the wrapped
++//      swap chain (its swapchain context) stays alive, because the
++//      host ResizeBuffers it and keeps presenting through it.
++//
++// Known approximations, stated so they can be fixed with real data:
++//   - Camera vectors: the title gives no camera matrices (same as
++//     DLSS in this layer, which builds its constants from FOV/near/
++//     far alone). Prepare is given position (0,0,0), up (0,1,0),
++//     right (1,0,0), forward (0,0,-1). If FSR 3's optical flow needs
++//     the real camera, this is where it goes in.
++//   - UI: the host draws its F1 menu / stats panel onto the back
++//     buffer before Present, so the present callback copies that
++//     buffer as-is. HUDLessColor (the scene texture, no host UI) is
++//     passed so FSR 3 can tell UI from scene. The F1 menu should be
++//     closed while frame generation is on.
++//   - SDR only: VIctory presents SDR (2560x1440 SDR). The
++//     back-buffer transfer function is SRGB and the luminance range
++//     is [0, 1].
++//   - Async workloads are off (flag bit 4 must be 0): the optical-
++//     flow and interpolation work runs on the graphics queue, in
++//     the order the layer submits it.
++
++#include "fsr3_bridge.h"
++
++#include <windows.h>
++#include <d3d12.h>
++#include <dxgi1_4.h>
++
++#include <ffx_api/ffx_api.h>
++#include <ffx_api/dx12/ffx_api_dx12.h>
++
++#include <cstring>
++
++// The bridge DLL's own base, for finding AMD's DLL beside it.
++EXTERN_C IMAGE_DOS_HEADER __ImageBase;
++
++namespace {
++
++// The five FidelityFX API functions, resolved from AMD's DLL.
++// Signatures are the documented ones (ffx_api.h):
++//   ffxCreateContext(ffxContext*, ffxCreateContextDescHeader*,
++//                    const ffxAllocationCallbacks*)
++//   ffxDestroyContext(ffxContext*, const ffxAllocationCallbacks*)
++//   ffxDispatch(ffxContext*, const ffxDispatchDescHeader*)
++//   ffxQuery(ffxContext*, ffxQueryDescHeader*)
++//   ffxConfigure(ffxContext*, ffxConfigureDescHeader*)
++using FfxCreateContextFn = ffxReturnCode_t (*)(ffxContext *, ffxCreateContextDescHeader *,
++                                                const ffxAllocationCallbacks *);
++using FfxDestroyContextFn = ffxReturnCode_t (*)(ffxContext *, const ffxAllocationCallbacks *);
++using FfxDispatchFn = ffxReturnCode_t (*)(ffxContext *, const ffxDispatchDescHeader *);
++using FfxQueryFn = ffxReturnCode_t (*)(ffxContext *, ffxQueryDescHeader *);
++using FfxConfigureFn = ffxReturnCode_t (*)(ffxContext *, ffxConfigureDescHeader *);
++
++struct FfxApi {
++    HMODULE module = nullptr;
++    FfxCreateContextFn createContext = nullptr;
++    FfxDestroyContextFn destroyContext = nullptr;
++    FfxDispatchFn dispatch = nullptr;
++    FfxQueryFn query = nullptr;
++    FfxConfigureFn configure = nullptr;
++};
++
++struct Fsr3Fg {
++    FfxApi api;
++    ffxContext fgContext = nullptr;
++    ffxContext swapContext = nullptr;
++    ID3D12Device *device = nullptr;
++    ID3D12CommandQueue *gameQueue = nullptr;
++    uint32_t displayWidth = 0, displayHeight = 0;
++    uint32_t renderWidth = 0, renderHeight = 0;
++    uint32_t backBufferFormat = 0; // DXGI_FORMAT
++    uint32_t flags = 0;
++    uint64_t lastFrameID = 0;
++    bool enabled = false;
++};
++
++// Load AMD's DLL from the same folder as this bridge DLL.
++bool loadAmd(FfxApi &api) {
++    wchar_t path[MAX_PATH];
++    if (GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), path, MAX_PATH) == 0) {
++        return false;
++    }
++    // __ImageBase is the bridge DLL's own base; its folder is AMD's.
++    wchar_t *slash = wcsrchr(path, L'\\');
++    if (slash) *slash = L'\0';
++    const wchar_t *names[] = {L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll"};
++    for (const wchar_t *name : names) {
++        wchar_t full[MAX_PATH];
++        _snwprintf_s(full, MAX_PATH, _TRUNCATE, L"%s\\%s", path, name);
++        HMODULE module = LoadLibraryW(full);
++        if (!module) continue;
++        auto get = [&](const char *n) {
++            return reinterpret_cast<void *>(GetProcAddress(module, n));
++        };
++        api.createContext = reinterpret_cast<FfxCreateContextFn>(get("ffxCreateContext"));
++        api.destroyContext = reinterpret_cast<FfxDestroyContextFn>(get("ffxDestroyContext"));
++        api.dispatch = reinterpret_cast<FfxDispatchFn>(get("ffxDispatch"));
++        api.query = reinterpret_cast<FfxQueryFn>(get("ffxQuery"));
++        api.configure = reinterpret_cast<FfxConfigureFn>(get("ffxConfigure"));
++        if (api.createContext && api.destroyContext && api.dispatch && api.query && api.configure) {
++            api.module = module;
++            return true;
++        }
++        FreeLibrary(module);
++        api = FfxApi{};
++    }
++    return false;
++}
++
++FfxApiSurfaceFormat surfaceFormat(uint32_t dxgiFormat) {
++    switch (dxgiFormat) {
++        case DXGI_FORMAT_R8G8B8A8_UNORM: return FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
++        case DXGI_FORMAT_B8G8R8A8_UNORM: return FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM;
++        case DXGI_FORMAT_R10G10B10A2_UNORM: return FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM;
++        case DXGI_FORMAT_R16G16B16A16_FLOAT: return FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT;
++        default: return FFX_API_SURFACE_FORMAT_UNKNOWN;
++    }
++}
++
++uint32_t fgFlags(uint32_t flags) {
++    uint32_t out = 0;
++    if (flags & FSR3_FG_FLAG_HDR) out |= FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE;
++    if (flags & FSR3_FG_FLAG_DEPTH_INVERTED) out |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
++    if (flags & FSR3_FG_FLAG_DISPLAY_MV) out |= FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
++    if (flags & FSR3_FG_FLAG_MV_JITTER) out |= FFX_FRAMEGENERATION_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
++    if (flags & FSR3_FG_FLAG_ASYNC_WORKLOADS) out |= FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
++    return out;
++}
++
++// Called by the FSR swap chain during Present, to generate a frame.
++// Dispatches the interpolation with the parameters FSR 3 supplies.
++ffxReturnCode_t frameGenerationCallback(ffxDispatchDescFrameGeneration *params, void *userCtx) {
++    auto *fg = static_cast<Fsr3Fg *>(userCtx);
++    if (!fg || !params) return FFX_API_RETURN_ERROR;
++    return fg->api.dispatch(&fg->fgContext, &params->header);
++}
++
++// Called by the FSR swap chain for every frame presented (real or
++// generated). Copies the back buffer — UI already composited into it
++// by the host — into the output buffer.
++ffxReturnCode_t presentCallback(ffxCallbackDescFrameGenerationPresent *params, void * /*userCtx*/) {
++    if (!params || !params->commandList) return FFX_API_RETURN_ERROR;
++    auto *list = static_cast<ID3D12GraphicsCommandList *>(params->commandList);
++    auto *back = static_cast<ID3D12Resource *>(params->currentBackBuffer.resource);
++    auto *out = static_cast<ID3D12Resource *>(params->outputSwapChainBuffer.resource);
++    if (!back || !out) return FFX_API_RETURN_ERROR;
++    list->CopyResource(out, back);
++    return FFX_API_RETURN_OK;
++}
++
++// Make the frame-generation context from fg's current fields.
++// The swapchain context is untouched: it keeps pointing at this
++// same Fsr3Fg for its callbacks.
++int createFgContext(Fsr3Fg *fg) {
++    ffxCreateBackendDX12Desc backendDesc{};
++    backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
++    backendDesc.device = fg->device;
++
++    ffxCreateContextDescFrameGeneration createFg{};
++    createFg.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
++    createFg.displaySize = {fg->displayWidth, fg->displayHeight};
++    createFg.maxRenderSize = {fg->renderWidth, fg->renderHeight};
++    createFg.flags = fgFlags(fg->flags);
++    createFg.backBufferFormat = surfaceFormat(fg->backBufferFormat);
++    if (createFg.backBufferFormat == FFX_API_SURFACE_FORMAT_UNKNOWN) {
++        return -1;
++    }
++
++    // SDK 2.1+ needs the version struct chained; SDK 1.1.4 does not
++    // provide it, so chain it only when the header defines it.
++#ifdef FFX_FRAMEGENERATION_VERSION
++    ffxCreateContextDescFrameGenerationVersion versionDesc{};
++    versionDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
++    versionDesc.version = FFX_FRAMEGENERATION_VERSION;
++    versionDesc.header.pNext = &backendDesc.header;
++    createFg.header.pNext = &versionDesc.header;
++#else
++    createFg.header.pNext = &backendDesc.header;
++#endif
++
++    ffxReturnCode_t code = fg->api.createContext(&fg->fgContext, &createFg.header, nullptr);
++    if (code != FFX_API_RETURN_OK || !fg->fgContext) {
++        return static_cast<int>(code);
++    }
++    return 0;
++}
++
++} // namespace
++
++extern "C" {
++
++int fsr3_bridge_version(void) { return FSR3_BRIDGE_ABI_VERSION; }
++
++int fsr3_fg_create(
++    void *device, void *gameQueue,
++    uint32_t displayWidth, uint32_t displayHeight,
++    uint32_t renderWidth, uint32_t renderHeight,
++    uint32_t backBufferFormat, uint32_t flags,
++    void **outFg) {
++    if (!device || !gameQueue || !outFg || displayWidth == 0 || displayHeight == 0) return -1;
++    auto *fg = new (std::nothrow) Fsr3Fg{};
++    if (!fg) return -1;
++    if (!loadAmd(fg->api)) {
++        delete fg;
++        return -1;
++    }
++    fg->device = static_cast<ID3D12Device *>(device);
++    fg->gameQueue = static_cast<ID3D12CommandQueue *>(gameQueue);
++    fg->displayWidth = displayWidth;
++    fg->displayHeight = displayHeight;
++    fg->renderWidth = renderWidth;
++    fg->renderHeight = renderHeight;
++    fg->backBufferFormat = backBufferFormat;
++    fg->flags = flags;
++
++    int code = createFgContext(fg);
++    if (code != 0) {
++        delete fg;
++        return code;
++    }
++    *outFg = fg;
++    return 0;
++}
++
++int fsr3_fg_recreate(
++    void *fgIn,
++    uint32_t displayWidth, uint32_t displayHeight,
++    uint32_t renderWidth, uint32_t renderHeight,
++    uint32_t backBufferFormat, uint32_t flags) {
++    auto *fg = static_cast<Fsr3Fg *>(fgIn);
++    if (!fg || displayWidth == 0 || displayHeight == 0) return -1;
++    // The old context goes first; the wrapped swap chain (its
++    // swapchain context, whose callbacks point at this Fsr3Fg)
++    // stays alive and is ResizeBuffers'd by the host right after.
++    if (fg->fgContext) {
++        fg->api.destroyContext(&fg->fgContext, nullptr);
++        fg->fgContext = nullptr;
++    }
++    fg->displayWidth = displayWidth;
++    fg->displayHeight = displayHeight;
++    fg->renderWidth = renderWidth;
++    fg->renderHeight = renderHeight;
++    fg->backBufferFormat = backBufferFormat;
++    fg->flags = flags;
++    fg->lastFrameID = 0;
++    fg->enabled = false;
++    return createFgContext(fg);
++}
++
++int fsr3_fg_wrap_swapchain(void *fgIn, void **swapchainInOut, void **outWrapped) {
++    auto *fg = static_cast<Fsr3Fg *>(fgIn);
++    if (!fg || !swapchainInOut || !*swapchainInOut || !outWrapped) return -1;
++    auto *swapchain = static_cast<IDXGISwapChain4 *>(*swapchainInOut);
++
++    ffxCreateContextDescFrameGenerationSwapChainWrapDX12 wrapDesc{};
++    wrapDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12;
++    wrapDesc.swapchain = &swapchain;
++    wrapDesc.gameQueue = fg->gameQueue;
++
++#ifdef FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION
++    ffxCreateContextDescFrameGenerationSwapChainVersionDX12 versionDesc{};
++    versionDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_DX12;
++    versionDesc.version = FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION;
++    wrapDesc.header.pNext = &versionDesc.header;
++#endif
++
++    ffxReturnCode_t code = fg->api.createContext(&fg->swapContext, &wrapDesc.header, nullptr);
++    if (code != FFX_API_RETURN_OK || !fg->swapContext || !swapchain) {
++        return static_cast<int>(code);
++    }
++    // The wrap replaces the chain in place; `swapchain` now points at
++    // the frame-interpolation proxy. Hand it back with a new reference.
++    swapchain->AddRef();
++    *outWrapped = swapchain;
++    return 0;
++}
++
++int fsr3_fg_prepare(
++    void *fgIn, void *commandList,
++    void *depth, uint32_t depthState,
++    void *motionVectors, uint32_t motionVectorState,
++    float jitterX, float jitterY,
++    float motionVectorScaleX, float motionVectorScaleY,
++    float frameTimeMs, int reset,
++    float cameraNear, float cameraFar, float cameraFovAngleVertical,
++    uint64_t frameID) {
++    auto *fg = static_cast<Fsr3Fg *>(fgIn);
++    if (!fg || !commandList || !depth || !motionVectors) return -1;
++    if (fg->lastFrameID != 0 && frameID != fg->lastFrameID + 1) {
++        // A step other than +1 resets FSR 3's logic; that is expected
++        // after a scene cut, so it is not an error here — the reset
++        // flag carries it.
++    }
++
++    ffxDispatchDescFrameGenerationPrepareV2 prepare{};
++    prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
++    prepare.commandList = commandList;
++    prepare.renderSize = {fg->renderWidth, fg->renderHeight};
++    prepare.jitterOffset = {jitterX, jitterY};
++    prepare.motionVectorScale = {motionVectorScaleX, motionVectorScaleY};
++    prepare.frameTimeDelta = frameTimeMs;
++    prepare.reset = reset != 0;
++    prepare.cameraNear = cameraNear;
++    prepare.cameraFar = cameraFar;
++    prepare.cameraFovAngleVertical = cameraFovAngleVertical;
++    prepare.viewSpaceToMetersFactor = 1.0f;
++    prepare.depth = ffxGetResource(depth, L"FSR3_Depth", static_cast<FfxApiResourceState>(depthState));
++    prepare.motionVectors = ffxGetResource(motionVectors, L"FSR3_MotionVectors", static_cast<FfxApiResourceState>(motionVectorState));
++    // The title gives no camera matrices (see the file header).
++    prepare.cameraPosition = {0.0f, 0.0f, 0.0f};
++    prepare.cameraUp = {0.0f, 1.0f, 0.0f};
++    prepare.cameraRight = {1.0f, 0.0f, 0.0f};
++    prepare.cameraForward = {0.0f, 0.0f, -1.0f};
++    prepare.frameID = static_cast<uint32_t>(frameID);
++
++    ffxReturnCode_t code = fg->api.dispatch(&fg->fgContext, &prepare.header);
++    if (code == FFX_API_RETURN_OK) fg->lastFrameID = frameID;
++    return static_cast<int>(code);
++}
++
++int fsr3_fg_configure(
++    void *fgIn, void *swapChain,
++    void *hudlessColor, uint32_t hudlessState,
++    uint64_t frameID, int enabled) {
++    auto *fg = static_cast<Fsr3Fg *>(fgIn);
++    if (!fg || !swapChain) return -1;
++
++    ffxConfigureDescFrameGeneration config{};
++    config.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
++    config.swapChain = swapChain;
++    config.frameGenerationCallback = &frameGenerationCallback;
++    config.frameGenerationCallbackUserContext = fg;
++    config.presentCallback = &presentCallback;
++    config.presentCallbackUserContext = fg;
++    config.frameGenerationEnabled = enabled != 0;
++    config.allowAsyncWorkloads = (fg->flags & FSR3_FG_FLAG_ASYNC_WORKLOADS) != 0;
++    config.HUDLessColor = hudlessColor
++        ? ffxGetResource(hudlessColor, L"FSR3_HudlessColor", static_cast<FfxApiResourceState>(hudlessState))
++        : FfxApiResource{};
++    config.flags = 0;
++    config.onlyPresentGenerated = false;
++    config.generationRect = {0, 0, static_cast<int32_t>(fg->displayWidth), static_cast<int32_t>(fg->displayHeight)};
++    config.frameID = static_cast<uint32_t>(frameID);
++
++    ffxReturnCode_t code = fg->api.configure(&fg->fgContext, &config.header);
++    if (code == FFX_API_RETURN_OK) fg->enabled = enabled != 0;
++    return static_cast<int>(code);
++}
++
++void fsr3_fg_destroy(void *fgIn) {
++    auto *fg = static_cast<Fsr3Fg *>(fgIn);
++    if (!fg) return;
++    if (fg->swapContext) fg->api.destroyContext(&fg->swapContext, nullptr);
++    if (fg->fgContext) fg->api.destroyContext(&fg->fgContext, nullptr);
++    if (fg->api.module) FreeLibrary(fg->api.module);
++    delete fg;
++}
++
++} // extern "C"
+diff --git a/tools/fsr3-bridge/fsr3_bridge.h b/tools/fsr3-bridge/fsr3_bridge.h
+new file mode 100644
+index 0000000..e791e0b
+--- /dev/null
++++ b/tools/fsr3-bridge/fsr3_bridge.h
+@@ -0,0 +1,121 @@
++// fsr3_bridge.h — the C ABI between Rust (`crates/victory-gpu/src/fsr3.rs`)
++// and this bridge DLL.
++//
++// The bridge is the only place that knows AMD's FidelityFX API structs.
++// It is compiled on Windows against the FidelityFX SDK 1.1.4 headers
++// (FSR 3.1), which `scripts/get-fsr3.ps1` fetches. Rust passes only
++// opaque pointers and scalars across this boundary, so no AMD struct
++// layout is ever hand-mirrored in Rust.
++//
++// Versioning: `fsr3_bridge_version()` must return FSR3_BRIDGE_ABI_VERSION.
++// Rust refuses any other version — a stale bridge must never run against
++// a newer Rust side, or vice versa.
++//
++// All functions return 0 on success, otherwise a FidelityFX return code
++// (FFX_API_RETURN_OK is 0), or -1 for a bridge-side failure (missing AMD
++// DLL, missing export, bad argument). No function throws; all failures
++// are reported as a code so the Rust side can fall back to the plain
++// present and the title's own upscaling.
++//
++// Threading: create / wrap / destroy are called once, on the presenting
++// thread. prepare is called while recording the title's command list.
++// configure is called once per present, on the presenting thread.
++// frameID must increment by exactly 1 per frame (FSR 3.1's rule); the
++// Rust side owns that counter (the upscale id).
++
++#ifndef FSR3_BRIDGE_H
++#define FSR3_BRIDGE_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define FSR3_BRIDGE_ABI_VERSION 1
++
++// Flags for fsr3_fg_create (bit positions are this ABI's, not AMD's):
++//   bit 0: HDR colour
++//   bit 1: inverted depth [1..0]
++//   bit 2: display-resolution motion vectors
++//   bit 3: motion vectors carry the jitter
++//   bit 4: async workloads (must be 0 in this milestone — off)
++#define FSR3_FG_FLAG_HDR (1u << 0)
++#define FSR3_FG_FLAG_DEPTH_INVERTED (1u << 1)
++#define FSR3_FG_FLAG_DISPLAY_MV (1u << 2)
++#define FSR3_FG_FLAG_MV_JITTER (1u << 3)
++#define FSR3_FG_FLAG_ASYNC_WORKLOADS (1u << 4)
++
++// The ABI version this bridge speaks.
++__declspec(dllexport) int fsr3_bridge_version(void);
++
++// Opaque frame-generation state. Created by fsr3_fg_create, destroyed
++// by fsr3_fg_destroy. Do not free it yourself.
++typedef struct Fsr3Fg Fsr3Fg;
++
++// Create the FSR 3 frame-generation context for displaySize /
++// renderSize, with backBufferFormat as a DXGI_FORMAT value.
++// device is ID3D12Device*, gameQueue is ID3D12CommandQueue*.
++// Returns 0 and *outFg on success.
++__declspec(dllexport) int fsr3_fg_create(
++    void *device, void *gameQueue,
++    uint32_t displayWidth, uint32_t displayHeight,
++    uint32_t renderWidth, uint32_t renderHeight,
++    uint32_t backBufferFormat, uint32_t flags,
++    void **outFg);
++
++// Wrap an existing swap chain in FSR 3's frame-interpolation swap
++// chain. *swapchainInOut is IDXGISwapChain4* on entry; on success
++// *outWrapped is the wrapped IDXGISwapChain4* (a new reference, owned
++// by the caller), and the original chain stays held by the wrap.
++// Present / ResizeBuffers / GetBuffer must go through the wrapped
++// chain from then on. Returns 0 on success.
++__declspec(dllexport) int fsr3_fg_wrap_swapchain(
++    void *fg, void **swapchainInOut, void **outWrapped);
++
++// Remake the frame-generation context inside the same Fsr3Fg, at a
++// new display / render size, keeping the wrapped swap chain (its
++// swapchain context) alive: the host ResizeBuffers the wrapped chain
++// on a resize, and the swapchain context's callbacks still point at
++// this same Fsr3Fg, so a brand-new Fsr3Fg (whose callbacks the wrap
++// never registered) would dispatch through a dead context. The old
++// frame-generation context is destroyed first; the swapchain context
++// is not touched. Returns 0 on success. Safe with NULL (returns -1).
++__declspec(dllexport) int fsr3_fg_recreate(
++    void *fg,
++    uint32_t displayWidth, uint32_t displayHeight,
++    uint32_t renderWidth, uint32_t renderHeight,
++    uint32_t backBufferFormat, uint32_t flags);
++
++// Record the frame-generation prepare pass into commandList
++// (ID3D12GraphicsCommandList*), from depth and motionVectors
++// (ID3D12Resource*, in the given D3D12_RESOURCE_STATES). frameID must
++// match the configure call for the same frame. Returns 0 on success.
++__declspec(dllexport) int fsr3_fg_prepare(
++    void *fg, void *commandList,
++    void *depth, uint32_t depthState,
++    void *motionVectors, uint32_t motionVectorState,
++    float jitterX, float jitterY,
++    float motionVectorScaleX, float motionVectorScaleY,
++    float frameTimeMs, int reset,
++    float cameraNear, float cameraFar, float cameraFovAngleVertical,
++    uint64_t frameID);
++
++// Configure frame generation for the next present: swapChain is
++// IDXGISwapChain*, hudlessColor is ID3D12Resource* (may be NULL) in
++// hudlessState, frameID is the same id as the prepare's, enabled is
++// 1 to generate, 0 for passthrough. Must be called once per frame.
++// Returns 0 on success.
++__declspec(dllexport) int fsr3_fg_configure(
++    void *fg, void *swapChain,
++    void *hudlessColor, uint32_t hudlessState,
++    uint64_t frameID, int enabled);
++
++// Destroy a context made by fsr3_fg_create. Safe with NULL.
++__declspec(dllexport) void fsr3_fg_destroy(void *fg);
++
++#ifdef __cplusplus
++} // extern "C"
++#endif
++
++#endif // FSR3_BRIDGE_H
+-- 
+2.43.0
+

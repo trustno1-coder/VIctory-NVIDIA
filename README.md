@@ -6,6 +6,8 @@
 
 1. Download `victory.exe` from the
    [latest release](https://github.com/trustno1-coder/VIctory-NVIDIA/releases/latest).
+   (That binary is the upstream build, without FSR 3 frame generation; to get
+   FSR 3, build it yourself below.)
 2. Put it into the folder of **your own dump** of the title's Xbox Series
    build v1.0.2.1, next to `game_scarlett_master.exe`.
 3. Double-click it. Windows may say the publisher is unknown (the file is not
@@ -35,14 +37,19 @@ Install [Rust](https://rustup.rs) and the
 with "Desktop development with C++", then in PowerShell:
 
 ```powershell
-git clone https://github.com/trustno1-coder/VIctory-NVIDIA
-cd VIctory-NVIDIA
+git clone https://github.com/EhRabz/Claude9
+cd Claude9
+git checkout fsr3-framegen-3080ti
 .\Get-NVIDIA-DLSS.cmd
-powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+.\Get-FSR3.cmd
+powershell -ExecutionPolicy Bypass -File scripts\play-foxhound.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Fsr3FrameGen
 ```
 
 Put the path to **your** `game_scarlett_master.exe` in the last line. The
-first start builds the layer, which takes a few minutes.
+first start builds the layer, which takes a few minutes. `Get-FSR3.cmd`
+fetches AMD's FSR 3 files (see
+[FSR 3 frame generation](#fsr-3-frame-generation)); leave off
+`-Fsr3FrameGen` to run the DLSS path instead.
 
 Options, requirements in full and the details are under
 [How to run it](#how-to-run-it).
@@ -225,19 +232,22 @@ What is known to be wrong:
 ## How to run it
 
 You need Windows 10 or 11 (x64), a CPU with AVX2, 32 GB of RAM or more, an
-SSD, an NVIDIA GeForce RTX card with a recent driver (RTX 40 or later for frame
-generation, with hardware-accelerated GPU scheduling on; more than 2x needs an
-RTX 50), [Rust](https://rustup.rs) (the toolchain is pinned), the Visual Studio
-Build Tools with "Desktop development with C++", and **your own dump** of the
-title's Xbox Series build v1.0.2.1 (the folder with
-`game_scarlett_master.exe`).
+SSD, an NVIDIA GeForce RTX card with a recent driver (RTX 40 or later for DLSS
+frame generation, with hardware-accelerated GPU scheduling on; more than 2x
+needs an RTX 50; RTX 30-series can do frame generation through FSR 3 instead,
+see [FSR 3 frame generation](#fsr-3-frame-generation)),
+[Rust](https://rustup.rs) (the toolchain is pinned), the Visual Studio Build
+Tools with "Desktop development with C++", and **your own dump** of the title's
+Xbox Series build v1.0.2.1 (the folder with `game_scarlett_master.exe`).
 
 ```powershell
-git clone https://github.com/trustno1-coder/VIctory-NVIDIA
-cd VIctory-NVIDIA
+git clone https://github.com/EhRabz/Claude9
+cd Claude9
+git checkout fsr3-framegen-3080ti
 copy victory.example.toml victory.toml      # then set game_dir to your dump's folder, outside this one
 .\Get-NVIDIA-DLSS.cmd                        # once: NVIDIA's DLSS and frame generation files, about 70 MB
-scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+.\Get-FSR3.cmd                               # once: AMD's FSR 3 files, for frame generation on RTX 30-series
+scripts\play-foxhound.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Fsr3FrameGen
 ```
 
 The first start builds the layer (a few minutes). `Get-NVIDIA-DLSS.cmd` gets
@@ -246,15 +256,17 @@ NVIDIA's files from
 `nvidia-sdk\` (git-ignored). They are NVIDIA's, under NVIDIA's licences, which
 are saved beside them; this repository does not carry them and may not. Nothing
 is downloaded unless you run that file; `VICTORY_STREAMLINE_DIR` names another
-folder if you have the Streamline SDK already.
+folder if you have the Streamline SDK already. `Get-FSR3.cmd` gets AMD's FSR 3
+files the same way (see [FSR 3 frame generation](#fsr-3-frame-generation));
+nothing is downloaded unless you run it either.
 
-`scripts\play-nvidia.ps1` is `scripts\play-foxhound.ps1` under the name this
-fork has always had; its options:
+`scripts\play-foxhound.ps1` runs the game; its options:
 
 | Option | What |
 |---|---|
 | *(none)* | Series X profile, 2560x1440, DLSS Quality, no frame rate cap, frame generation ready but off |
 | `-FrameGen`, `-FrameGenX 4` | frame generation on from the start, 2 to 6 frames shown for each one rendered |
+| `-Fsr3FrameGen` | FSR 3 frame generation on from the start, 2x, with DLSS upscaling — for RTX 30-series and other GPUs DLSS frame generation cannot run on (run `Get-FSR3.cmd` once first; see [FSR 3 frame generation](#fsr-3-frame-generation)) |
 | `-Dlss off` / `dlaa` / `balanced` / `performance` | the title's own upscaling, or another DLSS mode |
 | `-Fps 60` | a frame rate cap (30 is the title's own) |
 | `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
@@ -267,6 +279,124 @@ What the F1 menu saved (`victory-settings.txt`) goes over these at every start;
 delete that file to go back to them. Full screen: start the game, then run
 `.\scripts\fullscreen.ps1` in another window. Logs go to
 `%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
+
+## FSR 3 frame generation
+
+DLSS frame generation needs an RTX 40-series card or later. On an RTX
+30-series card (or any other GPU DLSS frame generation cannot run on), this
+branch can do frame generation with AMD's FSR 3 instead. It is frame
+generation only, 2x: DLSS Super Resolution still does the upscaling, and only
+DLSS frame generation is off. The F1 menu shows it as FSR 3 FRAME GENERATION,
+OFF or 2X, and it can be switched while playing.
+
+### Getting the FSR 3 files
+
+The FSR 3 files are AMD's, under AMD's licences; this repository does not
+carry them and may not. `Get-FSR3.cmd` fetches them once:
+
+```powershell
+.\Get-FSR3.cmd
+```
+
+It downloads the FidelityFX SDK (version 1.1.4, the FSR 3.1 release) from
+GPUOpen, builds the small C++ bridge in `tools/fsr3-bridge` against it with
+CMake and the Visual Studio compiler, and puts the two files the game needs
+into `fsr3-sdk\` (git-ignored):
+
+- `fsr3_bridge.dll` — the bridge, built here
+- `amd_fidelityfx_dx12.dll` — AMD's prebuilt, signed FSR 3.1 library
+
+It needs CMake: if it is not on PATH, the script finds the copy Visual Studio
+ships with (through `vswhere` or the usual install folders). If the SDK is
+already extracted somewhere, point at it instead of downloading it again:
+
+```powershell
+.\Get-FSR3.cmd -SdkDir 'E:\Claude9\fsr3-sdk\sdk-src\FidelityFX-SDK-1.1.4'
+```
+
+`victory get-fsr3` does the same thing, and `victory upscaler-check` reports
+whether the bridge loads. `VICTORY_FSR3_DIR` names another folder if the files
+are somewhere else. DLSS is still needed for the upscaling, so run
+`Get-NVIDIA-DLSS.cmd` too (or set `VICTORY_STREAMLINE_DIR` to a Streamline
+SDK you already have).
+
+FSR 3.0 has no prebuilt library (it is source-only), and the 2.0 SDK splits
+the library into several files, so 3.1 (SDK 1.1.4) is the one this targets.
+Rust never touches AMD's structures directly: it talks only to the bridge
+over a small C interface, and all of AMD's types live in the bridge, compiled
+on Windows against the real SDK headers. The details are in
+[docs/FSR3_INTEGRATION.md](docs/FSR3_INTEGRATION.md) and the bridge's own
+[tools/fsr3-bridge/README.md](tools/fsr3-bridge/README.md).
+
+### Building and running it
+
+```powershell
+git clone https://github.com/EhRabz/Claude9
+cd Claude9
+git checkout fsr3-framegen-3080ti
+cargo build --release --locked -p victory
+.\scripts\play-foxhound.ps1 -Exe 'E:\GTA\game_scarlett_master.exe' -Fsr3FrameGen
+```
+
+Put the path to **your** `game_scarlett_master.exe` in the last line. The
+script only builds `victory.exe` if it is missing: after changing any `.rs`
+file, run the `cargo build` line again yourself. `-Fsr3FrameGen` sets DLSS
+Quality upscaling on, DLSS frame generation ready but off
+(`VICTORY_FRAMEGEN=1`, `VICTORY_FRAMEGEN_X=0`), and FSR 3 frame generation on
+(`VICTORY_FSR3_FG=1`), with a fifth of the texture budget held back
+(`VICTORY_TEXTURE_ROOM_PERCENT=80`) so the card has room for the extra frames.
+If both DLSS frame generation and FSR 3 frame generation are asked for, DLSS
+wins and FSR 3 stays off. The start-up line says which upscaling is in use;
+with DLSS on it reads `FSR 3 frame generation on (2x, DLSS upscaling), scene
+at the DLSS quality scale`.
+
+The game runs at 2560x1440. At that size the title's own upscaling cannot
+run: its shipping FSR4 upscaler only takes 1920x1080 out, so at 2560x1440 it
+fails to make and the title then divides by zero on its first upscale. DLSS
+upscaling is therefore required at 1440p, and `-Fsr3FrameGen` keeps it on.
+Close the F1 menu while frame generation is on: the interface is copied into
+the scene as-is, so the menu would be interpolated too. Frame generation is
+SDR only, and the camera vectors are approximated (the title gives no camera
+matrices), so depth and motion tagging are best-effort.
+
+### Where it stands
+
+Tested on Windows 11, GeForce RTX 3080 Ti 12 GB, 2560x1440, DLSS Quality.
+As of 2026-11-27 the frame-generation context is created and the game runs
+clean for minutes at a time with DLSS upscaling, but the swap-chain wrap
+fails (`FFX_API_RETURN_ERROR_RUNTIME_ERROR`, code 3), so frame generation
+stays off and the game presents as before. The wrap has been traced with
+diagnostics written beside the bridge (`fsr3-sdk\fsr3_wrap_diag.txt`, and
+`fsr3-sdk\fsr3_debug.txt` once the debug checker is on): the chain, its
+device, the game queue, fences, allocators, textures, descriptor heap,
+`IDXGISwapChain3` and `IDXGISwapChain4` all check out, so the failure is in
+a call none of those cover. That is the open problem; everything up to it
+works.
+
+### Troubleshooting
+
+- **DLSS is off even though `-Fsr3FrameGen` was passed.** What the F1 menu
+  saved (`victory-settings.txt`) goes over the script's options at every
+  start, and an old file still holds DLSS off. Delete it:
+  `Remove-Item 'victory-settings.txt'`.
+- **The build finishes in a fraction of a second.** Nothing recompiled: the
+  script only builds `victory.exe` if it is missing. Run
+  `cargo build --release --locked -p victory` yourself after replacing any
+  `.rs` file (about 20 seconds); if it still comes back instant,
+  `cargo clean -p victory` first.
+- **The script will not run: "not digitally signed".** A downloaded script
+  is marked as from the internet. Unblock it once:
+  `Unblock-File 'scripts\play-foxhound.ps1'`.
+- **`Get-FSR3.cmd` fails on `Expand-Archive`.** Older .NET has no
+  three-argument extract; the script now uses the two-argument form. Get the
+  latest `scripts/get-fsr3.ps1`.
+- **`Get-FSR3.cmd` fails with "cmake is not on PATH".** The script now finds
+  Visual Studio's own CMake. Get the latest `scripts/get-fsr3.ps1`.
+- **The game crashes with a divide-by-zero.** That is the title's own
+  upscaler at 1440p, not FSR 3: it only happens when DLSS upscaling is off.
+  Delete `victory-settings.txt` and run with `-Fsr3FrameGen` so DLSS stays on.
+- **Logs** go to `%LOCALAPPDATA%\victory\logs` (`foxhound-*.log`); the wrap
+  diagnostics to `fsr3-sdk\fsr3_wrap_diag.txt`.
 
 ## How it works, and the findings
 

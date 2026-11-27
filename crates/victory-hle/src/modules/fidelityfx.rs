@@ -1,14 +1,22 @@
 //! `amd_fidelityfx_loader_xbox.dll`: the title's FidelityFX API, five
 //! functions over chains of descriptions, each starting with a type id and
 //! the next one's address. With DLSS or frame generation on
-//! (`victory_gpu::streamline`, `VICTORY_DLSS=1`, `VICTORY_FRAMEGEN=1`), the
-//! title's imports of it are bound to the functions here ([`Interpose`]),
-//! which call the title's own DLL for everything except an upscale dispatch
-//! DLSS takes: DLSS then records the upscaling at that place of the title's
-//! command list instead, from the same textures into the same output. With
-//! frame generation alone the title's own upscaling runs and its depth and
-//! motion vectors are noted for the present. Without either switch, or
-//! without Streamline, the imports are bound as before.
+//! (`victory_gpu::streamline`, `VICTORY_DLSS=1`, `VICTORY_FRAMEGEN=1`), or
+//! with FSR 3 frame generation on (`victory_gpu::fsr3`,
+//! `VICTORY_FSR3_FG=1`), the title's imports of it are bound to the
+//! functions here ([`Interpose`]), which call the title's own DLL for
+//! everything except an upscale dispatch DLSS takes: DLSS then records
+//! the upscaling at that place of the title's command list instead,
+//! from the same textures into the same output. With frame generation
+//! alone — DLSS or FSR 3 — the title's own upscaling runs and its depth
+//! and motion vectors are noted for the present. Without either switch,
+//! or without Streamline / the FSR 3 bridge, the imports are bound as
+//! before.
+//!
+//! FSR 3 frame generation never clamps the title's upscaler context
+//! (that clamp is DLSS's, in `ffxCreateContext` below, and only when
+//! `streamline::upscaling()`): FSR 3 FG-only relies on the title's own
+//! upscaling running at the size the title asked for.
 //!
 //! The title's upscaler context stays the title's own (its FidelityFX makes
 //! it), so the title's upscaling runs again on any frame DLSS does not take.
@@ -25,6 +33,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
+use victory_gpu::fsr3;
 use victory_gpu::object::Object;
 use victory_gpu::streamline::{self, Taken, Upscale, plan::Camera};
 use victory_loader::{ImportResolver, Provenance, Resolution};
@@ -131,8 +140,9 @@ macro_rules! once {
 }
 
 /// Binds the title's imports of [`LOADER_DLL`] to the functions here when
-/// DLSS or frame generation is on, keeping what `inner` binds them to (the
-/// title's own DLL) for them to call; otherwise binds as `inner` does.
+/// DLSS or frame generation is on (Streamline, or FSR 3), keeping what
+/// `inner` binds them to (the title's own DLL) for them to call;
+/// otherwise binds as `inner` does.
 pub struct Interpose<'a> {
     pub inner: &'a dyn ImportResolver,
 }
@@ -140,7 +150,7 @@ pub struct Interpose<'a> {
 impl ImportResolver for Interpose<'_> {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         let found = self.inner.resolve(dll, symbol);
-        if !dll.eq_ignore_ascii_case(LOADER_DLL) || !streamline::serving() {
+        if !dll.eq_ignore_ascii_case(LOADER_DLL) || !(streamline::serving() || fsr3::serving()) {
             return found;
         }
         match (&found, symbol) {
@@ -235,12 +245,21 @@ extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, mem
         // Frame generation without DLSS leaves the upscaling to the title's
         // own FidelityFX, which is made for the Series S sizes only.
         if code != OK && !streamline::upscaling() {
-            tracing::error!(
-                code,
-                max_render = ?asked.max_render,
-                max_output = ?asked.max_output,
-                "FidelityFX: the title's own upscaler was not made at these sizes (its shipping FSR4 takes 1280x720 or 1920x1080 in, 1920x1080 out): with frame generation at another output size, set VICTORY_DLSS=1 as well; the title fails at its first upscaling without an upscaler"
-            );
+            if fsr3::serving() {
+                tracing::error!(
+                    code,
+                    max_render = ?asked.max_render,
+                    max_output = ?asked.max_output,
+                    "FidelityFX: the title's own upscaler was not made at these sizes (its shipping FSR4 takes 1280x720 or 1920x1080 in, 1920x1080 out): FSR 3 frame generation relies on that upscaler, so frame generation cannot run at this size; the title fails at its first upscaling without an upscaler"
+                );
+            } else {
+                tracing::error!(
+                    code,
+                    max_render = ?asked.max_render,
+                    max_output = ?asked.max_output,
+                    "FidelityFX: the title's own upscaler was not made at these sizes (its shipping FSR4 takes 1280x720 or 1920x1080 in, 1920x1080 out): with frame generation at another output size, set VICTORY_DLSS=1 as well; the title fails at its first upscaling without an upscaler"
+                );
+            }
         }
         return code;
     }
@@ -313,7 +332,15 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     let d = unsafe { desc.cast::<DispatchUpscale>().read() };
     first_dispatch(&d, &created);
     let up = upscale(&d, &created, handle);
-    match streamline::upscale(&up) {
+    // Only one frame-generation path can be serving: Streamline's init
+    // refuses FSR 3 when DLSS frame generation is available, and the
+    // launchers refuse to ask for both. Streamline first, FSR 3 second.
+    let (taken, from_streamline) = if streamline::serving() {
+        (streamline::upscale(&up), true)
+    } else {
+        (fsr3::upscale(&up), false)
+    };
+    match taken {
         Taken::Dlss => OK,
         Taken::Noted => own(),
         Taken::No(why) if created.clamped => {
@@ -325,7 +352,9 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
             OK
         }
         Taken::No(why) => {
-            streamline::forwarded();
+            if from_streamline {
+                streamline::forwarded();
+            }
             refused(why);
             own()
         }

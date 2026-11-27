@@ -181,7 +181,7 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
     let fps = 1e3 / ms.max(0.001);
     vec![
         format!("FPS {fps:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}"),
-        generated(fps, crate::streamline::shown_per_frame()),
+        generated(fps, crate::streamline::shown_per_frame().max(crate::fsr3::shown_per_frame())),
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),

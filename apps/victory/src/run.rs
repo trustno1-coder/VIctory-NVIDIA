@@ -62,12 +62,42 @@ pub fn run(
     // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
     let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
     let available = victory_hle::streamline::init(&asked);
+    // FSR 3 frame generation (`VICTORY_FSR3_FG=1`): the bridge is loaded
+    // before anything of the title or the host GPU, and fails soft.
+    // `fsr3::init` refuses it if DLSS frame generation is already
+    // available — never both proxy swap chains. DLSS upscaling stays
+    // on under FSR 3 frame generation (only DLSS frame generation is
+    // off): the title's own upscaling cannot run at 1440p, its
+    // shipping FSR4 takes 1920x1080 out at most. Without DLSS the
+    // title's own runs, at the native scale.
+    let fsr_asked = victory_hle::fsr3::Asked::from_env().map_err(anyhow::Error::msg)?;
+    let fsr_available = victory_hle::fsr3::init(&fsr_asked);
+    if fsr_asked.any() {
+        // The upscaling in use: DLSS at the asked mode, or the title's
+        // own without it.
+        let (state, scale) = if !fsr_available.framegen {
+            ("asked, not available", String::new())
+        } else if available.dlss {
+            (
+                "on (2x, DLSS upscaling)",
+                format!(", scene at the DLSS {} scale", asked.mode.name()),
+            )
+        } else {
+            ("on (2x, title's own upscaling)", ", scene at the native scale".to_owned())
+        };
+        println!("upscaling      FSR 3 frame generation {state}{scale}");
+    }
     // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
     // scale with its own FidelityFX upscaling (no Streamline): DLSS's
     // comparison, and on Series X what that path alone looks like.
     let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
+    // The upscaler is the normal one (DLSS at the asked mode, or the
+    // title's own without it). Forcing DLAA here used to put the title
+    // on its FidelityFX path at the native scale, where its shipping
+    // FSR4 cannot make an upscaler at 2560x1440 and the title then
+    // divides by zero on its first upscale dispatch.
     let upscaler = (available.dlss || available.framegen || fsr_path).then_some(asked.mode);
-    if fsr_path && !asked.any() {
+    if fsr_path && !asked.any() && !fsr_asked.any() {
         println!("upscaling      the title's own FidelityFX at the {} scale (VICTORY_FSR_PATH=1)", asked.mode.name());
     }
     if asked.any() {

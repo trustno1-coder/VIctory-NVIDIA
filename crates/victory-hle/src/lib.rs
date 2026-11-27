@@ -27,6 +27,10 @@ pub use victory_gpu::console;
 /// DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`).
 #[cfg(windows)]
 pub use victory_gpu::streamline;
+/// FSR 3 frame generation (`VICTORY_FSR3_FG`), for GPUs without DLSS
+/// frame generation.
+#[cfg(windows)]
+pub use victory_gpu::fsr3;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::replay;
 

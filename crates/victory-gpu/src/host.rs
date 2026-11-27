@@ -964,6 +964,12 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?,
         };
+        // FSR 3 frame generation (`VICTORY_FSR3_FG`): the bridge is given
+        // the device and the direct queue, so it can make its context
+        // lazily on the first present, once the display size is known.
+        // A no-op when FSR 3 was not asked for, or when DLSS frame
+        // generation already owns the present (mutual exclusion).
+        let _ = crate::fsr3::device_made(&device, &queue);
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -5651,6 +5657,7 @@ impl Host {
             let id = run.take_upscale();
             if id != 0 {
                 crate::streamline::submitted(id);
+                crate::fsr3::submitted(id);
             }
             let id = run.take_hudless();
             if id != 0 {
@@ -9702,7 +9709,7 @@ impl Meter {
         }
         let Some(caption) = &self.caption else { return };
         // With frame generation showing more frames than are rendered, both rates.
-        let text = match crate::streamline::shown_per_frame() {
+        let text = match crate::streamline::shown_per_frame().max(crate::fsr3::shown_per_frame()) {
             1 => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
             per => format!(" | VIctory {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
         };
@@ -9799,6 +9806,7 @@ impl Host {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             crate::streamline::resizing();
+            crate::fsr3::resizing([width, height], format);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -10019,6 +10027,15 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             // Frame generation: the frame's markers, constants and tags.
+            // FSR 3 first (it configures this frame with the scene
+            // texture — no host UI in it — as its hudless colour), then
+            // DLSS. Each is a no-op when its frame generation is off.
+            let fsr3_presenting = crate::fsr3::present_begins(
+                frame,
+                Some((texture, state_u32)),
+                [width, height],
+                &p.swap_chain,
+            );
             let presenting = crate::streamline::present_begins(
                 frame,
                 crate::streamline::Planes {
@@ -10031,6 +10048,7 @@ impl Host {
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
+            crate::fsr3::present_ends(fsr3_presenting);
             showing.next("the frame meter");
             p.panel.frame(p.meter.line_due());
             p.menu.frame();
@@ -10100,11 +10118,26 @@ impl Host {
                     crate::streamline::swap_chain_made(false, Some(&e));
                     factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?
                 }
-                // (`VICTORY_STREAMLINE_PRESENT=1`, DLSS without frame
-                // generation: Streamline's proxy of it, for its present hook.)
-                None => crate::streamline::present_hooked(
-                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
-                ),
+                None => {
+                    let plain = factory
+                        .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                        .cast::<IDXGISwapChain3>()?;
+                    if crate::fsr3::serving() {
+                        // FSR 3 frame generation: wrap the plain chain in
+                        // the frame-interpolation proxy. The render size
+                        // is the display size here — the first noted
+                        // upscaling has not run yet, and FSR 3 takes a
+                        // render at or below the context's maximum, so
+                        // this is safe; the context is remade on resize.
+                        // On any failure the plain chain is returned and
+                        // frame generation stays off.
+                        crate::fsr3::wrap_swapchain(plain, [width, height], [width, height], format)
+                    } else {
+                        // (`VICTORY_STREAMLINE_PRESENT=1`, DLSS without frame
+                        // generation: Streamline's proxy of it, for its present hook.)
+                        crate::streamline::present_hooked(plain)
+                    }
+                }
             };
             let copy = self.new_list()?;
             copy.close();

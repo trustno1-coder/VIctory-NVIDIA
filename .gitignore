@@ -79,6 +79,9 @@ Thumbs.db
 
 # NVIDIA's own files (Get-NVIDIA-DLSS.cmd fetches them from NVIDIA; never part of this repository)
 /nvidia-sdk/
+# AMD's own files and FSR 3's bridge (Get-FSR3.cmd builds the bridge against the FidelityFX SDK
+# and fetches AMD's DLL; never part of this repository)
+/fsr3-sdk/
 # What the F1 menu saved
 /victory-settings.txt
 /victory-settings.*.txt

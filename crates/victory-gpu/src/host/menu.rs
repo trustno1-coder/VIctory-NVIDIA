@@ -60,6 +60,10 @@ const ITEMS: &[Item] = &[
     // The launcher's own choices.
     Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
     Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
+    // FSR 3 frame generation (2x only, RTX 30-series): live only when
+    // this run started with it ready. Never on together with DLSS
+    // frame generation above — the launchers refuse to ask for both.
+    Item { var: "VICTORY_MENU_FSR3_FG", label: "FSR 3 FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X")], live: false },
     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
     Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
@@ -96,7 +100,9 @@ fn get(var: &str) -> String {
 /// Whether a change of `item` shows at once. Frame generation does when this run started with
 /// it ready (the launcher asks for that whenever Streamline is there).
 fn live(item: &Item) -> bool {
-    item.live || (item.var == "VICTORY_MENU_FRAMEGEN" && crate::streamline::framegen_live())
+    item.live
+        || (item.var == "VICTORY_MENU_FRAMEGEN" && crate::streamline::framegen_live())
+        || (item.var == "VICTORY_MENU_FSR3_FG" && crate::fsr3::framegen_live())
 }
 
 /// Whether the frame-rate line is shown at the top while the menu is closed
@@ -119,7 +125,7 @@ fn fps_line() -> Option<String> {
     if fps <= 0.0 {
         return None;
     }
-    Some(match crate::streamline::shown_per_frame() {
+    Some(match crate::streamline::shown_per_frame().max(crate::fsr3::shown_per_frame()) {
         1 => format!("FPS: {fps:.1}"),
         per => format!("FPS: {fps:.1}  FG: {:.1}", fps * f64::from(per)),
     })
@@ -339,6 +345,8 @@ impl Menu {
         match var {
             // Off (0) or the frames shown for each one rendered, from the next present on.
             "VICTORY_MENU_FRAMEGEN" => crate::streamline::set_framegen(value.parse().unwrap_or(0)),
+            // FSR 3: off (0) or on (2x), from the next present on.
+            "VICTORY_MENU_FSR3_FG" => crate::fsr3::set_framegen(value.parse().unwrap_or(0)),
             "VICTORY_FPS_LINE" => fps_line_on().store(value != "0", Ordering::Relaxed),
             "VICTORY_PANEL" => super::panel::shown().store(value == "1", Ordering::Relaxed),
             _ => {}

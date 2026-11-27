@@ -24,6 +24,13 @@ const GAME: &str = "game_scarlett_master.exe";
 
 /// `scripts\get-nvidia-sdks.ps1`, run by Windows PowerShell.
 const FETCH: &str = include_str!("../../../scripts/get-nvidia-sdks.ps1");
+/// `scripts\get-fsr3.ps1`, run by Windows PowerShell.
+const FETCH_FSR3: &str = include_str!("../../../scripts/get-fsr3.ps1");
+/// The bridge's sources, written beside the script when `get-fsr3` runs
+/// away from the repository (its `-BridgeDir` then names that folder).
+const FSR3_BRIDGE_H: &str = include_str!("../../../tools/fsr3-bridge/fsr3_bridge.h");
+const FSR3_BRIDGE_CPP: &str = include_str!("../../../tools/fsr3-bridge/fsr3_bridge.cpp");
+const FSR3_BRIDGE_CMAKE: &str = include_str!("../../../tools/fsr3-bridge/CMakeLists.txt");
 
 /// The settings the title is started with (`scripts\play-foxhound.ps1` has
 /// the same, with what each is for).
@@ -88,6 +95,7 @@ const KEPT: &[&str] = &[
     "VICTORY_CACHE_DIR",
     "VICTORY_DATA_DIR",
     "VICTORY_STREAMLINE_DIR",
+    "VICTORY_FSR3_DIR",
     "VICTORY_LOG",
 ];
 
@@ -113,6 +121,14 @@ pub(crate) struct Play {
     /// rendered, 2 to 6. Without it, it is ready and the F1 menu switches it.
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=6))]
     framegen: Option<u32>,
+    /// FSR 3 frame generation on from the start, 2x (RTX 30-series and
+    /// most other GPUs; DLSS upscaling stays on, only DLSS frame
+    /// generation stays off — the title's own upscaling cannot run
+    /// at 1440p, its shipping FSR4 takes 1920x1080 out at most).
+    /// Never together with --framegen: one frame-generation swap
+    /// chain at a time. Needs the bridge built by `victory get-fsr3`.
+    #[arg(long)]
+    fsr3_framegen: bool,
     /// Frame generation not made ready at the start.
     #[arg(long)]
     no_framegen_ready: bool,
@@ -139,6 +155,20 @@ fn has_streamline(dir: &Path) -> bool {
     dir.join("sl.interposer.dll").is_file()
 }
 
+fn has_fsr3_bridge(dir: &Path) -> bool {
+    dir.join("fsr3_bridge.dll").is_file()
+}
+
+/// The folder with FSR 3's bridge: the one `VICTORY_FSR3_DIR` names,
+/// where `get-fsr3` puts it, or beside this program (a repository's
+/// `fsr3-sdk`, or the files themselves).
+fn fsr3_dir(here: &Path) -> Option<PathBuf> {
+    let named = std::env::var_os("VICTORY_FSR3_DIR").filter(|v| !v.is_empty()).map(PathBuf::from);
+    let ours = home().ok().map(|d| d.join("fsr3-sdk"));
+    let beside = [here.join("fsr3-sdk"), here.to_path_buf()];
+    named.into_iter().chain(ours).chain(beside).find(|d| has_fsr3_bridge(d))
+}
+
 /// The folder with NVIDIA's files: the one `VICTORY_STREAMLINE_DIR` names,
 /// where `get-dlss` puts them, or beside this program (a repository's
 /// `nvidia-sdk`, or the files themselves).
@@ -163,10 +193,23 @@ fn parse_menu(text: &str) -> Vec<(String, String)> {
 /// The settings of a start and whether it is the Series S profile: the
 /// options, what the menu saved over them (`menu`), `--set` over both.
 /// `streamline`: the folder with NVIDIA's files, if there is one.
-fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (BTreeMap<String, String>, bool) {
+/// `fsr3`: the folder with FSR 3's bridge, if there is one.
+fn settings(
+    o: &Play,
+    menu: &[(String, String)],
+    streamline: Option<&Path>,
+    fsr3: Option<&Path>,
+) -> (BTreeMap<String, String>, bool) {
     let saved = |k: &str| menu.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     let series_s = saved("VICTORY_MENU_CONSOLE").map_or(o.series_s, |c| c == "series-s");
     let res = saved("VICTORY_MENU_RES").filter(|r| RESOLUTIONS.contains(r)).unwrap_or(&o.res);
+    // FSR 3 frame generation: --fsr3-framegen, or the menu's
+    // VICTORY_MENU_FSR3_FG (2: on). Never together with DLSS frame
+    // generation: DLSS wins, FSR 3 off. DLSS upscaling stays on
+    // under FSR 3 frame generation (only DLSS frame generation is
+    // off): the title's own upscaling cannot run at 1440p, its
+    // shipping FSR4 takes 1920x1080 out at most.
+    let mut fsr3_wanted = o.fsr3_framegen || saved("VICTORY_MENU_FSR3_FG").is_some_and(|v| v == "2");
     let dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
     // 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).
     let (mut framegen, mut times) = (o.framegen.is_some(), o.framegen.unwrap_or(2));
@@ -191,6 +234,15 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
             _ => {}
         }
     }
+    if fsr3_wanted && framegen {
+        // DLSS frame generation wins; FSR 3 off.
+        fsr3_wanted = false;
+    }
+    // No forcing DLSS off here: with FSR 3 frame generation on, DLSS
+    // upscaling stays on and only DLSS frame generation stays off
+    // (`framegen` is false here — the both-asked check above turned
+    // FSR 3 off if DLSS frame generation was asked — so the DLSS
+    // block below makes it ready but off).
     let (mut dlss_on, mut framegen_x) = (false, None);
     if dlss != "off"
         && let Some(dir) = streamline
@@ -213,6 +265,18 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
             set("VICTORY_TEXTURE_ROOM_PERCENT", if framegen { "80" } else { "86" });
         }
     }
+    let mut fsr3_on = false;
+    if fsr3_wanted
+        && let Some(dir) = fsr3
+    {
+        fsr3_on = true;
+        set("VICTORY_FSR3_FG", "1");
+        set("VICTORY_FSR3_DIR", &dir.to_string_lossy());
+        // Frame generation takes 1.5 to 2 GB of the card's memory, which
+        // the layer otherwise fills with textures: on from the start it
+        // is left a fifth of the budget.
+        set("VICTORY_TEXTURE_ROOM_PERCENT", "80");
+    }
     set("VICTORY_FRAME_INTERVAL_US", &(1_000_000.0 / f64::from(fps)).round().to_string());
     for (k, v) in menu.iter().filter(|(k, _)| !k.starts_with("VICTORY_MENU_")) {
         if v.is_empty() {
@@ -230,6 +294,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     set("VICTORY_MENU_RES", res);
     set("VICTORY_MENU_DLSS", if dlss_on { dlss } else { "off" });
     set("VICTORY_MENU_FRAMEGEN", &framegen_x.unwrap_or(0).to_string());
+    set("VICTORY_MENU_FSR3_FG", if fsr3_on { "2" } else { "0" });
     set("VICTORY_MENU_FPS", &fps.to_string());
     (s, series_s)
 }
@@ -297,6 +362,46 @@ pub(crate) fn get_dlss() -> Result<()> {
     fetch(&to)
 }
 
+/// `victory get-fsr3`: builds FSR 3's bridge against the FidelityFX
+/// SDK (1.1.4 by default) and puts `fsr3_bridge.dll` with AMD's
+/// `amd_fidelityfx_dx12.dll` where the launcher looks for them.
+pub(crate) fn get_fsr3() -> Result<()> {
+    let to = home()?.join("fsr3-sdk");
+    let script = to.join("get-fsr3.ps1");
+    std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
+    std::fs::write(&script, FETCH_FSR3).with_context(|| format!("writing {}", script.display()))?;
+    // The bridge's sources, for the build: this runs away from the
+    // repository, so the script's default (the repository's
+    // tools\fsr3-bridge) is not there.
+    let bridge = to.join("bridge");
+    std::fs::create_dir_all(&bridge).with_context(|| format!("creating {}", bridge.display()))?;
+    for (name, text) in [
+        ("fsr3_bridge.h", FSR3_BRIDGE_H),
+        ("fsr3_bridge.cpp", FSR3_BRIDGE_CPP),
+        ("CMakeLists.txt", FSR3_BRIDGE_CMAKE),
+    ] {
+        std::fs::write(bridge.join(name), text)
+            .with_context(|| format!("writing {}", bridge.join(name).display()))?;
+    }
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-InstallDir")
+        .arg(&to)
+        .arg("-BridgeDir")
+        .arg(&bridge)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .context("running get-fsr3.ps1: Windows PowerShell")?;
+    let _ = std::fs::remove_file(&script);
+    anyhow::ensure!(
+        out.status.success() && has_fsr3_bridge(&to),
+        "FSR 3's bridge did not arrive (see above); the title runs without FSR 3 frame generation"
+    );
+    Ok(())
+}
+
 /// Asks once, at a start without NVIDIA's files, whether to fetch them.
 fn offer_dlss() {
     let Ok(to) = nvidia_home() else { return };
@@ -360,15 +465,30 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     if wants_dlss && streamline_dir(&here).is_none() {
         offer_dlss();
     }
+    let wants_fsr3 = o.fsr3_framegen
+        || menu
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "VICTORY_MENU_FSR3_FG")
+            .is_some_and(|(_, v)| v == "2");
     let streamline = streamline_dir(&here);
-    let (mut s, series_s) = settings(o, &menu, streamline.as_deref());
+    let fsr3 = fsr3_dir(&here);
+    if wants_fsr3 && fsr3.is_none() {
+        println!("No FSR 3 bridge: running without FSR 3 frame generation (`victory get-fsr3` builds it).");
+    }
+    let (mut s, series_s) = settings(o, &menu, streamline.as_deref(), fsr3.as_deref());
     // Where the menu saves, and how it starts the title again (`--set` is not carried over).
     let quoted = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "''"));
     s.insert("VICTORY_MENU_FILE".to_owned(), menu_file.to_string_lossy().into_owned());
     s.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
     s.insert(
         "VICTORY_MENU_ARGS".to_owned(),
-        format!("play {}{}", quoted(&exe), if o.no_framegen_ready { " --no-framegen-ready" } else { "" }),
+        format!(
+            "play {}{}{}",
+            quoted(&exe),
+            if o.no_framegen_ready { " --no-framegen-ready" } else { "" },
+            if o.fsr3_framegen { " --fsr3-framegen" } else { "" }
+        ),
     );
     let log = log_file(&home.join("logs"))?;
     let console = if series_s { "series-s" } else { "series-x" };
@@ -415,6 +535,7 @@ mod tests {
             res: "1440".to_owned(),
             dlss: "quality".to_owned(),
             framegen: None,
+            fsr3_framegen: false,
             no_framegen_ready: false,
             fps: 1000,
             more: Vec::new(),
@@ -424,7 +545,7 @@ mod tests {
     #[test]
     fn a_plain_start_is_the_launchers() {
         let dir = Path::new(r"C:\nvidia");
-        let (s, series_s) = settings(&options(), &[], Some(dir));
+        let (s, series_s) = settings(&options(), &[], Some(dir), None);
         assert!(!series_s);
         for (k, v) in SETTINGS {
             assert_eq!(s.get(*k).map(String::as_str), Some(*v), "{k}");
@@ -443,7 +564,7 @@ mod tests {
 
     #[test]
     fn without_nvidias_files_there_is_no_dlss() {
-        let (s, _) = settings(&options(), &[], None);
+        let (s, _) = settings(&options(), &[], None, None);
         assert!(!s.contains_key("VICTORY_DLSS") && !s.contains_key("VICTORY_FRAMEGEN"));
         assert!(!s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT"));
         assert_eq!(s.get("VICTORY_MENU_DLSS").map(String::as_str), Some("off"));
@@ -456,7 +577,7 @@ mod tests {
              VICTORY_MENU_DLSS=performance\r\nVICTORY_MENU_FPS=60\r\nVICTORY_BVH_BUILDER=\r\n\
              VICTORY_AMBIENT=0.5\r\nVICTORY_EARLY_DEPTH=\r\nnot a setting=1\r\n",
         );
-        let (s, series_s) = settings(&options(), &menu, Some(Path::new("x")));
+        let (s, series_s) = settings(&options(), &menu, Some(Path::new("x")), None);
         let get = |k: &str| s.get(k).map(String::as_str);
         assert!(series_s);
         // the Series S profile has no picture size of its own
@@ -475,13 +596,57 @@ mod tests {
         let mut o = options();
         (o.res, o.dlss, o.framegen, o.fps) = ("1080to1440".to_owned(), "off".to_owned(), Some(4), 30);
         o.more = vec!["VICTORY_AMBIENT=0".to_owned(), "VICTORY_NEW = 2".to_owned()];
-        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        let (s, _) = settings(&o, &[], Some(Path::new("x")), None);
         let get = |k: &str| s.get(k).map(String::as_str);
         assert_eq!((get("VICTORY_RENDER_1080P"), get("VICTORY_NATIVE_1440P")), (Some("1"), None));
         // no DLSS, so no frame generation either
         assert_eq!((get("VICTORY_DLSS"), get("VICTORY_FRAMEGEN")), (None, None));
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("33333"));
         assert_eq!((get("VICTORY_AMBIENT"), get("VICTORY_NEW")), (Some("0"), Some("2")));
+    }
+
+    #[test]
+    fn fsr3_framegen_without_streamline_runs_with_the_titles_own_upscaling() {
+        let mut o = options();
+        o.fsr3_framegen = true;
+        let (s, _) = settings(&o, &[], None, Some(Path::new(r"C:\fsr3")));
+        let get = |k: &str| s.get(k).map(String::as_str);
+        assert_eq!(get("VICTORY_FSR3_FG"), Some("1"));
+        assert_eq!(get("VICTORY_FSR3_DIR"), Some(r"C:\fsr3"));
+        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("80"));
+        // No Streamline files, so no DLSS at all: the title's own upscaling runs.
+        assert_eq!((get("VICTORY_DLSS"), get("VICTORY_FRAMEGEN")), (None, None));
+        assert_eq!(get("VICTORY_MENU_FSR3_FG"), Some("2"));
+        assert_eq!(get("VICTORY_MENU_DLSS"), Some("off"));
+    }
+
+    #[test]
+    fn fsr3_framegen_keeps_dlss_upscaling_but_not_dlss_framegen() {
+        let mut o = options();
+        o.fsr3_framegen = true;
+        let (s, _) = settings(&o, &[], Some(Path::new("x")), Some(Path::new(r"C:\fsr3")));
+        let get = |k: &str| s.get(k).map(String::as_str);
+        assert_eq!(get("VICTORY_FSR3_FG"), Some("1"));
+        assert_eq!(get("VICTORY_FSR3_DIR"), Some(r"C:\fsr3"));
+        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("80"));
+        // DLSS upscaling stays on; DLSS frame generation is ready but off.
+        assert_eq!((get("VICTORY_DLSS"), get("VICTORY_DLSS_MODE")), (Some("1"), Some("quality")));
+        assert_eq!((get("VICTORY_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
+        assert_eq!(get("VICTORY_MENU_DLSS"), Some("quality"));
+        assert_eq!(get("VICTORY_MENU_FRAMEGEN"), Some("0"));
+        assert_eq!(get("VICTORY_MENU_FSR3_FG"), Some("2"));
+    }
+
+    #[test]
+    fn dlss_framegen_wins_over_fsr3() {
+        let mut o = options();
+        o.fsr3_framegen = true;
+        o.framegen = Some(2);
+        let (s, _) = settings(&o, &[], Some(Path::new("x")), Some(Path::new(r"C:\fsr3")));
+        let get = |k: &str| s.get(k).map(String::as_str);
+        assert_eq!((get("VICTORY_DLSS"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("2")));
+        assert_eq!(get("VICTORY_FSR3_FG"), None);
+        assert_eq!(get("VICTORY_MENU_FSR3_FG"), Some("0"));
     }
 
     #[test]

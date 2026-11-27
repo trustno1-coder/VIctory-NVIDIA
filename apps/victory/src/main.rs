@@ -139,6 +139,12 @@ enum Command {
     /// (about 70 MB) to where `play` looks for them.
     #[cfg(windows)]
     GetDlss,
+    /// Build FSR 3's bridge against AMD's FidelityFX SDK (1.1.4 by
+    /// default) and put it with AMD's `amd_fidelityfx_dx12.dll` where
+    /// `play` looks for them, for FSR 3 frame generation on RTX 30-series
+    /// and other GPUs DLSS frame generation cannot run on.
+    #[cfg(windows)]
+    GetFsr3,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -272,6 +278,7 @@ fn main() -> Result<()> {
         Command::Play(_) => unreachable!("handled above"),
         #[cfg(windows)]
         Command::GetDlss => play::get_dlss(),
+        Command::GetFsr3 => play::get_fsr3(),
         Command::Run {
             exe,
             unimplemented,
@@ -293,6 +300,9 @@ fn main() -> Result<()> {
                 .and_then(|(w, h)| Some([w.trim().parse().ok()?, h.trim().parse().ok()?]))
                 .ok_or_else(|| anyhow::anyhow!("--output {output}: not <width>x<height>"))?;
             for line in victory_hle::streamline::check(size, device || present, present) {
+                println!("{line}");
+            }
+            for line in victory_hle::fsr3::check() {
                 println!("{line}");
             }
             Ok(())
