@@ -36,6 +36,9 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// Timed out waiting on a previous frame; skip repeating per-frame waits
+    /// for slow non-screen pipelines while a worker finishes compiling them.
+    waited_out: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -172,6 +175,7 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            waited_out: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -333,10 +337,25 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Whether a slow non-screen pipeline that timed out waiting once stops
+/// repeating per-frame waits on subsequent frames while its worker finishes
+/// (`VICTORY_PIPELINE_WAIT_ONCE=0`: wait on every frame, as before).
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
+    if !screen && wait_once() && p.waited_out.load(Ordering::Relaxed) {
+        return;
+    }
     let budget = if screen { screen_budget() } else { wait_budget() };
+    wait_with_budget(p, frame, screen, budget);
+}
+
+fn wait_with_budget(p: &Pending, frame: u64, screen: bool, budget: Duration) {
     if budget.is_zero() {
         return;
     }
@@ -370,6 +389,9 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    if !screen && p.made.get().is_none() {
+        p.waited_out.store(true, Ordering::Relaxed);
+    }
     let waited = started.elapsed().min(left);
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
@@ -742,5 +764,23 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn slow_non_screen_pipeline_does_not_repeat_frame_waits() {
+        let p = Pending::new(Vec::new(), None);
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let p = Arc::new(p);
+        // First wait on frame 1000 times out and marks `waited_out`.
+        wait_with_budget(&p, 1000, false, Duration::from_millis(10));
+        assert!(p.waited_out.load(Ordering::Relaxed));
+        // Second call on a later frame returns immediately without spending another budget.
+        let started = Instant::now();
+        wait(&p, 1001);
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "repeated wait stalled for {:?}",
+            started.elapsed()
+        );
     }
 }
