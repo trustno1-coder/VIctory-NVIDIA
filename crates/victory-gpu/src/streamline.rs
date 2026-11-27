@@ -415,6 +415,11 @@ pub fn notice_at_start() -> Vec<String> {
     notice_of(f, f.dlss_fg_supported, f.fsr_loaded && !f.dlss_fg_supported)
 }
 
+/// Whether either frame-generation backend was actually made available.
+pub(crate) fn framegen_available() -> bool {
+    FACTS.get().is_some_and(|f| f.dlss_fg_supported || f.fsr_loaded)
+}
+
 fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
     if !f.dlss_fg_asked && !f.fsr_asked {
         return Vec::new();
