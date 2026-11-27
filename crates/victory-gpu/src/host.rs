@@ -334,6 +334,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// New memory (made with [`not_resident`]) is resident when this returns.
+#[track_caller]
 pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
     if !wait_resident() {
         return Ok(());
@@ -343,6 +344,7 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     // SAFETY: a live heap or resource of the device's.
     let made = unsafe { device.MakeResident(&[Some(object)]) };
     let us = started.elapsed().as_micros() as u64;
+    crate::lab::made(std::panic::Location::caller(), 0, started, false);
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
     RESIDENT[2].fetch_max(us, Ordering::Relaxed);
@@ -590,7 +592,10 @@ fn bury_drop(done: Vec<(u64, Retired)>) {
     let (mut slots, mut slots_ns, mut others, mut others_ns, mut slow, mut slow_ns, mut longest) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     for (_, retired) in done {
         let slot = matches!(retired, Retired::Resource(_));
-        drop(retired);
+        match retired {
+            Retired::Resource(resource) => crate::lab::let_go(resource),
+            other => drop(other),
+        }
         let now = std::time::Instant::now();
         let ns = (now - at).as_nanos() as u64;
         at = now;
@@ -611,6 +616,7 @@ fn bury_drop(done: Vec<(u64, Retired)>) {
         BURIED[2 + i].fetch_add(v, Ordering::Relaxed);
     }
     BURIED[8].fetch_max(longest, Ordering::Relaxed);
+    crate::lab::trim();
 }
 
 /// Lab, for the frame-rate line: what dropping the objects let go cost.
@@ -2926,6 +2932,10 @@ impl Drop for Deferred {
         give_chunks(std::mem::take(&mut self.plane_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // (Lab: one of them held by nothing else is kept for the next list.)
+        for buffer in self.uploads.drain(..) {
+            crate::lab::let_go(buffer);
+        }
     }
 }
 
@@ -4336,6 +4346,7 @@ fn late_line(frames: f64) {
     }
     crate::land::log(frames);
     bury_log(frames);
+    crate::lab::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -9719,7 +9730,23 @@ impl Host {
         }
     }
 
+    #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let (site, began) = (std::panic::Location::caller(), std::time::Instant::now());
+        if let Some(again) = crate::lab::take(0, size) {
+            crate::lab::made(site, size, began, true);
+            return Some(again);
+        }
+        let made = self.upload_buffer_new(size);
+        if let Some((buffer, _)) = &made {
+            crate::lab::tag(buffer, 0, size);
+        }
+        crate::lab::made(site, size, began, false);
+        made
+    }
+
+    /// [`Self::upload_buffer`], a new one.
+    fn upload_buffer_new(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -11009,14 +11036,27 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let (site, began) = (std::panic::Location::caller(), std::time::Instant::now());
+        // Lab: one kept for use again comes first.
+        if let Some(again) = crate::lab::take(1, size) {
+            crate::lab::made(site, size, began, true);
+            return Some(again);
+        }
         // (one made ahead, if it is of that size and one is in store: `crate::ahead`)
-        if size == crate::ahead::SIZE
+        let made = if size == crate::ahead::SIZE
             && let Some(made) = crate::ahead::shared()
         {
-            return Some(made);
+            Some(made)
+        } else {
+            self.shared_buffer_now(size)
+        };
+        if let Some((buffer, _)) = &made {
+            crate::lab::tag(buffer, 1, size);
         }
-        self.shared_buffer_now(size)
+        crate::lab::made(site, size, began, false);
+        made
     }
 
     /// [`Host::shared_buffer`], made now.
@@ -11163,7 +11203,16 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    #[track_caller]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let (site, began) = (std::panic::Location::caller(), std::time::Instant::now());
+        let made = self.uav_buffer_new(size);
+        crate::lab::made(site, size, began, false);
+        made
+    }
+
+    /// [`Self::uav_buffer`], a new one.
+    fn uav_buffer_new(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
