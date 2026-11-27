@@ -309,6 +309,7 @@ delete that file to go back to them. Full screen: start the game, then run
 - [docs/architecture.md](docs/architecture.md): the layer's parts.
 - [docs/findings.md](docs/findings.md): measurements behind the choices.
 - [docs/dlss.md](docs/dlss.md): DLSS and Frame Generation.
+- [docs/linux.md](docs/linux.md): running on Linux under Wine, with DLSS and frame generation.
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): the title's ray tracing
   and the light estimate.
 - [docs/asset-policy.md](docs/asset-policy.md): what may and may not be in this
