@@ -607,13 +607,23 @@ pub fn emit(
             ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
             ("without skips", form("without skips", ir::without_skips(p, false))),
         ];
+        // Where the last of these forms stopped at code the two host waves exchange through
+        // (a lane mask, a first lane...) where not every lane runs (for
+        // `VICTORY_WAVE_WIDE_AUTO` below).
+        let exchange_at = |r: &Result<(HostShader, Option<u32>), ShaderError>| match r {
+            Err(ShaderError::Unsupported { offset, what }) if what.ends_with("where not every lane runs") => Some(*offset),
+            _ => None,
+        };
+        let mut stopped_at = exchange_at(&original);
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
+                    record_form(name);
                     return again.map(|(shader, _)| shader);
                 }
+                stopped_at = exchange_at(&again);
             }
         }
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
@@ -646,11 +656,27 @@ pub fn emit(
             )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        // `VICTORY_WAVE_WIDE=<digest>,<digest>...`: the wave-wide form for those containers
+        // alone (hex prefixes of the container digest), tried before the form without skips
+        // that follows scalars; every other container behaves as with the switch unset.
+        let wide_listed = wide_option.as_ref().and_then(|v| v.to_str()).and_then(|v| wide_digests(v, &c.digest));
+        // `VICTORY_WAVE_WIDE_AUTO` (on unless "0", and only while `VICTORY_WAVE_WIDE` is
+        // unset): try the wave-wide form before "without skips, scalars followed" where the
+        // earlier forms stopped at a cross-half exchange kept from every lane only by a
+        // deep-only skip (`ir::deep_skip_holds`, matching the 18 cascade-shadow raster
+        // variants). Refused when the wave-wide form would put a translator barrier in a
+        // loop (`lower::watch_loop_barriers`); the normal order then stands.
+        let wide_auto = wide_option.is_none()
+            && std::env::var_os("VICTORY_WAVE_WIDE_AUTO").is_none_or(|v| v != "0")
+            && stopped_at.is_some_and(|at| ir::deep_skip_holds(p, at));
+        let wide_on = match wide_listed {
+            Some(listed) => listed || scene_kernel,
+            None => wide_option.as_ref().map_or(scene_kernel, |v| v == "1"),
+        };
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
-        let driver_loop = wide_option.is_none()
+        let driver_loop = (wide_option.is_none() || wide_listed == Some(false))
             && c.part(FourCC::DXIL).is_none()
             && c.part(FourCC::ACCC).is_some()
             && matches!(&original, Err(ShaderError::Unsupported { what, .. })
@@ -660,16 +686,37 @@ pub fn emit(
         for exact in [true, false] {
             if !exact {
                 // Before anything approximate, the exact forms that cost group barriers.
+                if wide_auto {
+                    let bases = [forms[1].1.as_ref().map(|f| &f.0), forms[0].1.as_ref().map(|f| &f.0), Some(p)];
+                    if let Some(base) = bases.into_iter().flatten().next() {
+                        let (again, looped) = lower::watch_loop_barriers(|| widen(c, native, base, why, false, false));
+                        report("wave-wide branches", &again);
+                        if why {
+                            eprintln!(
+                                "WAVE64-WIDE-AUTO {} stopped at {:#x}: {}",
+                                digest_hex(c),
+                                stopped_at.unwrap_or(0),
+                                if looped { "a barrier in a loop, not taken" } else { "taken" }
+                            );
+                        }
+                        if done(&again) && !looped {
+                            record_form("wave-wide branches");
+                            return again.map(|(shader, _)| shader);
+                        }
+                    }
+                }
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0")
+                    && wide_listed != Some(true);
                 let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
+                        record_form("without skips, scalars followed");
                         return again.map(|(shader, _)| shader);
                     }
                 }
@@ -687,6 +734,7 @@ pub fn emit(
                         let again = widen(c, native, base, why, driver_loop, wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {
+                            record_form("wave-wide branches");
                             return again.map(|(shader, _)| shader);
                         }
                     }
@@ -781,6 +829,51 @@ pub fn emit(
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The form the last [`emit`] on this thread returned ([`record_form`]).
+    static CHOSEN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn record_form(label: &str) {
+    #[cfg(test)]
+    CHOSEN.with_borrow_mut(|l| {
+        l.clear();
+        l.push_str(label);
+    });
+    #[cfg(not(test))]
+    let _ = label;
+}
+
+/// The form of the program the last [`emit`] on this thread returned ("without skips",
+/// "without skips, scalars followed", "wave-wide branches", ...).
+#[cfg(test)]
+pub(super) fn last_form() -> String {
+    CHOSEN.with_borrow(Clone::clone)
+}
+
+/// The container's own digest (`Container::digest`, bytes 4..20 of the DXBC header) in hex.
+fn digest_hex(c: &Container) -> String {
+    c.digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `VICTORY_WAVE_WIDE` as a list of container digests (hex prefixes, at least 8 digits,
+/// separated by commas): whether `digest` is listed. `None` when the value is not such a
+/// list ("0", "1", anything else), which keeps the switch's old meaning.
+fn wide_digests(value: &str, digest: &[u8; 16]) -> Option<bool> {
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let mut listed = false;
+    let mut any = false;
+    for item in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if item.len() < 8 || item.len() > 32 || !item.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        any = true;
+        listed |= hex.starts_with(&item.to_ascii_lowercase());
+    }
+    any.then_some(listed)
+}
+
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
@@ -824,6 +917,7 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
+        lower::reset_loop_barriers();
         let r = if pairs {
             lower::with_pair_meetings(|| emit_program(c, native, p, &st, &io, &res))
         } else {
@@ -3291,5 +3385,19 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// `VICTORY_WAVE_WIDE=<digests>` names container digests (hex prefixes >= 8 digits);
+    /// `"0"` and `"1"` keep their old meaning (`None`).
+    #[test]
+    fn wide_digest_list_matches_prefixes_and_leaves_flags_alone() {
+        let d = [0x19, 0x1e, 0xca, 0xed, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98];
+        assert_eq!(super::wide_digests("0", &d), None);
+        assert_eq!(super::wide_digests("1", &d), None);
+        assert_eq!(super::wide_digests("", &d), None);
+        assert_eq!(super::wide_digests("191ecaed", &d), Some(true));
+        assert_eq!(super::wide_digests("deadbeef, 191ECAED0123", &d), Some(true));
+        assert_eq!(super::wide_digests("deadbeef,cafebabe", &d), Some(false));
+        assert_eq!(super::wide_digests("191ecaed,not-hex!", &d), None);
     }
 }

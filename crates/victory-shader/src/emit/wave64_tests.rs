@@ -1010,3 +1010,104 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+fn branches_named(p: &ir::Program, name: &str) -> usize {
+    p.blocks
+        .iter()
+        .filter(|b| b.insts.last().is_some_and(|i| i.name() == name))
+        .count()
+}
+
+/// 64 threads (one console wave): `if (t < s0) { if (t < s1) { n = WaveActiveCountBits(t ==
+/// s2); store n ? 2 : 1 } }`, the inner skip (`s_cbranch_execz`) ending at the outer one's
+/// join as the cascade-shadow rasters' inner skip ends with their outer one, or (`own_join`)
+/// at a restore of EXEC of its own. `looped`: all of it in a uniform loop.
+fn count_behind_two_skips(own_join: bool, looped: bool) -> NativeProgram {
+    let gate = [
+        0x7D84_0002, // v_cmp_eq_u32 vcc, s2, v0
+        0xBE90_106A, // s_bcnt1_i32_b64 s16, vcc
+        0xBF06_8010, // s_cmp_eq_u32 s16, 0
+        0x8511_8281, // s_cselect_b32 s17, 1, 2
+        0x7E02_0211, // v_mov_b32 v1, s17
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 2, // buffer_store_dword v1, v2, s[8:11], 0 offen
+    ];
+    let inner = gate.len() as u32;
+    let outer = 3 + inner + u32::from(own_join);
+    let mut words = vec![
+        0x7D88_0000,         // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A,         // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | outer, // s_cbranch_execz to the join
+        0x7D88_0001,         // v_cmp_gt_u32 vcc, s1, v0
+        0xBE8E_246A,         // s_and_saveexec_b64 s[14:15], vcc
+        0xBF88_0000 | inner, // s_cbranch_execz to the join, or to its own
+    ];
+    words.extend_from_slice(&gate);
+    if own_join {
+        words.push(0xBEFE_040E); // s_mov_b64 exec, s[14:15]
+    }
+    words.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    if looped {
+        words.push(0xBF06_8003); // s_cmp_eq_u32 s3, 0
+        let back = -(words.len() as i32 + 1);
+        words.push(0xBF85_0000 | (back as u32 & 0xFFFF)); // s_cbranch_scc1 to the start
+    }
+    native_of(&words, true, 64)
+}
+
+/// The form [`super::emit`] gives `native` on a host of 32-lane waves (validated by `dxil.dll`
+/// where there is one).
+fn emitted_form(native: &NativeProgram) -> String {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let r = super::emit(&c, native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = r.expect("translates");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    super::last_form()
+}
+
+/// The cascade-shadow rasters' pattern: a wave-wide count behind an inner skip that ends
+/// together with an outer one. Only the deep form of `ir::without_skips` leaves that skip out,
+/// and "without skips, scalars followed" then places the exchange after per-lane branching with
+/// no barrier. Such a program now takes the wave-wide form; one whose inner skip ends on its
+/// own keeps "without skips"; and where the wave-wide form would put a barrier in a loop, the
+/// deep form stays.
+#[test]
+fn a_count_behind_a_skip_that_ends_with_an_outer_one_takes_the_wave_wide_form() {
+    let native = count_behind_two_skips(false, false);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert_eq!(branches_named(&p, "s_cbranch_execz"), 2);
+    let shallow = ir::without_skips(&p, false).expect("the outer skip is left out");
+    assert_eq!(branches_named(&shallow, "s_cbranch_execz"), 1, "the inner skip stays without `deep`");
+    let deep = ir::without_skips(&p, true).expect("left out");
+    assert_eq!(branches_named(&deep, "s_cbranch_execz"), 0, "`deep` leaves the inner skip out too");
+    let count = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.name() == "s_bcnt1_i32_b64").expect("the count");
+    let first = p.blocks.iter().flat_map(|b| &b.insts).next().expect("an instruction");
+    assert!(ir::deep_skip_holds(&p, count.machine.offset), "the count lies behind the deep-only skip");
+    assert!(!ir::deep_skip_holds(&p, first.machine.offset), "the program's start does not");
+    assert_eq!(emitted_form(&native), "wave-wide branches");
+
+    let own = count_behind_two_skips(true, false);
+    let p = ir::build(&own.code, own.wave64, own.vgprs).expect("ir::build");
+    let shallow = ir::without_skips(&p, false).expect("left out");
+    assert_eq!(branches_named(&shallow, "s_cbranch_execz"), 0, "an inner skip with a join of its own goes");
+    assert_eq!(emitted_form(&own), "without skips");
+
+    // In a loop the pattern holds, but the wave-wide form would put the count's exchange
+    // barriers into the loop: "without skips, scalars followed" stays.
+    let looped = count_behind_two_skips(false, true);
+    let p = ir::build(&looped.code, looped.wave64, looped.vgprs).expect("ir::build");
+    let count = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.name() == "s_bcnt1_i32_b64").expect("the count");
+    assert!(ir::deep_skip_holds(&p, count.machine.offset));
+    assert_eq!(emitted_form(&looped), "without skips, scalars followed");
+}
