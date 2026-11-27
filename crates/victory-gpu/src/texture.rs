@@ -17,6 +17,21 @@
 
 pub(crate) mod ahead;
 
+/// Bound the number of refreshes between opportunities for a remapping writer.
+pub(crate) fn refresh_group_size() -> usize {
+    static SIZE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("VICTORY_REFRESH_BATCH").is_some_and(|v| v == "1") { 8 } else { 1 }
+    });
+    if *SIZE > 1 && crate::watch::refresh_may_materialize() { 1 } else { *SIZE }
+}
+
+pub(crate) fn refresh_group<'a>(textures: impl IntoIterator<Item = &'a Arc<Staging>>) {
+    let mut mapping = None;
+    for texture in textures {
+        texture.refresh_in(&mut mapping);
+    }
+}
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -1408,10 +1423,14 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
+        self.refresh_in(&mut None);
+    }
+
+    fn refresh_in(&self, mapping: &mut Option<crate::watch::Reading>) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
-        let read = self.refresh_now();
+        let read = self.refresh_now(mapping);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -1432,17 +1451,28 @@ impl Staging {
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(&self, mapping: &mut Option<crate::watch::Reading>) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let read = self.refresh_timed(mapping);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn refresh_timed(&self, mapping: &mut Option<crate::watch::Reading>) -> usize {
         let size = self.read;
         let start = self.memory as usize;
-        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut last = waited(0, || {
+            if mapping.is_some() {
+                match self.last.try_lock() {
+                    Ok(last) => return last,
+                    Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+                    // Other refreshes take last before MAPPING. Release our
+                    // previous read before waiting behind one of them.
+                    Err(std::sync::TryLockError::WouldBlock) => *mapping = None,
+                }
+            }
+            self.last.lock().unwrap_or_else(|e| e.into_inner())
+        });
         let last = &mut *last;
         let exact = self.exact.swap(false, std::sync::atomic::Ordering::Relaxed);
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
@@ -1537,30 +1567,32 @@ impl Staging {
                 return size;
             }
         }
-        let _mapped = if no_wait() && !exact {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else if exact && exact_unlocked() {
-            match crate::watch::title_memory_reading_now() {
-                Some(mapped) => mapped,
-                None => match self.refresh_exact_unlocked(last, size) {
-                    Some(read) => {
-                        if read {
-                            found_blind(last);
+        if mapping.is_none() {
+            *mapping = Some(if no_wait() && !exact {
+                // Not waited for: while the runtime remaps title memory the
+                // texture is read through the kernel instead, whole or not at
+                // all (`no_wait`).
+                let Some(mapped) = crate::watch::title_memory_reading_now() else {
+                    return self.refresh_unlocked(last, size);
+                };
+                mapped
+            } else if exact && exact_unlocked() {
+                match crate::watch::title_memory_reading_now() {
+                    Some(mapped) => mapped,
+                    None => match self.refresh_exact_unlocked(last, size) {
+                        Some(read) => {
+                            if read {
+                                found_blind(last);
+                            }
+                            return size;
                         }
-                        return size;
-                    }
-                    None => waited(2, crate::watch::title_memory_reading),
-                },
-            }
-        } else {
-            waited(2, crate::watch::title_memory_reading)
-        };
+                        None => waited(2, crate::watch::title_memory_reading),
+                    },
+                }
+            } else {
+                waited(2, crate::watch::title_memory_reading)
+            });
+        }
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the

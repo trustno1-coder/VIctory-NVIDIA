@@ -2999,6 +2999,12 @@ pub struct SoftViews {
 
 static SOFT_VIEWS: std::sync::OnceLock<SoftViews> = std::sync::OnceLock::new();
 
+/// The next texture's write-watch or copy may call into the runtime to
+/// materialize a view. That takes the mapping write lock.
+pub(crate) fn refresh_may_materialize() -> bool {
+    LAZY_VIEWS.get().is_some() || SOFT_VIEWS.get().is_some()
+}
+
 /// The runtime keeps views in its books alone ([`SoftViews`]).
 pub fn use_soft_views(hooks: SoftViews) {
     let _ = SOFT_VIEWS.set(hooks);
