@@ -1012,6 +1012,10 @@ fn noted(ops: &[Op]) {
 /// Why submissions were refused since the last line, and how often (few a frame: a list is enough).
 static REFUSALS: std::sync::Mutex<Vec<(&'static str, u32)>> = std::sync::Mutex::new(Vec::new());
 
+/// Lab: fills that read through a copy at its place to its source, fills that overlap one only in part (left as
+/// they were), and fills inside one that something wrote in between (left as they were).
+pub(super) static FILL_THROUGH: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 fn count_refusal(why: &'static str) {
     let mut all = REFUSALS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|(w, _)| std::ptr::eq(*w, why)) {
@@ -1030,6 +1034,13 @@ pub(super) fn log(frames: f64) {
         let all: Vec<String> = refusals.iter().map(|(why, n)| format!("{:.2} {why}", f64::from(*n) / frames)).collect();
         tracing::info!("submissions refused for the card's steps, per frame: {}", all.join("; "));
     }
+    let through: Vec<f64> = FILL_THROUGH.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "fills read through a copy at its place to its source per frame (lab, VICTORY_FILL_THROUGH_PLACED): {:.1}; left: {:.1} in part over one, {:.1} written in between",
+        through[0],
+        through[1],
+        through[2],
+    );
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \

@@ -2651,6 +2651,64 @@ struct CardPlan {
 }
 
 /// One piece of submission-time work, in recorded order.
+/// Lab (2026-11-27): where a fill of upload memory reads title memory that a
+/// copy at its place earlier in the same list writes, the bytes it is to get
+/// are that copy's source bytes; with nothing in the air the CPU puts exactly
+/// those there first ([`place::Placed::prepare`]) and the fill reads them back.
+/// The fill reads the source instead, so that it no longer reads the copy's
+/// destination: flights that write the destination no longer hold the
+/// submission, and the card's steps no longer refuse it for a copy at its
+/// place (`card_steps::BEHIND_PLACED`, 0.2 to 0.65 submissions a frame and
+/// 5 to 24 ms of waiting in runs 27-30). Only a fill wholly inside the copy's
+/// destination, and only if nothing after the copy and before the fill writes
+/// the fill's bytes or the copy's source (a buffer copy, another copy at its
+/// place, a shader write, work that may write title memory).
+/// `VICTORY_FILL_THROUGH_PLACED=0`: as before.
+fn fill_through_placed(copies: &[Step], src: usize, len: usize) -> usize {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if len == 0 || !*ON.get_or_init(|| std::env::var_os("VICTORY_FILL_THROUGH_PLACED").is_none_or(|v| v != "0")) {
+        return src;
+    }
+    let meets = |a: usize, b: usize, from: usize, to: usize| a < to && from < b;
+    let end = src + len;
+    // Ranges written between the copy and the fill, seen walking back.
+    let mut between: Vec<(usize, usize)> = Vec::new();
+    for step in copies.iter().rev().take(4096) {
+        match step {
+            Step::Placed(p) => {
+                let (d0, d1) = (p.dst, p.dst + p.len);
+                if src >= d0 && end <= d1 {
+                    let from = p.src + (src - d0);
+                    let clear = !meets(p.src, p.src + p.len, d0, d1)
+                        && !between.iter().any(|&(a, b)| meets(a, b, from, from + len));
+                    card_steps::FILL_THROUGH[if clear { 0 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+                    return if clear { from } else { src };
+                }
+                if meets(d0, d1, src, end) {
+                    card_steps::FILL_THROUGH[1].fetch_add(1, Ordering::Relaxed);
+                    return src;
+                }
+                between.push((d0, d1));
+            }
+            &Step::Copy(dst, _, n) => {
+                if meets(dst, dst + n, src, end) {
+                    return src;
+                }
+                between.push((dst, dst + n));
+            }
+            &Step::GpuWrite(_, at, n) => {
+                if meets(at, at + n, src, end) {
+                    return src;
+                }
+                between.push((at, at + n));
+            }
+            Step::Run(_) => return src,
+            _ => {}
+        }
+    }
+    src
+}
+
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
@@ -7608,9 +7666,9 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len, None));
+        let mut deferred = self.deferred();
+        let src = fill_through_placed(&deferred.copies, src as usize, len);
+        deferred.copies.push(Step::Fill(dst as usize, src, len, None));
     }
 
     /// The host address of `len` bytes of scratch memory that hold the title
@@ -7631,16 +7689,18 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+        let mut deferred = self.deferred();
+        let src = fill_through_placed(&deferred.copies, src as usize, len);
+        deferred.copies.push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
-        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
+        let mut deferred = self.deferred();
+        let src = fill_through_placed(&deferred.copies, src as usize, len);
+        deferred.copies.push(Step::Fill(dst as usize, src, len, to));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
