@@ -54,6 +54,44 @@ generation and HDR choices win over the ones the F1 menu saved; every other F1 c
 - **Ray tracing.** The title's own builder calls are interposed (`VICTORY_RT_NATIVE=1`). It works, at 5-8 fps.
   Next: a builder of our own and the title's two traversal loop shapes on RayQuery, then DLSS Ray Reconstruction.
 
+## How the frame pipeline was rebuilt
+
+The title was written for a console where the CPU and the GPU share one memory. A PC with an RTX card has two, with
+a bus between them. Almost every slow frame came down to that, so the path from the title's draw calls to the picture
+on your screen was rebuilt stage by stage. Each stage is behind its own `VICTORY_*` switch, so it can be compared
+against the old path, and `PLAY.cmd` turns on the set that measured fastest.
+
+1. **Recording: the title's command lists are written down, not run.** On the console the title records straight
+   into GPU memory. Here each list call is noted in a compact list of words (`VICTORY_THIN=1`), and threads of ours
+   turn those words into D3D12 calls, in parallel with the title's own threads. The title's recording threads never
+   wait for D3D12.
+2. **Shaders: console GPU code becomes DXIL.** Every program the title has (vertex, pixel, compute, mesh) is decoded
+   from the console's own machine code and translated to DXIL for the RTX card. Wave64 code runs on NVIDIA's 32-lane
+   waves. The translated programs are cached on disk, and the host pipelines go into the driver's pipeline library,
+   so a second start loads fast.
+3. **Pipelines from pieces.** Many of the title's pipelines are not finished containers but loose pieces: a stage's
+   code, its metadata and raw register packets. Those are now assembled, the registers read (blend, depth, cull,
+   export formats), and the result translated into one host pipeline. A piece that does not translate refuses its
+   pipeline when it is made, so the title takes its own fallback instead of drawing garbage.
+4. **Memory: where the bytes are, and who moves them.** A title buffer can exist in four places: its own memory, our
+   copy in PC memory, an upload heap, and the card. The rebuilt path moves each byte at most once:
+   - the title's writes are watched page by page, and only the 4 KiB pages it touched are copied;
+   - a buffer the card wrote and the card reads stays on the card (`VICTORY_CARD_STEPS`, the relay), without a trip
+     back through the CPU;
+   - shaders that read memory by address (the console's 40-bit pointers) find it through a directory of title
+     memory on the card, kept in step frame by frame;
+   - textures go up in order of use, with room held back for DLSS and frame generation.
+5. **Submitting: one thread used to do everything; now it prepares, and others send.** The submitting thread was the
+   limit at 32:9. It now takes one refresh step per list instead of about 52,000 single steps a frame, merges only
+   the parts that changed, and hands `ExecuteCommandLists` and the fence signals to a thread of their own
+   (`VICTORY_SEND_THREAD=1`). It moves straight on to the next submission.
+6. **Presenting.** The frame, the interface plane and HDR10 are composed into the swap chain's buffer on the card.
+   NVIDIA Streamline adds DLSS Super Resolution, Frame Generation (2x-6x) and Reflex there, before the present.
+   Since test 8 the present also waits for the send thread, so the frame's last copy always reaches the card first.
+
+The numbers behind each choice are in [docs/findings.md](docs/findings.md). How the parts fit together is in
+[docs/architecture.md](docs/architecture.md).
+
 ## Building it
 
 ```powershell

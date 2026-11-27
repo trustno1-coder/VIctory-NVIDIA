@@ -155,7 +155,19 @@ impl Upload {
             Some(place) => place,
             None => {
                 let blocks = n.max(ARENA / BLOCK);
-                let at = reserve(blocks * BLOCK)?;
+                let Some(at) = reserve(blocks * BLOCK) else {
+                    // the caller answers null and the title's structure builder ends the run on it
+                    // ("Failed to allocate upload buffer"): what Windows said goes in the log first
+                    // (1455: the PC's memory and page file are used up; 8: no free range left)
+                    let error = last_error();
+                    tracing::error!(
+                        bytes = blocks * BLOCK,
+                        error,
+                        arenas = arenas.len(),
+                        "no memory for lists' uploads where shaders reach it by address (between 4 GiB and 128 GiB)"
+                    );
+                    return None;
+                };
                 crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
                 tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
                 arenas.push(Arena { at, taken: vec![false; blocks] });

@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(map[&d].named, 0);
         assert!(index(&dir.join("missing")).0.is_empty());
         // a container that carries a name from `NAMES` marks its program with that name only
-        let named = stock_with([0x33; 16], b"..CS_ScreenProbes_ActivateRays ");
+        let named = stock_with([0x33; 16], b"..CS_ScreenProbes_ActivateRays\0");
         std::fs::write(dir.join(SHADERS), record(5, &named)).unwrap();
         let (map, _) = index(&dir);
         assert_eq!(map[&[0x33; 16]].named, 0b10);
