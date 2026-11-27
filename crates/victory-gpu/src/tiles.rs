@@ -44,9 +44,9 @@
 //!   the next upload. Its tiles go back when the host copy does.
 //!
 //! Only for a texture the title places in memory and fills, two-dimensional,
-//! one layer, more than one level, of [`floor`] bytes or more, whose memory
-//! is not all its own when the host copy is made (`resource.rs` `hosted`);
-//! every other texture is made as before. Off unless
+//! one layer, more than one level, and [`floor`] bytes or more, when there
+//! is no compact host copy or host-written alias (`resource.rs` `hosted`).
+//! Off unless
 //! `VICTORY_LEVELS_ON_DEMAND=1`.
 
 use std::sync::Mutex;
@@ -124,6 +124,11 @@ pub(crate) fn floor() -> u64 {
 /// hold (`resource.rs` `room` counts it with the other host copies).
 pub(crate) fn given_total() -> u64 {
     STATS[2].load(Ordering::Relaxed)
+}
+
+/// Backing already committed in this pool that a sparse mip can reuse.
+pub(crate) fn free_bytes() -> u64 {
+    STATS[3].load(Ordering::Relaxed).saturating_sub(given_total())
 }
 
 /// One heap of the pool and its free runs of tiles (first tile, tiles), in
@@ -245,6 +250,9 @@ struct Given {
     packed: bool,
     /// The runs taken: the heap's place, first tile, tiles.
     runs: Vec<(usize, u32, u32)>,
+    /// Levels initialized by an upload or a card write. Packed mips may
+    /// share a physical tile before every mip inside it has been written.
+    ready: u32,
 }
 
 /// A host texture made without memory, and the tiles its levels have been
@@ -328,6 +336,7 @@ impl Tiled {
                 levels: vec![false; standard.len()],
                 packed: false,
                 runs: Vec::new(),
+                ready: 0,
             }),
             standard,
             packed: packed_tiles,
@@ -340,11 +349,9 @@ impl Tiled {
         })
     }
 
-    /// At the submission of a list that uploads every level of `texture`
-    /// from its staging buffer, of which `held` are the title's now (the
-    /// others are zeros there): tiles for the held ones that have none.
-    /// `room`: whether the card has room for more host copies
-    /// (`resource.rs` `room`). Without room no held level gets tiles: the
+    /// At the submission of a list that uploads the levels of `texture` from
+    /// `first` onwards, give tiles to held levels covered by the upload.
+    /// `allowance`: bytes of texture headroom. Without room no held level gets tiles: the
     /// list still brings the levels that have theirs up to date (which
     /// takes none of the card's memory), and its copies into the others go
     /// nowhere. (An upload of a host copy that exists passes the full
@@ -355,9 +362,9 @@ impl Tiled {
     /// whether a level named is still without tiles (no room, or no heap
     /// could be had): the caller has the upload recorded again later, or
     /// the level would stay empty until the title writes the texture.
-    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool) -> (bool, bool) {
+    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, first: u32, allowance: u64) -> (bool, bool) {
         match host() {
-            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, room),
+            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, first, allowance),
             None => (false, false),
         }
     }
@@ -369,18 +376,20 @@ impl Tiled {
         device: &ID3D12Device,
         texture: &ID3D12Resource,
         held: u32,
-        room: bool,
+        first: u32,
+        allowance: u64,
     ) -> (bool, bool) {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
-        // The levels the card itself writes are few and are not kept
-        // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
-        let missing = self.without_locked(&given, named) != 0;
-        (changed, missing)
+        let covered = u32::MAX.checked_shl(first).unwrap_or(0);
+        let uploaded = held & covered;
+        self.give_locked(&mut given, queue, device, texture, uploaded, allowance);
+        let missing = self.without_locked(&given, uploaded);
+        given.ready = (given.ready & named & !covered) | (uploaded & !missing) | card;
+        (self.show_locked(&given, named), missing != 0)
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -408,26 +417,20 @@ impl Tiled {
         let levels = levels & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         let prev = self.card.load(Ordering::Relaxed);
-        let changed = self.give_locked(
-            &mut given,
-            queue,
-            device,
-            texture,
-            prev | levels | self.held.load(Ordering::Relaxed),
-            levels,
-        );
+        self.give_locked(&mut given, queue, device, texture, levels, u64::MAX);
         // Only levels that actually received tiles (or already had them) saw
         // the card's write; a level that got no tiles saw its zeros and write
         // dropped, so neither `card` nor `claimed` should keep it.
         let without = self.without_locked(&given, levels);
         let backed = levels & !without;
+        given.ready |= backed;
         if backed != 0 {
             self.card.fetch_or(backed, Ordering::Relaxed);
         }
         if without != 0 {
             self.unclaim(without);
         }
-        changed
+        self.show_locked(&given, prev | backed | self.held.load(Ordering::Relaxed))
     }
 
     /// The bits of the levels that get their tiles with level `level`:
@@ -482,18 +485,7 @@ impl Tiled {
         levels & without
     }
 
-    /// Gives tiles to the levels of `texture` that both `named` and `may`
-    /// name (a bit a level, level 0 the lowest) and that have none yet;
-    /// the levels the card packs together get theirs when any of them is
-    /// so named. `named`: the levels that are the title's or the card's
-    /// own, by which the first level a view may show is told; `may`: the
-    /// ones of them that may get tiles in this call. To be called only
-    /// from a submission-time step of a list that writes every level of
-    /// `may`, whole: the call is ahead of that list on `queue`, and tiles
-    /// hold what their last owner left.
-    /// Returns whether the first level a view may show changed
-    /// ([`Tiled::first_shown`]): the caller has the texture's slots made
-    /// again.
+    /// Maps levels for the test lists that immediately write those levels.
     #[cfg(test)]
     pub(crate) fn give_on(
         &self,
@@ -504,35 +496,51 @@ impl Tiled {
         may: u32,
     ) -> bool {
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        self.give_locked(&mut given, queue, device, texture, named, may)
+        let written = named & may;
+        self.give_locked(&mut given, queue, device, texture, written, u64::MAX);
+        given.ready |= written & !self.without_locked(&given, written);
+        self.show_locked(&given, named)
     }
 
+    /// Gives tiles to levels that the next submission writes in full.
+    /// Map the coarsest levels first so the texture still has a fallback
+    /// when there is insufficient room for its finest level.
     fn give_locked(
         &self,
         given: &mut Given,
         queue: &ID3D12CommandQueue,
         device: &ID3D12Device,
         texture: &ID3D12Resource,
-        named: u32,
         may: u32,
-    ) -> bool {
-        let has = |level: u32| level < 32 && named & (1 << level) != 0;
-        let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
+        mut allowance: u64,
+    ) {
+        let now = |level: u32| level < 32 && may & (1 << level) != 0;
         let first_packed = self.standard.len() as u32;
         // (subresource, tiles, the level if it has tiles of its own) to map now.
         let mut wanted: Vec<(u32, u32, Option<usize>)> = Vec::new();
-        for level in 0..first_packed {
+        if self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
+            wanted.push((first_packed, self.packed, None));
+        }
+        for level in (0..first_packed).rev() {
             if !given.levels[level as usize] && now(level) {
                 wanted.push((level, self.standard[level as usize], Some(level as usize)));
             }
         }
-        if self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
-            wanted.push((first_packed, self.packed, None));
-        }
+        let budgeted = allowance != u64::MAX;
         for (subresource, tiles, level) in wanted {
+            let bytes = u64::from(tiles) * TILE;
+            if bytes > allowance {
+                break;
+            }
             let Some((heap, index, runs)) = take(device, tiles) else {
+                if budgeted {
+                    break;
+                }
                 continue;
             };
+            if budgeted {
+                allowance -= bytes;
+            }
             let at = D3D12_TILED_RESOURCE_COORDINATE {
                 X: 0,
                 Y: 0,
@@ -580,14 +588,11 @@ impl Tiled {
             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
         }
-        let with_tiles = |level: u32| {
-            if level < first_packed {
-                given.levels[level as usize]
-            } else {
-                given.packed
-            }
-        };
-        let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
+    }
+
+    fn show_locked(&self, given: &Given, named: u32) -> bool {
+        let ready = given.ready & named;
+        let shown = if ready == 0 { u32::MAX } else { ready.trailing_zeros() };
         self.shown.swap(shown, Ordering::Relaxed) != shown
     }
 
@@ -1381,14 +1386,14 @@ void look() {
         };
         // No room: nothing is given, the held levels are said to wait,
         // nothing is shown, every level reads zeros.
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), false);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), 0, 0);
         rig.check("an upload without room");
         assert!(!changed && waiting, "without room: changed {changed}, waiting {waiting}");
         assert_eq!(tiled.given_bytes(), 0, "without room no tile is given");
         assert_eq!(tiled.first_shown(), None);
         read_as_given(rig, "without room");
         // Asked again with room: the same levels get theirs.
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), 0, u64::MAX);
         rig.check("the upload again, with room");
         assert!(changed && !waiting, "with room: changed {changed}, waiting {waiting}");
         assert!(tiled.has_tiles(3) && !tiled.has_tiles(2));
@@ -1397,7 +1402,7 @@ void look() {
         // More levels held and no room again: the ones that have tiles
         // are brought up to date, the new ones wait, the view stays.
         let before = tiled.given_bytes();
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), false);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), 0, 0);
         rig.check("more levels held, without room");
         assert!(!changed && waiting, "more levels without room: changed {changed}, waiting {waiting}");
         assert_eq!(tiled.given_bytes(), before);
@@ -1412,10 +1417,34 @@ void look() {
         assert_eq!(tiled.first_shown(), Some(0));
         assert_eq!(tiled.claim(1 << 0), 0, "a level with tiles is not claimed again");
         // With room everything held gets its tiles.
-        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
+        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), 0, u64::MAX);
         rig.check("the last upload, with room");
         assert!(!waiting && tiled.whole());
         read_as_given(rig, "everything given");
+    }
+
+    fn partial_uploads_map_and_expose_only_initialized_levels(rig: &mut Rig) {
+        rig.step = "partial staging and a budget for only the coarsest tile group";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let (texture, tiled) = rig.reserved(&desc);
+        let last = u32::from(LEVELS) - 1;
+        let coarse_tiles = if tiled.packed != 0 { tiled.packed } else { tiled.standard[last as usize] };
+        let coarse_bytes = u64::from(coarse_tiles) * TILE;
+        let held = tiled.every_level();
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, held, last, u64::MAX);
+        assert!(changed && !waiting);
+        assert_eq!(tiled.given_bytes(), coarse_bytes);
+        assert_eq!(tiled.first_shown(), Some(last), "unwritten packed mips stay hidden");
+
+        let (other, budgeted) = rig.reserved(&desc);
+        let (changed, waiting) = budgeted.uploaded_on(&rig.queue, &rig.device, &other, held, 0, coarse_bytes);
+        assert!(changed && waiting);
+        assert_eq!(budgeted.given_bytes(), coarse_bytes);
+        assert_eq!(budgeted.first_shown(), Some(budgeted.with_level(last).trailing_zeros()));
+        let (_, waiting) = budgeted.uploaded_on(&rig.queue, &rig.device, &other, held, 0, u64::MAX);
+        assert!(!waiting);
+        assert_eq!(budgeted.first_shown(), Some(0));
+        rig.check("partial and budgeted mip mappings");
     }
 
     fn a_claim_given_up_is_made_again(rig: &mut Rig) {
@@ -1451,6 +1480,7 @@ void look() {
         a_reused_tile_reads_as_written(&mut rig);
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
+        partial_uploads_map_and_expose_only_initialized_levels(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
             eprintln!("the view test's shader or objects could not be made; that part was skipped");
@@ -1565,6 +1595,7 @@ void look() {
                 levels: vec![false, false],
                 packed: false,
                 runs: Vec::new(),
+                ready: 0,
             }),
             shown: AtomicU32::new(u32::MAX),
             held: AtomicU32::new(0),
@@ -1580,7 +1611,7 @@ void look() {
         // Even if level 0 later becomes allocatable, an upload with `room == false`
         // that does not hold level 0 must not treat level 0 as card-owned.
         tiled.standard[0] = 1;
-        let (changed, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, 1 << 1, false);
+        let (changed, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, 1 << 1, 0, 0);
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);

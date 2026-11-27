@@ -30,16 +30,17 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 const BLOCK: u64 = 64 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
-/// The same while the card has room ([`room`]): 4 GiB of them.
+/// Upper bound while the card has room, further limited by its DXGI budget.
 const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
+static STAGING_SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
+/// Up to 1/16 of the local budget below 85 %, else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
@@ -48,24 +49,29 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
+    let staging_limit = if crate::residency::critical_commit() {
+        0
+    } else if pressure {
+        1
+    } else if crate::residency::limited_host_ram() {
+        SPARE
+    } else {
+        limit
+    };
+    STAGING_SPARES.store(staging_limit, Ordering::Relaxed);
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
-            0
-        } else if pressure {
-            1
-        } else {
-            limit
-        };
         pool.reclaim(tick, staging_limit, true);
     }
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            (budget / (16 * BLOCK)).clamp(SPARE as u64, SPARE_KEPT as u64) as usize
+        }
         _ => SPARE,
     }
 }
@@ -198,12 +204,13 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    limit: &'static AtomicUsize,
     retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
-    const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+    const fn new(most: usize, limit: &'static AtomicUsize) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, limit, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -229,14 +236,19 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
+        let mut empty = None;
         for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
+            let Some(block) = block.as_mut().filter(|b| ripe.is(b)) else { continue };
+            // Filling a partially used block keeps whole blocks available to trim.
+            if block.free.whole(BLOCK) {
+                empty.get_or_insert(i);
+            } else if let Some(start) = block.free.take(len, align) {
                 found = Some((i, start));
                 break;
             }
+        }
+        if found.is_none() && let Some(i) = empty {
+            found = self.blocks[i].as_mut()?.free.take(len, align).map(|start| (i, start));
         }
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
@@ -305,7 +317,7 @@ impl<B: Clone> Pool<B> {
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        self.reclaim(now, self.limit.load(Ordering::Relaxed), false);
     }
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
@@ -346,8 +358,8 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT, &SPARES));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT, &STAGING_SPARES));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -744,15 +756,17 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        let budget = 6 << 30;
+        assert_eq!(spares(Some([budget, budget * 84 / 100, 0, 0]), true), 6);
+        assert_eq!(spares(Some([budget, budget * 85 / 100 + 1, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([budget, 0, 0, 0]), false), SPARE);
+        assert_eq!(spares(Some([100 << 30, 0, 0, 0]), true), SPARE_KEPT);
         assert_eq!(spares(None, true), SPARE);
     }
 
     #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
-        let mut pool: Pool<u32> = Pool::new(2);
+        let mut pool: Pool<u32> = Pool::new(2, &SPARES);
         let calls = std::cell::Cell::new(0);
         let refuse = || { calls.set(calls.get() + 1); None };
         for size in [704008, 179720, 179720, 24080, 48648, 524288, 89616, 351760] {
@@ -764,7 +778,7 @@ mod tests {
 
     #[test]
     fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces() {
-        let mut pool = Pool::new(STAGING_KEPT);
+        let mut pool = Pool::new(STAGING_KEPT, &SPARES);
         let (held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
         let (resting, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(2)).unwrap();
         pool.give(resting, 0);
@@ -785,8 +799,31 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_block_is_used_before_an_earlier_empty_block() {
+        static LIMIT: AtomicUsize = AtomicUsize::new(2);
+        let mut pool = Pool::new(2, &LIMIT);
+        let empty = pool.add(0u32, 0);
+        let partial = pool.add(1u32, 0);
+        assert_eq!(pool.blocks[partial].as_mut().unwrap().free.take(BLOCK / 2, 1), Some(0));
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, 0, || panic!("already has room")).unwrap();
+        assert_eq!(piece.block, partial);
+        assert_eq!(piece.start, BLOCK / 2);
+        assert!(pool.blocks[empty].as_ref().unwrap().free.whole(BLOCK));
+    }
+
+    #[test]
+    fn allocation_reclaims_using_its_own_pool_limit() {
+        static LIMIT: AtomicUsize = AtomicUsize::new(0);
+        let mut pool = Pool::new(2, &LIMIT);
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        pool.give(piece, 0);
+        let (_, memory, _) = pool.take(BLOCK / 2, 1, REST, || Some(2)).unwrap();
+        assert_eq!(memory, 2);
+    }
+
+    #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
-        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let mut pool: Pool<u32> = Pool::new(SPARE, &SPARES);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);
@@ -816,13 +853,13 @@ mod tests {
         assert_eq!(pool.blocks(), blocks.min(SPARE));
         // Too big for a block, and a block that cannot be made.
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
-        let mut none: Pool<u32> = Pool::new(SPARE);
+        let mut none: Pool<u32> = Pool::new(SPARE, &SPARES);
         assert!(none.take(65536, 65536, 0, || None).is_none());
     }
 
     #[test]
     fn pieces_come_from_blocks_older_than_the_lists_that_run() {
-        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
+        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT, &SPARES);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);

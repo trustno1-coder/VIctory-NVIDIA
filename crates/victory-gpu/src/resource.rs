@@ -1325,9 +1325,7 @@ struct Hosted {
 #[cfg(windows)]
 pub(crate) fn held_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
-    })
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0"))
 }
 
 /// The first level a placed texture's view shows: of views of one 2D
@@ -1671,13 +1669,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        // Levels on demand (`crate::tiles`): a texture the title places in
-        // memory and fills, of a megabyte or more, that does not hold all
-        // its levels now, is made without memory and given it level by
-        // level. It does not hold them all if its memory is not all
-        // mapped, if the next texture starts inside its span, or if a
-        // view of it starts below level 0. Every other texture, and this
-        // one if the card will not have it so, is made as before.
+        // Levels on demand (`crate::tiles`): eligible placed textures start
+        // sparse even when all their title pages happen to be mapped at
+        // creation. The upload step decides which mips receive backing.
         const TEXTURE_2D: u32 = 3;
         let mut tiled = None;
         let mut texture = None;
@@ -1686,18 +1680,36 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        let placed = shape_fits && r.host.placed.load(Relaxed);
+        let start = r.data() as u64;
+        let viewed = if placed {
+            crate::descriptor::host::first_viewed(start)
+        } else {
+            None
+        };
+        let compact = placed && held_only();
+        let sparse = placed && crate::tiles::wanted();
+        let can_stream = (compact || sparse) && alias_of(this).is_none();
+        // If every known view starts at a coarser level, a compact host copy
+        // also reduces upload-buffer size and can share the small texture pool.
+        let mut base = 0;
+        if can_stream && compact {
+            let first = r.host.wanted.load(Relaxed).min(viewed.unwrap_or(u32::MAX));
+            if first != u32::MAX {
+                base = base_level(&r.desc, first);
+            }
+        }
+        if can_stream && sparse && base == 0 {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
-            let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
-            let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
-            let partly = readable
-                && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
-                    || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
-                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            let readable = texture_layout(&r.desc)
+                .is_some_and(|t| t.planes.len() == 1 && !t.planes[0].layout.desc.swizzle.xor());
+            let reserved = if bytes >= crate::tiles::floor() && readable {
+                host_texture_as(&r.desc, r.host.state, clear, true)
+            } else {
+                None
+            };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1707,17 +1719,6 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             if cut.is_some() {
                 tiled = cut;
                 texture = reserved;
-            }
-        }
-        // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them.
-        let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
-            let wanted = r.host.wanted.load(Relaxed);
-            let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
-            let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
             }
         }
         let texture = match texture {
@@ -1820,33 +1821,35 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
+    texture_room(memory, crate::pool::texture_room) != 0
+}
+
+#[cfg(windows)]
+fn texture_room(memory: Option<[u64; 4]>, reusable: impl FnOnce() -> u64) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+        mb.trim().parse::<u64>().ok().map(|mb| mb.saturating_mul(1 << 20))
     });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
-        return filled < limit;
+        return limit.saturating_sub(filled);
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
-        return true;
-    }
     match memory {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < room_line(budget)
+            let used = used.saturating_sub(reusable()) + crate::shadow::card_room_kept() + targets_room_kept();
+            room_line(budget).saturating_sub(used).max(floor.saturating_sub(filled))
         }
-        None => filled < WITHOUT_BUDGET,
+        None => WITHOUT_BUDGET.saturating_sub(filled),
     }
 }
 
@@ -2978,10 +2981,10 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    // A texture the title fills, whose every subresource is uploaded before
-    // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // A regular texture the title fills can be cut from a block. Sparse
+    // textures must reach CreateReservedResource so mips can be mapped later.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -3096,11 +3099,12 @@ impl OnDemand {
     /// Held levels get tiles only while the card has room ([`room`]).
     /// Returns whether a level is still without its tiles: the caller
     /// records the upload again later.
-    pub(crate) fn uploaded(&self, held: u32, memory: u64) -> bool {
+    pub(crate) fn uploaded(&self, held: u32, first: u32, memory: u64) -> bool {
         let Some(tiled) = &self.0.tiled else {
             return false;
         };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room(crate::host::host().and_then(|h| h.video_memory())));
+        let allowance = texture_room(crate::host::host().and_then(|h| h.video_memory()), crate::tiles::free_bytes);
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, first, allowance);
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }
@@ -5167,6 +5171,37 @@ float4 lit() : SV_Target { return 1.0; }
         // 6 GB: 90 % (768 MiB would be more than a tenth).
         assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
         assert_eq!(line_for(0), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sparse_texture_creation_bypasses_the_regular_texture_pool() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else { return };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: the feature query writes the corresponding options structure.
+        let supported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        if supported.is_err() || options.TiledResourcesTier.0 < 2 {
+            return;
+        }
+        let raw = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        // SAFETY: the fixture uses the ResourceDesc field layout.
+        let desc = unsafe { raw.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        let regular = host_texture_as(&desc, 0, std::ptr::null(), false).unwrap();
+        let sparse = host_texture_as(&desc, 0, std::ptr::null(), true).unwrap();
+        let mut heap = D3D12_HEAP_PROPERTIES::default();
+        // SAFETY: these are live textures and the optional output points into our stack.
+        unsafe {
+            assert!(regular.GetHeapProperties(Some(&raw mut heap), None).is_ok());
+            let error = sparse.GetHeapProperties(Some(&raw mut heap), None).unwrap_err();
+            assert_eq!(error.code(), windows::Win32::Foundation::E_INVALIDARG);
+        }
     }
 
     /// The room kept for render targets goes once the world's targets are

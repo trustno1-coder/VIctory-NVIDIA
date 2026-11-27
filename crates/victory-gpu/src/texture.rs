@@ -914,9 +914,8 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // Levels on demand (`crate::tiles`): after the check below, in the
     // order of this list's steps, and before the list is executed, the
     // levels the staging buffer holds as the title's are given the card's
-    // memory if they have none. The list copies every level, so each one
-    // given here is written whole by it (the rest are copies into no
-    // memory, which the card drops).
+    // memory if they have none and this staging buffer covers them. Each
+    // newly mapped level is written whole by the upload.
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
     let Some(on_demand) = on_demand else {
         // Once per submission however many of its lists sample the texture.
@@ -927,7 +926,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
-        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
+        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.first, staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
         // upload: its slots are made due again by the texture pass.
@@ -1015,7 +1014,11 @@ impl PreludeUpload {
         // noted.
         match &self.on_demand {
             Some(on_demand) => {
-                let waiting = on_demand.uploaded(self.staging.detiled.load(Relaxed), self.staging.memory as u64);
+                let waiting = on_demand.uploaded(
+                    self.staging.detiled.load(Relaxed),
+                    self.staging.first,
+                    self.staging.memory as u64,
+                );
                 self.staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
                 // A texture picked by index has no staging buffer after this
                 // upload: its slots are made due again by the texture pass.

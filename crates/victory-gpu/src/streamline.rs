@@ -282,6 +282,8 @@ struct Calls {
     /// the frame whose simulation began.
     framegen_on: bool,
     framegen_times: u32,
+    /// Earliest time to release DLSS-G resources, if they may still be allocated.
+    framegen_free_at: Option<u64>,
     simulating: Option<u32>,
 }
 
@@ -290,6 +292,7 @@ static CALLS: Mutex<Calls> = Mutex::new(Calls {
     last: None,
     framegen_on: false,
     framegen_times: 0,
+    framegen_free_at: None,
     simulating: None,
 });
 
@@ -1787,9 +1790,25 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             calls.framegen_on = on;
             // What was asked (the driver may give fewer): not set again until that changes.
             calls.framegen_times = times;
-            if !on {
+            if on {
+                calls.framegen_free_at = Some(0);
+            } else {
                 FG_PER.store(1, Relaxed);
             }
+        }
+    }
+    // A menu or loading screen may have already switched the mode off with
+    // retention. An explicit Off still needs to free the plugin's allocations.
+    let now = crate::host::coarse_ms();
+    if wanted == 0 && !calls.framegen_on && calls.framegen_free_at.is_some_and(|at| now >= at) {
+        // SAFETY: this viewport is off, on the presenting thread under the Streamline lock.
+        let code = unsafe { (sl.free_resources)(abi::FEATURE_DLSS_G, &viewport) };
+        if code == 0 {
+            calls.framegen_free_at = None;
+            tracing::info!(frame, "DLSS Frame Generation resources freed after explicit Off");
+        } else {
+            calls.framegen_free_at = Some(now.saturating_add(1000));
+            tracing::warn!(frame, code, result = abi::result_name(code), "DLSS Frame Generation resources could not be freed");
         }
     }
     if calls.framegen_on {
@@ -1962,10 +1981,14 @@ pub(crate) fn resizing() {
         let options = abi::DlssgOptions::new(abi::DLSSG_OFF);
         let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
         // SAFETY: filled options.
-        unsafe { set_options(&viewport, &options) };
-        calls.framegen_on = false;
-        calls.framegen_times = 0;
-        FG_PER.store(1, Relaxed);
+        let code = unsafe { set_options(&viewport, &options) };
+        if code == 0 || code == 39 {
+            calls.framegen_on = false;
+            calls.framegen_times = 0;
+            // Resize uses Off without the retention flag.
+            calls.framegen_free_at = None;
+            FG_PER.store(1, Relaxed);
+        }
     }
 }
 
