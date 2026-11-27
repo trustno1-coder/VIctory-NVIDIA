@@ -1050,7 +1050,7 @@ impl Module {
             }
         }
         self.drop_unused_functions();
-        self.drop_unused_tables();
+        self.drop_unused_globals();
     }
 
     /// See [`Usage`]: over the blocks reached from the entry.
@@ -1113,14 +1113,13 @@ impl Module {
         u
     }
 
-    /// A constant table no remaining load reads leaves the module (the
-    /// validator refuses an internal declaration nothing uses). Shared
-    /// memory stays declared whether it is read or not.
-    fn drop_unused_tables(&mut self) {
-        let mut used: Vec<bool> = self.globals.iter().map(|g| g.init.is_none()).collect();
-        if used.iter().all(|&u| u) {
+    /// The DXIL validator rejects globals whose last use was removed, including
+    /// group-shared exchange slots in unreachable blocks.
+    fn drop_unused_globals(&mut self) {
+        if self.globals.is_empty() {
             return;
         }
+        let mut used = vec![false; self.globals.len()];
         for blk in &self.blocks {
             for &i in blk.phis.iter().chain(&blk.body) {
                 for_each_operand(&self.insts[i as usize].op, |v| {
@@ -1250,6 +1249,28 @@ mod tests {
 
     fn body(m: &Module, b: usize) -> usize {
         m.blocks[b].body.len()
+    }
+
+    #[test]
+    fn only_reachable_exchange_arrays_survive_and_their_uses_are_remapped() {
+        let Kit { mut m, b, .. } = kit();
+        let word = m.int(32);
+        let pair = m.array(2, word);
+        let dead = m.global("dead", pair, 3);
+        let live = m.global("live", pair, 3);
+        let zero = m.i32(0);
+        let unreachable = m.new_block();
+        for (block, array) in [(b, live), (unreachable, dead)] {
+            let ptr = m.element(block, array, zero);
+            m.store(block, ptr, zero);
+            m.terminate(block, Term::Ret);
+        }
+        m.optimise(DEAD);
+        assert_eq!(m.globals.len(), 1);
+        assert_eq!(m.globals[0].name, "live");
+        let ptr = m.blocks[b].body[0];
+        assert!(matches!(m.insts[ptr as usize].op, Op::Gep(_, V::Global(0), _)));
+        m.write();
     }
 
     #[test]

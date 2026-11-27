@@ -219,6 +219,56 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     eprintln!("ran on the hardware device: the sum {:#x} of the console's tree", tree[0]);
 }
 
+#[test]
+fn a_later_half_wave_exchange_preserves_an_earlier_unread_result() {
+    let mut words = vec![
+        0xD760_000E, 0x0001_0B00, // v_readlane_b32 s14, v0, 5
+        0xD760_000F, 0x0001_5100, // v_readlane_b32 s15, v0, 40
+        0x7E0E_0300,              // v_mov_b32 v7, v0
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend([
+        0x7E04_020E, 0x7E06_020F, 0x7E08_0207, // s14, s15 and s7 to v2..v4
+        0x341E_0084,                          // v_lshlrev_b32 v15, 4, v0
+    ]);
+    for (i, reg) in [2, 3, 4, 0].into_iter().enumerate() {
+        // Store each result at this lane's 16-byte output record.
+        words.extend([0xE070_1000 | (4 * i as u32), 0x8002_000F | (reg << 8)]);
+    }
+    let native = native(&words);
+    let p = ir::build(&native.code, true, native.vgprs).unwrap();
+    let shader = lowered(&native, &p, &HashSet::new()).unwrap();
+    let Some(text) = super::tests::dump_dxil(&shader.dxil) else {
+        eprintln!("no DXC disassembler");
+        return;
+    };
+    // This group contains one logical wave and the guest declares no LDS. Each
+    // broadcast uses word zero; the reduction writes the two partial results
+    // to words zero and one. Take the arrays from the actual DXIL pointers.
+    let mut arrays = std::collections::HashMap::new();
+    let mut writes = Vec::new();
+    let mut reads = Vec::new();
+    for line in text.lines().map(str::trim) {
+        let Some((op, pointer)) = line.split_once("addrspace(3)* ") else { continue };
+        let pointer = pointer.split(',').next().unwrap();
+        if let Some((result, _)) = op.split_once(" = getelementptr ") {
+            arrays.insert(result, pointer);
+        } else if op.starts_with("store i32 %") {
+            writes.push(arrays[pointer]);
+        } else if op.contains(" = load i32, ") {
+            reads.push(arrays[pointer]);
+        }
+    }
+    let [first, second, reduction] = writes[..] else { panic!("exchange stores: {writes:?}") };
+    let [a, b, lo, hi] = reads[..] else { panic!("exchange loads: {reads:?}") };
+    // Fault injection: issue all three sites' writes before reading any site.
+    let mut lds = std::collections::HashMap::new();
+    for (location, value) in [((first, 0), 5), ((second, 0), 40), ((reduction, 0), 31), ((reduction, 1), 63)] {
+        lds.insert(location, value);
+    }
+    assert_eq!([lds[&(a, 0)], lds[&(b, 0)], lds[&(lo, 0)], lds[&(hi, 1)]], [5, 40, 31, 63]);
+}
+
 /// "Some lane is left" of a mask operation as a number: an upscaler's programs wait for
 /// other groups in a loop that ends when every lane saw its flag, or after enough rounds:
 /// both tests become -1 or 0 and SCC of `timeout | ~waiting` ends it.
