@@ -86,6 +86,30 @@ fn interval_override() -> Option<Duration> {
     })
 }
 
+/// The frame rate cap the F1 menu set in this run, in microseconds (0: none set).
+static LIVE_US: AtomicU64 = AtomicU64::new(0);
+
+fn live_interval() -> Option<Duration> {
+    Some(Duration::from_micros(LIVE_US.load(Ordering::Relaxed))).filter(|d| !d.is_zero())
+}
+
+/// The F1 menu's frame rate cap, at once: our clock starts again with the new
+/// interval, as at the title's own change ([`set_interval`]). Without
+/// `VICTORY_FRAME_INTERVAL_MS` only; that one patches the title's rate too.
+pub(crate) fn set_cap(fps: u32) {
+    let us = 1_000_000 / u64::from(fps.clamp(1, 1000));
+    LIVE_US.store(us, Ordering::Relaxed);
+    if asked().is_some() {
+        return;
+    }
+    let first = LAST.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap_or(0);
+    let mut clock = clock();
+    if clock.is_some() {
+        *clock = Some(Clock { start: Instant::now(), interval: Duration::from_micros(us), first });
+        tracing::info!(fps, "frame rate cap changed in the F1 menu");
+    }
+}
+
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
 /// not part of the rate.
@@ -102,7 +126,7 @@ pub(crate) extern "system" fn set_interval(
     };
     // VICTORY_FRAME_INTERVAL_MS (with the title's own rate patched to match)
     // first, then VICTORY_FRAME_INTERVAL_US (our clock alone).
-    let interval = asked().or_else(interval_override).unwrap_or(asked_by_title);
+    let interval = asked().or_else(live_interval).or_else(interval_override).unwrap_or(asked_by_title);
     tracing::info!(?interval, title = ?asked_by_title, period, flags, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
