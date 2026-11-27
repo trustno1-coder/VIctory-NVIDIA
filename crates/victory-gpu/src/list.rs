@@ -278,6 +278,11 @@ impl Detached {
     pub(crate) fn release_tables(&mut self) {
         self._state.tables_done();
     }
+
+    /// It was sent to the card (for `crate::host::slot_stats`).
+    pub(crate) fn sent(&mut self) {
+        self._state.slots_at(2);
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
@@ -489,7 +494,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        state.slots_at(1);
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -563,8 +569,9 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             host.close_if_left_open();
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state =
+            let mut state =
                 std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
+            state.slots_at(1);
             (host, uploads, state)
         };
         order.push(taken.len());

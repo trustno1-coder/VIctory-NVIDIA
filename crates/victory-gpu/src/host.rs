@@ -3413,6 +3413,264 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether a draw that finds no free dynamic descriptor slot waits for the
+/// next landing without the submission lock (`VICTORY_DYNAMIC_WAIT=1`; off
+/// by default: everything in the air is settled under the submission lock,
+/// as before, [`settle_for_fence`]).
+///
+/// Why: the slots come back flight by flight, when the thread that lands
+/// flights is done with one (`Detached::release_tables`), and that thread
+/// never takes the submission lock. The settle waited for all of them and
+/// kept the lock meanwhile, so the submitting thread stood at the lock with
+/// submissions ready and the card ran dry behind it.
+///
+/// What changes: the thread that translates the draw waits until a landing
+/// gave slots back, and takes them; other submissions go on meanwhile. With
+/// nothing in the air and nothing being landed no slot can come back that
+/// way: then, and without the relay, as before.
+fn dynamic_wait() -> bool {
+    match dynamic_wait_mode() {
+        0 => false,
+        1 => true,
+        _ => dynamic_wait_turn().0,
+    }
+}
+
+/// 0: off; 1: on; 2: `VICTORY_DYNAMIC_WAIT=alt`, on and off in turns of 20 s
+/// ([`dynamic_wait_turn`]), to compare the two inside one run at one place.
+fn dynamic_wait_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_DYNAMIC_WAIT").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether this turn of 20 s is an "on" one, and the seconds into it.
+fn dynamic_wait_turn() -> (bool, u64) {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let s = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    ((s / 20).is_multiple_of(2), s % 20)
+}
+
+/// Since the last frame-rate line: draws that found no free dynamic
+/// descriptor slot; the microseconds they waited; those that had their slots
+/// after a landing ([`dynamic_wait`]); those that settled everything in the
+/// air under the submission lock; and those that went without.
+static DYNAMIC_WAITS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// What took and gave back dynamic descriptor slots since the last line
+/// ([`dynamic_wait_line`]): always counted, a few additions a table.
+pub(crate) mod slot_stats {
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+
+    /// Size classes of a table: 1 slot, up to 8, 16, 32, 64, 128, and more.
+    const CLASSES: usize = 7;
+    /// Tables made afresh (their number, their slots) by size class.
+    static MADE: [[AtomicU64; 2]; CLASSES] = [const { [const { AtomicU64::new(0) }; 2] }; CLASSES];
+    /// Slots of tables made for draws, for dispatches, and for root views
+    /// bound as one-slot tables.
+    static KINDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    /// Tables the list had already; then, each as tables and slots: made
+    /// though the list had a longer copy of the same table with the same
+    /// records; made longer than a copy the list had (the shorter one's
+    /// slots); made though another list made the same this frame.
+    static CACHE: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    /// Given back: slots, lists, slots times the milliseconds held, the
+    /// longest held in milliseconds.
+    static BACK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    /// Slots held now by lists not submitted yet, submitted and not sent to
+    /// the card, and sent to the card.
+    static HELD: [AtomicI64; 3] = [const { AtomicI64::new(0) }; 3];
+    /// The most of each since the last line.
+    static MOST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    /// Draws that found no slot, and [`HELD`] summed over those moments.
+    static REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    pub(crate) const HAD: usize = 0;
+    pub(crate) const LONGER: usize = 1;
+    pub(crate) const SHORTER: usize = 3;
+    pub(crate) const ELSEWHERE: usize = 5;
+
+    fn class(n: u32) -> usize {
+        match n {
+            0..=1 => 0,
+            2..=8 => 1,
+            9..=16 => 2,
+            17..=32 => 3,
+            33..=64 => 4,
+            65..=128 => 5,
+            _ => 6,
+        }
+    }
+
+    /// A table of `n` slots was made afresh, for a dispatch or a draw.
+    pub(crate) fn made(n: u32, compute: bool) {
+        let class = &MADE[class(n)];
+        class[0].fetch_add(1, Relaxed);
+        class[1].fetch_add(u64::from(n), Relaxed);
+        KINDS[usize::from(compute)].fetch_add(u64::from(n), Relaxed);
+    }
+
+    /// A root view took a slot.
+    pub(crate) fn root_view() {
+        KINDS[2].fetch_add(1, Relaxed);
+    }
+
+    /// One of [`HAD`], [`LONGER`], [`SHORTER`], [`ELSEWHERE`], of `n` slots.
+    pub(crate) fn cache(what: usize, n: u32) {
+        CACHE[what].fetch_add(1, Relaxed);
+        if what != HAD {
+            CACHE[what + 1].fetch_add(u64::from(n), Relaxed);
+        }
+    }
+
+    /// `by` slots more or fewer are held by lists at `stage` (0: not
+    /// submitted yet, 1: submitted and not sent, 2: sent to the card).
+    pub(crate) fn held(stage: u8, by: i64) {
+        let stage = usize::from(stage.min(2));
+        let now = HELD[stage].fetch_add(by, Relaxed) + by;
+        if by > 0 {
+            MOST[stage].fetch_max(now.max(0) as u64, Relaxed);
+        }
+    }
+
+    /// A list gave back the `n` slots it held, the first taken `ms` ago.
+    pub(crate) fn back(n: u32, ms: u64) {
+        BACK[0].fetch_add(u64::from(n), Relaxed);
+        BACK[1].fetch_add(1, Relaxed);
+        BACK[2].fetch_add(u64::from(n) * ms, Relaxed);
+        BACK[3].fetch_max(ms, Relaxed);
+    }
+
+    /// A draw found no slot.
+    pub(super) fn refused() {
+        REFUSED[0].fetch_add(1, Relaxed);
+        for (sum, held) in REFUSED[1..].iter().zip(&HELD) {
+            sum.fetch_add(held.load(Relaxed).max(0) as u64, Relaxed);
+        }
+    }
+
+    /// The line, if a slot was taken or given back since the last one.
+    pub(super) fn line(frames: f64) {
+        let take = |a: &[AtomicU64]| -> Vec<u64> { a.iter().map(|x| x.swap(0, Relaxed)).collect() };
+        let made: Vec<Vec<u64>> = MADE.iter().map(|c| take(c)).collect();
+        let (kinds, cache, back, most, refused) = (take(&KINDS), take(&CACHE), take(&BACK), take(&MOST), take(&REFUSED));
+        let tables: u64 = made.iter().map(|c| c[0]).sum();
+        if tables + kinds[2] + back[0] == 0 {
+            return;
+        }
+        let per = |n: u64| n as f64 / frames;
+        let sizes: Vec<String> = made.iter().map(|c| format!("{:.0}/{:.0}", per(c[0]), per(c[1]))).collect();
+        let at_refusal = |i: usize| if refused[0] == 0 { 0 } else { refused[i] / refused[0] };
+        tracing::info!(
+            "dynamic descriptor slots taken per frame: {:.0} in {:.0} tables ({:.0} for draws, {:.0} for dispatches) and {:.0} \
+             for root views; tables/slots by size 1, 2-8, 9-16, 17-32, 33-64, 65-128, 129 and more: {}; the list had the \
+             table already {:.0} times; made though the list had a longer copy with the same records {:.0} ({:.0} slots); \
+             made longer than a copy the list had {:.0} ({:.0} slots of the shorter); made though another list made the \
+             same this frame {:.0} ({:.0} slots); given back {:.0} by {:.0} lists, held {:.0} ms on average and {} ms at \
+             most; the most held at once by lists not taken for sending yet {}, being prepared {}, sent to the card {}; \
+             held when a draw found none (the average of {} such moments): {}, {}, {}",
+            per(kinds[0] + kinds[1] + kinds[2]),
+            per(tables),
+            per(kinds[0]),
+            per(kinds[1]),
+            per(kinds[2]),
+            sizes.join(", "),
+            per(cache[HAD]),
+            per(cache[LONGER]),
+            per(cache[LONGER + 1]),
+            per(cache[SHORTER]),
+            per(cache[SHORTER + 1]),
+            per(cache[ELSEWHERE]),
+            per(cache[ELSEWHERE + 1]),
+            per(back[0]),
+            per(back[1]),
+            if back[0] == 0 { 0.0 } else { back[2] as f64 / back[0] as f64 },
+            back[3],
+            most[0],
+            most[1],
+            most[2],
+            refused[0],
+            at_refusal(1),
+            at_refusal(2),
+            at_refusal(3),
+        );
+    }
+}
+
+/// `take` found no free dynamic descriptor slots (it gives `None`): waits
+/// for flights to land, which gives their lists' slots back, and asks again.
+/// With [`dynamic_wait`] without the submission lock and only until `take`
+/// has its slots; else by [`settle_for_fence`], as before.
+pub(crate) fn wait_for_slots(mut take: impl FnMut() -> Option<u32>) -> Option<u32> {
+    let began = std::time::Instant::now();
+    DYNAMIC_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    slot_stats::refused();
+    let mut found = None;
+    if dynamic_wait() && relay() {
+        let _waiting = crate::timeline::span("waiting for landings: dynamic descriptor slots");
+        loop {
+            // (Looked at before the asking: what lands after this look is
+            // waited for below.)
+            let nothing = {
+                let line = line();
+                line.line.is_empty() && !line.settling
+            };
+            found = take();
+            if found.is_some() || nothing {
+                break;
+            }
+            // A landing that ended between the asking and here is not
+            // told again: looked at once a millisecond all the same.
+            let line = line();
+            drop(LINE_LANDED.wait_timeout(line, std::time::Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+    if found.is_some() {
+        DYNAMIC_WAITS[2].fetch_add(1, Ordering::Relaxed);
+    } else {
+        DYNAMIC_WAITS[3].fetch_add(1, Ordering::Relaxed);
+        settle_for_fence();
+        found = take();
+        if found.is_none() {
+            DYNAMIC_WAITS[4].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    DYNAMIC_WAITS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
+}
+
+/// For the frame-rate line: [`DYNAMIC_WAITS`] per frame, and the fewest
+/// dynamic slots a view heap had free since the last line.
+fn dynamic_wait_line(frames: f64) {
+    slot_stats::line(frames);
+    let w: Vec<f64> = DYNAMIC_WAITS.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let low = crate::descriptor::host::DYNAMIC_LOW[0].swap(u32::MAX, Ordering::Relaxed);
+    if low == u32::MAX && w[0] <= 0.0 {
+        return;
+    }
+    tracing::info!(
+        "dynamic descriptor slots: the fewest free since the last line {} of {}; per frame {:.2} draws found none and waited \
+         {:.1} ms, {:.2} had their slots after a landing, {:.2} settled everything in the air under the submission lock, \
+         {:.2} went without (VICTORY_DYNAMIC_WAIT=1 waits for the next landing without that lock: now {})",
+        if low == u32::MAX { 0 } else { low },
+        crate::descriptor::host::DYNAMIC_LOW[1].load(Ordering::Relaxed),
+        w[0],
+        w[1] / 1000.0,
+        w[2],
+        w[3],
+        w[4],
+        if dynamic_wait_mode() == 2 {
+            let (on, s) = dynamic_wait_turn();
+            format!("{} for {s} s, in turns of 20 s", if on && relay() { "on" } else { "off" })
+        } else {
+            (if dynamic_wait() && relay() { "on" } else { "off" }).to_owned()
+        }
+    );
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -3835,6 +4093,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    dynamic_wait_line(frames);
     crate::port::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
@@ -5025,8 +5284,27 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // The card has run every flight given here (`relay_worker` takes only
+        // those the host's fence says are done), so nothing reads the dynamic
+        // descriptor slots of their lists' tables any more: they are given
+        // back now, not after the copies back below (15 to 30 ms of a frame at
+        // 9,000 draws). What the landing does from here on reads buffers and
+        // title memory, no view heap slot of these lists.
+        let mut gave = false;
+        for item in &mut items {
+            if let Late::Run(flight) = item {
+                for detached in &mut flight.lists {
+                    detached.release_tables();
+                }
+                gave |= !flight.lists.is_empty();
+            }
+        }
+        if gave {
+            // (A draw waiting for slots looks again: `wait_for_slots`.)
+            LINE_LANDED.notify_all();
+        }
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5351,7 +5629,7 @@ impl Host {
         self.send_late(lists, order, parts);
     }
 
-    fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+    fn send_late(&self, mut lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, parts, true)
@@ -5361,6 +5639,10 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         };
+        // (For the slots line: what they hold is on the card from here on.)
+        for detached in &mut lists {
+            detached.sent();
+        }
         let after = std::time::Instant::now();
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));

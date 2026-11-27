@@ -454,6 +454,13 @@ pub(crate) fn line_moved() {
     behind::wake();
 }
 
+/// Presents put in the line of submissions so far, and those that have gone
+/// ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn presents() -> (u64, u64) {
+    behind::presents()
+}
+
 /// This thread does work the line waits for: it does not wait for the line.
 #[cfg(windows)]
 pub(crate) fn no_drain_here() {
