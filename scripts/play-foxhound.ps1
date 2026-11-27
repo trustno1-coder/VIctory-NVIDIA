@@ -70,8 +70,12 @@ if ($menu['VICTORY_MENU_FG_TYPE'] -in 'auto', 'dlss', 'fsr') { $FgType = $menu['
 if ($menu['VICTORY_MENU_FPS'] -match '^\d+$' -and [int]$menu['VICTORY_MENU_FPS'] -ge 1 -and [int]$menu['VICTORY_MENU_FPS'] -le 1000) { $fpsWanted = [int]$menu['VICTORY_MENU_FPS'] }
 $settings = @{
     # Submission and copy machinery
-    VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_RELAY = '2'; VICTORY_RELAY_COPY = '1'; VICTORY_WIDE_BACK = '1'
-    VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_CARD_AWAKE = '1'
+    # Left off (measured on an RTX 5070 Ti, the first cutscene's diner and the prologue's cell, release, every
+    # pipeline warmed): VICTORY_CARD_AWAKE, whose compute queue kept busy (tuned on AMD) cost 27 against 31 fps;
+    # and VICTORY_RELAY=2, as fast as off there (26.9 against 27.4 fps) with more frames over 50 ms, and the switch
+    # fxceless/victory-fork #89 found characters' skin missing with on an RTX 5070 Laptop.
+    VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_RELAY_COPY = '1'; VICTORY_WIDE_BACK = '1'
+    VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_INDIRECT_BATCH = '2'
     VICTORY_UPLOAD_AHEAD = '1'; VICTORY_SHOW_AFTER = '1'; VICTORY_MAP_THREADS = '1'
     # Shader writes into big write-combined copies stay on the card (-5 ms a frame)
@@ -81,7 +85,10 @@ $settings = @{
     # Textures: pool with no blocks made ahead, 16 ms a pass, no catch-up, levels not on demand (sharp)
     VICTORY_TEXTURE_POOL = '1'; VICTORY_RIPE_BLOCKS = '0'; VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_TEXTURE_CATCHUP = '0'
     VICTORY_TEXTURE_STAGE_MS = '16'; VICTORY_LEVELS_ON_DEMAND = '0'
-    VICTORY_PRELUDE_UPLOADS = '1'; VICTORY_SHOW_NEW_LATER = '1'; VICTORY_POOL_SMALL = '0'; VICTORY_TABLED_REREAD = '1'
+    # VICTORY_POOL_SMALL at its default (textures of 64 KiB and less at 4 KiB multiples in the pool): the 64 KiB
+    # placement was for device losses on an AMD card. On the RTX 5070 Ti the same ~18,000 textures took 1.52 GB
+    # instead of 2.24 and the pool's blocks 2.8 GB instead of 3.9; no device loss in six minutes.
+    VICTORY_PRELUDE_UPLOADS = '1'; VICTORY_SHOW_NEW_LATER = '1'; VICTORY_TABLED_REREAD = '1'
     VICTORY_QUEUE_HOST_TEXTURES = '0'
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
