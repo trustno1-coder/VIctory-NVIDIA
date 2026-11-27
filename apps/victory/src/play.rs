@@ -311,6 +311,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
             // otherwise fills with textures: on from the start it is left a fifth of the
             // budget; ready but off, a little less is held back.
             set("VICTORY_TEXTURE_ROOM_PERCENT", if framegen { "80" } else { "86" });
+            set("VICTORY_FRAMEGEN_ROOM_RESERVE", "1");
         }
     }
     // AMD FSR 3 frame generation, made ready as DLSS frame generation is: auto, the layer uses
@@ -326,11 +327,15 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         set("VICTORY_FRAMEGEN_X", &x.to_string());
         if !s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT") {
             s.insert("VICTORY_TEXTURE_ROOM_PERCENT".to_owned(), if framegen { "80" } else { "86" }.to_owned());
+            s.insert("VICTORY_FRAMEGEN_ROOM_RESERVE".to_owned(), "1".to_owned());
         }
     }
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     set("VICTORY_FRAME_INTERVAL_US", &(1_000_000.0 / f64::from(fps)).round().to_string());
     for (k, v) in menu.iter().filter(|(k, _)| !k.starts_with("VICTORY_MENU_")) {
+        if k == "VICTORY_TEXTURE_ROOM_PERCENT" {
+            s.remove("VICTORY_FRAMEGEN_ROOM_RESERVE");
+        }
         if v.is_empty() {
             s.remove(k);
         } else {
@@ -338,6 +343,9 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         }
     }
     for (k, v) in o.more.iter().filter_map(|m| m.split_once('=')) {
+        if k.trim() == "VICTORY_TEXTURE_ROOM_PERCENT" {
+            s.remove("VICTORY_FRAMEGEN_ROOM_RESERVE");
+        }
         s.insert(k.trim().to_owned(), v.trim().to_owned());
     }
     // For the menu: what it shows as the current choices.
@@ -932,6 +940,7 @@ mod tests {
         // frame generation ready, off, with a little memory held back for it
         assert_eq!((get("VICTORY_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
         assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
+        assert_eq!(get("VICTORY_FRAMEGEN_ROOM_RESERVE"), Some("1"));
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("1000"));
         assert_eq!((get("VICTORY_MENU_DLSS"), get("VICTORY_MENU_FRAMEGEN")), (Some("quality"), Some("0")));
         assert_eq!((get("VICTORY_MENU_CONSOLE"), get("VICTORY_MENU_FPS")), (Some("series-x"), Some("1000")));
@@ -946,6 +955,7 @@ mod tests {
         // FSR 3 frame generation is made ready instead (the layer says whether it can run)
         assert_eq!((get("VICTORY_FSR_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
         assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
+        assert_eq!(get("VICTORY_FRAMEGEN_ROOM_RESERVE"), Some("1"));
         assert_eq!(get("VICTORY_MENU_FG_TYPE"), Some("auto"));
     }
 
@@ -998,6 +1008,15 @@ mod tests {
         assert_eq!((get("VICTORY_DLSS"), get("VICTORY_FRAMEGEN")), (None, None));
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("33333"));
         assert_eq!((get("VICTORY_AMBIENT"), get("VICTORY_NEW")), (Some("0"), Some("2")));
+    }
+
+    #[test]
+    fn an_explicit_texture_room_limit_is_not_marked_as_a_frame_generation_reserve() {
+        let mut o = options();
+        o.more = vec!["VICTORY_TEXTURE_ROOM_PERCENT=92".to_owned()];
+        let (s, _) = settings(&o, &[], Some(Path::new(r"C:\nvidia")));
+        assert_eq!(s.get("VICTORY_TEXTURE_ROOM_PERCENT").map(String::as_str), Some("92"));
+        assert!(!s.contains_key("VICTORY_FRAMEGEN_ROOM_RESERVE"));
     }
 
     /// AMD's files are offered only to cards without DLSS Frame Generation (or FSR 3 chosen).

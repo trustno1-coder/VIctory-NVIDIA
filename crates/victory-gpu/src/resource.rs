@@ -1999,15 +1999,26 @@ pub(crate) fn room_percent() -> u64 {
 
 /// The line [`room`] weighs the card's use against, in bytes of a budget
 /// of `budget`: `VICTORY_TEXTURE_ROOM_PERCENT`'s share of it if set, else
-/// [`line_for`] it.
+/// [`line_for`] it. An automatic frame-generation setting without an
+/// available backend caps this at 80 % to leave more room for other GPU work.
 #[cfg(windows)]
 pub(crate) fn room_line(budget: u64) -> u64 {
     static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
-        budget / 100 * room_percent()
+    let percent = if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
+        Some(room_percent())
     } else {
-        line_for(budget)
+        None
+    };
+    let framegen_reserve = std::env::var_os("VICTORY_FRAMEGEN_ROOM_RESERVE").is_some();
+    room_line_for(budget, percent, framegen_reserve, crate::streamline::framegen_available())
+}
+
+#[cfg(any(windows, test))]
+fn room_line_for(budget: u64, percent: Option<u64>, framegen_reserve: bool, framegen_available: bool) -> u64 {
+    if framegen_reserve && !framegen_available {
+        return budget / 100 * percent.unwrap_or(80).min(80);
     }
+    percent.map_or_else(|| line_for(budget), |p| budget / 100 * p.clamp(50, 97))
 }
 
 /// The budget less what is left free for the host's own needs that are
@@ -5167,6 +5178,15 @@ float4 lit() : SV_Target { return 1.0; }
         // 6 GB: 90 % (768 MiB would be more than a tenth).
         assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
         assert_eq!(line_for(0), 0);
+    }
+
+    #[test]
+    fn unsupported_frame_generation_uses_the_conservative_texture_limit() {
+        const MIB: u64 = 1 << 20;
+        let budget = 5_221 * MIB;
+        assert_eq!(room_line_for(budget, Some(86), true, false), budget / 100 * 80);
+        assert_eq!(room_line_for(budget, Some(86), true, true), budget / 100 * 86);
+        assert_eq!(room_line_for(budget, Some(86), false, false), budget / 100 * 86);
     }
 
     /// The room kept for render targets goes once the world's targets are

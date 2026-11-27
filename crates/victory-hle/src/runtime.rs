@@ -109,12 +109,12 @@ impl Title {
                 .map(|(_, text)| text.as_str())
         };
         let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
-        let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
+        let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse::<u64>().ok());
         Title {
             id: id.unwrap_or(0),
             store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
             storage: PathBuf::new(),
-            storage_bytes: storage_mb.unwrap_or(0) << 20,
+            storage_bytes: storage_mb.unwrap_or(0).saturating_mul(1 << 20),
         }
     }
 
@@ -314,6 +314,15 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn storage_quota_conversion_saturates_instead_of_wrapping() {
+        let text = format!(
+            "<Game><PersistentLocalStorage><SizeMB>{}</SizeMB></PersistentLocalStorage></Game>",
+            u64::MAX
+        );
+        assert_eq!(Title::from_manifest(&text).storage_bytes, u64::MAX);
     }
 
     #[test]

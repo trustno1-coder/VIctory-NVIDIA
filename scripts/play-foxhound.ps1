@@ -106,10 +106,11 @@ if ($Dlss -ne 'off') {
         $settings.VICTORY_DLSS = '1'; $settings.VICTORY_DLSS_MODE = $Dlss; $settings.VICTORY_STREAMLINE_DIR = $sl
         if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = [string]$timesWanted }
         elseif (-not $NoFrameGenReady) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = '0' }   # ready, off
-        # Frame generation takes 1.5 to 2 GB of the card's memory, which the layer otherwise fills with textures up
-        # to nine tenths of its budget (on a 12 GB card it then ran out: no generated frames). On from the start, it
-        # is left a fifth of the budget; ready but off, a little less is held back.
-        if ($settings.VICTORY_FRAMEGEN -eq '1') { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }
+        # This reserve is applied only when a frame-generation backend was made available on this adapter.
+        if ($settings.VICTORY_FRAMEGEN -eq '1') {
+            $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' }
+            $settings.VICTORY_FRAMEGEN_ROOM_RESERVE = '1'
+        }
     } else {
         Write-Host "No NVIDIA files in ${sl}: running without DLSS and frame generation. Get-NVIDIA-DLSS.cmd in the"
         Write-Host "repository folder fetches them from NVIDIA once (about 70 MB); VICTORY_STREAMLINE_DIR names another folder."
@@ -129,14 +130,21 @@ if ($FgType -ne 'dlss' -and ($FrameGen -or -not $NoFrameGenReady)) {
     }
     if ($FgType -eq 'fsr') { $settings.Remove('VICTORY_FRAMEGEN') }
     if (-not $settings.VICTORY_FRAMEGEN_X) { $settings.VICTORY_FRAMEGEN_X = if ($FrameGen) { [string]$timesWanted } else { '0' } }
-    if (-not $settings.VICTORY_TEXTURE_ROOM_PERCENT) { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }
+    if (-not $settings.VICTORY_TEXTURE_ROOM_PERCENT) {
+        $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' }
+        $settings.VICTORY_FRAMEGEN_ROOM_RESERVE = '1'
+    }
 }
 if ($fpsWanted -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
 foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
+    if ($k -eq 'VICTORY_TEXTURE_ROOM_PERCENT') { $settings.Remove('VICTORY_FRAMEGEN_ROOM_RESERVE') }
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
 }
-foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+foreach ($k in $More.Keys) {
+    if ($k -eq 'VICTORY_TEXTURE_ROOM_PERCENT') { $settings.Remove('VICTORY_FRAMEGEN_ROOM_RESERVE') }
+    $settings[$k] = $More[$k]
+}
 $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 # For the menu: what it shows as the current choices, where it saves, and how it starts the game again
 # (-More is not carried over a restart from the menu).
