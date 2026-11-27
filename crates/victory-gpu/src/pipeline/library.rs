@@ -67,6 +67,11 @@ pub(super) fn folder() -> Option<PathBuf> {
     DIR.get().cloned()
 }
 
+/// The folder of the library and the lists beside it, if one was given.
+pub(super) fn dir() -> Option<&'static std::path::Path> {
+    DIR.get().map(PathBuf::as_path)
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -496,6 +501,16 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+            // A library filled before static samplers were made in a kept
+            // order (`super::samplers`) holds pipelines of any order: a
+            // pipeline loaded from it may sample with other samplers than
+            // its root signature names (fxceless/victory-fork#1459). It is let go once.
+            if let Some(d) = DIR.get()
+                && super::samplers::on()
+                && !super::samplers::listed_at_start(d)
+            {
+                unlisted(d);
+            }
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
@@ -504,6 +519,23 @@ fn library() -> Option<&'static Library> {
             library
         })
         .as_ref()
+}
+
+/// Removes the library in `dir`, and one a save left beside it: they were
+/// filled with no list of static samplers beside them.
+fn unlisted(dir: &std::path::Path) {
+    for name in [LIBRARY_FILE, NEXT_FILE] {
+        let path = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                file = name,
+                mb = meta.len() >> 20,
+                "the host pipeline library of before the static samplers' kept order is let go: its pipelines are made again"
+            ),
+            Err(e) => tracing::warn!(error = %e, file = name, "an old host pipeline library could not be removed; it is used as it is"),
+        }
+    }
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
