@@ -1210,7 +1210,14 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         if host.copied_tabled(index, frame) {
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let mut view = host.mirror(index, heap.handle(index)?, true)?;
+        // A slot made on a window a longer one took the place of is made
+        // again on the longer one (`crate::shadow::grow`).
+        if host.shows_taken_over(index) {
+            host.make_again(index);
+            view = host.mirror(index, heap.handle(index)?, true)?;
+            crate::shadow::GROWN[1].fetch_add(1, Ordering::Relaxed);
+        }
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
         let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;

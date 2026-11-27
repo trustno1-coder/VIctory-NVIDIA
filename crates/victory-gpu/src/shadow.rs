@@ -105,6 +105,14 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With [`grow`]: the windows of the same memory this one took the place
+    /// of, while anything still holds them (a descriptor slot made before, a
+    /// pass's kept range, a list): what is brought up to date or written
+    /// through this one is through them too, so whatever reads them reads
+    /// the same bytes ([`Shadow::forward`]).
+    before_me: Mutex<Vec<std::sync::Weak<Shadow>>>,
+    /// With [`grow`]: a longer window took this one's place ([`TAKEN_OVER`]).
+    taken_over: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -3213,6 +3221,7 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    let_go_taken_over();
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -3355,6 +3364,30 @@ impl Shadow {
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
+        self.forward(address, len, |before, address, len| before.refresh(list, address, len));
+    }
+
+    /// With [`grow`]: `f` for each window this one took the place of that
+    /// is still held, with the part of `[address, address + len)` it holds.
+    fn forward(&self, address: u64, len: u64, f: impl Fn(&Arc<Shadow>, u64, u64)) {
+        if !grow() {
+            return;
+        }
+        let before: Vec<Arc<Shadow>> = {
+            let mut before = self.before_me.lock().unwrap_or_else(|e| e.into_inner());
+            if before.is_empty() {
+                return;
+            }
+            before.retain(|w| w.strong_count() > 0);
+            before.iter().filter_map(std::sync::Weak::upgrade).collect()
+        };
+        for shadow in before {
+            let from = address.max(shadow.start);
+            let to = (address + len).min(shadow.start + shadow.len);
+            if from < to {
+                f(&shadow, from, to - from);
+            }
+        }
     }
 
     /// The bytes of the host buffer.
@@ -3398,6 +3431,8 @@ impl Shadow {
             wc: AtomicU8::new(0),
             mapped: false,
             place: None,
+            before_me: Mutex::default(),
+            taken_over: Default::default(),
         }
     }
 
@@ -3418,6 +3453,9 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        // A slot made before a longer window took the place of this one's
+        // window may be what the shaders write through.
+        self.forward(address, len, |before, address, len| before.gpu_writes(list, address, len));
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -5596,7 +5634,96 @@ fn holder(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> 
 /// Whether windows may be smaller than their 4 MiB cell (a finer grid, or
 /// tails): only then is there more than one window to choose from.
 fn fine() -> bool {
-    tails() || window() < WINDOW
+    !grow() && (tails() || window() < WINDOW)
+}
+
+/// Whether a window covers only what was asked for in its 4 MiB cell, and
+/// grows when more is (`VICTORY_WINDOW_GROW=1`; off by default).
+///
+/// A window is the PC's memory, all of it, whatever is read (run
+/// nv-1127-k, RTX 5080: 727 windows, 3,100 MB, all resident; between the
+/// lowest and highest address asked for in each, 1,700 MB). Cut on a finer
+/// grid (`VICTORY_WINDOW_KB`, `VICTORY_WINDOW_TAILS`) the same memory lay
+/// in several windows held at once, each by the descriptor slots made on
+/// it (nv-1127-l: 3,060 MB of windows over 1,746 MB of title memory).
+///
+/// Here a cell has one window, from the lowest [`GROW_STEP`] asked for to
+/// the highest (to the cell's end for an ask without a length, which reads
+/// that far). An ask past it makes a longer window that takes the place of
+/// the shorter one: [`find`] gives the longer one from then on, the pass
+/// over the heap remakes the slots that show the shorter one
+/// ([`taken_over`]), and until nothing holds the shorter one any more what
+/// is brought up to date or written through the longer one is through it
+/// too ([`Shadow::forward`]).
+///
+/// shortcut: a slot of a draw's table made on the shorter window keeps it
+/// until the title writes the slot again (it is brought up to date all the
+/// same).
+pub(crate) fn grow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_GROW").is_some_and(|v| v == "1"))
+}
+
+/// The steps a growing window's ends lie on: each step it grows by is a new
+/// host buffer filled again, so not the 64 KiB page.
+const GROW_STEP: u64 = TAIL_STEP;
+
+/// The windows a longer window took the place of, by their host buffer
+/// ([`grow`]), kept here until nothing else holds them ([`let_go_taken_over`]).
+/// A descriptor slot holds a window's buffer and not the copy: let go while
+/// a slot still showed it, the copy would be brought up to date no more,
+/// and the pass over the heap would not know the slot is to be made again.
+static TAKEN_OVER: Mutex<BTreeMap<usize, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// How many there are (asked by every slot the pass over the heap looks at).
+static TAKEN_OVER_N: AtomicU64 = AtomicU64::new(0);
+
+/// Windows grown since the start, and the slots of the heap moved to the
+/// longer window.
+pub(crate) static GROWN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether `buffer` is a window's that a longer window took the place of.
+pub(crate) fn taken_over(buffer: &ID3D12Resource) -> bool {
+    use windows::core::Interface;
+    grow()
+        && TAKEN_OVER_N.load(Ordering::Relaxed) > 0
+        && TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(buffer.as_raw() as usize))
+}
+
+/// Whether any window was taken over and is still held.
+pub(crate) fn any_taken_over() -> bool {
+    TAKEN_OVER_N.load(Ordering::Relaxed) > 0
+}
+
+/// Lets go of the windows taken over that only [`TAKEN_OVER`] holds: no list,
+/// no pass's kept range, no newer window's [`Shadow::forward`] holds the
+/// copy, and no descriptor slot its buffer. Called with [`let_go_idle`].
+fn let_go_taken_over() {
+    if !any_taken_over() {
+        return;
+    }
+    let gone: Vec<Arc<Shadow>> = {
+        let mut map = TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner());
+        let free: Vec<usize> = map
+            .iter()
+            .filter(|(_, s)| Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1)
+            .map(|(&key, _)| key)
+            .collect();
+        let gone: Vec<Arc<Shadow>> = free.into_iter().filter_map(|key| map.remove(&key)).collect();
+        TAKEN_OVER_N.store(map.len() as u64, Ordering::Relaxed);
+        gone
+    };
+    for shadow in gone {
+        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+        crate::host::retire(shadow);
+    }
+}
+
+/// For the memory line: windows taken over and still held, and their bytes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn taken_over_held() -> (u64, u64) {
+    let map = TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner());
+    (map.len() as u64, map.values().map(|s| s.len).sum())
 }
 
 /// For the memory line: the bytes of title memory the windows alive lie
@@ -5730,6 +5857,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    if grow() {
+        return grown(address, end, unsized_ask, &note);
+    }
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
@@ -5755,13 +5885,19 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
+    let shadow = made_window(start, len)?;
+    note(&shadow);
+    map.insert((start, len), shadow.clone());
+    Some(shadow)
+}
+
+/// A new copy of the window `[start, start + len)` of title memory outside
+/// buffers (not yet in [`LOOSE`]).
+fn made_window(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return Some(Arc::new(Shadow::placed(placed, start, len, true)));
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
     if let Some((buffer, data)) = window_mapped_for(len) {
@@ -5771,10 +5907,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
         shadow.mapped = true;
-        let shadow = Arc::new(shadow);
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return Some(Arc::new(shadow));
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -5810,8 +5943,66 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if shadow.card.is_some() {
         carded(&shadow);
     }
+    Some(shadow)
+}
+
+/// The window (start, end) that holds `[address, reach)` and the cell's
+/// window `now` (start, bytes), on [`GROW_STEP`]s.
+fn grown_extent(address: u64, reach: u64, now: Option<(u64, u64)>) -> (u64, u64) {
+    let (from, to) = (address & !(GROW_STEP - 1), reach.next_multiple_of(GROW_STEP));
+    match now {
+        Some((start, len)) => (from.min(start), to.max(start + len)),
+        None => (from, to),
+    }
+}
+
+/// [`loose`] with [`grow`]: the window of the ask's cell, grown first if it
+/// does not hold the ask.
+fn grown(address: u64, end: u64, unsized_ask: bool, note: &dyn Fn(&Shadow)) -> Option<Arc<Shadow>> {
+    let (cell, _) = window_of(address, end, WINDOW);
+    // An ask without a length reads from its address to its cell's end.
+    let reach = if unsized_ask { end.max(cell + WINDOW) } else { end };
+    // A window that begins in the cell, or in the one below and reaches this
+    // far, and holds the ask.
+    let holding = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
+        map.range((cell.saturating_sub(WINDOW), 0)..=(address, u64::MAX))
+            .rev()
+            .find(|&(&(start, len), _)| start <= address && start + len >= reach)
+            .map(|(_, shadow)| shadow.clone())
+    };
+    if let Some(shadow) = holding(&LOOSE.read().unwrap_or_else(|e| e.into_inner())) {
+        note(&shadow);
+        return Some(shadow);
+    }
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(shadow) = holding(&map) {
+        note(&shadow);
+        return Some(shadow);
+    }
+    // The cell's window now (one at most begins in a cell), which the new
+    // one takes in.
+    let now = map.range((cell, 0)..(cell + WINDOW, 0)).next().map(|(&key, shadow)| (key, shadow.clone()));
+    let (from, to) = grown_extent(address, reach, now.as_ref().map(|(key, _)| *key));
+    let shadow = made_window(from, to - from)?;
+    if let Some((key, old)) = now {
+        use windows::core::Interface;
+        map.remove(&key);
+        let mut before = std::mem::take(&mut *old.before_me.lock().unwrap_or_else(|e| e.into_inner()));
+        before.retain(|w| w.strong_count() > 0);
+        before.push(Arc::downgrade(&old));
+        *shadow.before_me.lock().unwrap_or_else(|e| e.into_inner()) = before;
+        if !old.taken_over.swap(true, Ordering::Relaxed) {
+            let mut taken = TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner());
+            taken.insert(old.buffer.as_raw() as usize, old.clone());
+            TAKEN_OVER_N.store(taken.len() as u64, Ordering::Relaxed);
+        }
+        shadow.asked[0].fetch_min(old.asked[0].load(Ordering::Relaxed), Ordering::Relaxed);
+        shadow.asked[1].fetch_max(old.asked[1].load(Ordering::Relaxed), Ordering::Relaxed);
+        shadow.unsized_asks.fetch_add(old.unsized_asks.load(Ordering::Relaxed), Ordering::Relaxed);
+        GROWN[0].fetch_add(1, Ordering::Relaxed);
+    }
     note(&shadow);
-    map.insert((start, len), shadow.clone());
+    map.insert((from, to - from), shadow.clone());
     Some(shadow)
 }
 
@@ -5936,9 +6127,27 @@ mod write_combined_tests {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        GROW_STEP, WINDOW, cover, default_card_limits_mb, grid, grown_extent, holder, longest_tail,
+        resolve_card_limits, tail_of, window_of,
     };
+
+    /// A growing window holds what was asked on 256 KiB steps, takes in the
+    /// cell's window it replaces, and reaches the cell's end for an ask
+    /// without a length (whose reach the caller makes the cell's end).
+    #[test]
+    fn grown_windows_hold_the_asks_and_what_was_there() {
+        let cell = 0xd_1200_0000u64;
+        assert_eq!(GROW_STEP, 256 << 10);
+        // First ask, with a length: its steps only.
+        assert_eq!(grown_extent(cell + 0x5_1000, cell + 0x5_2000, None), (cell + 0x4_0000, cell + 0x8_0000));
+        // A later ask below it: the new window runs from it to the old one's end.
+        let now = Some((cell + 0x4_0000, 0x4_0000));
+        assert_eq!(grown_extent(cell + 0x1_0000, cell + 0x1_0100, now), (cell, cell + 0x8_0000));
+        // An ask without a length: to the cell's end.
+        assert_eq!(grown_extent(cell + 0x30_0000, cell + WINDOW, now), (cell + 0x4_0000, cell + WINDOW));
+        // An ask that runs into the next cell keeps going past it.
+        assert_eq!(grown_extent(cell + 0x3f_0000, cell + WINDOW + 0x100, None), (cell + 0x3c_0000, cell + WINDOW + GROW_STEP));
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {

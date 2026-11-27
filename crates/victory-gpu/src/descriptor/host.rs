@@ -4136,6 +4136,26 @@ impl HostHeap {
         Some(windows::core::Interface::as_raw(&shown) == windows::core::Interface::as_raw(buffer))
     }
 
+    /// Whether host slot `index` shows a window of title memory that a longer
+    /// one took the place of (`crate::shadow::grow`).
+    pub(crate) fn shows_taken_over(&self, index: u32) -> bool {
+        crate::shadow::grow()
+            && crate::shadow::any_taken_over()
+            && self.kept_in(index).is_some_and(|shown| crate::shadow::taken_over(&shown))
+    }
+
+    /// Host slot `index` is made again by the next [`HostHeap::mirror`] of
+    /// it, as if the title had written it: what it showed is retired when
+    /// the new view is kept.
+    pub(crate) fn make_again(&self, index: u32) {
+        if index >= self.count {
+            return;
+        }
+        let _held = self.made.lock(index);
+        self.quick_is(index, 0);
+        self.made.set(index, 0);
+    }
+
     /// What the queue of textures picked by index knows of title slot
     /// `index` at `frame`, in a few words (diagnostics).
     #[cfg(feature = "diagnostics")]

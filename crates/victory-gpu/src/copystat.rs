@@ -949,10 +949,15 @@ fn log_memory() {
     tracing::info!(
         "memory, windows: the {:.0} MB of windows lie over {:.0} MB of title memory (the rest is \
          memory that is in more than one window, and is copied once for each); host lists never \
-         reset since they were made: {}",
+         reset since they were made: {}; windows grown (VICTORY_WINDOW_GROW): {} since the start, \
+         {} taken over and still held {:.0} MB, {} slots of the heap moved to the longer one",
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
+        crate::shadow::GROWN[0].load(Relaxed),
+        crate::shadow::taken_over_held().0,
+        mb(crate::shadow::taken_over_held().1),
+        crate::shadow::GROWN[1].load(Relaxed),
     );
 }
 
