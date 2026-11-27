@@ -518,6 +518,7 @@ fn bury_lag() -> u64 {
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
+    let handing = std::time::Instant::now();
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
@@ -527,7 +528,115 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    drop(done);
+    let n = done.len() as u64;
+    BURIED[0].fetch_add(n, Ordering::Relaxed);
+    match bury_aside() {
+        Some(aside) => {
+            BURY_WAITING.fetch_add(n, Ordering::Relaxed);
+            // (The thread is gone only as the process ends.)
+            if let Err(back) = aside.send(done) {
+                BURY_WAITING.fetch_sub(n, Ordering::Relaxed);
+                bury_drop(back.0);
+            }
+        }
+        None => bury_drop(done),
+    }
+    BURIED[1].fetch_add(handing.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Lab: since the last frame-rate line: objects whose wait was over, the
+/// microseconds the thread that found them so spent on them (all of the
+/// dropping with `VICTORY_BURY_ASIDE=0`); then of the dropping itself:
+/// descriptor slots' old resources and their nanoseconds, the other objects
+/// and theirs, the drops of over 50 microseconds and theirs, the longest.
+static BURIED: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+/// Handed to the burying thread and not dropped yet.
+static BURY_WAITING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lab: the thread that drops what [`bury`] found (`victory-bury`), and
+/// `None` with `VICTORY_BURY_ASIDE=0`, where the thread that finished the
+/// submission drops it as before. Runs 30 and 31 (2026-11-27, prison room)
+/// had the thread that lands flights 34-38 ms a frame in the rest of a
+/// landing, which is this dropping and nothing else in a release build, of
+/// 44-47 ms landing in all: every fence signal and bottom-of-pipe write of
+/// the next flights waited behind it. Dropping later than could be is what
+/// [`bury_lag`] does already; no drop is earlier.
+fn bury_aside() -> Option<&'static std::sync::mpsc::Sender<Vec<(u64, Retired)>>> {
+    static ASIDE: OnceLock<Option<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>> = OnceLock::new();
+    ASIDE
+        .get_or_init(|| {
+            if std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "0") {
+                return None;
+            }
+            let (send, receive) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+            std::thread::Builder::new()
+                .name("victory-bury".into())
+                .spawn(move || {
+                    for done in receive {
+                        let n = done.len() as u64;
+                        bury_drop(done);
+                        BURY_WAITING.fetch_sub(n, Ordering::Relaxed);
+                    }
+                })
+                .ok()
+                .map(|_| send)
+        })
+        .as_ref()
+}
+
+/// Drops `done`, oldest first, each drop timed (the line of [`bury_log`]).
+fn bury_drop(done: Vec<(u64, Retired)>) {
+    let mut at = std::time::Instant::now();
+    let (mut slots, mut slots_ns, mut others, mut others_ns, mut slow, mut slow_ns, mut longest) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    for (_, retired) in done {
+        let slot = matches!(retired, Retired::Resource(_));
+        drop(retired);
+        let now = std::time::Instant::now();
+        let ns = (now - at).as_nanos() as u64;
+        at = now;
+        if slot {
+            slots += 1;
+            slots_ns += ns;
+        } else {
+            others += 1;
+            others_ns += ns;
+        }
+        if ns > 50_000 {
+            slow += 1;
+            slow_ns += ns;
+        }
+        longest = longest.max(ns);
+    }
+    for (i, v) in [slots, slots_ns, others, others_ns, slow, slow_ns].into_iter().enumerate() {
+        BURIED[2 + i].fetch_add(v, Ordering::Relaxed);
+    }
+    BURIED[8].fetch_max(longest, Ordering::Relaxed);
+}
+
+/// Lab, for the frame-rate line: what dropping the objects let go cost.
+fn bury_log(frames: f64) {
+    let b: Vec<f64> = BURIED.iter().map(|b| b.swap(0, Ordering::Relaxed) as f64).collect();
+    if b[0] == 0.0 {
+        return;
+    }
+    let ms = |ns: f64| ns / 1e6 / frames;
+    tracing::info!(
+        "objects let go dropped per frame (lab, VICTORY_BURY_ASIDE={}): {:.0} whose wait was over, {:.2} ms of the thread that \
+         found them; dropping them {:.2} ms: {:.0} descriptor slots' old resources {:.2} ms, {:.0} others {:.2} ms; {:.1} drops of \
+         over 50 us {:.2} ms, the longest {:.2} ms; {} handed over and not dropped yet",
+        u8::from(bury_aside().is_some()),
+        b[0] / frames,
+        b[1] / 1000.0 / frames,
+        ms(b[3] + b[5]),
+        b[2] / frames,
+        ms(b[3]),
+        b[4] / frames,
+        ms(b[5]),
+        b[6] / frames,
+        ms(b[7]),
+        b[8] / 1e6,
+        BURY_WAITING.load(Ordering::Relaxed),
+    );
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -4226,6 +4335,7 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    bury_log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
