@@ -40,9 +40,20 @@ pub(crate) const FRAMES: usize = 11;
 /// So many frames of what the line, the flights and the title's waits do
 /// are written to the log, from the next present on ([`trace_frame`]).
 pub(crate) const T: usize = 12;
+/// A write fault of the title's on a block we made read-only opens it
+/// without the guards' lock (1), as `VICTORY_FAULT_UNLOCKED=1` does
+/// (`crate::watch`).
+pub(crate) const U: usize = 13;
+/// Milliseconds a block the title writes again and again is left open, as
+/// `VICTORY_GUARD_HOT` gives them (0: as the environment says).
+pub(crate) const HOT: usize = 14;
+/// The submitting thread has a physical core to itself (1), or shares it
+/// with the thread that lands flights and nothing else (2); every other
+/// thread of the process runs on the other cores ([`own_core`]).
+pub(crate) const OWN: usize = 15;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 13] = [
+const KNOBS: [(&str, i64); 16] = [
     ("reuse", 1),
     ("zero", 1),
     ("a", 0),
@@ -56,8 +67,77 @@ const KNOBS: [(&str, i64); 13] = [
     ("w", 0),
     ("frames", 0),
     ("t", 0),
+    ("u", 0),
+    ("hot", 0),
+    ("own", 0),
 ];
-static VALUES: [AtomicI64; 13] = [const { AtomicI64::new(0) }; 13];
+static VALUES: [AtomicI64; 16] = [const { AtomicI64::new(0) }; 16];
+
+/// Switch `own`, asked by the submitting thread (`role` 0) before each
+/// submission and by the thread that lands flights (`role` 1) before each
+/// landing. With 1 the process's default processor sets leave out the last
+/// physical core and the submitting thread is kept on its first logical
+/// processor, the second left idle; with 2 the landing thread is kept on the
+/// second. 0: as made. (The 12 logical processors of this PC are nearly all
+/// busy in play, the submitting thread is what the frame waits for, and a
+/// thread whose core's other half is busy runs at some two thirds of its
+/// speed. Run 29's try of this, from outside the process, was compared
+/// between runs whose scenes differed.) On a processor with two kinds of
+/// cores this drops the thread's selection of the fast ones when switched
+/// off again.
+pub(crate) fn own_core(role: usize) {
+    thread_local! {
+        static APPLIED: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    }
+    if role == 0 && !SUBMITS.get() {
+        return;
+    }
+    let want = knob(OWN).clamp(0, 2);
+    if APPLIED.get() == want {
+        return;
+    }
+    APPLIED.set(want);
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, SetProcessDefaultCpuSets, SetThreadSelectedCpuSets};
+    let sets = crate::cores::sets_by_core();
+    let Some(core) = sets.iter().map(|s| s.1).max() else {
+        return;
+    };
+    // The core's logical processors (their number, their set's id), in order.
+    let mut mine: Vec<(u8, u32)> = sets.iter().filter(|s| s.1 == core).map(|s| (s.2, s.0)).collect();
+    mine.sort_unstable();
+    let rest: Vec<u32> = sets.iter().filter(|s| s.1 != core).map(|s| s.0).collect();
+    if mine.is_empty() || rest.is_empty() {
+        return;
+    }
+    let keep = |ids: &[u32]| {
+        // SAFETY: this thread, and the system's own set ids (none: as made).
+        unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), if ids.is_empty() { std::ptr::null() } else { ids.as_ptr() }, ids.len() as u32) != 0 }
+    };
+    if role == 0 {
+        let others: &[u32] = if want > 0 { &rest } else { &[] };
+        // SAFETY: this process, and the system's own set ids (none: as made).
+        let process = unsafe { SetProcessDefaultCpuSets(GetCurrentProcess(), if others.is_empty() { std::ptr::null() } else { others.as_ptr() }, others.len() as u32) } != 0;
+        let first = [mine[0].1];
+        let thread = keep(if want > 0 { &first } else { &[] });
+        tracing::info!(
+            "lab switch own={want}: core {core} (logical processors {:?}) {}; the process's other threads on {} sets: {process}, the submitting thread: {thread}",
+            mine.iter().map(|m| m.0).collect::<Vec<_>>(),
+            if want > 0 { "is the submitting thread's" } else { "is everybody's again" },
+            rest.len(),
+        );
+    } else {
+        let second = [mine[mine.len() - 1].1];
+        let thread = keep(if want == 2 && mine.len() > 1 { &second } else { &[] });
+        tracing::info!("lab switch own={want}: the landing thread's processors set: {thread}");
+    }
+}
+
+/// A switch as the file was last read, with nothing started and no lock
+/// taken: for the write-fault handler (`crate::watch`). 0 until [`knob`] has
+/// been asked once.
+pub(crate) fn peek(which: usize) -> i64 {
+    VALUES[which].load(Relaxed)
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())

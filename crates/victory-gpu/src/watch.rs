@@ -1093,7 +1093,8 @@ fn unlocked() -> bool {
     if UNLOCKED_IN_TEST.get() {
         return true;
     }
-    crate::asked_for!("VICTORY_FAULT_UNLOCKED")
+    // (Lab: `u=1` in the switch file, while the title runs.)
+    crate::asked_for!("VICTORY_FAULT_UNLOCKED") || crate::lab::peek(crate::lab::U) == 1
 }
 
 #[cfg(test)]
@@ -1646,6 +1647,11 @@ fn hot() -> Option<std::time::Duration> {
     }
     #[cfg(not(test))]
     {
+        // (Lab: `hot=<milliseconds>` in the switch file, while the title runs.)
+        let lab = crate::lab::peek(crate::lab::HOT);
+        if lab > 0 {
+            return Some(std::time::Duration::from_millis(lab.min(10_000) as u64));
+        }
         static HOT: std::sync::OnceLock<(std::time::Duration, Option<u32>)> = std::sync::OnceLock::new();
         let &(keep, _bit) = HOT.get_or_init(|| {
             let ms = std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|ms| *ms > 0.0);

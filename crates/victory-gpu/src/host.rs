@@ -4159,6 +4159,7 @@ fn relay_worker() {
     let mut fetch: Option<RelayFetch> = None;
     loop {
         crate::lab::priority(crate::lab::H);
+        crate::lab::own_core(1);
         let next = {
             let mut line = line();
             loop {
@@ -6243,6 +6244,7 @@ impl Host {
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         crate::lab::burn(crate::lab::B);
+        crate::lab::own_core(0);
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
