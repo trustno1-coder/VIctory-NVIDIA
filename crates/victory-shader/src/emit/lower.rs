@@ -362,7 +362,14 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// A program with console lanes in a group of several host waves (not `halves`): the LDS
+    /// dword of `wave_base`'s counter. A host need not give a host wave a wave-aligned run of
+    /// flat thread ids (NVIDIA fills 2-D groups from 16 x 2 tiles), so the waves take their
+    /// console threads from a counter as with `halves` (fxceless issue #1243, Vice-Tay c125c0c).
+    ticket: Option<u32>,
     wave_base: Option<V>,
+    /// With `wave_base`: this thread's place among the active lanes of its host wave.
+    wave_rank: Option<V>,
     /// The host waves of a console wave meet on their own ([`with_pair_meetings`]): the first
     /// of the LDS dwords that count each console wave's arrivals, and the dword of this
     /// thread's console wave (made in the entry block).
@@ -1388,6 +1395,12 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+/// Whether programs with console lanes in groups of several host waves take their console
+/// threads from a group counter (`ticket`). `VICTORY_THREAD_TICKET=0`: as before.
+fn ticket_on() -> bool {
+    std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0")
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1664,6 +1677,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // console lanes in a group of several host waves: the LDS dword of `wave_base`'s counter
+        let mut ticket: Option<u32> = None;
         // its host waves meet per console wave (`with_pair_meetings`): the first counter's dword
         let mut pairs: Option<u32> = None;
         let mut pair_waves = 0;
@@ -1811,6 +1826,10 @@ impl<'a> Lower<'a> {
                     pair_waves = group / 64;
                     s.lds_dwords += 9 * pair_waves;
                 }
+            } else if console_lanes && group > wave && ticket_on() {
+                // the flat id rounded down is not a host wave's base on every host (#1243)
+                ticket = Some(s.lds_dwords);
+                s.lds_dwords += 1;
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1983,7 +2002,9 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            ticket,
             wave_base: None,
+            wave_rank: None,
             pairs,
             meeting: None,
             lds_unordered: lds_order.unordered.clone(),
@@ -2780,6 +2801,15 @@ impl<'a> Lower<'a> {
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
                     // No wave overlaps this one (see `ordered_section`).
                     None if self.pops_collision(v) => Val::I32(self.s.m.i32(0)),
+                    // VCC is undefined at wave launch; any read of it on entry
+                    // is one no correct program depends on, so it reads as
+                    // zero, as the SGPRs above. Only for a program made from
+                    // pieces.
+                    None if self.made_from_pieces()
+                        && (n == crate::ir::VCC || n == crate::ir::VCC + 1) =>
+                    {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -2860,6 +2890,7 @@ impl<'a> Lower<'a> {
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
             }
+            Input::FixedPosition if self.made_from_pieces() => return self.fixed_position(),
             _ => return Val::Missing("a pixel system input"),
         };
         let free = self
@@ -2905,6 +2936,33 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// The fixed-point position (SPI_PS_INPUT_ADDR bit 15): the pixel's integer x in bits
+    /// 0-15 and y in bits 16-31. The floor of SV_Position's x and y is that pixel, at the
+    /// centre, a sample or the centroid alike; coordinates are never negative, so the
+    /// conversion to unsigned is the floor.
+    fn fixed_position(&mut self) -> Val {
+        let Some(id) = self.s.inputs.iter().position(|e| e.kind == 3) else {
+            return Val::Missing("a pixel system input the signature lacks");
+        };
+        let entry = self.s.entry;
+        let mut half = [None; 2];
+        for c in 0..2u8 {
+            let Val::I32(bits) = self.load_input(id, c) else {
+                return Val::Missing("a 16-bit input");
+            };
+            let f = self.s.m.cast(entry, Cast::Bitcast, bits, self.s.t.f32);
+            let n = self.s.m.cast(entry, Cast::FpToUi, f, self.s.t.i32);
+            let k = self.s.m.i32(0xFFFF);
+            half[usize::from(c)] = Some(self.s.m.bin(entry, Bin::And, n, k));
+        }
+        let (Some(x), Some(y)) = (half[0], half[1]) else {
+            return Val::Missing("a 16-bit input");
+        };
+        let k16 = self.s.m.i32(16);
+        let y = self.s.m.bin(entry, Bin::Shl, y, k16);
+        Val::I32(self.s.m.bin(entry, Bin::Or, x, y))
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -4377,11 +4435,13 @@ impl<'a> Lower<'a> {
     /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
     /// found. Branch-free, in the entry block, which every thread runs.
     fn wave_base(&mut self) -> Option<V> {
-        let slot = self.halves?;
+        let slot = self.halves.or(self.ticket)?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let w = self.s.wave_size.unwrap_or(32);
+        let group: u32 = self.s.threads.map_or(w, |t| t.iter().product());
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
@@ -4402,15 +4462,29 @@ impl<'a> Lower<'a> {
             self.s.m.store(e, ptr, zero);
         }
         self.group_sync(e);
-        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        let first = self.s.m.cmp(e, pred::EQ, lane, zero);
-        let k32 = self.s.m.i32(32);
-        let add = self.s.m.select(e, first, k32, zero);
+        let one = self.s.m.i32(1);
+        let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(1));
+        let count = self.s.op(e, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[one, sum, unsigned]);
+        let rank = self.s.op(e, "wavePrefixOp.i32", Attr::NoUnwind, i32t, 121, &[one, sum, unsigned]);
+        let kw = self.s.m.i32(w);
+        let full = self.s.m.cmp(e, pred::EQ, count, kw);
+        let first = self.s.m.cmp(e, pred::EQ, rank, zero);
+        let sixteen = self.s.m.i32(16);
+        let high = self.s.m.bin(e, Bin::Shl, count, sixteen);
+        let take = self.s.m.select(e, full, kw, high);
+        let add = self.s.m.select(e, first, take, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
-        let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let found = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let low_mask = self.s.m.i32(0xffff);
+        let low = self.s.m.bin(e, Bin::And, found, low_mask);
+        let past = self.s.m.bin(e, Bin::LShr, found, sixteen);
+        let blocks = self.s.m.i32(group / w * w);
+        let tail = self.s.m.bin(e, Bin::Add, blocks, past);
+        let base = self.s.m.select(e, full, low, tail);
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
+        self.wave_rank = Some(rank);
         Some(base)
     }
 
@@ -4418,10 +4492,11 @@ impl<'a> Lower<'a> {
     /// (host waves of 32), else the wave's first thread index rounded down plus the lane.
     fn console_thread(&mut self) -> V {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
-        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         if let Some(base) = self.wave_base() {
-            return self.s.m.bin(e, Bin::Add, base, lane);
+            let rank = self.wave_rank.expect("made with the base");
+            return self.s.m.bin(e, Bin::Add, base, rank);
         }
+        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
         let first = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
         let wave = self.s.wave_size.unwrap_or(32);
@@ -5041,7 +5116,7 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() {
+        if self.halves.is_some() || self.ticket.is_some() {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -6446,6 +6521,15 @@ impl<'a> Lower<'a> {
                     let nb = self.s.m.bin(c, Bin::Xor, bit, ones);
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
+            }
+            "s_pack_ll_b32_b16" => {
+                // low half of the first source, then the low half of the second
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let low = self.s.m.i32(0xFFFF);
+                let k16 = self.s.m.i32(16);
+                let a = self.s.m.bin(c, Bin::And, a, low);
+                let b = self.s.m.bin(c, Bin::Shl, b, k16);
+                (self.s.m.bin(c, Bin::Or, a, b), None)
             }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -9116,6 +9200,22 @@ impl<'a> Lower<'a> {
                         self.cross_lane(false)?;
                         self.lane_bit(c, lo, hi)
                     }
+                    // A mask of all lanes or none (`s_cselect_b64 vcc, -1, 0`
+                    // on a scalar test): each lane's bit is the scalar
+                    // condition, on a wave of any size and lane order.
+                    // Only for a program made from pieces: a title's
+                    // programs are decided as before.
+                    None if self.made_from_pieces() => {
+                        let lo = mask.ok_or(UNTRACKED)?;
+                        let hi = match v.src.get(2) {
+                            Some(&Operand::Scalar { code, .. }) if self.x.native.wave64 => {
+                                inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?
+                            }
+                            _ => lo,
+                        };
+                        let m = self.x.st.uniform_bits(lo, hi).ok_or(UNTRACKED)?;
+                        self.boolean(m, c)?
+                    }
                     None => return Err(UNTRACKED),
                 };
                 if v.abs != 0 || v.neg != 0 {
@@ -11455,12 +11555,15 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            // One channel goes into a view the program also counts in.
+            // shortcut: stores are taken to write a float format (the console
+            // converts by the view's format). One channel goes into a view
+            // the program also counts in.
             let counter = *dmask == 1 && self.is_counter(src);
-            if *dmask != 0xF && !counter {
-                return Err("an image store of some channels");
+            if !counter && *dmask == 0 {
+                return Err("an image store of no channels");
+            }
+            if !counter && *dmask != 0xF && self.is_counter(src) {
+                return Err("an image store of some channels into a view the program counts in");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -11498,14 +11601,24 @@ impl<'a> Lower<'a> {
                 self.end_guarded(at, &[]);
                 return Ok(());
             }
+            // the console writes the channels the mask leaves out as zero, not
+            // their old values, so no read of the texel is needed and no other
+            // lane's write is lost. The enabled channels sit in consecutive
+            // registers (d16: two to a register, low half first), `n` counts
+            // them.
             let mut vals = Vec::new();
+            let mut n = 0u8;
             for k in 0..4u8 {
-                // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                if (*dmask >> k) & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
+                let r = if *d16 { n / 2 } else { n };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
+                n += 1;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if (n - 1) % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -11655,7 +11768,10 @@ impl<'a> Lower<'a> {
             if kind == 5 && (*unorm || op == 81) {
                 return Err("a cube sample with texel coordinates or a level query");
             }
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // CalculateLOD takes spatial coordinates only. Array samples
+            // still need the slice, but the query leaves that operand undef.
+            let coord_count = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(coord_count) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
@@ -12561,15 +12677,19 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                // shortcut: typed stores are taken to write a float format.
+                if *offen || *offset != 0 {
+                    return Err("a typed buffer store at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
                     args.push(self.as_float(x));
+                }
+                // the console writes the channels past the instruction's last
+                // as zero; the view drops those it lacks.
+                for _ in count..4 {
+                    args.push(self.s.m.f32(0));
                 }
                 (69, "bufferStore.f32")
             } else {
