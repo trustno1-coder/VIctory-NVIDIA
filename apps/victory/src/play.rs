@@ -1001,6 +1001,10 @@ mod tests {
         assert!(fg("NVIDIA GeForce RTX 5070") && fg("NVIDIA GeForce RTX 4070 SUPER") && fg("NVIDIA GeForce RTX 5090 Laptop GPU"));
         assert!(!fg("NVIDIA GeForce RTX 3080 Ti") && !fg("NVIDIA GeForce RTX 2060") && !fg("NVIDIA GeForce GTX 1080"));
         assert!(!fg("AMD Radeon RX 7900 XTX") && !fg("Intel(R) Arc(TM) A770 Graphics") && !fg(""));
+        // Workstation cards of the same generations (issue #312), and not the older ones.
+        assert!(fg("NVIDIA RTX PRO 4000 Blackwell SFF Edition") && fg("NVIDIA RTX PRO 6000 Blackwell Workstation Edition"));
+        assert!(fg("NVIDIA RTX 2000 Ada Generation") && fg("NVIDIA RTX 3500 Ada Generation Laptop GPU") && fg("NVIDIA RTX 2000 Ada Laptop GPU"));
+        assert!(!fg("NVIDIA RTX A4000") && !fg("NVIDIA RTX A2000 Laptop GPU") && !fg("Quadro RTX 8000"));
     }
 
     /// MFG Unlocker is offered only to RTX 20 and 30 cards.

@@ -628,10 +628,15 @@ pub fn adapter_name() -> Option<String> {
 }
 
 /// Whether a card of this name runs DLSS Frame Generation: a GeForce RTX of
-/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU").
+/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU"),
+/// or a workstation RTX of the same generations, which names it
+/// ("NVIDIA RTX 2000 Ada Generation", "NVIDIA RTX PRO 4000 Blackwell SFF Edition").
 pub fn dlss_framegen_card(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     let Some(at) = name.find("RTX") else { return false };
+    if name.split_whitespace().any(|w| w == "ADA" || w == "BLACKWELL") {
+        return true;
+    }
     let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
     model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
 }
