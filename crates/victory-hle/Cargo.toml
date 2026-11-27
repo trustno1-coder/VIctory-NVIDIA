@@ -51,6 +51,8 @@ windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# The log of `live_pads`, the probe for real pads.
+tracing-subscriber.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).

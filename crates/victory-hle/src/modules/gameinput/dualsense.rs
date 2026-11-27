@@ -1,20 +1,52 @@
-//! PlayStation 5 pads (DualSense, DualSense Edge) read straight from HID:
-//! they are not XInput devices, so without a remapper (Steam Input,
-//! DS4Windows) XInput never lists them. Reports can be USB or Bluetooth. A scan
-//! thread looks for new pads every [`SCAN`]; each pad has a reader thread
-//! that keeps its latest state until the pad goes away. By default XInput
-//! has priority over HID, since a remapper can present the same pad twice.
+//! Pads read straight from HID: PlayStation 5 (DualSense, DualSense Edge),
+//! PlayStation 4 (DualShock 4, both models, and Sony's wireless adapter)
+//! and the Nintendo Switch Pro Controller ([`super::switch_pro`]). They are
+//! not XInput devices, so without a remapper (Steam Input, DS4Windows)
+//! XInput never lists them. Reports can be USB or Bluetooth. A scan thread
+//! looks for new pads every [`SCAN`]; each pad has a reader thread that
+//! keeps its latest state until the pad goes away. By default XInput has
+//! priority over HID, since a remapper can present the same pad twice
+//! (`VICTORY_DUALSENSE` covers all of these pads).
 
 use super::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
     RIGHT_STICK, UP, VIEW, X, Y,
 };
 
-#[cfg(windows)]
 const SONY: u16 = 0x054C;
 /// DualSense, DualSense Edge.
-#[cfg(windows)]
-const PRODUCTS: [u16; 2] = [0x0CE6, 0x0DF2];
+const DUALSENSE: [u16; 2] = [0x0CE6, 0x0DF2];
+/// DualShock 4 (first and second model), Sony's wireless adapter.
+const DUALSHOCK4: [u16; 3] = [0x05C4, 0x09CC, 0x0BA0];
+
+/// Which pad a HID device is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    DualSense,
+    DualShock4,
+    SwitchPro,
+}
+
+impl Kind {
+    /// The pad of this vendor and product id, `None` for anything else.
+    pub(super) fn of(vendor: u16, product: u16) -> Option<Kind> {
+        match (vendor, product) {
+            (SONY, p) if DUALSENSE.contains(&p) => Some(Kind::DualSense),
+            (SONY, p) if DUALSHOCK4.contains(&p) => Some(Kind::DualShock4),
+            (super::switch_pro::NINTENDO, super::switch_pro::PRODUCT) => Some(Kind::SwitchPro),
+            _ => None,
+        }
+    }
+
+    /// For the log.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Kind::DualSense => "DualSense",
+            Kind::DualShock4 => "DualShock 4",
+            Kind::SwitchPro => "Switch Pro Controller",
+        }
+    }
+}
 
 /// The D-pad hat (low nibble of the first button byte): 0 up, clockwise in
 /// eighths, 8 and above centred.
@@ -48,17 +80,20 @@ const BUTTONS: [(usize, u8, u32); 11] = [
     (2, 0x02, VIEW), // touchpad click
 ];
 
-/// The pad in one input report, `None` for a report of another kind.
+/// The PlayStation pad in one input report, `None` for a report of
+/// another kind (and for a Switch Pro Controller, [`super::switch_pro`]).
 /// `bluetooth`: the pad is connected over Bluetooth, where the full report
-/// is 0x31 (one byte further in) and 0x01 is the short report the pad sends
-/// before it was asked for the full one.
-pub(super) fn parse(report: &[u8], bluetooth: bool) -> Option<PadState> {
+/// is 0x31 on a DualSense (one byte further in) and 0x11 on a DualShock 4
+/// (two bytes), and 0x01 is the short report the pad sends before it was
+/// asked for the full one. Both pads have the same three button bytes.
+pub(super) fn parse(kind: Kind, report: &[u8], bluetooth: bool) -> Option<PadState> {
     // Offsets of the sticks (LX LY RX RY), the triggers (L2 R2) and the
     // three button bytes.
-    let (sticks, triggers, buttons) = match (report.first()?, bluetooth) {
-        (0x01, false) => (1, 5, 8),
-        (0x31, true) => (2, 6, 9),
-        (0x01, true) => (1, 8, 5),
+    let (sticks, triggers, buttons) = match (kind, report.first()?, bluetooth) {
+        (Kind::DualSense, 0x01, false) => (1, 5, 8),
+        (Kind::DualSense, 0x31, true) => (2, 6, 9),
+        (Kind::DualShock4, 0x11, true) => (3, 10, 7),
+        (Kind::DualSense | Kind::DualShock4, 0x01, _) => (1, 8, 5),
         _ => return None,
     };
     if report.len() < sticks + 4 || report.len() < triggers + 2 || report.len() < buttons + 3 {
@@ -85,6 +120,29 @@ pub(super) fn parse(report: &[u8], bluetooth: bool) -> Option<PadState> {
 /// 1..7 on both transports), `None` when it is too short or all zeros.
 fn mac(pairing: &[u8]) -> Option<[u8; 6]> {
     let mac: [u8; 6] = pairing.get(1..7)?.try_into().ok()?;
+    (mac != [0; 6]).then_some(mac)
+}
+
+/// A DualShock 4's address over USB, in its pairing report (0x12, least
+/// significant byte first), most significant byte first as
+/// [`serial_mac`] has it.
+fn dualshock4_mac(pairing: &[u8]) -> Option<[u8; 6]> {
+    let mut mac = mac(pairing)?;
+    mac.reverse();
+    Some(mac)
+}
+
+/// A Bluetooth pad's address in its HID serial number string, which
+/// Windows fills with it (twelve hex digits, perhaps with separators);
+/// a DualShock 4 has no feature report with it over Bluetooth.
+fn serial_mac(serial: &[u16]) -> Option<[u8; 6]> {
+    let digits: Vec<u8> = String::from_utf16_lossy(serial)
+        .chars()
+        .take_while(|&c| c != '\0')
+        .filter_map(|c| c.to_digit(16).map(|d| d as u8))
+        .collect();
+    let mac: [u8; 6] = (digits.len() == 12)
+        .then(|| std::array::from_fn(|i| digits[2 * i] << 4 | digits[2 * i + 1]))?;
     (mac != [0; 6]).then_some(mac)
 }
 
@@ -158,7 +216,8 @@ mod host {
     };
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{
         HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData,
-        HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid, HidD_GetPreparsedData, HidP_GetCaps,
+        HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid, HidD_GetPreparsedData,
+        HidD_GetSerialNumberString, HidP_GetCaps,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
@@ -166,14 +225,15 @@ mod host {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        ReadFile,
+        ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::IO::{
         CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
     };
     use windows_sys::Win32::System::Threading::CreateEventW;
 
-    use super::{PRODUCTS, PadState, SONY, mac, parse};
+    use super::super::switch_pro::{self, Sticks};
+    use super::{Kind, PadState, dualshock4_mac, mac, parse, serial_mac};
 
     /// How often to look for newly connected pads.
     const SCAN: Duration = Duration::from_secs(2);
@@ -227,14 +287,16 @@ mod host {
     }
 
     /// Windows sizes each report buffer for its top-level HID collection.
-    /// The calibration and pairing reports use the same feature buffer.
+    /// The calibration and pairing reports use the same feature buffer; a
+    /// Switch Pro Controller has no feature reports, only output reports.
     struct Reports {
         input: Vec<u8>,
         feature: Vec<u8>,
+        output: Vec<u8>,
     }
 
     impl Reports {
-        fn for_device(handle: HANDLE) -> Option<Self> {
+        fn for_device(handle: HANDLE, kind: Kind) -> Option<Self> {
             let mut data = 0;
             // SAFETY: the device is open and the output is writable.
             if !unsafe { HidD_GetPreparsedData(handle, &mut data) } {
@@ -244,15 +306,18 @@ mod host {
             // SAFETY: `data` was obtained above and is released after its last use.
             let status = unsafe { HidP_GetCaps(data, &mut caps) };
             unsafe { HidD_FreePreparsedData(data) };
-            if status != HIDP_STATUS_SUCCESS
-                || caps.InputReportByteLength == 0
-                || caps.FeatureReportByteLength == 0
-            {
+            let needed = match kind {
+                Kind::DualSense | Kind::DualShock4 => caps.FeatureReportByteLength,
+                // Room for a subcommand with a flash read's arguments.
+                Kind::SwitchPro => caps.OutputReportByteLength.saturating_sub(15),
+            };
+            if status != HIDP_STATUS_SUCCESS || caps.InputReportByteLength == 0 || needed == 0 {
                 return None;
             }
             Some(Self {
                 input: vec![0; usize::from(caps.InputReportByteLength)],
-                feature: vec![0; usize::from(caps.FeatureReportByteLength)],
+                feature: vec![0; usize::from(caps.FeatureReportByteLength).max(1)],
+                output: vec![0; usize::from(caps.OutputReportByteLength).max(1)],
             })
         }
     }
@@ -267,11 +332,229 @@ mod host {
         unsafe { HidD_GetFeature(handle, buffer.as_mut_ptr().cast(), buffer.len() as u32) }
     }
 
-    /// Asks for the calibration report: it switches a pad on Bluetooth to
-    /// full reports (0x31), again after it reconnected; over USB it changes
-    /// nothing. `false` when the pad did not answer.
-    fn full_reports(handle: HANDLE, buffer: &mut [u8]) -> bool {
-        feature(handle, 0x05, buffer)
+    /// Asks for the calibration report (0x05; 0x02 on a DualShock 4 over
+    /// USB): it switches a pad on Bluetooth to full reports (0x31, 0x11),
+    /// again after it reconnected; over USB it changes nothing. `false` when
+    /// the pad did not answer.
+    fn full_reports(handle: HANDLE, kind: Kind, bluetooth: bool, buffer: &mut [u8]) -> bool {
+        let id = if kind == Kind::DualShock4 && !bluetooth { 0x02 } else { 0x05 };
+        feature(handle, id, buffer)
+    }
+
+    /// A PlayStation pad's Bluetooth address, the same over USB and
+    /// Bluetooth, if it tells it.
+    fn address(handle: HANDLE, kind: Kind, bluetooth: bool, buffer: &mut [u8]) -> Option<[u8; 6]> {
+        match (kind, bluetooth) {
+            (Kind::DualSense, _) => feature(handle, 0x09, buffer).then(|| mac(buffer)).flatten(),
+            (Kind::DualShock4, false) => {
+                feature(handle, 0x12, buffer).then(|| dualshock4_mac(buffer)).flatten()
+            }
+            (Kind::DualShock4, true) => {
+                let mut serial = [0u16; 64];
+                // SAFETY: the buffer is as long as we say, in bytes.
+                unsafe { HidD_GetSerialNumberString(handle, serial.as_mut_ptr().cast(), 128) }
+                    .then(|| serial_mac(&serial))
+                    .flatten()
+            }
+            // From its set-up ([`Switch::start`]).
+            (Kind::SwitchPro, _) => None,
+        }
+    }
+
+    /// How long the set-up of a Switch Pro Controller waits for each answer.
+    const ANSWER_MS: u32 = 300;
+
+    /// Waits up to `ms` for the overlapped transfer `overlapped` started by
+    /// `started` (`ReadFile`'s or `WriteFile`'s result), cancelling it if it
+    /// does not end: the bytes moved, `None` if it failed or timed out.
+    ///
+    /// # Safety
+    /// The transfer's buffer and `overlapped` live until this returns.
+    unsafe fn finish(handle: HANDLE, started: i32, overlapped: &OVERLAPPED, ms: u32) -> Option<u32> {
+        let mut moved = 0;
+        // SAFETY: the caller's transfer, on this handle.
+        unsafe {
+            if started == 0 && GetLastError() != ERROR_IO_PENDING {
+                return None;
+            }
+            if GetOverlappedResultEx(handle, overlapped, &mut moved, ms, 0) != 0 {
+                return Some(moved);
+            }
+            CancelIoEx(handle, overlapped);
+            GetOverlappedResult(handle, overlapped, &mut moved, 1);
+        }
+        None
+    }
+
+    /// Writes one output report; `false` if it was not taken within `ms`
+    /// (a Bluetooth pad that is gone). The handle may have a read pending.
+    fn write(handle: HANDLE, report: &[u8], ms: u32) -> bool {
+        // SAFETY: an unnamed manual-reset event; no security attributes.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return false;
+        }
+        // SAFETY: plain data; only the event is set.
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = event;
+        // SAFETY: the report and `overlapped` outlive the write, which
+        // `finish` waits for.
+        let written = unsafe {
+            let started = WriteFile(handle, report.as_ptr(), report.len() as u32, std::ptr::null_mut(), &mut overlapped);
+            finish(handle, started, &overlapped, ms)
+        };
+        // SAFETY: ours, and the write is over.
+        unsafe { CloseHandle(event) };
+        written.is_some()
+    }
+
+    /// Reads input reports into `buffer` until one for which `wanted` holds
+    /// (its length then), for at most [`ANSWER_MS`]. Only while no reader
+    /// thread has the pad.
+    fn answer(handle: HANDLE, buffer: &mut [u8], wanted: impl Fn(&[u8]) -> bool) -> Option<usize> {
+        // SAFETY: an unnamed manual-reset event; no security attributes.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return None;
+        }
+        let until = std::time::Instant::now() + Duration::from_millis(ANSWER_MS.into());
+        let mut found = None;
+        while found.is_none() {
+            let left = until.saturating_duration_since(std::time::Instant::now()).as_millis() as u32;
+            if left == 0 {
+                break;
+            }
+            // SAFETY: plain data; only the event is set.
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            overlapped.hEvent = event;
+            // SAFETY: the buffer and `overlapped` outlive the read, which
+            // `finish` waits for.
+            let got = unsafe {
+                let started = ReadFile(handle, buffer.as_mut_ptr(), buffer.len() as u32, std::ptr::null_mut(), &mut overlapped);
+                finish(handle, started, &overlapped, left)
+            };
+            let Some(got) = got else {
+                break;
+            };
+            if wanted(&buffer[..got as usize]) {
+                found = Some(got as usize);
+            }
+        }
+        // SAFETY: ours, and no read is pending on it.
+        unsafe { CloseHandle(event) };
+        found
+    }
+
+    /// A Switch Pro Controller's per-connection state: its stick
+    /// calibration and the counter of the packets sent to it.
+    struct Switch {
+        sticks: Sticks,
+        counter: u8,
+    }
+
+    impl Switch {
+        /// Sends subcommand `id` and waits for its answer's data, copied
+        /// out (`None`: not answered).
+        fn ask(&mut self, handle: HANDLE, reports: &mut Reports, id: u8, args: &[u8]) -> Option<Vec<u8>> {
+            switch_pro::subcommand(&mut reports.output, &mut self.counter, id, args);
+            if !write(handle, &reports.output, ANSWER_MS) {
+                return None;
+            }
+            let got = answer(handle, &mut reports.input, |r| switch_pro::answer(r, id).is_some())?;
+            switch_pro::answer(&reports.input[..got], id).map(<[u8]>::to_vec)
+        }
+
+        /// `len` bytes at `at` in the pad's flash.
+        fn flash(&mut self, handle: HANDLE, reports: &mut Reports, at: u32, len: u8) -> Option<Vec<u8>> {
+            let data = self.ask(handle, reports, switch_pro::SPI_READ, &switch_pro::spi_read(at, len))?;
+            switch_pro::spi_data(&data, at, len).map(<[u8]>::to_vec)
+        }
+
+        /// Asks for full reports without waiting for the answer (a reader
+        /// may be reading): what tells whether a quiet pad is still there,
+        /// and what a pad that reconnected needs again.
+        fn full_reports(&mut self, handle: HANDLE, output: &mut [u8]) -> bool {
+            switch_pro::subcommand(output, &mut self.counter, switch_pro::INPUT_MODE, &[switch_pro::FULL]);
+            write(handle, output, ANSWER_MS)
+        }
+
+        /// Sets the pad up for reading: over USB the handshake that makes it
+        /// talk HID, then its address, its stick calibration, the first
+        /// player light (they blink until one is set) and full reports.
+        /// `None` if it did not answer.
+        fn start(handle: HANDLE, bluetooth: bool, reports: &mut Reports) -> Option<(Switch, Option<[u8; 6]>)> {
+            let mut pad = Switch { sticks: Sticks::default(), counter: 0 };
+            let mut mac = None;
+            if bluetooth {
+                let info = pad.ask(handle, reports, switch_pro::DEVICE_INFO, &[])?;
+                mac = switch_pro::info_mac(&info);
+                if mac.is_some() && lock().iter().any(|open| open.mac == mac) {
+                    return Some((pad, mac));
+                }
+            } else {
+                // A USB command, and whether it was taken (and answered, if
+                // it is one that is).
+                let usb = |reports: &mut Reports, command: u8, answered: bool| {
+                    switch_pro::usb_command(&mut reports.output, command);
+                    write(handle, &reports.output, ANSWER_MS)
+                        && (!answered
+                            || answer(handle, &mut reports.input, |r| switch_pro::answers_usb(r, command)).is_some())
+                };
+                if usb(reports, switch_pro::USB_STATUS, true) {
+                    mac = switch_pro::usb_mac(&reports.input);
+                }
+                // Open over Bluetooth already: the handshake would take the
+                // pad from there; the caller sees the twin and lets it be.
+                if mac.is_some() && lock().iter().any(|open| open.mac == mac) {
+                    return Some((pad, mac));
+                }
+                for command in [switch_pro::USB_HANDSHAKE, switch_pro::USB_HIGH_SPEED, switch_pro::USB_HANDSHAKE] {
+                    if !usb(reports, command, true) {
+                        return None;
+                    }
+                }
+                usb(reports, switch_pro::USB_HID_ONLY, false);
+            }
+            let factory = pad.flash(handle, reports, switch_pro::FACTORY_STICKS, 18);
+            let user = pad.flash(handle, reports, switch_pro::USER_STICKS, 22);
+            if factory.is_none() {
+                tracing::warn!("Switch Pro Controller: no stick calibration; the sticks are read as a typical pad's");
+            }
+            pad.sticks = Sticks::from_flash(factory.as_deref(), user.as_deref());
+            pad.ask(handle, reports, switch_pro::PLAYER_LIGHTS, &[0x01]);
+            pad.ask(handle, reports, switch_pro::INPUT_MODE, &[switch_pro::FULL])?;
+            Some((pad, mac))
+        }
+    }
+
+    /// How a pad's reports are read, and how it is asked for full ones.
+    enum Decoder {
+        PlayStation(Kind),
+        Switch(Switch, bool),
+    }
+
+    impl Decoder {
+        fn parse(&self, report: &[u8], bluetooth: bool) -> Option<PadState> {
+            match self {
+                Decoder::PlayStation(kind) => parse(*kind, report, bluetooth),
+                Decoder::Switch(pad, labels) => switch_pro::parse(report, &pad.sticks, *labels),
+            }
+        }
+
+        fn kind(&self) -> Kind {
+            match self {
+                Decoder::PlayStation(kind) => *kind,
+                Decoder::Switch(..) => Kind::SwitchPro,
+            }
+        }
+
+        /// Asks for full reports; `false` when the pad did not take it.
+        fn full_reports(&mut self, handle: HANDLE, bluetooth: bool, reports: &mut Reports) -> bool {
+            match self {
+                Decoder::PlayStation(kind) => full_reports(handle, *kind, bluetooth, &mut reports.feature),
+                Decoder::Switch(pad, _) => pad.full_reports(handle, &mut reports.output),
+            }
+        }
     }
 
     /// Opens the pads not open yet, each with a reader thread.
@@ -289,10 +572,11 @@ mod host {
                 });
         }
         for path in paths {
-            // Cheap filter before opening anything: Sony's vendor id is in
-            // the path, as `vid_054c` (USB) or `vid&0002054c` (Bluetooth).
+            // Cheap filter before opening anything: Sony's or Nintendo's
+            // vendor id is in the path, as `vid_054c` (USB) or
+            // `vid&0002054c` (Bluetooth).
             let lower = String::from_utf16_lossy(&path).to_ascii_lowercase();
-            if !lower.contains("054c") {
+            if !lower.contains("054c") && !lower.contains("057e") {
                 continue;
             }
             if lock().iter().any(|pad| pad.path == path)
@@ -304,22 +588,23 @@ mod host {
             {
                 continue;
             }
-            let Some((handle, mut reports)) = open(&path) else {
+            let Some((handle, kind, mut reports)) = open(&path) else {
                 continue;
             };
             let bluetooth = lower.contains("{00001124-");
             // A paired pad that is switched off can still be listed over
             // Bluetooth: it does not answer.
-            if !full_reports(handle, &mut reports.feature) {
-                tracing::debug!(path = %lower, "DualSense listed but not answering");
+            let started = match kind {
+                Kind::DualSense | Kind::DualShock4 => full_reports(handle, kind, bluetooth, &mut reports.feature)
+                    .then(|| (Decoder::PlayStation(kind), address(handle, kind, bluetooth, &mut reports.feature))),
+                Kind::SwitchPro => Switch::start(handle, bluetooth, &mut reports)
+                    .map(|(pad, mac)| (Decoder::Switch(pad, switch_pro::by_label()), mac)),
+            };
+            let Some((decoder, mac)) = started else {
+                tracing::debug!(path = %lower, pad = kind.name(), "pad listed but not answering");
                 // SAFETY: just opened, nothing else has it.
                 unsafe { CloseHandle(handle) };
                 continue;
-            }
-            let mac = if feature(handle, 0x09, &mut reports.feature) {
-                mac(&reports.feature)
-            } else {
-                None
             };
             static NEXT_ID: AtomicU64 = AtomicU64::new(0);
             let id = {
@@ -337,7 +622,7 @@ mod host {
                 })
             };
             let Some(id) = id else {
-                tracing::info!(path = %lower, bluetooth, "DualSense already open over the other transport");
+                tracing::info!(path = %lower, bluetooth, pad = kind.name(), "pad already open over the other transport");
                 if let Some(mac) = mac {
                     TWINS
                         .lock()
@@ -348,22 +633,22 @@ mod host {
                 unsafe { CloseHandle(handle) };
                 continue;
             };
-            tracing::info!(path = %lower, bluetooth, "DualSense connected");
+            tracing::info!(path = %lower, bluetooth, pad = kind.name(), "pad connected");
             let raw = handle as usize;
             if let Err(error) = std::thread::Builder::new()
-                .name("DualSense reader".into())
-                .spawn(move || read(raw as HANDLE, id, bluetooth, reports))
+                .name(format!("{} reader", kind.name()))
+                .spawn(move || read(raw as HANDLE, id, bluetooth, decoder, reports))
             {
                 lock().retain(|pad| pad.id != id);
                 // SAFETY: just opened, and no reader has it.
                 unsafe { CloseHandle(handle) };
-                tracing::warn!(%error, "could not start a DualSense reader");
+                tracing::warn!(%error, pad = kind.name(), "could not start a pad reader");
             }
         }
     }
 
     /// Reads reports until the pad goes away, then forgets it.
-    fn read(handle: HANDLE, id: u64, bluetooth: bool, mut reports: Reports) {
+    fn read(handle: HANDLE, id: u64, bluetooth: bool, mut decoder: Decoder, mut reports: Reports) {
         let set = |state: Option<PadState>| {
             if let Some(pad) = lock().iter_mut().find(|pad| pad.id == id) {
                 pad.state = state;
@@ -411,7 +696,7 @@ mod host {
                 // Silent: whatever was held is not held any more, and the
                 // pad may be gone without the read failing.
                 set(None);
-                if !full_reports(handle, &mut reports.feature) {
+                if !decoder.full_reports(handle, bluetooth, &mut reports) {
                     // SAFETY: cancel the read and wait for it to end, so
                     // nothing writes into the input buffer once we return.
                     unsafe {
@@ -421,11 +706,11 @@ mod host {
                     break 'pad "not answering";
                 }
             }
-            if let Some(state) = parse(&reports.input[..got as usize], bluetooth) {
+            if let Some(state) = decoder.parse(&reports.input[..got as usize], bluetooth) {
                 set(Some(state));
             }
         };
-        tracing::info!(why, bluetooth, "DualSense disconnected");
+        tracing::info!(why, bluetooth, pad = decoder.kind().name(), "pad disconnected");
         lock().retain(|pad| pad.id != id);
         // SAFETY: ours, and nothing uses them any more.
         unsafe {
@@ -438,7 +723,7 @@ mod host {
 
     /// The pad at `path` opened for reading, `None` when it is something else
     /// or cannot be opened.
-    fn open(path: &[u16]) -> Option<(HANDLE, Reports)> {
+    fn open(path: &[u16]) -> Option<(HANDLE, Kind, Reports)> {
         let mut name = path.to_vec();
         name.push(0);
         // SAFETY: a terminated path; no security attributes or template.
@@ -461,11 +746,13 @@ mod host {
             ..Default::default()
         };
         // SAFETY: an open device and room for its attributes.
-        let ours = unsafe { HidD_GetAttributes(handle, &mut attributes) }
-            && attributes.VendorID == SONY
-            && PRODUCTS.contains(&attributes.ProductID);
-        if ours && let Some(reports) = Reports::for_device(handle) {
-            return Some((handle, reports));
+        let kind = unsafe { HidD_GetAttributes(handle, &mut attributes) }
+            .then(|| Kind::of(attributes.VendorID, attributes.ProductID))
+            .flatten();
+        if let Some(kind) = kind
+            && let Some(reports) = Reports::for_device(handle, kind)
+        {
+            return Some((handle, kind, reports));
         }
         // SAFETY: just opened.
         unsafe { CloseHandle(handle) };
@@ -629,7 +916,7 @@ mod tests {
         report[5] = 255; // L2
         report[8] = 0x20 | 2; // cross, D-pad right
         report[9] = 0x20 | 0x01; // options, L1
-        let pad = parse(&report, false).unwrap();
+        let pad = parse(Kind::DualSense, &report, false).unwrap();
         assert_eq!(pad.buttons, A | RIGHT | MENU | LEFT_SHOULDER);
         assert_eq!(
             (pad.left_x, pad.left_y, pad.left_trigger),
@@ -645,14 +932,14 @@ mod tests {
         report[2..6].copy_from_slice(&[128, 0, 255, 128]); // left up, right right
         report[7] = 255; // R2
         report[9] = 0x80 | 8; // triangle, D-pad centred
-        let pad = parse(&report, true).unwrap();
+        let pad = parse(Kind::DualSense, &report, true).unwrap();
         assert_eq!(pad.buttons, Y);
         assert_eq!(
             (pad.left_y, pad.right_x, pad.right_trigger),
             (1.0, 1.0, 1.0)
         );
         // the same bytes over USB are not a pad report
-        assert_eq!(parse(&report, false), None);
+        assert_eq!(parse(Kind::DualSense, &report, false), None);
     }
 
     #[test]
@@ -663,8 +950,120 @@ mod tests {
         report[5] = 0x40 | 4; // circle, D-pad down
         report[7] = 0x02; // touchpad click
         report[8] = 128; // L2 halfway
-        let pad = parse(&report, true).unwrap();
+        let pad = parse(Kind::DualSense, &report, true).unwrap();
         assert_eq!(pad.buttons, B | DOWN | VIEW);
         assert!((pad.left_trigger - 0.5).abs() < 0.01);
+        // a DualShock 4's short report is laid out the same
+        assert_eq!(parse(Kind::DualShock4, &report, true), Some(pad));
+    }
+
+    /// Not a test but a probe for real pads, without the game: prints every
+    /// change of what the connected HID pads read as, for
+    /// `VICTORY_PAD_SECONDS` (20) seconds.
+    /// `cargo test -p victory-hle --lib -- --ignored --nocapture live_pads`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a pad in hand"]
+    fn live_pads() {
+        let seconds = std::env::var("VICTORY_PAD_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+        println!("Reading HID pads for {seconds} s: press buttons, move the sticks and triggers.");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        let mut last = Vec::new();
+        while std::time::Instant::now() < until {
+            let now = pads();
+            if now != last {
+                for (id, pad) in &now {
+                    println!(
+                        "pad {id}: buttons {:#06x} triggers {:.2} {:.2} left {:+.2} {:+.2} right {:+.2} {:+.2}",
+                        pad.buttons,
+                        pad.left_trigger,
+                        pad.right_trigger,
+                        pad.left_x,
+                        pad.left_y,
+                        pad.right_x,
+                        pad.right_y
+                    );
+                }
+                if now.is_empty() {
+                    println!("no pad reporting");
+                }
+                last = now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+    }
+
+    #[test]
+    fn pads_are_told_apart_by_vendor_and_product() {
+        assert_eq!(Kind::of(0x054C, 0x0CE6), Some(Kind::DualSense));
+        assert_eq!(Kind::of(0x054C, 0x0DF2), Some(Kind::DualSense));
+        for product in [0x05C4, 0x09CC, 0x0BA0] {
+            assert_eq!(Kind::of(0x054C, product), Some(Kind::DualShock4));
+        }
+        assert_eq!(Kind::of(0x057E, 0x2009), Some(Kind::SwitchPro));
+        // a Joy-Con, a DualShock 3, another vendor's pad
+        assert_eq!(Kind::of(0x057E, 0x2006), None);
+        assert_eq!(Kind::of(0x054C, 0x0268), None);
+        assert_eq!(Kind::of(0x045E, 0x0B12), None);
+    }
+
+    #[test]
+    fn a_dualshock4_usb_report_has_its_buttons_before_its_triggers() {
+        let mut report = [0u8; 64];
+        report[0] = 0x01;
+        report[1..5].copy_from_slice(&[255, 128, 128, 0]); // left right, right up
+        report[5] = 0x10 | 6; // square, D-pad left
+        report[6] = 0x02 | 0x10 | 0x80; // R1, share, R3
+        report[7] = 0x01; // PS: no console button
+        report[8] = 0; // L2
+        report[9] = 255; // R2
+        let pad = parse(Kind::DualShock4, &report, false).unwrap();
+        assert_eq!(pad.buttons, X | LEFT | RIGHT_SHOULDER | VIEW | RIGHT_STICK);
+        assert_eq!(
+            (pad.left_x, pad.right_y, pad.left_trigger, pad.right_trigger),
+            (1.0, 1.0, 0.0, 1.0)
+        );
+        // read as a DualSense's, the same bytes mean something else
+        assert_ne!(parse(Kind::DualSense, &report, false), Some(pad));
+        // and a switch pad's reports are not read here
+        assert_eq!(parse(Kind::SwitchPro, &report, false), None);
+    }
+
+    #[test]
+    fn a_dualshock4_bluetooth_report_reads_two_bytes_further_in() {
+        let mut report = [0u8; 78];
+        report[0] = 0x11;
+        report[1] = 0xC0;
+        report[3..7].copy_from_slice(&[128, 255, 0, 128]); // left down, right left
+        report[7] = 0x80 | 0x20 | 1; // triangle, cross, D-pad up-right
+        report[8] = 0x20 | 0x04; // options, L2 pressed
+        report[10] = 255; // L2
+        let pad = parse(Kind::DualShock4, &report, true).unwrap();
+        assert_eq!(pad.buttons, Y | A | UP | RIGHT | MENU);
+        assert_eq!(
+            (pad.left_y, pad.right_x, pad.left_trigger),
+            (-1.0, -1.0, 1.0)
+        );
+        // 0x11 is not a report a DualSense sends, nor one over USB
+        assert_eq!(parse(Kind::DualSense, &report, true), None);
+        assert_eq!(parse(Kind::DualShock4, &report, false), None);
+    }
+
+    #[test]
+    fn a_dualshock4_address_reads_the_same_over_usb_and_bluetooth() {
+        // USB pairing report: least significant byte first.
+        let mut pairing = [0u8; 16];
+        pairing[0] = 0x12;
+        pairing[1..7].copy_from_slice(&[0x56, 0x34, 0x12, 0x6D, 0x66, 0x1C]);
+        let usb = dualshock4_mac(&pairing);
+        assert_eq!(usb, Some([0x1C, 0x66, 0x6D, 0x12, 0x34, 0x56]));
+        // Bluetooth: the serial number string, with or without separators.
+        let wide = |s: &str| s.encode_utf16().chain([0, 0x41]).collect::<Vec<u16>>();
+        assert_eq!(serial_mac(&wide("1c666d123456")), usb);
+        assert_eq!(serial_mac(&wide("1C:66:6D:12:34:56")), usb);
+        assert_eq!(serial_mac(&wide("")), None);
+        assert_eq!(serial_mac(&wide("000000000000")), None);
+        assert_eq!(serial_mac(&wide("1c666d1234")), None);
     }
 }

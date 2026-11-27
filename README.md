@@ -342,6 +342,22 @@ delete that file to go back to them. Full screen: start the game, then run
 `.\scripts\fullscreen.ps1` in another window. Logs go to
 `%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
 
+## Controllers
+
+Xbox controllers (XInput) work as they are. These are read straight from
+USB or Bluetooth too, with no Steam Input or DS4Windows needed:
+
+| Controller | Notes |
+|---|---|
+| PlayStation 5: DualSense, DualSense Edge | |
+| PlayStation 4: DualShock 4 (both models), Sony's wireless adapter | |
+| Nintendo Switch Pro Controller | Face buttons by where they sit, as on an Xbox controller (Nintendo's B is A). `VICTORY_SWITCH_LABELS=1`: by the letter printed on them. ZL and ZR are buttons, not triggers |
+
+While an XInput controller is connected the game reads that one, as a
+remapper can show the same controller twice. `VICTORY_DUALSENSE=1` reads
+both, `VICTORY_DUALSENSE=0` none of the controllers above. The play log says
+`pad connected` with the controller's name when one is found.
+
 ## How it works, and the findings
 
 - [docs/README-foxhound.md](docs/README-foxhound.md): foxhound's own README

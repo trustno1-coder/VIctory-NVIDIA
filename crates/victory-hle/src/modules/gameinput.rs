@@ -24,6 +24,7 @@ use crate::{HleExport, HleModule};
 // PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy).
 #[cfg(any(windows, test))]
 mod dualsense;
+mod switch_pro;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -1266,7 +1267,7 @@ mod host {
             Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            // XInput first; HID PS5 pads take the slots XInput leaves free (`VICTORY_DUALSENSE`: 0 off, 1 both).
+            // XInput first; HID pads (PlayStation 4 and 5, Switch Pro) take the slots XInput leaves free (`VICTORY_DUALSENSE`: 0 off, 1 both).
             if slot == 0 {
                 let xinput = std::array::from_fn(|slot| self.xinput(slot));
                 self.pads = super::dualsense::slots(
