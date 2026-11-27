@@ -367,6 +367,12 @@ enum Command {
     /// frame generation in a window of ours.
     #[cfg(windows)]
     UpscalerCheck {
+        /// Validate deterministic SR input/output and measure synchronized host latency.
+        #[arg(long, conflicts_with = "present")]
+        validate: bool,
+        /// Evaluation count for --validate (3 warm-up evaluations, then measurements).
+        #[arg(long, default_value_t = 12, requires = "validate", value_parser = clap::value_parser!(u32).range(4..=48))]
+        iterations: u32,
         /// The output size, `<width>x<height>`.
         #[arg(long, default_value = "2560x1440")]
         output: String,
@@ -518,12 +524,17 @@ fn main() -> Result<()> {
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
         #[cfg(windows)]
-        Command::UpscalerCheck { output, device, present } => {
+        Command::UpscalerCheck { output, device, present, validate, iterations } => {
             let size = output
                 .split_once(['x', 'X'])
                 .and_then(|(w, h)| Some([w.trim().parse().ok()?, h.trim().parse().ok()?]))
                 .ok_or_else(|| anyhow::anyhow!("--output {output}: not <width>x<height>"))?;
-            for line in victory_hle::streamline::check(size, device || present, present) {
+            let lines = if validate {
+                victory_hle::streamline::verified_check(size, iterations).map_err(anyhow::Error::msg)?
+            } else {
+                victory_hle::streamline::check(size, device || present, present)
+            };
+            for line in lines {
                 println!("{line}");
             }
             Ok(())

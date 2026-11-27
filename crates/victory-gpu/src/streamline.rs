@@ -32,6 +32,8 @@
 
 pub(crate) mod abi;
 pub mod plan;
+mod probe;
+pub use probe::verified_check;
 
 pub use plan::Mode;
 
@@ -1294,6 +1296,10 @@ struct Recorded {
 /// frame's constants (frame `id` of the upscaling's viewport), the textures
 /// as local tags. The textures are left in the states given.
 fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exposure: f32, id: u64) -> Result<Recorded, String> {
+    record_mode(list, textures, camera, pre_exposure, id, None)
+}
+
+fn record_mode(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exposure: f32, id: u64, selected: Option<u32>) -> Result<Recorded, String> {
     let (Some(plan), Some(sl), Some(functions)) = (PLAN.get(), SL.get(), FUNCTIONS.get()) else {
         return Err("Streamline is not ready".into());
     };
@@ -1321,7 +1327,8 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
         calls.optimal.push((output, mode, size));
         size
     };
-    let sizes: Vec<(u32, Option<[u32; 2]>)> = plan::MODES.iter().map(|&m| (m, optimal(&mut calls, m))).collect();
+    let modes = selected.as_ref().map_or(plan::MODES.as_slice(), std::slice::from_ref);
+    let sizes: Vec<(u32, Option<[u32; 2]>)> = modes.iter().map(|&m| (m, optimal(&mut calls, m))).collect();
     let optimal_of_mode = |m: u32| sizes.iter().find(|s| s.0 == m).and_then(|s| s.1);
     let mode = plan::pick_mode(camera.render, output, optimal_of_mode)
         .ok_or_else(|| format!("no DLSS mode takes a {:?} render for a {output:?} output", camera.render))?;
@@ -1996,12 +2003,14 @@ static CHECK_DEVICE: AtomicBool = AtomicBool::new(false);
 /// 2.14.16). Nothing of Streamline is called afterwards.
 /// `VICTORY_CHECK_TEARDOWN=0`: left out.
 fn shut_down() -> Option<String> {
-    if !CHECK_DEVICE.load(Relaxed) || std::env::var("VICTORY_CHECK_TEARDOWN").is_ok_and(|v| v.trim() == "0") {
+    if PLAN.get().is_none() || std::env::var("VICTORY_CHECK_TEARDOWN").is_ok_and(|v| v.trim() == "0") {
         return None;
     }
-    let (sl, host) = (SL.get()?, crate::host::host()?);
-    resizing();
-    host.drop_presenter();
+    let sl = SL.get()?;
+    if CHECK_DEVICE.load(Relaxed) && let Some(host) = crate::host::host() {
+        resizing();
+        host.drop_presenter();
+    }
     for ready in [&FG_READY, &DLSS_READY, &SWAP_CHAIN_PROXIED, &HUDLESS_WANTED] {
         ready.store(false, Release);
     }
