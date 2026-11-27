@@ -1164,7 +1164,7 @@ fn fill_plane(
     bytes: usize,
     pitch: usize,
 ) {
-    let _pin = crate::watch::title_memory_reading();
+    let _pin = crate::watch::reading_range(at, len);
     // SAFETY: the list owns this full upload allocation until its GPU work completes.
     let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
     let mip = &layout.mips[0];
@@ -1461,6 +1461,8 @@ impl Staging {
     fn refresh_timed(&self, mapping: &mut Option<crate::watch::Reading>) -> usize {
         let size = self.read;
         let start = self.memory as usize;
+        // Never extend a held set of stripes. Reuse the batch guard only for a subset.
+        if mapping.as_ref().is_some_and(|held| !held.covers(start, size)) { *mapping = None; }
         let mut last = waited(0, || {
             if mapping.is_some() {
                 match self.last.try_lock() {
@@ -1572,12 +1574,12 @@ impl Staging {
                 // Not waited for: while the runtime remaps title memory the
                 // texture is read through the kernel instead, whole or not at
                 // all (`no_wait`).
-                let Some(mapped) = crate::watch::title_memory_reading_now() else {
+                let Some(mapped) = crate::watch::reading_range_now(start, size) else {
                     return self.refresh_unlocked(last, size);
                 };
                 mapped
             } else if exact && exact_unlocked() {
-                match crate::watch::title_memory_reading_now() {
+                match crate::watch::reading_range_now(start, size) {
                     Some(mapped) => mapped,
                     None => match self.refresh_exact_unlocked(last, size) {
                         Some(read) => {
@@ -1586,11 +1588,11 @@ impl Staging {
                             }
                             return size;
                         }
-                        None => waited(2, crate::watch::title_memory_reading),
+                        None => waited(2, || crate::watch::reading_range(start, size)),
                     },
                 }
             } else {
-                waited(2, crate::watch::title_memory_reading)
+                waited(2, || crate::watch::reading_range(start, size))
             });
         }
         if !committed(self.memory, size) {
