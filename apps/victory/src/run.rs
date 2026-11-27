@@ -255,27 +255,39 @@ pub fn run(
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
     }
-    // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
-    // clock ticks at that interval (victory-gpu), and the title is given
-    // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS
-    // overrides it; `off` leaves the title alone).
+    // The frame rate. VICTORY_FRAME_INTERVAL_MS, or else
+    // VICTORY_FRAME_INTERVAL_US (the launcher's no-cap default of 1000):
+    // our frame clock ticks at that interval (victory-gpu), and the title
+    // is given the matching rate in place of its setting's 30
+    // (VICTORY_TITLE_FPS overrides it; `off` leaves the title alone).
+    // The US switch used to move only our clock. The title then kept its
+    // 30, and a frame that ran past 33.3 ms waited for the next tick of
+    // that clock: the present locked at 66.7 ms while the frame was ~30 ms
+    // of work.
     #[cfg(windows)]
-    if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
-        use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
-        let asked = std::env::var("VICTORY_TITLE_FPS").ok();
-        match title_rate(ms, asked.as_deref()) {
-            Some(rate) => {
-                let size = image.info().size_of_image as usize;
-                // SAFETY: the image stays mapped and nothing of it has run yet.
-                let done = unsafe { apply(image.base(), size, rate, &SITES) };
-                let patched = done.iter().filter(|d| **d == Patched::Done).count();
-                println!(
-                    "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
-                    SITES.len(),
-                    title_interval_us(rate, false)
-                );
+    if execute {
+        use victory_loader::frame_rate::{
+            Patched, SITES, apply, asked_interval_ms, asked_interval_us, title_interval_us, title_rate,
+        };
+        let clock = asked_interval_ms()
+            .map(|ms| (ms, "VICTORY_FRAME_INTERVAL_MS"))
+            .or_else(|| asked_interval_us().map(|us| (us as f64 / 1000.0, "VICTORY_FRAME_INTERVAL_US")));
+        if let Some((ms, from)) = clock {
+            let asked = std::env::var("VICTORY_TITLE_FPS").ok();
+            match title_rate(ms, asked.as_deref()) {
+                Some(rate) => {
+                    let size = image.info().size_of_image as usize;
+                    // SAFETY: the image stays mapped and nothing of it has run yet.
+                    let done = unsafe { apply(image.base(), size, rate, &SITES) };
+                    let patched = done.iter().filter(|d| **d == Patched::Done).count();
+                    println!(
+                        "frame rate: our clock {ms} ms ({from}); the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
+                        SITES.len(),
+                        title_interval_us(rate, false)
+                    );
+                }
+                None => println!("frame rate: our clock {ms} ms ({from}); the title's own rate (30) left as it is"),
             }
-            None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
         }
     }
     if !execute {

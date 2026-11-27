@@ -100,8 +100,9 @@ pub(crate) extern "system" fn set_interval(
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    // VICTORY_FRAME_INTERVAL_MS (with the title's own rate patched to match)
-    // first, then VICTORY_FRAME_INTERVAL_US (our clock alone).
+    // VICTORY_FRAME_INTERVAL_MS first, then VICTORY_FRAME_INTERVAL_US.
+    // The loader patches the title's own rate to the same interval, so its
+    // limiter does not keep a 33.3 ms tick under a 1 ms clock.
     let interval = asked().or_else(interval_override).unwrap_or(asked_by_title);
     tracing::info!(?interval, title = ?asked_by_title, period, flags, "frame interval");
     // A new interval starts from now, after the last tick handed out.

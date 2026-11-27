@@ -53,6 +53,24 @@ pub fn asked_interval_ms() -> Option<f64> {
     ms
 }
 
+/// `VICTORY_FRAME_INTERVAL_US`, the same range the frame clock accepts
+/// (1,000..=1,000,000). The launcher sets 1000 for no cap. `None` if unset
+/// or outside that range (said why).
+pub fn asked_interval_us() -> Option<u64> {
+    let spec = std::env::var("VICTORY_FRAME_INTERVAL_US").ok()?;
+    let us = parse_interval_us(&spec);
+    if us.is_none() {
+        eprintln!("VIctory: VICTORY_FRAME_INTERVAL_US={spec}: expected microseconds from 1000 to 1000000");
+    }
+    us
+}
+
+/// `1000` → 1000; outside 1,000..=1,000,000 → `None`.
+pub fn parse_interval_us(spec: &str) -> Option<u64> {
+    let us = spec.trim().parse::<u64>().ok()?;
+    (1_000..=1_000_000).contains(&us).then_some(us)
+}
+
 /// `16.667` â†’ 16.667; 0 is allowed (no wait), more than a second is not.
 pub fn parse_interval_ms(spec: &str) -> Option<f64> {
     spec.trim().parse::<f64>().ok().filter(|ms| ms.is_finite() && (0.0..=1000.0).contains(ms))
@@ -243,6 +261,16 @@ mod tests {
         assert_eq!(title_rate(16.667, Some("off")), None);
         assert_eq!(title_rate(0.0, Some("90")), Some(90));
         assert_eq!(title_rate(0.0, Some("lots")), None);
+        assert_eq!(parse_interval_us("1000"), Some(1000));
+        assert_eq!(parse_interval_us("16667"), Some(16667));
+        assert_eq!(parse_interval_us("999"), None);
+        assert_eq!(parse_interval_us("1000001"), None);
+        // 1000 us is the launcher's "no cap". The title's own limiter must
+        // follow it: left at its setting of 30, a frame just past 33.3 ms
+        // waits out the next tick and the present locks at 66.7 ms.
+        assert_eq!(title_rate(1000.0 / 1000.0, None), Some(1000));
+        assert_eq!(title_rate(16667.0 / 1000.0, None), Some(60));
+        assert_eq!(title_rate(33333.0 / 1000.0, None), Some(30));
     }
 
     /// The title's own arithmetic: its 30 is the 33,333 us the log shows,
