@@ -101,6 +101,48 @@ pub(crate) fn card() -> Option<ID3D12Resource> {
     Some(made.0)
 }
 
+// Opt-in: only idle, never-issued buffers are affected. The original path is unchanged.
+fn adaptive() -> bool {
+    std::env::var_os("VICTORY_LOWSPEC_ADAPTIVE").is_some_and(|v| v == "1")
+}
+
+const GIB: u64 = 1 << 30;
+
+fn ram_pressure(was: bool, physical: u64, commit_free: u64) -> bool {
+    if was {
+        physical < 3 * GIB || commit_free < 2 * GIB
+    } else {
+        physical < 2 * GIB || commit_free < GIB
+    }
+}
+
+fn card_pressure(was: bool, budget: u64, used: u64) -> bool {
+    budget == 0 || used >= budget / 100 * if was { 65 } else { 80 }
+}
+
+fn system_commit_free() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the structure and length describe writable storage.
+    if unsafe { K32GetPerformanceInfo(&mut info, info.cb) } == 0 {
+        return None;
+    }
+    Some((info.CommitLimit.saturating_sub(info.CommitTotal) as u64).saturating_mul(info.PageSize as u64))
+}
+
+fn trim_idle<T>(pool: &Mutex<Vec<T>>, keep: usize) {
+    let gone = {
+        let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+        let keep = keep.min(pool.len());
+        pool.split_off(keep)
+    };
+    // Release COM resources outside the lock. These have never been handed to a title list.
+    drop(gone);
+}
+
 fn fill() {
     #[cfg(windows)]
     {
@@ -123,7 +165,34 @@ fn fill() {
     let began = std::time::Instant::now();
     let mut want = first();
     let mut said = false;
+    let adaptive = adaptive();
+    let mut ram_high = false;
+    let mut card_high = false;
+    let mut sampled = None::<std::time::Instant>;
     loop {
+        if adaptive && sampled.is_none_or(|t| t.elapsed().as_secs() >= 1) {
+            let physical = crate::host::available_physical_ram();
+            let commit = system_commit_free();
+            let memory = host.video_memory();
+            let next_ram = match (physical, commit) {
+                (Some(p), Some(c)) => ram_pressure(ram_high, p, c),
+                _ => true,
+            };
+            let next_card = memory.is_none_or(|[budget, used, ..]| card_pressure(card_high, budget, used));
+            if sampled.is_none() || next_ram != ram_high || next_card != card_high {
+                tracing::info!(?physical, ?commit, ?memory, ram_pressure = next_ram, card_pressure = next_card,
+                    "lowspec ahead pool pressure (bytes)");
+            }
+            ram_high = next_ram;
+            card_high = next_card;
+            if ram_high {
+                trim_idle(&SHARED, 0);
+            }
+            if ram_high || card_high {
+                trim_idle(&CARD, 0);
+            }
+            sampled = Some(std::time::Instant::now());
+        }
         let shared = SHARED.lock().unwrap_or_else(|e| e.into_inner()).len();
         let card = CARD.lock().unwrap_or_else(|e| e.into_inner()).len();
         let card_wanted = CARD_WANTED.load(Ordering::Relaxed);
@@ -131,7 +200,10 @@ fn fill() {
         // textures need (seven tenths of the budget; the title's own copies stop at eight).
         let card_room = card_wanted
             && host.video_memory().is_none_or(|[budget, used, ..]| used + SIZE <= budget / 100 * 70);
-        let (more_shared, more_card) = (shared < want, card < want && card_room);
+        let (more_shared, more_card) = (
+            shared < want && !ram_high,
+            card < want && card_room && !ram_high && !card_high,
+        );
         if !more_shared && !more_card {
             if !said && shared >= want && (card >= want || !card_room) && card_wanted {
                 said = true;
@@ -161,5 +233,44 @@ fn fill() {
         {
             CARD.lock().unwrap_or_else(|e| e.into_inner()).push(Card(buffer));
         }
+        if adaptive {
+            // Back off if allocation fails rather than repeatedly hammering the driver.
+            let shared_now = SHARED.lock().unwrap_or_else(|e| e.into_inner()).len();
+            let card_now = CARD.lock().unwrap_or_else(|e| e.into_inner()).len();
+            if shared_now <= shared && card_now <= card {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ram_pressure_has_hysteresis() {
+        assert!(ram_pressure(false, GIB, 4 * GIB));
+        assert!(ram_pressure(false, 4 * GIB, GIB - 1));
+        assert!(ram_pressure(true, 2 * GIB, 3 * GIB));
+        assert!(!ram_pressure(true, 3 * GIB, 2 * GIB));
+        assert!(!ram_pressure(false, 2 * GIB, GIB));
+    }
+
+    #[test]
+    fn card_pressure_has_hysteresis() {
+        assert!(card_pressure(false, 1000, 800));
+        assert!(card_pressure(true, 1000, 700));
+        assert!(!card_pressure(true, 1000, 649));
+        assert!(card_pressure(false, 0, 0));
+    }
+
+    #[test]
+    fn only_idle_pool_is_trimmed() {
+        let pool = Mutex::new(vec![1, 2, 3]);
+        trim_idle(&pool, 1);
+        assert_eq!(*pool.lock().unwrap(), vec![1]);
+        trim_idle(&pool, 0);
+        assert!(pool.lock().unwrap().is_empty());
     }
 }
