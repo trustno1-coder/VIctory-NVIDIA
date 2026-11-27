@@ -303,6 +303,15 @@ impl Pool {
         let mut state = self.state();
         // (After a panic here: nothing more is begun.)
         state.work = None;
+        // Awake a little while for the helpers' last calls, if that is asked
+        // for (`crate::shadow::wait_spin`): no helper can begin another now,
+        // so `running` only falls; the wait below is the one that counts.
+        let most = crate::shadow::wait_spin();
+        if most > 0 && state.running > 0 {
+            drop(state);
+            crate::shadow::spin_for(most, || self.state.try_lock().is_ok_and(|state| state.running == 0));
+            state = self.state();
+        }
         while state.running > 0 {
             state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
         }

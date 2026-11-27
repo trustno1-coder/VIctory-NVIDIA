@@ -1534,6 +1534,12 @@ struct Workers {
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    spin_for(most, there);
+}
+
+/// Waits awake until `there` says so, `most` microseconds at most (0: not at
+/// all).
+pub(crate) fn spin_for(most: u64, there: impl Fn() -> bool) {
     if most == 0 {
         return;
     }
@@ -1543,6 +1549,32 @@ fn spin(there: impl Fn() -> bool) {
             std::hint::spin_loop();
         }
     }
+}
+
+/// `VICTORY_WAIT_SPIN=<microseconds>` (0, the default: not at all): how long
+/// the thread that spread work over helpers ([`wide`], `crate::land`'s
+/// pools) waits awake for the last of it before it sleeps.
+///
+/// Why: that thread is the one a frame waits for (the submitting thread, 50
+/// to 54 ms of a 57 ms frame in session 2026-11-28 00:45). It does its own
+/// share, and then sleeps until a helper is done with its last piece, which
+/// is microseconds away more often than not; woken, it is not running for 50
+/// us and more (2 to 4 ms a frame of "woken, not running yet" on the frame's
+/// chain, timeline of 2026-11-27). `VICTORY_WIDE_SPIN` keeps the helpers awake
+/// too, after every job, on cores the title's threads want; this is the one
+/// waiting thread, for a bounded time, and only while helpers are at work.
+pub(crate) fn wait_spin() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let most = std::env::var("VICTORY_WAIT_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0u64).min(2000);
+        if most > 0 {
+            tracing::info!(
+                micros = most,
+                "the thread that spreads work over helpers waits awake for the last of it (VICTORY_WAIT_SPIN)"
+            );
+        }
+        most
+    })
 }
 
 /// How many threads are kept for [`wide`].
@@ -1606,13 +1638,18 @@ fn wide(jobs: Vec<Job>) {
     // takes what nobody took.
     let wake = (jobs.len() - 1).min(wide_threads());
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    // Jobs not done yet, for [`wait_spin`]: read without the lock the helpers
+    // take when they are done (the count under the lock is the one waited on).
+    let undone = Arc::new(std::sync::atomic::AtomicUsize::new(jobs.len()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
+            let undone = undone.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
                 job();
+                undone.fetch_sub(1, Ordering::Release);
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
@@ -1636,6 +1673,7 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
+    spin_for(wait_spin(), || undone.load(Ordering::Acquire) == 0);
     spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
     let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
     while *n > 0 {
