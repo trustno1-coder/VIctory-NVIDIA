@@ -2821,10 +2821,7 @@ impl HostHeap {
             // (As `mirror`.)
             let stale = self.note_buffer(index, Some(&view), true);
             let old = view_at(shown as u32, (shown >> 32) as u32);
-            let kept = old.is_some_and(|old| match kin(&old, &view) {
-                Kin::Same => true,
-                kin => kin.kept(keep_shown()),
-            });
+            let kept = old.is_some_and(|old| kept_meanwhile(&old, &view));
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
                 note_before(index, shown, "neutral");
@@ -3958,7 +3955,7 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = kin.kept(keep_shown());
+                    let kept = kept_meanwhile(&old, &view);
                     rewritten(kin, kept);
                     if kept {
                         drop(held);
@@ -3986,10 +3983,7 @@ impl HostHeap {
                     return Some(view);
                 }
                 let old = view_at(shown as u32, (shown >> 32) as u32);
-                let kept = old.is_some_and(|old| match kin(&old, &view) {
-                    Kin::Same => true,
-                    kin => kin.kept(keep_shown()),
-                });
+                let kept = old.is_some_and(|old| kept_meanwhile(&old, &view));
                 if shown == 0 || !kept {
                     #[cfg(feature = "diagnostics")]
                     note_before(index, shown, "neutral, new texture");
@@ -5180,7 +5174,9 @@ fn kin(old: &View, new: &View) -> Kin {
 /// showing the one it shows until the new one is made and its upload has run
 /// (`VICTORY_KEEP_SHOWN`): 0: never, it reads as zeros, then as the neutral
 /// texture; 1: one of the same kind in another place or size; 2: any of the
-/// same dimension.
+/// same dimension; `checked`: as 1, except that a texture of the same
+/// description placed elsewhere ([`Kin::Moved`]) is kept only when both
+/// memories begin and end with the same 4 KiB.
 fn keep_shown() -> u8 {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
@@ -5188,6 +5184,69 @@ fn keep_shown() -> u8 {
     }
     static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+}
+
+/// `VICTORY_KEEP_SHOWN=checked`: as 1, except that a slot written with a
+/// texture of the same description placed elsewhere ([`Kin::Moved`]) goes on
+/// showing the old one only where both memories begin and end with the same
+/// bytes, i.e. the title moved the texture. Otherwise it shows the neutral
+/// texture until the new one's upload has run.
+///
+/// Why: "the same kind elsewhere" also matches a streamer reusing a slot for
+/// a different texture of the same size and format (e.g. an albedo where a
+/// mask or another character's map was), which renders rainbow-noise texels on
+/// the surface until the upload lands.
+fn keep_checked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").is_ok_and(|v| v.trim() == "checked"))
+}
+
+/// Since the start, under `VICTORY_KEEP_SHOWN=checked`: `[0]` moved slots
+/// whose memories began and ended alike (kept), `[1]` moved slots whose
+/// memories differed or were unreadable (shown neutral).
+static CHECKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether `old` stays in a slot rewritten with `new` until `new`'s upload
+/// runs ([`keep_shown`], [`keep_checked`]).
+fn kept_meanwhile(old: &View, new: &View) -> bool {
+    match kin(old, new) {
+        Kin::Same => true,
+        Kin::Moved if keep_checked() => {
+            let same = moved_whole(old, new);
+            CHECKED[usize::from(!same)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            same
+        }
+        kin => kin.kept(keep_shown()),
+    }
+}
+
+/// Whether the memories of two placed texture views of one description begin
+/// and end with the same bytes (4 KiB each end; title memory read as the
+/// texture pass reads it). False where either cannot be read.
+fn moved_whole(old: &View, new: &View) -> bool {
+    let (View::Placed(false, resource, from), View::Placed(false, _, to)) = (old, new) else {
+        return false;
+    };
+    let at = |d: &[u32]| u64::from(d[10]) | u64::from(d[11]) << 32;
+    let Some(bytes) = crate::resource::placed_bytes(resource) else {
+        return false;
+    };
+    same_ends(at(from), at(to), bytes, |at, out| crate::host::read_into(at as *const u8, out))
+}
+
+/// Whether `[a, a + bytes)` and `[b, b + bytes)` hold the same first and last
+/// 4 KiB (all of them under 8 KiB), read by `read` (false: unreadable).
+fn same_ends(a: u64, b: u64, bytes: u64, read: impl Fn(u64, &mut [u8]) -> bool) -> bool {
+    const END: u64 = 4096;
+    if a == 0 || b == 0 || bytes == 0 {
+        return false;
+    }
+    let ends = if bytes <= 2 * END { vec![(0, bytes)] } else { vec![(0, END), (bytes - END, END)] };
+    let (mut x, mut y) = (vec![0u8; END as usize * 2], vec![0u8; END as usize * 2]);
+    ends.into_iter().all(|(offset, len)| {
+        let len = len as usize;
+        read(a + offset, &mut x[..len]) && read(b + offset, &mut y[..len]) && x[..len] == y[..len]
+    })
 }
 
 /// Slots that showed a texture and were written with a view of another,
@@ -5208,12 +5267,14 @@ fn rewritten(kin: Kin, kept: bool) {
     let n: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
     if n.is_multiple_of(5000) {
         tracing::info!(
-            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN)",
+            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN); moved ones checked: {} with the same bytes kept, {} with other bytes shown neutral (VICTORY_KEEP_SHOWN=checked)",
             REWRITTEN[0].load(Relaxed),
             REWRITTEN[1].load(Relaxed),
             REWRITTEN[2].load(Relaxed),
             REWRITTEN[3].load(Relaxed),
-            REWRITTEN[4].load(Relaxed)
+            REWRITTEN[4].load(Relaxed),
+            CHECKED[0].load(Relaxed),
+            CHECKED[1].load(Relaxed)
         );
     }
 }
@@ -7030,5 +7091,41 @@ mod bake_flip_tests {
         assert_eq!(cb1(), None);
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
+
+    /// `VICTORY_KEEP_SHOWN=checked`: a texture of the same description elsewhere stands for the
+    /// new one only where both memories begin and end alike (a move), not where a streamer
+    /// gave the slot another texture of that size and format, nor where a memory is unreadable.
+    #[test]
+    fn a_moved_texture_is_kept_only_with_the_same_ends() {
+        let memory: Vec<u8> = (0..64 * 1024u32).map(|i| (i * 31 + i / 4096) as u8).collect();
+        let mut moved = memory.clone();
+        let mut other = memory.clone();
+        // (The middle of a move may still differ: only the ends are compared.)
+        moved[20_000] ^= 0xff;
+        other[64 * 1024 - 1] ^= 1;
+        let all = [memory.as_slice(), moved.as_slice(), other.as_slice()];
+        let base = |i: usize| (i as u64 + 1) << 32;
+        let read = |at: u64, out: &mut [u8]| {
+            let Some(bytes) = all.get(((at >> 32) as usize).wrapping_sub(1)) else {
+                return false;
+            };
+            let offset = (at & 0xffff_ffff) as usize;
+            match bytes.get(offset..offset + out.len()) {
+                Some(src) => {
+                    out.copy_from_slice(src);
+                    true
+                }
+                None => false,
+            }
+        };
+        let len = memory.len() as u64;
+        assert!(super::same_ends(base(0), base(1), len, read));
+        assert!(!super::same_ends(base(0), base(2), len, read));
+        // Unreadable (no such memory) or no address: not kept.
+        assert!(!super::same_ends(base(0), base(7), len, read));
+        assert!(!super::same_ends(0, base(1), len, read));
+        // Under 8 KiB: compared whole.
+        assert!(super::same_ends(base(0), base(1), 6000, read));
     }
 }
