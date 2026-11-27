@@ -125,7 +125,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     let staging = super::staging(resource, &copy, first);
     super::PICKING.set(None);
     let Some(staging) = staging.filter(|s| {
-        !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
+        !s.on_demand && !s.is_gpu() && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
     }) else {
         copy.ahead.store(LISTED, Relaxed);
         return turned_down();

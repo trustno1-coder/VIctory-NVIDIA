@@ -40,6 +40,8 @@ pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
+mod gpudetile;
+#[cfg(windows)]
 mod heap_marks;
 #[cfg(windows)]
 mod host;
