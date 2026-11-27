@@ -40,7 +40,6 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
@@ -764,7 +763,7 @@ impl Rig {
         // SAFETY: the source and names live through the call; then the
         // blob's own bytes, which hold the root signature too.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
-            D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("inplace"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None)?;
+            crate::dxc::d3d_compile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("inplace"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None)?;
             let code = code.ok_or_else(windows::core::Error::empty)?;
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;

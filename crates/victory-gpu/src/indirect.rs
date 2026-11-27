@@ -33,7 +33,6 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
@@ -312,7 +311,7 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
-        D3DCompile(
+        crate::dxc::d3d_compile(
             source.as_ptr().cast(),
             source.len(),
             s!("clamp"),
@@ -852,7 +851,7 @@ void main() {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: source and entry names outlive `D3DCompile`.
         unsafe {
-            D3DCompile(
+            crate::dxc::d3d_compile(
                 source.as_ptr().cast(),
                 source.len(),
                 s!("worker"),
