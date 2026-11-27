@@ -39,6 +39,10 @@ use super::font::{colours, glyph};
 
 #[path = "menu_look.rs"]
 mod look;
+#[path = "launcher.rs"]
+pub(super) mod launcher;
+#[path = "launcher_shapes.rs"]
+mod launcher_shapes;
 use super::{Host, HostList, transition};
 
 const GLYPH: (u32, u32) = (5, 7);
@@ -256,9 +260,33 @@ fn pretty(text: &str) -> String {
         .join(" ")
 }
 
+/// What a setting does, and what its value picked means, for the description beside the list.
+fn explained(var: &str, value: &str) -> &'static [&'static str] {
+    const MODEL: &str = "The AI model DLSS rebuilds the picture with.";
+    match (var, value) {
+        ("VICTORY_DLSS_PRESET", "") => &[MODEL, "Default: the one NVIDIA's files pick for the DLSS mode chosen."],
+        ("VICTORY_DLSS_PRESET", "k") => &[MODEL, "K: the transformer model of DLSS 4. Sharp and steady, little ghosting: the safe choice."],
+        ("VICTORY_DLSS_PRESET", "j") => &[MODEL, "J: DLSS 4's transformer too, a little sharper than K but with more shimmer and ghosting."],
+        ("VICTORY_DLSS_PRESET", "m") => &[
+            MODEL,
+            "M: the newer transformer of DLSS 4.5, made for Performance mode (as ultrawide uses). More detail there; costs more on RTX 20 and 30.",
+        ],
+        ("VICTORY_DLSS_PRESET", "l") => &[
+            MODEL,
+            "L: DLSS 4.5's newer transformer, made for Ultra Performance. The heaviest; little gain at the other modes.",
+        ],
+        ("VICTORY_MENU_DLSS", _) => &[
+            "How much smaller the picture is drawn before DLSS brings it up to the output size: Quality the least, Performance half each way. DLAA draws it at full size and only smooths it.",
+        ],
+        _ => &[],
+    }
+}
+
 /// The actions' short names on their buttons.
-fn action_label(action: &str) -> &str {
+fn action_label(action: &str, launcher: bool) -> &str {
     match action {
+        "SAVE AND RESTART NOW" if launcher => "SAVE AND PLAY",
+        "CLOSE" if launcher => "BACK",
         "SAVE AND RESTART NOW" => "SAVE AND RESTART",
         "SAVE FOR NEXT START" => "SAVE",
         "PRELOAD SHADERS (RESTARTS THE GAME)" => "PRELOAD SHADERS",
@@ -620,6 +648,21 @@ pub(super) struct Menu {
     picking: bool,
     /// The tab shown.
     tab: usize,
+    /// Shown in the launcher's window (`launcher.rs`), before the game: nothing changes right away,
+    /// and its actions play, preload and go back.
+    launcher: bool,
+}
+
+/// What an action asks of whoever shows the menu.
+#[derive(Debug, PartialEq)]
+enum Leave {
+    /// Saved; start the game (again).
+    Play,
+    /// Saved; make every shader, then start the game.
+    Preload,
+    /// The settings file was removed.
+    Reset,
+    Close,
 }
 
 impl Menu {
@@ -631,7 +674,7 @@ impl Menu {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: tab_items(0)[0], note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 }
+        Menu { started: values.clone(), values, at: tab_items(0)[0], note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0, launcher: false }
     }
 
     fn open() -> bool {
@@ -746,11 +789,11 @@ impl Menu {
         let now = index_of(item, &self.values[i]).map_or(-1, |x| x as isize);
         let next = if now < 0 { if step > 0 { 0 } else { n - 1 } } else { (now + step).rem_euclid(n) };
         self.values[i] = item.values[next as usize].0.to_owned();
-        if live(item) {
+        if live(item) && !self.launcher {
             self.apply_live(i);
         }
         self.note.clear();
-        if item.var == FRAMEGEN && !live(item) && !matches!(self.values[i].as_str(), "" | "0") {
+        if !self.launcher && item.var == FRAMEGEN && !live(item) && !matches!(self.values[i].as_str(), "" | "0") {
             "RESTART REQUIRED TO ENABLE FRAME GENERATION".clone_into(&mut self.note);
         }
         self.match_series_s(item.var);
@@ -974,7 +1017,11 @@ impl Menu {
             return;
         }
         tracing::info!(name, "settings menu: save import staged; put in place at the next start");
-        if std::env::var_os("VICTORY_MENU_PLAY").is_some() {
+        if self.launcher {
+            // Put in place when the game starts, as after the restart in the game.
+            self.picking = false;
+            "IMPORTED: PLAY STARTS THE GAME WITH IT".clone_into(&mut self.note);
+        } else if std::env::var_os("VICTORY_MENU_PLAY").is_some() {
             self.restart(false);
         } else {
             self.note = "IMPORTED: CLOSE THE GAME AND START IT AGAIN".to_owned();
@@ -1032,19 +1079,26 @@ impl Menu {
                     sentence(&ABOUT_S_RES)
                 } else if item.var == DLSS && !matches!(value, "" | "off") && std::env::var_os("VICTORY_STREAMLINE_DIR").is_none() {
                     sentence(&ABOUT_NO_DLSS)
-                } else if item.var == FRAMEGEN && !live(item) && !matches!(value, "" | "0") {
+                } else if !self.launcher && item.var == FRAMEGEN && !live(item) && !matches!(value, "" | "0") {
                     sentence(&ABOUT_FRAMEGEN_RESTART)
                 } else {
                     Vec::new()
                 };
-                about.push(if live(item) { "Changes right away.".to_owned() } else { "Applies at the next start: pick Save And Restart.".to_owned() });
+                about.extend(explained(item.var, &self.values[self.at]).iter().map(|l| (*l).to_owned()));
+                about.push(if self.launcher {
+                    "Play saves it and starts with it.".to_owned()
+                } else if live(item) {
+                    "Changes right away.".to_owned()
+                } else {
+                    "Applies at the next start: pick Save And Restart.".to_owned()
+                });
                 about.push(format!("Now: {}", pretty(&shown_value(item, &self.values[self.at]))));
                 (pretty(item.label), about)
             }
-            (None, Some(PRELOAD)) => (pretty(action_label(ACTIONS[PRELOAD])), sentence(&ABOUT_PRELOAD)),
-            (None, Some(EXPORT)) => (pretty(action_label(ACTIONS[EXPORT])), sentence(&ABOUT_EXPORT)),
-            (None, Some(IMPORT)) => (pretty(action_label(ACTIONS[IMPORT])), sentence(&ABOUT_IMPORT)),
-            (None, Some(a)) => (pretty(action_label(ACTIONS[a])), Vec::new()),
+            (None, Some(PRELOAD)) => (pretty(action_label(ACTIONS[PRELOAD], self.launcher)), sentence(&ABOUT_PRELOAD)),
+            (None, Some(EXPORT)) => (pretty(action_label(ACTIONS[EXPORT], self.launcher)), sentence(&ABOUT_EXPORT)),
+            (None, Some(IMPORT)) => (pretty(action_label(ACTIONS[IMPORT], self.launcher)), sentence(&ABOUT_IMPORT)),
+            (None, Some(a)) => (pretty(action_label(ACTIONS[a], self.launcher)), Vec::new()),
             (None, None) => (String::new(), Vec::new()),
         };
         (rows, first, action, heading, about)
@@ -1069,21 +1123,27 @@ impl Menu {
     }
 
     fn picture(&self, s: f32) -> Option<Vec<u32>> {
+        self.picture_with_hits(s).map(|(pixels, _)| pixels)
+    }
+
+    fn picture_with_hits(&self, s: f32) -> Option<(Vec<u32>, look::Hits)> {
         let (rows, first, action, heading, about) = if self.picking {
             let (rows, first, heading, about) = self.pick_parts();
             (rows, first, None, heading, about)
         } else {
             self.page_parts()
         };
-        let actions: Vec<String> = ACTIONS.iter().map(|a| pretty(action_label(a))).collect();
+        let actions: Vec<String> = ACTIONS.iter().map(|a| pretty(action_label(a, self.launcher))).collect();
         let actions: Vec<&str> = actions.iter().map(String::as_str).collect();
-        let note = if self.note.is_empty() {
-            "* Changed: applies at the next start, unless it changes right away".to_owned()
-        } else {
+        let note = if !self.note.is_empty() {
             pretty_sentence(&self.note)
+        } else if self.launcher {
+            "* Changed. Esc goes back".to_owned()
+        } else {
+            "* Changed: applies at the next start, unless it changes right away".to_owned()
         };
         let page = look::Page { tabs: &TABS, tab: self.tab, rows: &rows, first, actions: &actions, action, heading, about, note, link: &REPO.to_ascii_lowercase() };
-        look::draw(&page, s)
+        look::draw_with_hits(&page, s)
     }
 
     /// Removes the settings file: the launcher's own settings at the next start.
@@ -1098,6 +1158,10 @@ impl Menu {
     /// menu without the save lines, and lost them. The save lines stay (and restart, preload).
     fn change_and_save(&mut self, i: usize, step: isize) {
         self.change(i, step);
+        // The launcher's window saves on Play or when leaving its settings (it asks).
+        if self.launcher {
+            return;
+        }
         if self.save() && live(&ITEMS[i]) {
             self.note = "SAVED. ON NOW".to_owned();
         }
@@ -1132,25 +1196,42 @@ impl Menu {
             if !open {
                 continue;
             }
-            // Only an Enter right after the first one starts a preload or an import.
-            let confirmed = self.note == CONFIRM_PRELOAD || self.note == CONFIRM_IMPORT;
-            if confirmed {
-                self.note.clear();
+            match self.key(vk) {
+                Some(Leave::Play) => self.restart(false),
+                Some(Leave::Preload) => self.restart(true),
+                Some(Leave::Close) => crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed),
+                Some(Leave::Reset) | None => {}
             }
-            if self.picking {
-                let (n, back) = (self.imports.len() + 1, self.import_at >= self.imports.len());
-                match vk {
-                    VK_UP => self.import_at = (self.import_at + n - 1) % n,
-                    VK_DOWN => self.import_at = (self.import_at + 1) % n,
-                    VK_RETURN if back => self.picking = false,
-                    VK_RETURN if !confirmed => self.note = CONFIRM_IMPORT.to_owned(),
-                    VK_RETURN => self.import_save(),
-                    _ => {}
-                }
-                self.changed = true;
-                continue;
-            }
+            self.changed = true;
+        }
+    }
+
+    /// A key pressed while the menu is shown (not F1); what it asks of the caller, if anything.
+    fn key(&mut self, vk: u16) -> Option<Leave> {
+        // Esc in the list of saves goes back to the settings.
+        if self.picking && vk == VK_ESCAPE {
+            self.picking = false;
+            self.note.clear();
+            return None;
+        }
+        // Only an Enter right after the first one starts a preload or an import.
+        let confirmed = self.note == CONFIRM_PRELOAD || self.note == CONFIRM_IMPORT;
+        if confirmed {
+            self.note.clear();
+        }
+        if self.picking {
+            let (n, back) = (self.imports.len() + 1, self.import_at >= self.imports.len());
             match vk {
+                VK_UP => self.import_at = (self.import_at + n - 1) % n,
+                VK_DOWN => self.import_at = (self.import_at + 1) % n,
+                VK_RETURN if back => self.picking = false,
+                VK_RETURN if !confirmed => self.note = CONFIRM_IMPORT.to_owned(),
+                VK_RETURN => self.import_save(),
+                _ => {}
+            }
+            return None;
+        }
+        match vk {
                 VK_Q => self.open_tab(self.tab + TABS.len() - 1),
                 VK_E | VK_TAB => self.open_tab(self.tab + 1),
                 VK_UP => self.step(-1),
@@ -1162,33 +1243,28 @@ impl Menu {
                 VK_RIGHT => self.at = ITEMS.len() + (self.at - ITEMS.len() + 1) % ACTIONS.len(),
                 VK_RETURN if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
                 VK_RETURN => match self.at - ITEMS.len() {
-                    0 => {
-                        if self.save() {
-                            self.restart(false);
-                        }
-                    }
+                    0 => return self.save().then_some(Leave::Play),
                     1 => {
                         self.save();
                     }
                     PRELOAD if !confirmed => self.note = CONFIRM_PRELOAD.to_owned(),
-                    PRELOAD => {
-                        if self.save() {
-                            self.restart(true);
-                        }
+                    PRELOAD => return self.save().then_some(Leave::Preload),
+                    3 => {
+                        self.reset();
+                        return Some(Leave::Reset);
                     }
-                    3 => self.reset(),
                     EXPORT => self.export_save(),
                     IMPORT => {
                         self.read_imports();
                         self.import_at = 0;
                         self.picking = true;
                     }
-                    _ => crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed),
+                    _ => return Some(Leave::Close),
                 },
+                VK_ESCAPE => return Some(Leave::Close),
                 _ => {}
             }
-            self.changed = true;
-        }
+        None
     }
 
     /// Records the copy of the box onto `back` (in the copy-destination state).
@@ -1302,7 +1378,7 @@ mod tests {
             std::env::remove_var("VICTORY_MENU_FILE");
             std::env::set_var("VICTORY_HOME", &home);
         }
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0, launcher: false };
         menu.started = menu.values.clone();
         let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
         menu.change_and_save(dlss, 1);
@@ -1319,7 +1395,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0, launcher: false };
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;
@@ -1334,7 +1410,7 @@ mod tests {
 
     #[test]
     fn the_link_is_always_right_under_the_note() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0, launcher: false };
         menu.started = menu.values.clone();
         for note in ["", "SAVED"] {
             menu.note = note.to_owned();
@@ -1406,7 +1482,7 @@ mod tests {
 
     #[test]
     fn the_picture_line_is_the_consoles() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0, launcher: false };
         menu.started = menu.values.clone();
         let at = |var: &str| ITEMS.iter().position(|i| i.var == var).expect("in the menu");
         let (console, x, s, dlss) = (at(CONSOLE), at(X_RES), at(S_RES), at(DLSS));
@@ -1455,7 +1531,7 @@ mod tests {
 
     #[test]
     fn the_picture_has_tabs_rows_and_a_fading_bar() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0, launcher: false };
         menu.started = menu.values.clone();
         menu.open_tab(1);
         let (w, h) = look::size(1.0);
@@ -1487,7 +1563,7 @@ mod tests {
     #[test]
     fn preview() {
         let Some(path) = std::env::var_os("VICTORY_MENU_PREVIEW") else { return };
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0, launcher: false };
         menu.started = menu.values.clone();
         menu.values[tab_items(1)[1]] = ITEMS[tab_items(1)[1]].values[1].0.to_owned();
         for tab in 0..TABS.len() {
@@ -1515,7 +1591,7 @@ mod tests {
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0 };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, tab: 0, launcher: false };
         menu.started = menu.values.clone();
         let n = ITEMS[0].values.len();
         for _ in 0..n {
@@ -1529,7 +1605,7 @@ mod tests {
     #[test]
     fn a_shared_save_name_is_shown_in_letters_the_menu_has() {
         let names = vec!["save 2026-11-27 23-45-10.zip".to_owned(), "Jason's boat ~ 100% [\u{e9}] and a very long name that goes on and on.zip".to_owned()];
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true, tab: 0 };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true, tab: 0, launcher: false };
         menu.started = menu.values.clone();
         let check = |menu: &Menu| {
             let lines = menu.lines();

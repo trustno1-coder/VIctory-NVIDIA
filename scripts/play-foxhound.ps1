@@ -8,6 +8,10 @@
 #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
 #
+# Before the game, a launcher window shows what the start uses, with Play, the same settings as F1 and an update
+# check (`victory launcher`). Its "Launcher" box unticked, the game starts at once; -Launcher, or holding Shift
+# while this starts, shows it again. -NoLauncher skips it.
+#
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
 # victory-settings.txt in the repository's folder and is applied here at every start, over the options above;
 # delete that file to go back to them.
@@ -44,6 +48,11 @@ param(
     # Every shader and the loading pipelines made first (`victory preload`), then the game; the F1 menu's
     # PRELOAD SHADERS starts this again with it.
     [switch]$Preload,
+    # The launcher window before the game: shown unless its box is unticked (-Launcher: shown anyway), or skipped.
+    [switch]$Launcher,
+    [switch]$NoLauncher,
+    # The launcher starts building the shaders at once (it asks for this after settings were saved in it).
+    [switch]$BuildShaders,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -58,6 +67,16 @@ if (Test-Path -LiteralPath $menuFile) {
     foreach ($line in Get-Content -LiteralPath $menuFile) {
         if ($line -match '^\s*(VICTORY_[A-Z0-9_]+)\s*=(.*)$') { $menu[$Matches[1]] = $Matches[2].Trim() }
     }
+}
+# The launcher window (below): shown unless its box was unticked; -Launcher or Shift held shows it anyway. It shows
+# what this start uses, so with it what the file saved also goes over -More's switches of the same name (a
+# shortcut's fixed choices): what it shows is what starts.
+$shift = $false
+try { Add-Type -AssemblyName System.Windows.Forms; $shift = [bool]([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Shift) } catch {}
+$showLauncher = -not $NoLauncher -and ($Launcher -or $shift -or $menu['VICTORY_MENU_LAUNCHER'] -ne '0')
+if ($showLauncher) {
+    $More = @{} + $More
+    foreach ($k in $menu.Keys) { $More.Remove($k) }
 }
 $fpsWanted = $Fps
 if ($menu.Contains('VICTORY_MENU_CONSOLE')) { $SeriesS = $menu['VICTORY_MENU_CONSOLE'] -eq 'series-s' }
@@ -155,7 +174,10 @@ $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
+# For the launcher: the game it builds shaders for, and whether to start that at once.
+$settings.VICTORY_MENU_EXE = $Exe
+if ($BuildShaders) { $settings.VICTORY_LAUNCHER_BUILD = '1' }
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build -NoLauncher$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
@@ -174,6 +196,34 @@ if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+
+# The launcher window, with this start's settings in the environment (it reads them as the F1 menu does, and saves
+# to the same file). Its exit code: 0 play, 1 closed, 3 preload then play, 4 settings reset (shown again), 5 build
+# the shaders in it with the settings just saved (shown again, building). For these this script starts again, so
+# that what it saved is read as above; anything else (an older victory.exe without it) goes on to the game.
+if ($showLauncher) {
+    Push-Location $repo
+    try { & $victory launcher } finally { Pop-Location }
+    $picked = $LASTEXITCODE
+    if ($picked -eq 1) { return }
+    if ($picked -in 0, 3, 4, 5) {
+        $again = @{} + $PSBoundParameters
+        'Launcher', 'NoLauncher', 'Preload', 'BuildShaders' | ForEach-Object { $again.Remove($_) }
+        if ($picked -in 4, 5) { $again.Launcher = $true } else { $again.NoLauncher = $true }
+        if ($picked -eq 5) { $again.BuildShaders = $true }
+        if ($picked -eq 3) { $again.Preload = $true }
+        # What the launcher saved goes over -More's switches of the same name (a shortcut's fixed choices).
+        if ($again.More -and (Test-Path -LiteralPath $menuFile)) {
+            $more = @{} + $again.More
+            foreach ($line in Get-Content -LiteralPath $menuFile) {
+                if ($line -match '^\s*(VICTORY_[A-Z0-9_]+)\s*=') { $more.Remove($Matches[1]) }
+            }
+            $again.More = $more
+        }
+        & $MyInvocation.MyCommand.Path @again
+        return
+    }
+}
 
 $logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
 $log = Join-Path $logs ('victory-nvidia-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))

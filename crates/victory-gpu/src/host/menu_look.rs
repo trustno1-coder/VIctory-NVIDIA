@@ -51,9 +51,27 @@ pub struct Page<'a> {
 /// Colours, sRGB 0 to 1.
 const BACK_LEFT: [f32; 3] = [0.25, 0.10, 0.33];
 const BACK_RIGHT: [f32; 3] = [0.62, 0.30, 0.58];
-const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
-const INK: [f32; 3] = [0.20, 0.07, 0.26];
+pub(super) const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
+pub(super) const INK: [f32; 3] = [0.20, 0.07, 0.26];
 const SOFT: [f32; 3] = [0.88, 0.80, 0.90];
+
+/// Where the parts of a drawn page are, in pixels (left, top, right, bottom), for a mouse.
+#[derive(Default)]
+pub struct Hits {
+    pub tabs: Vec<[i32; 4]>,
+    /// The Q and E boxes: the previous and the next tab.
+    pub prev: [i32; 4],
+    pub next: [i32; 4],
+    /// The rows shown: the row's index in `Page::rows`, the whole row, and its "<" and ">" (or toggle) ends.
+    pub rows: Vec<(usize, [i32; 4], [i32; 4], [i32; 4])>,
+    pub actions: Vec<[i32; 4]>,
+}
+
+impl Hits {
+    pub fn inside(r: [i32; 4], x: i32, y: i32) -> bool {
+        x >= r[0] && x < r[2] && y >= r[1] && y < r[3]
+    }
+}
 
 /// The rows that fit in the list.
 pub const ROWS: usize = 9;
@@ -62,10 +80,10 @@ const LIST_TOP: f32 = 138.0;
 const LIST_LEFT: f32 = 24.0;
 const LIST_RIGHT: f32 = 760.0;
 
-struct Canvas {
+pub(super) struct Canvas {
     w: i32,
     h: i32,
-    s: f32,
+    pub(super) s: f32,
     /// BGRX pixels, top-down, as GDI writes them.
     bits: *mut u32,
     dc: HDC,
@@ -73,7 +91,7 @@ struct Canvas {
 }
 
 impl Canvas {
-    fn new(w: u32, h: u32, s: f32) -> Option<Canvas> {
+    pub(super) fn new(w: u32, h: u32, s: f32) -> Option<Canvas> {
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -103,13 +121,13 @@ impl Canvas {
         }
     }
 
-    fn pixels(&mut self) -> &mut [u32] {
+    pub(super) fn pixels(&mut self) -> &mut [u32] {
         // SAFETY: the DIB section holds w * h pixels while the canvas lives.
         unsafe { std::slice::from_raw_parts_mut(self.bits, (self.w * self.h) as usize) }
     }
 
     /// `rgb` over the pixel at `at` by `alpha`.
-    fn blend(&mut self, x: i32, y: i32, rgb: [f32; 3], alpha: f32) {
+    pub(super) fn blend(&mut self, x: i32, y: i32, rgb: [f32; 3], alpha: f32) {
         if x < 0 || y < 0 || x >= self.w || y >= self.h || alpha <= 0.0 {
             return;
         }
@@ -136,7 +154,7 @@ impl Canvas {
 
     /// A rectangle (in units) whose colour fades from `left` at `alpha_left`
     /// to `alpha_right` across it.
-    fn bar(&mut self, (x0, y0, x1, y1): (f32, f32, f32, f32), rgb: [f32; 3], alpha_left: f32, alpha_right: f32) {
+    pub(super) fn bar(&mut self, (x0, y0, x1, y1): (f32, f32, f32, f32), rgb: [f32; 3], alpha_left: f32, alpha_right: f32) {
         flush();
         let s = self.s;
         let (px0, px1) = ((x0 * s).round() as i32, (x1 * s).round() as i32);
@@ -151,14 +169,14 @@ impl Canvas {
     }
 
     /// A line one pixel high (at least), in units.
-    fn rule(&mut self, x0: f32, x1: f32, y: f32, alpha: f32) {
+    pub(super) fn rule(&mut self, x0: f32, x1: f32, y: f32, alpha: f32) {
         let thick = (self.s).max(1.0);
         self.bar((x0, y, x1, y + thick / self.s), WHITE, alpha, alpha);
     }
 
     /// A rounded rectangle with smoothed edges, filled (or only its outline,
     /// `line` wide, in units).
-    fn round_rect(&mut self, (x0, y0, x1, y1): (f32, f32, f32, f32), radius: f32, rgb: [f32; 3], alpha: f32, line: Option<f32>) {
+    pub(super) fn round_rect(&mut self, (x0, y0, x1, y1): (f32, f32, f32, f32), radius: f32, rgb: [f32; 3], alpha: f32, line: Option<f32>) {
         flush();
         let s = self.s;
         let (x0, y0, x1, y1, r) = (x0 * s, y0 * s, x1 * s, y1 * s, radius * s);
@@ -179,12 +197,12 @@ impl Canvas {
         }
     }
 
-    fn circle(&mut self, cx: f32, cy: f32, radius: f32, rgb: [f32; 3]) {
+    pub(super) fn circle(&mut self, cx: f32, cy: f32, radius: f32, rgb: [f32; 3]) {
         self.round_rect((cx - radius, cy - radius, cx + radius, cy + radius), radius, rgb, 1.0, None);
     }
 
     /// `text` in `font`, its left (or, with `right`, its right) edge at `x` and its middle at `y` (units).
-    fn text(&mut self, font: &Font, text: &str, x: f32, y: f32, rgb: [f32; 3], right: bool) -> f32 {
+    pub(super) fn text(&mut self, font: &Font, text: &str, x: f32, y: f32, rgb: [f32; 3], right: bool) -> f32 {
         let wide: Vec<u16> = text.encode_utf16().collect();
         let mut size = SIZE::default();
         // SAFETY: our DC and font; plain GDI text calls.
@@ -201,7 +219,7 @@ impl Canvas {
     }
 
     /// `text` wrapped into the box (units), from its top.
-    fn paragraph(&mut self, font: &Font, text: &str, (x0, y0, x1, y1): (f32, f32, f32, f32), rgb: [f32; 3]) -> f32 {
+    pub(super) fn paragraph(&mut self, font: &Font, text: &str, (x0, y0, x1, y1): (f32, f32, f32, f32), rgb: [f32; 3]) -> f32 {
         let mut wide: Vec<u16> = text.encode_utf16().collect();
         let s = self.s;
         let mut rect = RECT { left: (x0 * s) as i32, top: (y0 * s) as i32, right: (x1 * s) as i32, bottom: (y1 * s) as i32 };
@@ -226,12 +244,17 @@ impl Drop for Canvas {
     }
 }
 
-struct Font(HFONT);
+pub(super) struct Font(HFONT);
 
 impl Font {
     /// Bahnschrift at `px` units high and `weight` (400 regular, 600 semibold), smoothed.
-    fn new(px: f32, s: f32, weight: i32) -> Font {
-        let face: Vec<u16> = "Bahnschrift".encode_utf16().chain(Some(0)).collect();
+    pub(super) fn new(px: f32, s: f32, weight: i32) -> Font {
+        Font::face("Bahnschrift", px, s, weight)
+    }
+
+    /// `face` at `px` units high and `weight`, smoothed.
+    pub(super) fn face(face: &str, px: f32, s: f32, weight: i32) -> Font {
+        let face: Vec<u16> = face.encode_utf16().chain(Some(0)).collect();
         // SAFETY: plain font creation; the face name is terminated.
         let font = unsafe {
             CreateFontW(
@@ -265,18 +288,18 @@ impl Drop for Font {
 }
 
 /// GDI may hold text back; the pixels are written directly after it.
-fn flush() {
+pub(super) fn flush() {
     // SAFETY: a plain call.
     unsafe {
         let _ = GdiFlush();
     }
 }
 
-fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+pub(super) fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
 }
 
-fn pack(rgb: [f32; 3]) -> u32 {
+pub(super) fn pack(rgb: [f32; 3]) -> u32 {
     let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
     c(rgb[0]) << 16 | c(rgb[1]) << 8 | c(rgb[2])
 }
@@ -286,9 +309,11 @@ fn colorref(rgb: [f32; 3]) -> COLORREF {
     COLORREF(c(rgb[0]) | c(rgb[1]) << 8 | c(rgb[2]) << 16)
 }
 
-/// Draws `page` at scale `s`: its pixels as 0x00RRGGBB, top-down, `size(s)`.
-pub fn draw(page: &Page, s: f32) -> Option<Vec<u32>> {
+/// Draws `page` at scale `s`: its pixels as 0x00RRGGBB, top-down, `size(s)`, and where its parts are.
+pub fn draw_with_hits(page: &Page, s: f32) -> Option<(Vec<u32>, Hits)> {
     let (w, h) = size(s);
+    let mut hits = Hits::default();
+    let px = |(x0, y0, x1, y1): (f32, f32, f32, f32)| [(x0 * s) as i32, (y0 * s) as i32, (x1 * s).ceil() as i32, (y1 * s).ceil() as i32];
     let mut c = Canvas::new(w, h, s)?;
     let (title, tab_font, row_font, small, heading) =
         (Font::new(40.0, s, 600), Font::new(19.0, s, 600), Font::new(22.0, s, 400), Font::new(16.0, s, 400), Font::new(26.0, s, 600));
@@ -302,10 +327,12 @@ pub fn draw(page: &Page, s: f32) -> Option<Vec<u32>> {
     c.round_rect((x - 6.0, tab_y0 + 6.0, x + 24.0, tab_y1 - 6.0), 4.0, WHITE, 0.9, None);
     let q = c.text(&small, "Q", -10_000.0, -10_000.0, INK, false);
     c.text(&small, "Q", x + 9.0 - q / 2.0, (tab_y0 + tab_y1) / 2.0, INK, false);
+    hits.prev = px((x - 6.0, tab_y0, x + 24.0, tab_y1));
     x += 38.0;
     for (i, name) in page.tabs.iter().enumerate() {
         let probe = c.text(&tab_font, name, -10_000.0, -10_000.0, WHITE, false);
         let (x0, x1) = (x, x + probe + 28.0);
+        hits.tabs.push(px((x0, tab_y0, x1, tab_y1)));
         if i == page.tab {
             c.bar((x0, tab_y0, x1, tab_y1), WHITE, 1.0, 1.0);
             c.text(&tab_font, name, x0 + 14.0, (tab_y0 + tab_y1) / 2.0, INK, false);
@@ -320,13 +347,25 @@ pub fn draw(page: &Page, s: f32) -> Option<Vec<u32>> {
     c.round_rect((x + 8.0, tab_y0 + 6.0, x + 38.0, tab_y1 - 6.0), 4.0, WHITE, 0.9, None);
     let e = c.text(&small, "E", -10_000.0, -10_000.0, INK, false);
     c.text(&small, "E", x + 23.0 - e / 2.0, (tab_y0 + tab_y1) / 2.0, INK, false);
+    hits.next = px((x + 8.0, tab_y0, x + 38.0, tab_y1));
     c.rule(LIST_LEFT, width - 24.0, 124.0, 0.55);
 
     // The list.
     let shown = page.rows.iter().enumerate().skip(page.first).take(ROWS);
-    for (n, (_, row)) in shown.enumerate() {
+    for (n, (index, row)) in shown.enumerate() {
         let y0 = LIST_TOP + n as f32 * ROW_H;
         let mid = y0 + ROW_H / 2.0;
+        let (less, more) = match row.value {
+            Value::Toggle(_) => ((LIST_RIGHT - 110.0, LIST_RIGHT), (LIST_RIGHT - 110.0, LIST_RIGHT)),
+            Value::Pick(..) => ((LIST_RIGHT - 56.0, LIST_RIGHT - 30.0), (LIST_RIGHT - 30.0, LIST_RIGHT)),
+            Value::Plain => ((0.0, 0.0), (0.0, 0.0)),
+        };
+        hits.rows.push((
+            index,
+            px((LIST_LEFT, y0, LIST_RIGHT, y0 + ROW_H)),
+            px((less.0, y0, less.1, y0 + ROW_H)),
+            px((more.0, y0, more.1, y0 + ROW_H)),
+        ));
         if row.picked {
             // A white bar fading out to the right, as the title's own menus have it.
             c.bar((LIST_LEFT, y0 + 1.0, LIST_RIGHT, y0 + ROW_H - 1.0), WHITE, 1.0, 0.25);
@@ -386,6 +425,7 @@ pub fn draw(page: &Page, s: f32) -> Option<Vec<u32>> {
         let probe = c.text(&tab_font, name, -10_000.0, -10_000.0, WHITE, false);
         let (x0, x1) = (x, x + probe + 32.0);
         let (y0, y1) = (action_y - 19.0, action_y + 19.0);
+        hits.actions.push(px((x0, y0, x1, y1)));
         if page.action == Some(i) {
             c.round_rect((x0, y0, x1, y1), 19.0, WHITE, 1.0, None);
             c.text(&tab_font, name, x0 + 16.0, action_y, INK, false);
@@ -405,5 +445,5 @@ pub fn draw(page: &Page, s: f32) -> Option<Vec<u32>> {
     unsafe {
         let _ = GdiFlush();
     }
-    Some(c.pixels().iter().map(|p| p & 0x00FF_FFFF).collect())
+    Some((c.pixels().iter().map(|p| p & 0x00FF_FFFF).collect(), hits))
 }

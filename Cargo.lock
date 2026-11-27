@@ -639,6 +639,7 @@ dependencies = [
  "victory-core",
  "victory-formats",
  "victory-game",
+ "victory-gpu",
  "victory-hle",
  "victory-loader",
  "victory-pe",

@@ -316,6 +316,11 @@ enum Command {
     Play(play::Play),
     /// Fetch NVIDIA's DLSS and frame generation files from NVIDIA's GitHub
     /// (about 70 MB) to where `play` looks for them.
+    /// The launcher's window (`scripts\play-foxhound.ps1` shows it before the
+    /// game): Play, the F1 menu's settings, an update check. Its exit code: 0
+    /// play, 1 closed, 3 preload and play, 4 show it again.
+    #[cfg(windows)]
+    Launcher,
     #[cfg(windows)]
     GetDlss,
     /// Fetch AMD's FSR 3 frame generation files from AMD's GitHub (about
@@ -498,6 +503,10 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),
         #[cfg(windows)]
+        Command::Launcher => {
+            save_folders_for_launcher();
+            std::process::exit(victory_gpu::launcher())
+        }
         Command::GetDlss => play::get_dlss(),
         #[cfg(windows)]
         Command::GetFsr => play::get_fsr(),
@@ -589,6 +598,26 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+/// The save folders the game's start sets (`run`: `<data>\<title id>`, and `Saves` beside the
+/// game), set for the launcher too, so its settings page exports and imports saves as F1 does.
+/// The game is `VICTORY_MENU_EXE`, as the script gives it; an import is put in place when the
+/// game starts, as after F1's restart.
+#[cfg(windows)]
+fn save_folders_for_launcher() {
+    let Some(exe) = std::env::var_os("VICTORY_MENU_EXE").map(PathBuf::from) else { return };
+    let Some(game) = exe.parent() else { return };
+    let manifest = std::fs::read_to_string(game.join("MicrosoftGame.config")).unwrap_or_default();
+    let title = victory_hle::runtime::Title::from_manifest(&manifest);
+    let Ok(cfg) = victory_core::Config::load() else { return };
+    let Ok(storage) = cfg.data_subdir(&format!("{:08X}/storage", title.id)) else { return };
+    let Some(data) = storage.parent() else { return };
+    // SAFETY: set before the launcher's window and threads start.
+    unsafe {
+        std::env::set_var("VICTORY_SAVE_DATA", data);
+        std::env::set_var("VICTORY_SAVE_SHARE", game.join("Saves"));
+    }
 }
 
 #[cfg(test)]
