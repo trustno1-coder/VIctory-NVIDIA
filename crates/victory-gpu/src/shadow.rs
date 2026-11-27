@@ -3389,10 +3389,8 @@ impl Shadow {
                 .collect()
         };
         for shadow in before {
-            let from = address.max(shadow.start);
-            let to = (address + len).min(shadow.start + shadow.len);
-            if from < to {
-                f(&shadow, from, to - from);
+            if let Some((from, bytes)) = overlap(address, len, shadow.start, shadow.len) {
+                f(&shadow, from, bytes);
             }
         }
     }
@@ -5585,6 +5583,14 @@ fn grid(kb: Option<u64>) -> u64 {
     }
 }
 
+/// The part (start, bytes) of `[address, address + len)` that lies in
+/// `[start, start + bytes)`, if any does.
+fn overlap(address: u64, len: u64, start: u64, bytes: u64) -> Option<(u64, u64)> {
+    let from = address.max(start);
+    let to = (address + len).min(start + bytes);
+    (from < to).then(|| (from, to - from))
+}
+
 /// The window (start, bytes) of title memory for an ask of `[address,
 /// end)` on a grid of `grid` bytes.
 fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
@@ -5963,6 +5969,24 @@ fn grown_extent(address: u64, reach: u64, now: Option<(u64, u64)>) -> (u64, u64)
     }
 }
 
+/// Of the windows in `map`, by (start, bytes), the one that begins in
+/// `cell` at or below `address` and holds `[address, reach)`.
+fn holding_in<T: Clone>(map: &BTreeMap<(u64, u64), T>, cell: u64, address: u64, reach: u64) -> Option<T> {
+    map.range((cell, 0)..=(address, u64::MAX))
+        .rev()
+        .find(|&(&(start, len), _)| start <= address && start + len >= reach)
+        .map(|(_, window)| window.clone())
+}
+
+/// The chain of the window that takes the place of `old`: those of `old`'s
+/// chain `before` that are still held, then `old`.
+fn chained<T>(before: &[std::sync::Weak<T>], old: &Arc<T>) -> Vec<std::sync::Weak<T>> {
+    let mut chain = before.to_vec();
+    chain.retain(|w| w.strong_count() > 0);
+    chain.push(Arc::downgrade(old));
+    chain
+}
+
 /// [`loose`] with [`grow`]: the window of the ask's cell, grown first if it
 /// does not hold the ask.
 fn grown(address: u64, end: u64, unsized_ask: bool, note: &dyn Fn(&Shadow)) -> Option<Arc<Shadow>> {
@@ -5975,18 +5999,12 @@ fn grown(address: u64, end: u64, unsized_ask: bool, note: &dyn Fn(&Shadow)) -> O
     // made on the first would show a window nothing brings up to date (it
     // was not taken over). One window per cell, changed only by a takeover;
     // memory at a cell's line may be in two windows.
-    let holding = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
-        map.range((cell, 0)..=(address, u64::MAX))
-            .rev()
-            .find(|&(&(start, len), _)| start <= address && start + len >= reach)
-            .map(|(_, shadow)| shadow.clone())
-    };
-    if let Some(shadow) = holding(&LOOSE.read().unwrap_or_else(|e| e.into_inner())) {
+    if let Some(shadow) = holding_in(&LOOSE.read().unwrap_or_else(|e| e.into_inner()), cell, address, reach) {
         note(&shadow);
         return Some(shadow);
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = holding(&map) {
+    if let Some(shadow) = holding_in(&map, cell, address, reach) {
         note(&shadow);
         return Some(shadow);
     }
@@ -6000,9 +6018,7 @@ fn grown(address: u64, end: u64, unsized_ask: bool, note: &dyn Fn(&Shadow)) -> O
         map.remove(&key);
         // A copy, not taken: a thread that got `old` from `find` before
         // this may still bring it up to date, and must forward to them.
-        let mut before = old.before_me.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        before.retain(|w| w.strong_count() > 0);
-        before.push(Arc::downgrade(&old));
+        let before = chained(&old.before_me.lock().unwrap_or_else(|e| e.into_inner()), &old);
         *shadow.before_me.lock().unwrap_or_else(|e| e.into_inner()) = before;
         if !old.taken_over.swap(true, Ordering::Relaxed) {
             let mut taken = TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner());
@@ -6140,9 +6156,11 @@ mod write_combined_tests {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        GROW_STEP, WINDOW, cover, default_card_limits_mb, grid, grown_extent, holder, longest_tail,
-        resolve_card_limits, tail_of, window_of,
+        GROW_STEP, WINDOW, chained, cover, default_card_limits_mb, grid, grown_extent, holder, holding_in,
+        longest_tail, overlap, resolve_card_limits, tail_of, window_of,
     };
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Weak};
 
     /// A growing window holds what was asked on 256 KiB steps, takes in the
     /// cell's window it replaces, and reaches the cell's end for an ask
@@ -6160,6 +6178,97 @@ mod window_tests {
         assert_eq!(grown_extent(cell + 0x30_0000, cell + WINDOW, now), (cell + 0x4_0000, cell + WINDOW));
         // An ask that runs into the next cell keeps going past it.
         assert_eq!(grown_extent(cell + 0x3f_0000, cell + WINDOW + 0x100, None), (cell + 0x3c_0000, cell + WINDOW + GROW_STEP));
+    }
+
+    /// Only the window that begins in the ask's cell is given, even when one
+    /// of the cell below reaches far enough to hold the ask.
+    #[test]
+    fn a_window_of_the_cell_below_does_not_hold_the_ask() {
+        let cell = 0xd_1200_0000u64;
+        // From the cell below, to 512 KiB into this one.
+        let map = BTreeMap::from([((cell - 0x4_0000, 0xc_0000), 1u32)]);
+        assert_eq!(holding_in(&map, cell, cell + 0x1_0000, cell + 0x2_0000), None);
+    }
+
+    #[test]
+    fn the_cells_window_holds_an_ask_only_up_to_its_end() {
+        let cell = 0xd_1200_0000u64;
+        let map = BTreeMap::from([((cell + 0x4_0000, 0x4_0000), 2u32)]);
+        assert_eq!(holding_in(&map, cell, cell + 0x5_0000, cell + 0x6_0000), Some(2));
+        // To its last byte, and from its first.
+        assert_eq!(holding_in(&map, cell, cell + 0x4_0000, cell + 0x8_0000), Some(2));
+        // Past its end.
+        assert_eq!(holding_in(&map, cell, cell + 0x7_0000, cell + 0x8_0001), None);
+        // Below its start.
+        assert_eq!(holding_in(&map, cell, cell + 0x3_0000, cell + 0x5_0000), None);
+    }
+
+    /// An ask without a length reaches the cell's end: the cell's window that
+    /// already goes past it holds the ask.
+    #[test]
+    fn a_window_past_the_cells_end_holds_an_ask_without_a_length() {
+        let cell = 0xd_1200_0000u64;
+        let map = BTreeMap::from([((cell + 0x3c_0000, 0x8_0000), 3u32)]);
+        assert_eq!(holding_in(&map, cell, cell + 0x3d_0000, cell + WINDOW), Some(3));
+    }
+
+    /// W1, then W2 for an ask above it, then W3 for one below: each new
+    /// window holds the one it takes the place of.
+    #[test]
+    fn each_grown_window_holds_the_one_before() {
+        let cell = 0xd_1200_0000u64;
+        let bytes = |(from, to): (u64, u64)| (from, to - from);
+        let holds = |(from, to): (u64, u64), (start, len): (u64, u64)| from <= start && to >= start + len;
+        let first = grown_extent(cell + 0x11_0000, cell + 0x12_0000, None);
+        assert_eq!(first, (cell + 0x10_0000, cell + 0x14_0000));
+        let second = grown_extent(cell + 0x21_0000, cell + 0x22_0000, Some(bytes(first)));
+        assert_eq!(second, (cell + 0x10_0000, cell + 0x24_0000));
+        assert!(holds(second, bytes(first)));
+        let third = grown_extent(cell + 0x5_0000, cell + 0x6_0000, Some(bytes(second)));
+        assert_eq!(third, (cell + 0x4_0000, cell + 0x24_0000));
+        assert!(holds(third, bytes(second)));
+        assert!(holds(third, bytes(first)));
+    }
+
+    #[test]
+    fn overlap_is_the_part_both_ranges_have() {
+        // Against [0x1000, 0x3000).
+        let part = |address, len| overlap(address, len, 0x1000, 0x2000);
+        assert_eq!(part(0x1800, 0x800), Some((0x1800, 0x800)), "inside");
+        assert_eq!(part(0x800, 0x1000), Some((0x1000, 0x800)), "across its start");
+        assert_eq!(part(0x2800, 0x1000), Some((0x2800, 0x800)), "across its end");
+        assert_eq!(part(0x5000, 0x1000), None, "apart");
+        assert_eq!(part(0, 0x800), None, "apart, below");
+        assert_eq!(part(0, 0x1000), None, "touching its start");
+        assert_eq!(part(0x3000, 0x1000), None, "touching its end");
+    }
+
+    #[test]
+    fn a_chain_drops_the_windows_gone_and_ends_with_the_old_one() {
+        let (held, gone, old) = (Arc::new(1u32), Arc::new(2u32), Arc::new(3u32));
+        let before = vec![Arc::downgrade(&gone), Arc::downgrade(&held)];
+        drop(gone);
+        let chain = chained(&before, &old);
+        let values: Vec<u32> = chain.iter().filter_map(Weak::upgrade).map(|v| *v).collect();
+        assert_eq!(values, [1, 3]);
+        assert_eq!(chain.len(), 2);
+        // The list it started from is as it was.
+        assert_eq!(before.len(), 2);
+        assert!(before[0].upgrade().is_none());
+        assert!(Weak::ptr_eq(&before[1], &Arc::downgrade(&held)));
+        // The chain holds nothing.
+        assert_eq!(Arc::strong_count(&old), 1);
+    }
+
+    #[test]
+    fn a_chain_of_three_keeps_their_order() {
+        let (first, second, third) = (Arc::new(1u32), Arc::new(2u32), Arc::new(3u32));
+        let of_second = chained(&[], &first);
+        let of_third = chained(&of_second, &second);
+        let of_fourth = chained(&of_third, &third);
+        let values: Vec<u32> = of_fourth.iter().filter_map(Weak::upgrade).map(|v| *v).collect();
+        assert_eq!(values, [1, 2, 3]);
+        assert_eq!((of_second.len(), of_third.len()), (1, 2));
     }
 
     #[test]
