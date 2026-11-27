@@ -321,30 +321,36 @@ static CHECKING: AtomicBool = AtomicBool::new(false);
 /// title's imports are bound. Fails soft: what is not there is logged and
 /// left off.
 pub fn init(asked: &Asked) -> Available {
-    let mut files_missing = false;
-    let available = if !asked.any() {
-        Available::default()
+    let outcome = if !asked.any() {
+        InitOutcome::default()
     } else {
         match load_and_init(asked, true) {
-            Ok(available) => available,
+            Ok(outcome) => outcome,
             Err(why) => {
                 tracing::warn!(
                     folder = %asked.dir.display(),
                     "Streamline: {why}; DLSS and frame generation stay off, the title's own upscaling and our present run"
                 );
-                files_missing = true;
-                Available::default()
+                InitOutcome {
+                    available: Available::default(),
+                    no_dlss: asked.dlss.then_some(NoDlss::FilesMissing),
+                    no_dlss_fg: asked.framegen.then_some(NoDlssFg::FilesMissing),
+                }
             }
         }
     };
+    let available = outcome.available;
     let no_dlss = if available.dlss {
         None
     } else if !asked.dlss {
         Some(NoDlss::TurnedOff)
-    } else if files_missing {
-        Some(NoDlss::FilesMissing)
     } else {
-        Some(NoDlss::Card)
+        outcome.no_dlss.or(Some(NoDlss::Card))
+    };
+    let no_dlss_fg = if available.framegen || !asked.framegen {
+        None
+    } else {
+        outcome.no_dlss_fg.or(Some(NoDlssFg::Card))
     };
     // FSR 3 frame generation needs the title's upscaling to run: on Series X that is DLSS's
     // (the title's own FidelityFX takes the Series S sizes only, and the title fails without it).
@@ -359,7 +365,7 @@ pub fn init(asked: &Asked) -> Available {
         adapter: default_adapter().map(|a| a.0).unwrap_or_default(),
         series_s: asked.series_s,
         no_dlss,
-        files_missing,
+        no_dlss_fg,
         dlss_fg_asked: asked.framegen,
         dlss_fg_supported: available.framegen,
         fsr_asked: asked.fsr_framegen,
@@ -369,14 +375,23 @@ pub fn init(asked: &Asked) -> Available {
     Available { fsr_framegen, ..available }
 }
 
+/// What [`load_and_init`] found out: what is available, and why anything asked
+/// for was declined.
+#[derive(Default)]
+struct InitOutcome {
+    available: Available,
+    no_dlss: Option<NoDlss>,
+    no_dlss_fg: Option<NoDlssFg>,
+}
+
 /// What the start found out about frame generation on this card ([`notice`]).
 struct Facts {
     adapter: String,
     series_s: bool,
     /// Why DLSS upscaling is not running (`None`: it runs).
     no_dlss: Option<NoDlss>,
-    /// Streamline's files did not load (nothing is known of the card).
-    files_missing: bool,
+    /// Why DLSS Frame Generation is not running (`None`: not asked or supported).
+    no_dlss_fg: Option<NoDlssFg>,
     dlss_fg_asked: bool,
     dlss_fg_supported: bool,
     fsr_asked: bool,
@@ -385,15 +400,70 @@ struct Facts {
 }
 
 /// Why DLSS upscaling is not running: the notice must not blame a card that
-/// has DLSS when it was only turned off or its files were not found.
+/// has DLSS when it was only turned off, its files were not found, or the
+/// driver/OS is too old.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NoDlss {
     /// Not asked (F1 > DLSS > OFF, or VICTORY_DLSS unset).
     TurnedOff,
     /// Asked, but Streamline's files did not load.
     FilesMissing,
+    /// Driver is too old (`sl::Result::eErrorDriverOutOfDate`).
+    DriverOutOfDate,
+    /// Windows version is too old (`sl::Result::eErrorOSOutOfDate`).
+    OsOutOfDate,
     /// Asked and loaded, and the card does not support it.
     Card,
+    /// Asked and loaded, and Streamline declined it for another reason.
+    Other(i32),
+}
+
+impl NoDlss {
+    fn from_code(code: Option<i32>) -> Self {
+        match code {
+            Some(abi::RESULT_DRIVER_OUT_OF_DATE) => Self::DriverOutOfDate,
+            Some(abi::RESULT_OS_OUT_OF_DATE) => Self::OsOutOfDate,
+            Some(abi::RESULT_NO_SUPPORTED_ADAPTER_FOUND | abi::RESULT_ADAPTER_NOT_SUPPORTED | abi::RESULT_FEATURE_NOT_SUPPORTED) | None => {
+                Self::Card
+            }
+            Some(other) => Self::Other(other),
+        }
+    }
+}
+
+/// Why DLSS Frame Generation is not running: the notice must not tell an RTX
+/// 40/50 owner "not on this card" when Windows HAGS is off or the driver/OS
+/// needs an update.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NoDlssFg {
+    /// Streamline's files did not load.
+    FilesMissing,
+    /// Submission line (`VICTORY_THIN=1` or `VICTORY_ASYNC_SUBMIT=1`) is off.
+    NeedsSubmissionLine,
+    /// Windows Hardware-accelerated GPU Scheduling (HAGS) is off (`code 4`).
+    HardwareSchedulingOff,
+    /// NVIDIA driver is too old (`code 2`).
+    DriverOutOfDate,
+    /// Windows version is too old (`code 3`).
+    OsOutOfDate,
+    /// The GPU does not support DLSS Frame Generation (`codes 6, 7, 32`).
+    Card,
+    /// Another Streamline error (see log).
+    Other(i32),
+}
+
+impl NoDlssFg {
+    fn from_code(code: Option<i32>) -> Self {
+        match code {
+            Some(abi::RESULT_OS_DISABLED_HWS) => Self::HardwareSchedulingOff,
+            Some(abi::RESULT_DRIVER_OUT_OF_DATE) => Self::DriverOutOfDate,
+            Some(abi::RESULT_OS_OUT_OF_DATE) => Self::OsOutOfDate,
+            Some(abi::RESULT_NO_SUPPORTED_ADAPTER_FOUND | abi::RESULT_ADAPTER_NOT_SUPPORTED | abi::RESULT_FEATURE_NOT_SUPPORTED) | None => {
+                Self::Card
+            }
+            Some(other) => Self::Other(other),
+        }
+    }
 }
 
 static FACTS: OnceLock<Facts> = OnceLock::new();
@@ -428,11 +498,21 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
     // A card DLSS Frame Generation was asked of and did not run on.
     let no_dlss_fg = f.dlss_fg_asked && !f.dlss_fg_supported;
     if no_dlss_fg {
-        lines.push(if f.files_missing {
-            "DLSS FRAME GEN: NVIDIA DLSS FILES NOT FOUND"
-        } else {
-            "DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)"
-        }.into());
+        match f.no_dlss_fg.unwrap_or(NoDlssFg::Card) {
+            NoDlssFg::FilesMissing => lines.push("DLSS FRAME GEN: NVIDIA DLSS FILES NOT FOUND".into()),
+            NoDlssFg::HardwareSchedulingOff => {
+                lines.push("DLSS FRAME GEN: WINDOWS GPU SCHEDULING (HAGS) IS OFF".into());
+                lines.push("TURN ON IN SETTINGS > DISPLAY > GRAPHICS, RESTART PC".into());
+            }
+            NoDlssFg::DriverOutOfDate => {
+                lines.push("DLSS FRAME GEN: NVIDIA DRIVER IS OUT OF DATE".into());
+                lines.push("UPDATE YOUR NVIDIA GRAPHICS DRIVER FOR DLSS FG".into());
+            }
+            NoDlssFg::OsOutOfDate => lines.push("DLSS FRAME GEN: WINDOWS VERSION IS OUT OF DATE".into()),
+            NoDlssFg::NeedsSubmissionLine => lines.push("DLSS FRAME GEN: NEEDS VICTORY_THIN=1 (SEE THE LOG)".into()),
+            NoDlssFg::Card => lines.push("DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)".into()),
+            NoDlssFg::Other(_) => lines.push("DLSS FRAME GEN: NOT AVAILABLE (SEE THE LOG)".into()),
+        }
     }
     if dlss_live && !f.adapter.is_empty() && !dlss_framegen_card(&f.adapter) {
         // An RTX 20 or 30 with DLSS Frame Generation: a mod beside victory.exe (MFG Unlocker,
@@ -457,7 +537,10 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
         lines.push("FRAME GEN OFF: FSR 3 ON SERIES X NEEDS DLSS ON".into());
         lines.push(match f.no_dlss {
             Some(NoDlss::FilesMissing) => "NVIDIA DLSS FILES NOT FOUND (VICTORY_STREAMLINE_DIR)",
+            Some(NoDlss::DriverOutOfDate) => "NVIDIA DRIVER IS TOO OLD FOR DLSS: UPDATE IT",
+            Some(NoDlss::OsOutOfDate) => "WINDOWS VERSION IS TOO OLD FOR DLSS",
             Some(NoDlss::Card) => "THIS CARD HAS NO DLSS UPSCALING",
+            Some(NoDlss::Other(_)) => "DLSS UPSCALING DID NOT START (SEE THE LOG)",
             _ => "DLSS UPSCALING IS OFF: TURN IT ON IN F1 > DLSS",
         }.into());
         lines.push(if f.no_dlss == Some(NoDlss::Card) {
@@ -478,7 +561,7 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
     lines
 }
 
-fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String> {
+fn load_and_init(asked: &Asked, require_line: bool) -> Result<InitOutcome, String> {
     let path = std::path::absolute(asked.dir.join(INTERPOSER)).map_err(|e| e.to_string())?;
     if !path.is_file() {
         return Err(format!("no {INTERPOSER} in that folder (VICTORY_STREAMLINE_DIR)"));
@@ -535,8 +618,8 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
     }
     let adapter = default_adapter();
     let luid = adapter.as_ref().map(|a| a.1);
-    let supported = |feature: u32| -> Result<(), String> {
-        let Some(luid) = luid else { return Err("no adapter".into()) };
+    let supported = |feature: u32| -> Result<(), Option<i32>> {
+        let Some(luid) = luid else { return Err(None) };
         let info = abi::AdapterInfo {
             base: abi::BaseStructure::new(abi::ADAPTER_INFO, 1),
             device_luid: std::ptr::from_ref(&luid).cast(),
@@ -545,12 +628,29 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
         };
         // SAFETY: an adapter description that lives through the call.
         let code = unsafe { (sl.is_feature_supported)(feature, &info) };
-        if code == 0 { Ok(()) } else { Err(format!("{} ({code})", abi::result_name(code))) }
+        if code == abi::RESULT_OK { Ok(()) } else { Err(Some(code)) }
     };
-    let dlss = asked.dlss && report("DLSS Super Resolution", abi::FEATURE_DLSS, supported(abi::FEATURE_DLSS), sl);
-    let framegen = framegen_asked
-        && report("DLSS Frame Generation", abi::FEATURE_DLSS_G, supported(abi::FEATURE_DLSS_G), sl)
-        && report("Reflex", abi::FEATURE_REFLEX, supported(abi::FEATURE_REFLEX), sl);
+    let dlss_res = asked
+        .dlss
+        .then(|| report("DLSS Super Resolution", abi::FEATURE_DLSS, supported(abi::FEATURE_DLSS), sl));
+    let dlss = matches!(dlss_res, Some(Ok(())));
+    let no_dlss = match dlss_res {
+        Some(Err(code)) => Some(NoDlss::from_code(code)),
+        _ => None,
+    };
+    let (framegen, no_dlss_fg) = if !asked.framegen {
+        (false, None)
+    } else if !framegen_asked {
+        (false, Some(NoDlssFg::NeedsSubmissionLine))
+    } else {
+        match report("DLSS Frame Generation", abi::FEATURE_DLSS_G, supported(abi::FEATURE_DLSS_G), sl) {
+            Err(code) => (false, Some(NoDlssFg::from_code(code))),
+            Ok(()) => match report("Reflex", abi::FEATURE_REFLEX, supported(abi::FEATURE_REFLEX), sl) {
+                Ok(()) => (true, None),
+                Err(code) => (false, Some(NoDlssFg::from_code(code))),
+            },
+        }
+    };
     tracing::info!(
         library = %path.display(),
         sdk = "2.14.16",
@@ -562,11 +662,11 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
         "Streamline loaded (manual hooking, no downloads)"
     );
     let _ = PLAN.set(Plan { asked: asked.clone(), dlss, framegen });
-    Ok(Available { dlss, framegen, fsr_framegen: false })
+    Ok(InitOutcome { available: Available { dlss, framegen, fsr_framegen: false }, no_dlss, no_dlss_fg })
 }
 
-/// Logs whether a feature is supported, with its requirements; whether it is.
-fn report(name: &str, feature: u32, supported: Result<(), String>, sl: &Sl) -> bool {
+/// Logs whether a feature is supported, with its requirements; passes through the result.
+fn report(name: &str, feature: u32, supported: Result<(), Option<i32>>, sl: &Sl) -> Result<(), Option<i32>> {
     let mut requirements: abi::FeatureRequirements = unsafe_zeroed_requirements();
     // SAFETY: a structure to fill.
     let asked = unsafe { (sl.get_feature_requirements)(feature, &mut requirements) };
@@ -584,11 +684,15 @@ fn report(name: &str, feature: u32, supported: Result<(), String>, sl: &Sl) -> b
     match supported {
         Ok(()) => {
             tracing::info!(requirements = needs.as_deref().unwrap_or("?"), "Streamline: {name} is supported on this GPU");
-            true
+            Ok(())
         }
-        Err(why) => {
+        Err(code) => {
+            let why = match code {
+                Some(c) => format!("{} ({c})", abi::result_name(c)),
+                None => "no adapter".into(),
+            };
             tracing::warn!(requirements = needs.as_deref().unwrap_or("?"), "Streamline: {name} is not supported here: {why}");
-            false
+            Err(code)
         }
     }
 }
@@ -1756,22 +1860,19 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         let mut options = abi::DlssgOptions::new(if on { abi::DLSSG_ON } else { abi::DLSSG_OFF });
         // `VICTORY_FRAMEGEN_X=2..6`: frames shown for each one rendered (2 unless set), no more
         // than this card and driver generate (the state says how many: 5 on an RTX 50).
-        let mut generated = wanted.max(2) - 1;
-        if on
-            && generated > 1
-            && let Some(get_state) = functions.dlssg_get_state
-        {
-            let mut state = abi::DlssgState::default();
-            // SAFETY: a structure to fill, no options.
-            let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
-            let most = if code == 0 { state.num_frames_to_generate_max.max(1) } else { 1 };
-            if generated > most {
-                tracing::warn!(asked = generated + 1, given = most + 1, "DLSS Frame Generation: more frames asked than this card generates");
-                generated = most;
-            }
+        let (generated, clamped_from) = dlssg_generated_frames(on, wanted, || {
+            functions.dlssg_get_state.map_or(1, |get_state| {
+                let mut state = abi::DlssgState::default();
+                // SAFETY: a structure to fill, no options.
+                let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
+                if code == abi::RESULT_OK { state.num_frames_to_generate_max } else { 1 }
+            })
+        });
+        if let Some(asked) = clamped_from {
+            tracing::warn!(asked = asked + 1, given = generated + 1, "DLSS Frame Generation: more frames asked than this card generates");
         }
         options.num_frames_to_generate = generated;
-        FG_TIMES.store(generated + 1, Relaxed);
+        FG_TIMES.store(if on { generated + 1 } else { 1 }, Relaxed);
         options.flags = abi::DLSSG_RETAIN_RESOURCES_WHEN_OFF;
         options.num_back_buffers = 2;
         options.color_width = planes.size[0];
@@ -1779,14 +1880,21 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         options.on_error_callback = Some(present_error);
         // SAFETY: filled options for viewport 0, on the presenting thread.
         let code = unsafe { set_options(&viewport, &options) };
-        tracing::info!(frame, on, times = generated + 1, code, result = abi::result_name(code), "DLSS Frame Generation switched");
+        tracing::info!(
+            frame,
+            on,
+            times = if on { generated + 1 } else { 0 },
+            code,
+            result = abi::result_name(code),
+            "DLSS Frame Generation switched"
+        );
         // 39, "warning: out of VRAM": the options are set all the same, with the card's memory
         // past its budget. Taken as set: asked again at every present (1,828 times in one
         // run, after the menu's 3X on a full 12 GB card) it showed no generated frame at all.
-        if code == 39 {
+        if on && code == abi::RESULT_WARN_OUT_OF_VRAM {
             tracing::warn!(times = generated + 1, "DLSS Frame Generation is on with the card's memory past its budget: frames may come unevenly (the launcher leaves it room when it is on from the start)");
         }
-        if code == 0 || code == 39 {
+        if code == abi::RESULT_OK || code == abi::RESULT_WARN_OUT_OF_VRAM {
             calls.framegen_on = on;
             // What was asked (the driver may give fewer): not set again until that changes.
             calls.framegen_times = times;
@@ -1858,6 +1966,27 @@ unsafe extern "C" fn present_error(error: *const i32) {
     // SAFETY: the error for the call.
     let code = unsafe { error.as_ref() }.copied().unwrap_or(0);
     once!(warn, hresult = format_args!("{:#x}", code as u32), "DLSS Frame Generation: a present failed");
+}
+
+/// `numFramesToGenerate` for `slDLSSGSetOptions`: `1` when turning frame
+/// generation off (Streamline checks `numFramesToGenerate <= numFramesToGenerateMax`
+/// even for `DLSSG_OFF`, so passing an uncapped 3x-6x choice on an RTX 40
+/// fails with code 38 and leaves `calls.framegen_on` stuck true), and
+/// `wanted - 1` clamped to the card's `num_frames_to_generate_max` when on.
+/// Returns `(generated, clamped_from)` where `clamped_from` is `Some(asked)`
+/// if the card caps the request below what was asked.
+fn dlssg_generated_frames(on: bool, wanted: u32, max_supported: impl FnOnce() -> u32) -> (u32, Option<u32>) {
+    if !on {
+        return (1, None);
+    }
+    let asked = wanted.max(2) - 1;
+    if asked > 1 {
+        let most = max_supported().max(1);
+        if asked > most {
+            return (most, Some(asked));
+        }
+    }
+    (asked, None)
 }
 
 /// Frames shown for each one rendered with frame generation on, as asked at the start:
@@ -2024,21 +2153,28 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
     asked.dlss = true;
     // (`VICTORY_STREAMLINE_PRESENT=1` is for DLSS without frame generation.)
     asked.framegen = !asked.present_hook;
-    let available = match load_and_init(&asked, false) {
-        Ok(available) => available,
+    let outcome = match load_and_init(&asked, false) {
+        Ok(outcome) => outcome,
         Err(why) => return vec![format!("Streamline did not load from {}: {why}", asked.dir.display())],
     };
+    let available = outcome.available;
+    let fg_status = if available.framegen {
+        "supported".to_owned()
+    } else if asked.framegen {
+        match outcome.no_dlss_fg {
+            Some(NoDlssFg::HardwareSchedulingOff) => "NOT supported (Windows Hardware-accelerated GPU scheduling / HAGS is off)".to_owned(),
+            Some(NoDlssFg::DriverOutOfDate) => "NOT supported (NVIDIA driver out of date)".to_owned(),
+            Some(NoDlssFg::OsOutOfDate) => "NOT supported (Windows version out of date)".to_owned(),
+            Some(NoDlssFg::Other(code)) => format!("NOT supported ({}, code {code})", abi::result_name(code)),
+            _ => "NOT supported".to_owned(),
+        }
+    } else {
+        "not asked for (VICTORY_STREAMLINE_PRESENT=1)".to_owned()
+    };
     lines.push(format!(
-        "Streamline loaded from {}: DLSS {}, frame generation {} on this GPU",
+        "Streamline loaded from {}: DLSS {}, frame generation {fg_status} on this GPU",
         asked.dir.display(),
         if available.dlss { "supported" } else { "NOT supported" },
-        if available.framegen {
-            "supported"
-        } else if asked.framegen {
-            "NOT supported"
-        } else {
-            "not asked for (VICTORY_STREAMLINE_PRESENT=1)"
-        }
     ));
     if !device {
         return lines;

@@ -572,6 +572,16 @@ pub type SlDlssgGetState = unsafe extern "C" fn(*const ViewportHandle, *mut Dlss
 pub type SlReflexSetOptions = unsafe extern "C" fn(*const ReflexOptions) -> i32;
 pub type SlPclSetMarker = unsafe extern "C" fn(u32, *const FrameToken) -> i32;
 
+// `sl::Result` codes inspected explicitly (`result_name` lists all 40).
+pub const RESULT_OK: i32 = 0;
+pub const RESULT_DRIVER_OUT_OF_DATE: i32 = 2;
+pub const RESULT_OS_OUT_OF_DATE: i32 = 3;
+pub const RESULT_OS_DISABLED_HWS: i32 = 4;
+pub const RESULT_NO_SUPPORTED_ADAPTER_FOUND: i32 = 6;
+pub const RESULT_ADAPTER_NOT_SUPPORTED: i32 = 7;
+pub const RESULT_FEATURE_NOT_SUPPORTED: i32 = 32;
+pub const RESULT_WARN_OUT_OF_VRAM: i32 = 39;
+
 /// The name of an `sl::Result`, for the log.
 pub fn result_name(code: i32) -> &'static str {
     const NAMES: [&str; 40] = [
@@ -671,9 +681,15 @@ mod tests {
         assert_eq!((SDK_VERSION >> 32) & 0xffff, 14);
         assert_eq!((SDK_VERSION >> 16) & 0xffff, 16);
         assert_eq!(SDK_VERSION & 0xffff, 0xfedc);
-        assert_eq!(result_name(0), "ok");
+        assert_eq!(result_name(RESULT_OK), "ok");
+        assert_eq!(result_name(RESULT_DRIVER_OUT_OF_DATE), "driver out of date");
+        assert_eq!(result_name(RESULT_OS_OUT_OF_DATE), "OS out of date");
+        assert_eq!(result_name(RESULT_OS_DISABLED_HWS), "OS hardware scheduling disabled");
+        assert_eq!(result_name(RESULT_NO_SUPPORTED_ADAPTER_FOUND), "no supported adapter found");
+        assert_eq!(result_name(RESULT_ADAPTER_NOT_SUPPORTED), "adapter not supported");
         assert_eq!(result_name(26), "missing constants");
-        assert_eq!(result_name(39), "warning: out of VRAM");
+        assert_eq!(result_name(RESULT_FEATURE_NOT_SUPPORTED), "feature not supported");
+        assert_eq!(result_name(RESULT_WARN_OUT_OF_VRAM), "warning: out of VRAM");
         assert_eq!(result_name(-1), "unknown result");
     }
 }

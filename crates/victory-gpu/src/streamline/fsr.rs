@@ -881,7 +881,7 @@ mod tests {
             adapter: "NVIDIA GeForce RTX 3080".into(),
             series_s,
             no_dlss: if dlss { None } else { Some(super::super::NoDlss::Card) },
-            files_missing: false,
+            no_dlss_fg: if dlss_fg_supported { None } else { Some(super::super::NoDlssFg::Card) },
             dlss_fg_asked: true,
             dlss_fg_supported,
             fsr_asked: true,
@@ -893,7 +893,7 @@ mod tests {
     /// The start's notice: what runs and why, in lines the picture's box and font show.
     #[test]
     fn the_notice_says_what_the_card_does() {
-        use super::super::notice_of;
+        use super::super::{NoDlss, NoDlssFg, abi, dlssg_generated_frames, notice_of};
         let shown = |lines: &[String]| {
             for l in lines {
                 assert!(l.len() <= 52, "{l}");
@@ -910,6 +910,32 @@ mod tests {
         rtx40.adapter = "NVIDIA GeForce RTX 4070".into();
         let rtx40 = lines(rtx40, true, false);
         assert!(rtx40.contains("FRAME GEN: DLSS, SUPPORTED") && !rtx40.contains("MOD"), "{rtx40}");
+        // RTX 40/50 with Windows HAGS disabled (Streamline code 4): blame HAGS, not the card.
+        let mut hags_off = facts(true, false, false, false);
+        hags_off.adapter = "NVIDIA GeForce RTX 4070 Ti".into();
+        hags_off.no_dlss_fg = Some(NoDlssFg::from_code(Some(abi::RESULT_OS_DISABLED_HWS)));
+        let hags_off = lines(hags_off, false, false);
+        assert!(hags_off.contains("HAGS") && hags_off.contains("DISPLAY > GRAPHICS") && !hags_off.contains("NOT ON THIS CARD"), "{hags_off}");
+        // Outdated NVIDIA driver (code 2): tell the user to update, not "not on this card".
+        let mut old_drv = facts(true, false, false, false);
+        old_drv.adapter = "NVIDIA GeForce RTX 5070 Ti".into();
+        old_drv.no_dlss_fg = Some(NoDlssFg::from_code(Some(abi::RESULT_DRIVER_OUT_OF_DATE)));
+        let old_drv = lines(old_drv, false, false);
+        assert!(old_drv.contains("DRIVER IS OUT OF DATE") && !old_drv.contains("NOT ON THIS CARD"), "{old_drv}");
+        // Outdated Windows version (code 3): say OS is out of date.
+        let mut old_os = facts(true, false, false, false);
+        old_os.no_dlss_fg = Some(NoDlssFg::from_code(Some(abi::RESULT_OS_OUT_OF_DATE)));
+        let old_os = lines(old_os, false, false);
+        assert!(old_os.contains("WINDOWS VERSION IS OUT OF DATE") && !old_os.contains("NOT ON THIS CARD"), "{old_os}");
+        // Missing submission line or unexpected Streamline error: do not blame the card.
+        let mut no_line = facts(true, false, false, false);
+        no_line.no_dlss_fg = Some(NoDlssFg::NeedsSubmissionLine);
+        let no_line = lines(no_line, false, false);
+        assert!(no_line.contains("VICTORY_THIN=1") && !no_line.contains("NOT ON THIS CARD"), "{no_line}");
+        let mut other_err = facts(true, false, false, false);
+        other_err.no_dlss_fg = Some(NoDlssFg::from_code(Some(31)));
+        let other_err = lines(other_err, false, false);
+        assert!(other_err.contains("SEE THE LOG") && !other_err.contains("NOT ON THIS CARD"), "{other_err}");
         // RTX 20/30 with DLSS frame generation running: a mod unlocked it (MFG Unlocker).
         let unlocked = lines(facts(true, true, true, false), true, false);
         assert!(unlocked.contains("UNLOCKED BY A MOD") && !unlocked.contains("SUPPORTED HERE"), "{unlocked}");
@@ -919,14 +945,23 @@ mod tests {
         // No DLSS at all, Series X: FSR 3 needs Series S.
         let amd_x = lines(facts(false, false, false, false), false, false);
         assert!(amd_x.contains("HAS NO DLSS") && amd_x.contains("SERIES S"), "{amd_x}");
+        // DLSS refused due to outdated driver or OS: say so instead of blaming the card.
+        let mut dlss_old_drv = facts(false, false, false, false);
+        dlss_old_drv.no_dlss = Some(NoDlss::from_code(Some(abi::RESULT_DRIVER_OUT_OF_DATE)));
+        let dlss_old_drv = lines(dlss_old_drv, false, false);
+        assert!(dlss_old_drv.contains("DRIVER IS TOO OLD") && !dlss_old_drv.contains("HAS NO DLSS"), "{dlss_old_drv}");
+        let mut dlss_old_os = facts(false, false, false, false);
+        dlss_old_os.no_dlss = Some(NoDlss::from_code(Some(abi::RESULT_OS_OUT_OF_DATE)));
+        let dlss_old_os = lines(dlss_old_os, false, false);
+        assert!(dlss_old_os.contains("WINDOWS VERSION IS TOO OLD") && !dlss_old_os.contains("HAS NO DLSS"), "{dlss_old_os}");
         // A card with DLSS, only turned off: say so, not "this card".
         let mut off = facts(false, true, false, false);
-        off.no_dlss = Some(super::super::NoDlss::TurnedOff);
+        off.no_dlss = Some(NoDlss::TurnedOff);
         let off = lines(off, false, false);
         assert!(off.contains("DLSS UPSCALING IS OFF") && !off.contains("THIS CARD"), "{off}");
         let mut missing = facts(false, false, false, false);
-        missing.no_dlss = Some(super::super::NoDlss::FilesMissing);
-        missing.files_missing = true;
+        missing.no_dlss = Some(NoDlss::FilesMissing);
+        missing.no_dlss_fg = Some(NoDlssFg::FilesMissing);
         let missing = lines(missing, false, false);
         assert!(missing.contains("FILES NOT FOUND") && !missing.contains("THIS CARD"), "{missing}");
         // No DLSS, Series S: FSR 3 runs.
@@ -935,6 +970,24 @@ mod tests {
         let mut quiet = facts(true, true, true, false);
         (quiet.dlss_fg_asked, quiet.fsr_asked) = (false, false);
         assert!(notice_of(&quiet, false, false).is_empty());
+
+        // DLSS-G frame count selection: turning off always sends 1 (even with 3x-6x selected
+        // on an RTX 40), and turning on clamps 3x-6x to the card's reported max.
+        for wanted in [0, 2, 3, 4, 5, 6] {
+            let mut queried = false;
+            let got = dlssg_generated_frames(false, wanted, || {
+                queried = true;
+                1
+            });
+            assert_eq!(got, (1, None), "off with wanted={wanted}");
+            assert!(!queried, "turning off must not query get_state");
+        }
+        assert_eq!(dlssg_generated_frames(true, 2, || panic!("2x does not need get_state")), (1, None));
+        assert_eq!(dlssg_generated_frames(true, 4, || 1), (1, Some(3)));
+        assert_eq!(dlssg_generated_frames(true, 6, || 1), (1, Some(5)));
+        assert_eq!(dlssg_generated_frames(true, 4, || 3), (3, None));
+        assert_eq!(dlssg_generated_frames(true, 6, || 3), (3, Some(5)));
+        assert_eq!(dlssg_generated_frames(true, 3, || 0), (1, Some(2)));
     }
 
     #[test]
