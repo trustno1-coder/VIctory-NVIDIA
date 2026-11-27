@@ -56,13 +56,62 @@ pub(crate) fn compile_compute_by(
     }
 }
 
+/// Compiles function `entry` of `source` for `target` (a `_5_1` target:
+/// `cs_5_1`, `vs_5_1`, `ps_5_1`): the system's compiler, then DXC at the 6.0
+/// model of the same stage. For the helpers that `crate::host::compile`
+/// and others compile at run time; Wine's builtin compiler refuses many of
+/// them (the ambient light's stand-in, the card compare, the depth planes'
+/// passes, the scatter, the upload check, keeping the card awake).
+pub(crate) fn compile_for(name: &str, source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
+    match system_compile_for(name, source, entry, target) {
+        Ok(code) => Ok(code),
+        Err((e, messages)) => {
+            tracing::info!(error = %e, "{name} ({entry}, {target}): the system's HLSL compiler refused it ({}); trying DXC", messages.trim());
+            let six = target.replacen("_5_1", "_6_0", 1).replacen("_5_0", "_6_0", 1);
+            match dxc_compile_for(name, source, entry, &six) {
+                Ok(code) => {
+                    tracing::info!("{name} ({entry}): compiled by DXC as {six}");
+                    Ok(code)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "{name} ({entry}): DXC failed too (VICTORY_DXC names dxcompiler.dll or its folder)");
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+/// A blob holding `bytes`, for code that hands compiled shaders around as
+/// blobs.
+pub(crate) fn blob(bytes: &[u8]) -> windows::core::Result<ID3DBlob> {
+    // SAFETY: a blob of `bytes.len()` bytes, filled before it is handed out.
+    unsafe {
+        let blob = windows::Win32::Graphics::Direct3D::Fxc::D3DCreateBlob(bytes.len())?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), blob.GetBufferPointer().cast::<u8>(), bytes.len());
+        Ok(blob)
+    }
+}
+
 /// Compiles `source` with the system's `D3DCompile` as `cs_5_1`; on failure
 /// the error and the compiler's messages.
 pub(crate) fn system_compile(
     name: &str,
     source: &str,
 ) -> Result<Vec<u8>, (windows::core::Error, String)> {
+    system_compile_for(name, source, "main", "cs_5_1")
+}
+
+/// [`system_compile`] of function `entry` for `target` (a `_5_1` target).
+fn system_compile_for(
+    name: &str,
+    source: &str,
+    entry: &str,
+    target: &str,
+) -> Result<Vec<u8>, (windows::core::Error, String)> {
     let cname = std::ffi::CString::new(name).unwrap_or_default();
+    let centry = std::ffi::CString::new(entry).unwrap_or_default();
+    let ctarget = std::ffi::CString::new(target).unwrap_or_default();
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -73,8 +122,8 @@ pub(crate) fn system_compile(
             PCSTR(cname.as_ptr().cast()),
             None,
             None,
-            s!("main"),
-            s!("cs_5_1"),
+            PCSTR(centry.as_ptr().cast()),
+            PCSTR(ctarget.as_ptr().cast()),
             0,
             0,
             &mut code,
@@ -153,11 +202,16 @@ fn dxc_library() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
 /// Compiles compute shader `source` with DXC as `cs_6_0` (see
 /// [`dxc_library`]); `name` labels its messages.
 pub(crate) fn dxc_compile(name: &str, source: &str) -> windows::core::Result<Vec<u8>> {
+    dxc_compile_for(name, source, "main", "cs_6_0")
+}
+
+/// [`dxc_compile`] of function `entry` for `target` (a 6.x target).
+fn dxc_compile_for(name: &str, source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Dxc::{
         CLSID_DxcCompiler, DXC_CP_UTF8, DxcBuffer, IDxcCompiler3, IDxcResult,
     };
     use windows::Win32::System::LibraryLoader::GetProcAddress;
-    use windows::core::{Interface, w};
+    use windows::core::{Interface, PCWSTR, w};
     type Create = unsafe extern "system" fn(
         *const windows::core::GUID,
         *const windows::core::GUID,
@@ -179,7 +233,8 @@ pub(crate) fn dxc_compile(name: &str, source: &str) -> windows::core::Result<Vec
             Size: source.len(),
             Encoding: DXC_CP_UTF8.0,
         };
-        let arguments = [w!("-T"), w!("cs_6_0"), w!("-E"), w!("main"), w!("-O3")];
+        let (target, entry) = (windows::core::HSTRING::from(target), windows::core::HSTRING::from(entry));
+        let arguments = [w!("-T"), PCWSTR(target.as_ptr()), w!("-E"), PCWSTR(entry.as_ptr()), w!("-O3")];
         let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
         if let Err(e) = result.GetStatus()?.ok() {
             if let Ok(errors) = result.GetErrorBuffer() {
