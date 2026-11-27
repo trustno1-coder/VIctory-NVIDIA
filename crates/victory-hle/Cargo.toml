@@ -55,6 +55,8 @@ tempfile.workspace = true
 [features]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
+# The A/B switches in a build without the rest of diagnostics (victory-gpu's `ab`).
+ab = ["victory-gpu/ab"]
 
 [lints]
 workspace = true

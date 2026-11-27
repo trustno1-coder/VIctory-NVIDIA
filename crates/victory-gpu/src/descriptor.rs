@@ -654,7 +654,7 @@ static SYNC_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// records before the place are taken as they were read.
 #[cfg(windows)]
 fn sync_in_place() -> bool {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_SYNC_IN_PLACE") {
         return on;
     }
@@ -709,7 +709,7 @@ const SYNC_AT_A_TIME_FINE: usize = 64;
 /// time, their run city4).
 #[cfg(windows)]
 fn sync_jobs() -> (usize, usize) {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(fine) = crate::ab::pick("VICTORY_SYNC_FINE") {
         return if fine { (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE) } else { (SYNC_PAGES, SYNC_AT_A_TIME) };
     }

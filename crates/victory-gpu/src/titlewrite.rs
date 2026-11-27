@@ -77,9 +77,9 @@ pub fn import(name: &str, address: usize) -> usize {
         "memset" => (2, set as *const () as usize),
         _ => return address,
     };
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     let on = crate::ab::bit("VICTORY_COPY_BESIDE").is_some() || copies_on();
-    #[cfg(not(feature = "diagnostics"))]
+    #[cfg(not(any(feature = "diagnostics", feature = "ab")))]
     let on = copies_on();
     if !on {
         return address;
