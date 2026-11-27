@@ -658,6 +658,86 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// The largest part of a console pipeline that is believed (the biggest seen
+/// is 127 KiB of code).
+const MAX_LOOSE_PART: usize = 16 << 20;
+
+/// A container holding one `ACCC` part: an `FSPX` of `entries` (kind, data), as
+/// the console compiler stores a compute program that another compiler made
+/// (`victory_shader::native::fspx_program` reads it back).
+fn fspx_container(entries: &[(u32, &[u8])]) -> Vec<u8> {
+    let mut fspx = b"FSPX".to_vec();
+    fspx.extend(1u32.to_le_bytes());
+    fspx.extend((entries.len() as u32).to_le_bytes());
+    fspx.extend(0u32.to_le_bytes());
+    let mut at = 0x10 + 16 * entries.len();
+    for (kind, data) in entries {
+        for word in [*kind, at as u32, data.len() as u32, 0] {
+            fspx.extend(word.to_le_bytes());
+        }
+        at += data.len();
+    }
+    for (_, data) in entries {
+        fspx.extend_from_slice(data);
+    }
+    let size = fspx.len() as u32;
+    fspx[12..16].copy_from_slice(&size.to_le_bytes());
+    // The container: header, one part offset, the part.
+    let total = 0x20 + 4 + 8 + fspx.len();
+    let mut out = b"DXBC".to_vec();
+    out.extend([0u8; 16]);
+    out.extend(1u16.to_le_bytes());
+    out.extend(0u16.to_le_bytes());
+    out.extend((total as u32).to_le_bytes());
+    out.extend(1u32.to_le_bytes());
+    out.extend(0x24u32.to_le_bytes());
+    out.extend(b"ACCC");
+    out.extend(size.to_le_bytes());
+    out.extend(fspx);
+    out
+}
+
+/// The container of a description of device method 0x218: the root signature
+/// and (address, size) pairs of a compute pipeline's registers (0x1c bytes),
+/// hash (0x14), GFX10 code and program metadata, then its registers again.
+/// `None` when a part is missing or implausible.
+///
+/// # Safety
+/// Every pair names bytes of the title that are mapped.
+unsafe fn loose_compute(desc: &[u64; 11]) -> Option<Vec<u8>> {
+    let part = |at: usize| -> Option<&[u8]> {
+        let (address, size) = (desc[at], desc[at + 1] as usize);
+        // SAFETY: the caller's.
+        (address != 0 && (1..=MAX_LOOSE_PART).contains(&size))
+            .then(|| unsafe { std::slice::from_raw_parts(address as *const u8, size) })
+    };
+    Some(fspx_container(&[(0, part(1)?), (1, part(3)?), (6, part(5)?), (7, part(7)?)]))
+}
+
+/// Device method 0x218 `(this, description, iid, out)`: a compute pipeline
+/// whose console parts come loose, not in a container. They are put into one
+/// and the pipeline goes on as any other.
+pub(crate) extern "system" fn create_loose_compute(
+    _: This,
+    desc: *const [u64; 11],
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    // SAFETY: the title passes a description (null is tolerated); its pairs
+    // name its own mapped bytes.
+    let container = unsafe { desc.as_ref().and_then(|desc| loose_compute(desc)) };
+    let Some(container) = container else {
+        return E_INVALIDARG;
+    };
+    hand_out(
+        vec![shader("compute", &container)],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -814,6 +894,59 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// The parts of a `VICTORY_DUMP_PSO` file: the 128-byte description, then
+    /// each (address, size, bytes).
+    fn dumped_parts(file: &[u8]) -> Vec<&[u8]> {
+        let (mut parts, mut at) = (Vec::new(), 128);
+        while at + 16 <= file.len() {
+            let size = u64::from_le_bytes(file[at + 8..at + 16].try_into().unwrap()) as usize;
+            parts.push(&file[at + 16..at + 16 + size]);
+            at += 16 + size;
+        }
+        parts
+    }
+
+    /// `VICTORY_TEST_PSO_DIR=<dir>` of `VICTORY_DUMP_PSO` files: every
+    /// `0x218-*.bin` goes into a container, which has to read as a compute
+    /// program and translate.
+    #[test]
+    #[ignore = "needs VICTORY_TEST_PSO_DIR"]
+    fn loose_compute_dumps_translate() {
+        let Some(dir) = std::env::var_os("VICTORY_TEST_PSO_DIR") else { return };
+        // A host with 32 lanes in a wave, as the run's GPU says.
+        victory_shader::emit::set_host_max_wave(32);
+        let (mut seen, mut read, mut translated) = (0, 0, 0);
+        let mut errors = std::collections::BTreeMap::<String, u32>::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("0x218-") {
+                continue;
+            }
+            let file = std::fs::read(entry.path()).unwrap();
+            let parts = dumped_parts(&file);
+            let [packet, hash, code, meta, ..] = parts.as_slice() else { continue };
+            seen += 1;
+            let container = fspx_container(&[(0, packet), (1, hash), (6, code), (7, meta)]);
+            let c = victory_shader::Container::parse(&container).unwrap();
+            let part = c.part(victory_shader::FourCC::ACCC).unwrap();
+            match victory_shader::native_programs(part.data) {
+                Ok(programs) if programs.len() == 1 => read += 1,
+                other => {
+                    *errors.entry(format!("read: {:?}", other.err())).or_default() += 1;
+                    continue;
+                }
+            }
+            match victory_shader::emit::translate(&container) {
+                Ok(_) => translated += 1,
+                Err(e) => *errors.entry(format!("translate: {e}")).or_default() += 1,
+            }
+        }
+        eprintln!("{seen} dumps, {read} read, {translated} translated");
+        for (what, n) in &errors {
+            eprintln!("  {n:4} {what}");
+        }
+        assert!(seen > 0 && read == seen, "{seen} dumps, {read} read");
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

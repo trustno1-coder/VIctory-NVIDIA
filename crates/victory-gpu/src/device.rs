@@ -346,6 +346,43 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// `VICTORY_DUMP_PSO=<dir>`: each of the first calls of the two unknown
+/// pipeline methods as a file `<slot>-<call>.bin`, for reading their formats
+/// away from the game: the description's 128 bytes, then for every
+/// (address, size) pair in it, the address, the size and the bytes.
+#[cfg(windows)]
+fn dump_description(slot: usize, calls: u32, desc: *const u8) {
+    use std::sync::OnceLock;
+    const CALLS: u32 = 600;
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("VICTORY_DUMP_PSO").map(Into::into)) else {
+        return;
+    };
+    let mut head = [0u8; 128];
+    if calls > CALLS || desc.is_null() || !crate::host::read_into(desc, &mut head) {
+        return;
+    }
+    let mut file = head.to_vec();
+    let words: Vec<u64> = head
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap_or_default()))
+        .collect();
+    for pair in words[1..].chunks_exact(2) {
+        let (at, size) = (pair[0], pair[1]);
+        if at == 0 || !(1..=1 << 20).contains(&size) {
+            continue;
+        }
+        let mut bytes = vec![0u8; size as usize];
+        if crate::host::read_into(at as *const u8, &mut bytes) {
+            file.extend(at.to_le_bytes());
+            file.extend(size.to_le_bytes());
+            file.extend(bytes);
+        }
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(format!("{slot:#x}-{calls:05}.bin")), file);
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -365,6 +402,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    dump_description(SLOT, calls, desc);
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
@@ -388,11 +427,32 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // The description reads as a root signature then (address, size)
+        // pairs, as the plain graphics one does, but with more of them: the
+        // first bytes of each show which are shader containers.
+        #[cfg(windows)]
+        let pairs: Vec<String> = description
+            .iter()
+            .flat_map(|w| w[1..].chunks_exact(2))
+            .filter(|p| p[0] != 0 && (1..=1 << 20).contains(&p[1]))
+            .map(|p| {
+                let mut head = [0u8; 16];
+                let seen = if crate::host::read_into(p[0] as *const u8, &mut head) {
+                    head.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                } else {
+                    "unreadable".to_owned()
+                };
+                format!("{:#x}+{:#x}:{seen}", p[0], p[1])
+            })
+            .collect();
+        #[cfg(not(windows))]
+        let pairs: Vec<String> = Vec::new();
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
+            pairs = format_args!("{pairs:?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
@@ -452,7 +512,7 @@ static FUNCTIONS: Table<160> = {
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = pipeline::create_loose_compute as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238

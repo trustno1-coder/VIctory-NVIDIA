@@ -535,6 +535,8 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         let sgprs = match root {
             RootType::Table => 1,
             RootType::Descriptor => 2,
+            // Root constants: the descriptor dwords field counts them.
+            RootType::Constants => u32::from(e[20]),
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
             _ => return Err(Malformed("an FSPX resource of an unknown root type")),
