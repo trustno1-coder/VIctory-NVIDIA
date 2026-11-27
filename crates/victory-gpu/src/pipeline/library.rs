@@ -808,6 +808,89 @@ pub(crate) fn note_time(key: &str, ms: u64) {
     }
 }
 
+/// Title pipelines whose making ended the thread making them (a stack
+/// overflow in the host's shader compiler: vkd3d-proton's DXIL-to-SPIR-V
+/// conversion of a compute shader overflowed the worker's stack, and Wine
+/// ended the thread without unwinding): not made again, in this run or a
+/// later one, while the translator and the driver stay the same
+/// ([`super::known::fingerprint`]: a new one may make it). One a line: the
+/// key, that fingerprint, what it was made of.
+/// `VICTORY_REFUSED_RETRY=1`: tried again (the list is not read).
+const REFUSED_FILE: &str = "refused-pipelines.txt";
+static REFUSED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// The translator and driver the refusals of this run are noted under.
+fn refused_under() -> &'static str {
+    static FINGERPRINT: OnceLock<String> = OnceLock::new();
+    FINGERPRINT.get_or_init(super::known::fingerprint)
+}
+
+/// The keys `listed` notes under `fingerprint`; lines of another translator or
+/// driver, or without one, are tried again.
+fn refused_keys(listed: &str, fingerprint: &str) -> HashSet<String> {
+    listed
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let key = words.next()?;
+            (words.next()? == fingerprint).then(|| key.to_owned())
+        })
+        .collect()
+}
+
+fn refused_ones() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+    // (Before the lock: the fingerprint asks the host.)
+    let fingerprint = refused_under();
+    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if refused.is_none() {
+        let retry = std::env::var_os("VICTORY_REFUSED_RETRY").is_some_and(|v| v == "1");
+        let listed = if retry {
+            String::new()
+        } else {
+            DIR.get()
+                .and_then(|d| std::fs::read_to_string(d.join(REFUSED_FILE)).ok())
+                .unwrap_or_default()
+        };
+        let set = refused_keys(&listed, fingerprint);
+        if !set.is_empty() {
+            tracing::info!(
+                pipelines = set.len(),
+                "title pipelines not made: their making ended a thread in an earlier run"
+            );
+        }
+        *refused = Some(set);
+    }
+    refused
+}
+
+/// Whether making the title pipeline with `key` ended its thread, in this
+/// run or an earlier one.
+pub(crate) fn refused(key: &str) -> bool {
+    refused_ones().as_ref().is_some_and(|r| r.contains(key))
+}
+
+/// Making the title pipeline with `key` (of `what`) ended its thread: kept,
+/// so no later run gives it a thread again.
+pub(crate) fn note_refused(key: &str, what: &str) {
+    let mut refused = refused_ones();
+    if !refused.get_or_insert_default().insert(key.to_owned()) {
+        return;
+    }
+    let Some(dir) = DIR.get() else { return };
+    let line = format!("{key} {} {what}\n", refused_under());
+    let written = std::fs::create_dir_all(dir).and_then(|()| {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(REFUSED_FILE))?
+            .write_all(line.as_bytes())
+    });
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "refused pipeline not noted");
+    }
+}
+
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
@@ -851,6 +934,17 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_pipeline_is_tried_again_by_another_translator_or_driver() {
+        let listed = "aaaa 1111 [compute x]\nbbbb 2222 [compute y]\ncccc [compute z]\n\ndddd 1111\n";
+        assert_eq!(
+            refused_keys(listed, "1111"),
+            HashSet::from(["aaaa".to_owned(), "dddd".to_owned()])
+        );
+        assert_eq!(refused_keys(listed, "2222"), HashSet::from(["bbbb".to_owned()]));
+        assert!(refused_keys(listed, "3333").is_empty());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
