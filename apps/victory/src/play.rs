@@ -91,7 +91,7 @@ const KEPT: &[&str] = &[
     "VICTORY_LOG",
 ];
 
-const RESOLUTIONS: [&str; 4] = ["1440", "1080to1440", "4k", "wide"];
+const RESOLUTIONS: [&str; 5] = ["1440", "1080to1440", "4k", "wide", "ultrawide"];
 const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
 
 #[derive(clap::Args, Clone, Debug)]
@@ -105,8 +105,8 @@ pub(crate) struct Play {
     /// 1440: output and scene 2560x1440; 1080to1440: scene 1920x1080
     /// upscaled by the title; 4k: the stock 3840x2160 output; wide: the Series X
     /// output and scene made for 5120x1440 (32:9), the interface kept 16:9 in the
-    /// middle (VICTORY_DISPLAY_WIDE; another size: --set VICTORY_DISPLAY_WIDE=3440x1440
-    /// with --res 1440).
+    /// middle (VICTORY_DISPLAY_WIDE; another size: --set VICTORY_DISPLAY_WIDE=2560x1080
+    /// with --res 1440); ultrawide: the same at 3440x1440 (21:9).
     #[arg(long, default_value = "1440", value_parser = RESOLUTIONS)]
     res: String,
     /// DLSS in place of the title's upscaling (needs NVIDIA's files).
@@ -194,6 +194,11 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
             "wide" => {
                 set("VICTORY_NATIVE_1440P", "1");
                 set("VICTORY_DISPLAY_WIDE", "5120x1440");
+            }
+            // 21:9, made the same way as 32:9
+            "ultrawide" => {
+                set("VICTORY_NATIVE_1440P", "1");
+                set("VICTORY_DISPLAY_WIDE", "3440x1440");
             }
             _ => {}
         }
@@ -507,6 +512,15 @@ mod tests {
         let menu = parse_menu("VICTORY_MENU_RES=wide\r\n");
         let (s, _) = settings(&options(), &menu, Some(Path::new("x")));
         assert_eq!(s.get("VICTORY_DISPLAY_WIDE").map(String::as_str), Some("5120x1440"));
+        // and 21:9, from the command line or the menu
+        let mut o = options();
+        o.res = "ultrawide".to_owned();
+        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        let get = |k: &str| s.get(k).map(String::as_str);
+        assert_eq!((get("VICTORY_NATIVE_1440P"), get("VICTORY_DISPLAY_WIDE")), (Some("1"), Some("3440x1440")));
+        let menu = parse_menu("VICTORY_MENU_RES=ultrawide\r\n");
+        let (s, _) = settings(&options(), &menu, Some(Path::new("x")));
+        assert_eq!(s.get("VICTORY_DISPLAY_WIDE").map(String::as_str), Some("3440x1440"));
     }
 
     #[test]

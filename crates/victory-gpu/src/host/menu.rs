@@ -73,7 +73,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
     Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
-    Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160"), ("wide", "5120X1440 (32:9)")], live: false },
+    Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160"), ("wide", "5120X1440 (32:9)"), ("ultrawide", "3440X1440 (21:9)")], live: false },
     // The layer's switches.
     // Both HDR items apply at the next start: the title is asked about HDR once at start and the swap chain's
     // format is fixed then. The paper white is the level the interface, intro videos and F1/F3 text sit at.
