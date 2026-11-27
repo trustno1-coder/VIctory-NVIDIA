@@ -618,15 +618,56 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// As [`save`], from a worker while more pipelines are still queued.
+///
+/// Every save serialises the whole library (over a gigabyte once it is warm)
+/// and, while it does, holds off every store; in the middle of a burst of new
+/// pipelines (a new area, a cutscene) that is exactly when the title is
+/// waiting on them, and the write competes with texture streaming for the
+/// disk. Saves in a burst are kept to one every `VICTORY_LIBRARY_SAVE_BUSY_S`
+/// seconds (default 180; 20 as before); the save when the queue runs dry and
+/// the one at exit are as they were.
+pub(crate) fn save_while_busy() {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        let secs = std::env::var("VICTORY_LIBRARY_SAVE_BUSY_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(180);
+        std::time::Duration::from_secs(secs)
+    });
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            // The first busy save of the run waits a full interval too.
+            None => {
+                *last = Some(std::time::Instant::now());
+                return;
+            }
+            Some(t) if t.elapsed() < every => return,
+            _ => *last = Some(std::time::Instant::now()),
+        }
+    }
+    save(false);
+}
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
+///
+/// Under host memory pressure ([`crate::residency::pressured`]) the interval
+/// is `SAVE_EVERY_PRESSURED` instead: the serialised library (over a gigabyte
+/// once warm) is written through the PC's memory, and on a 32 GB PC that ran
+/// pressured for a whole session (log of 2026-11-27, commit headroom 3.4 GB)
+/// those pages pushed the title's own out, and its threads stalled on page
+/// faults. The save at exit (`now`) is unchanged, so nothing made is lost
+/// unless the process ends without one.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    const SAVE_EVERY_PRESSURED: std::time::Duration = std::time::Duration::from_secs(600);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        let every = if crate::residency::pressured() { SAVE_EVERY_PRESSURED } else { SAVE_EVERY };
+        if !now && last.is_some_and(|t| t.elapsed() < every) {
             return;
         }
         *last = Some(std::time::Instant::now());

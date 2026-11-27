@@ -581,7 +581,7 @@ fn workers() -> bool {
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
-                            super::library::save(false);
+                            super::library::save_while_busy();
                         }
                     }
                 });
