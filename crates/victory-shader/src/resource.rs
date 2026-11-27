@@ -363,7 +363,13 @@ pub fn track(
     for (block, (accesses, mut reads, loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
-        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
+        // Where the per-lane form cannot follow the loop, its exact shape
+        // still proves it ([`Tracer::waterfall_shape`]).
+        let proof = t
+            .waterfall(block, &accesses, &reads)
+            .ok()
+            .or_else(|| t.waterfall_shape(block, &accesses, &reads, &loads));
+        if let Some(proof) = proof {
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
@@ -2128,6 +2134,213 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
+    /// The console compiler's waterfall over a first-lane table offset, by
+    /// its exact shape, where [`Self::waterfall`] cannot follow the lanes
+    /// (its per-lane form loses the relation of the two lane masks around
+    /// the loop in larger programs). The loop is one block that branches to
+    /// itself with `s_cbranch_execnz`, and holds nothing but:
+    ///
+    /// - `v_readfirstlane_b32 sX, vY` of a value set before the loop, under
+    ///   EXEC as the loop found it;
+    /// - `v_cmpx_eq_u32`/`_i32 exec, sX, vY` of the same two values, without
+    ///   modifiers: EXEC becomes the lanes whose offset is the first lane's;
+    /// - the table loads at those offsets (`loads`), waits and `s_nop`;
+    /// - the accesses that use them, which only read (`buffer_load_*`,
+    ///   `image_load*`, `image_sample*`, `image_gather*`), under that EXEC;
+    /// - `s_andn2_wrexec` of a mask T with itself (EXEC and T become T and
+    ///   not EXEC), then the branch.
+    ///
+    /// And T is EXEC on every entry to the loop: from outside, T's value is
+    /// a move of the very EXEC value the loop starts with; around the back
+    /// edge both are what that one `s_andn2_wrexec` wrote. So each pass
+    /// serves the waiting lanes with the first one's offset, drops exactly
+    /// those, and the loop ends when none waits: every lane makes its own
+    /// access once, with its own entry, which is what the per-lane load
+    /// does.
+    fn waterfall_shape(
+        &self,
+        b: usize,
+        accesses: &[usize],
+        reads: &[Value],
+        loads: &[Site],
+    ) -> Option<Waterfall> {
+        let block = &self.p.blocks[b];
+        let wave64 = self.p.wave64;
+        let halves: &[u8] = if wave64 { &[0, 1] } else { &[0] };
+        if !matches!(block.exit, Exit::Branch { taken, not_taken } if taken == b && not_taken != b)
+            || block.preds.len() != 2
+        {
+            return None;
+        }
+        let back = block.preds.iter().position(|&p| p == b)?;
+        let entry = 1 - back;
+        let (exit, body) = block.insts.split_last()?;
+        if exit.name() != "s_cbranch_execnz" {
+            return None;
+        }
+        let (retry, body) = body.split_last()?;
+        let wrexec = if wave64 {
+            "s_andn2_wrexec_b64"
+        } else {
+            "s_andn2_wrexec_b32"
+        };
+        if retry.name() != wrexec {
+            return None;
+        }
+        // T: the mask the retry reads and writes besides EXEC.
+        let t = retry.writes.iter().find_map(|&(reg, _)| match reg {
+            Reg::S(code) if code != EXEC && code != EXEC + 1 => Some(code),
+            _ => None,
+        })?;
+        let t = t - t % 2 * u8::from(wave64);
+        let phi = |reg: u8| block.phis.iter().find(|p| p.reg == Reg::S(reg));
+        let mut head_exec = Vec::new();
+        for &k in halves {
+            let (pe, pt) = (phi(EXEC + k)?, phi(t + k)?);
+            // Around the back edge: both what the retry wrote, from T as the
+            // loop found it.
+            if pe.args[back] != retry.write(Reg::S(EXEC + k))?
+                || pt.args[back] != retry.write(Reg::S(t + k))?
+                || retry.read(Reg::S(t + k))? != pt.value
+            {
+                return None;
+            }
+            // From outside: T is a move of the EXEC the loop is entered with.
+            let (tb, ti) = self.defs[pt.args[entry].0 as usize]?;
+            let mov = self.inst((tb, ti));
+            let moves = if wave64 { "s_mov_b64" } else { "s_mov_b32" };
+            if mov.name() != moves || mov.read(Reg::S(EXEC + k))? != pe.args[entry] {
+                return None;
+            }
+            head_exec.push(pe.value);
+        }
+        let exec_is = |inst: &Inst, values: &[Value]| {
+            halves
+                .iter()
+                .zip(values)
+                .all(|(&k, &v)| inst.read(Reg::S(EXEC + k)) == Some(v))
+        };
+        let mut out = Waterfall::default();
+        let mut selected: Option<Vec<Value>> = None;
+        // The lane value each first-lane read took, by the read's result.
+        let mut read_from: Vec<(Value, Value)> = Vec::new();
+        for (i, inst) in body.iter().enumerate() {
+            let name = inst.name();
+            let site = (b, i);
+            if name == "s_nop" || name.starts_with("s_waitcnt") {
+                continue;
+            }
+            if name == "v_readfirstlane_b32" {
+                // Before the compares, under the loop's own EXEC.
+                if selected.is_some() || !exec_is(inst, &head_exec) {
+                    return None;
+                }
+                let Fields::Valu(f) = &inst.fields else {
+                    return None;
+                };
+                let Some(&Operand::Vector { reg, .. }) = f.src.first() else {
+                    return None;
+                };
+                let lane = inst.read(Reg::V(reg))?;
+                // Set before the loop: the same in every pass.
+                if self.phis[lane.0 as usize].is_some_and(|(pb, _)| pb == b)
+                    || self.defs[lane.0 as usize].is_some_and(|(db, _)| db == b)
+                {
+                    return None;
+                }
+                let &(_, got) = inst.writes.first()?;
+                read_from.push((got, lane));
+                continue;
+            }
+            if name == "v_cmpx_eq_u32" || name == "v_cmpx_eq_i32" {
+                let Fields::Valu(f) = &inst.fields else {
+                    return None;
+                };
+                if f.abs != 0
+                    || f.neg != 0
+                    || f.opsel != 0
+                    || f.clamp
+                    || f.sdwa.is_some()
+                    || f.dpp.is_some()
+                {
+                    return None;
+                }
+                // Compares narrow EXEC one after another.
+                let before = selected.clone().unwrap_or_else(|| head_exec.clone());
+                if !exec_is(inst, &before) {
+                    return None;
+                }
+                let (Some(a), Some(c)) = (f.src.first(), f.src.get(1)) else {
+                    return None;
+                };
+                let pair = |first: &Operand, own: &Operand| -> Option<Value> {
+                    let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) =
+                        (first, own)
+                    else {
+                        return None;
+                    };
+                    let x = inst.read(Reg::S(code))?;
+                    let lane = inst.read(Reg::V(reg))?;
+                    read_from
+                        .iter()
+                        .any(|&(got, from)| got == x && from == lane)
+                        .then_some(x)
+                };
+                let x = pair(a, c).or_else(|| pair(c, a))?;
+                let narrowed = halves
+                    .iter()
+                    .map(|&k| inst.write(Reg::S(EXEC + k)))
+                    .collect::<Option<Vec<_>>>()?;
+                selected = Some(narrowed);
+                out.compares.push(site);
+                if !out.reads.contains(&x) {
+                    out.reads.push(x);
+                }
+                continue;
+            }
+            let sel = selected.as_deref()?;
+            if loads.contains(&site) {
+                continue;
+            }
+            let reads_only = name.starts_with("buffer_load")
+                || name.starts_with("image_load")
+                || name.starts_with("image_sample")
+                || name.starts_with("image_gather");
+            if accesses.contains(&i) && reads_only && exec_is(inst, sel) {
+                continue;
+            }
+            return None;
+        }
+        // The retry takes T and not the EXEC the compares left.
+        let sel = selected?;
+        if !exec_is(retry, &sel) {
+            return None;
+        }
+        // Every offset read is one a compare made the lane's own, and every
+        // access was seen.
+        if reads.iter().any(|v| !out.reads.contains(v)) || accesses.iter().any(|&i| i >= body.len())
+        {
+            return None;
+        }
+        // Read nowhere else: made the lane's own, a first-lane value must
+        // not reach code past the loop, which would see the last pass's.
+        for (ob, other) in self.p.blocks.iter().enumerate() {
+            let carried = other
+                .phis
+                .iter()
+                .any(|p| p.args.iter().any(|a| out.reads.contains(a)));
+            let read_there = ob != b
+                && other
+                    .insts
+                    .iter()
+                    .any(|inst| inst.reads.iter().any(|(_, v)| out.reads.contains(v)));
+            if carried || read_there {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
     /// Consecutive dwords of one scalar load.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
@@ -3380,6 +3593,138 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.reads.len(), 1);
         assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    /// [`WATERFALL_INDEXED_WAVE32`] as a wave of 64 runs it: EXEC saved
+    /// and the lanes still waiting kept in SGPR pairs, the retry
+    /// `s_andn2_wrexec_b64`.
+    fn waterfall_indexed_wave64() -> Vec<u32> {
+        let mut w = WATERFALL_INDEXED_WAVE32.to_vec();
+        for (from, to) in [
+            (0xBE97_037E, 0xBE96_047E), // s_mov_b64 s[22:23], exec
+            (0xBE95_037E, 0xBE98_047E), // s_mov_b64 s[24:25], exec
+            (0xBE95_4715, 0xBE98_3A18), // s_andn2_wrexec_b64 s[24:25], s[24:25]
+            (0xBEFE_0317, 0xBEFE_0416), // s_mov_b64 exec, s[22:23]
+        ] {
+            let at = word_at(&w, from);
+            w[at] = to;
+        }
+        w
+    }
+
+    #[test]
+    fn the_console_waterfall_over_a_first_lane_offset_is_one_in_a_wave_of_64() {
+        let r = waterfall(&waterfall_indexed_wave64(), true).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    /// [`Tracer::waterfall_shape`] on the one loop of `words`, with what
+    /// [`track`] would hand it: the loop's table loads, its first-lane reads
+    /// and its buffer and image accesses.
+    fn by_shape(words: &[u32], wave64: bool) -> Option<Waterfall> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, wave64, 256).unwrap();
+        let layout = [param(Table, 0, 1), param(Table, 1, 1)];
+        let lanes = lanes(&p);
+        let t = Tracer::new(&p, &layout, HwStage::Cs, lanes.as_ref()).unwrap();
+        let b = (0..p.blocks.len())
+            .find(|&b| matches!(p.blocks[b].exit, Exit::Branch { taken, .. } if taken == b))
+            .unwrap();
+        let insts = &p.blocks[b].insts;
+        let loads: Vec<Site> = (0..insts.len())
+            .filter(|&i| insts[i].name().starts_with("s_load_"))
+            .map(|i| (b, i))
+            .collect();
+        let reads: Vec<Value> = insts
+            .iter()
+            .filter(|i| i.name() == "v_readfirstlane_b32")
+            .filter_map(|i| i.writes.first().map(|w| w.1))
+            .collect();
+        let accesses: Vec<usize> = (0..insts.len())
+            .filter(|&i| {
+                matches!(
+                    insts[i].fields,
+                    Fields::Buffer { .. } | Fields::Image { .. }
+                )
+            })
+            .collect();
+        t.waterfall_shape(b, &accesses, &reads, &loads)
+    }
+
+    /// [`WATERFALL_INDEXED_WAVE32`] or [`waterfall_indexed_wave64`] with
+    /// words replaced.
+    fn indexed_with(wave64: bool, changes: &[(u32, u32)]) -> Vec<u32> {
+        let mut w = if wave64 {
+            waterfall_indexed_wave64()
+        } else {
+            WATERFALL_INDEXED_WAVE32.to_vec()
+        };
+        for &(from, to) in changes {
+            let at = word_at(&w, from);
+            w[at] = to;
+        }
+        w
+    }
+
+    #[test]
+    fn the_console_waterfall_over_a_first_lane_offset_holds_by_its_shape() {
+        for wave64 in [false, true] {
+            let shape = by_shape(&indexed_with(wave64, &[]), wave64)
+                .unwrap_or_else(|| panic!("wave64 {wave64}"));
+            assert_eq!(shape.compares.len(), 1, "wave64 {wave64}");
+            assert_eq!(shape.reads.len(), 1, "wave64 {wave64}");
+        }
+    }
+
+    #[test]
+    fn a_waterfall_loop_with_other_work_in_it_is_none_by_shape() {
+        for wave64 in [false, true] {
+            // s_waitcnt vmcnt(0) in the loop becomes v_mov_b32 v20, v7.
+            let words = indexed_with(wave64, &[(0xBF8C_3F70, 0x7E28_0307)]);
+            assert!(by_shape(&words, wave64).is_none(), "wave64 {wave64}");
+        }
+    }
+
+    #[test]
+    fn a_waterfall_comparing_another_lane_value_is_none_by_shape() {
+        for wave64 in [false, true] {
+            // v_cmpx_eq_u32 exec, s20, v0: the lane's index, not the offset
+            // the first lane's was read from (v7).
+            let words = indexed_with(wave64, &[(0x7DA4_0E14, 0x7DA4_0014)]);
+            assert!(by_shape(&words, wave64).is_none(), "wave64 {wave64}");
+        }
+    }
+
+    #[test]
+    fn a_waterfall_whose_lanes_to_do_are_not_exec_is_none_by_shape() {
+        // The mask of lanes still to do starts as every lane, not EXEC.
+        let words = indexed_with(false, &[(0xBE95_037E, 0xBE95_03C1)]); // s_mov_b32 s21, -1
+        assert!(by_shape(&words, false).is_none());
+        let words = indexed_with(true, &[(0xBE98_047E, 0xBE98_04C1)]); // s_mov_b64 s[24:25], -1
+        assert!(by_shape(&words, true).is_none());
+    }
+
+    #[test]
+    fn a_first_lane_offset_read_after_its_loop_is_none_by_shape() {
+        for wave64 in [false, true] {
+            // The store after the loop becomes v_mov_b32 v20, s20 (the
+            // first lane's offset of the last pass) and s_nop.
+            let words = indexed_with(
+                wave64,
+                &[(0xE070_1000, 0x7E28_0214), (0x800A_0C10, 0xBF80_0000)],
+            );
+            assert!(by_shape(&words, wave64).is_none(), "wave64 {wave64}");
+        }
     }
 
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes
