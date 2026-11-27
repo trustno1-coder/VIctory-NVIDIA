@@ -572,6 +572,7 @@ pub(crate) unsafe fn piece(
 ///
 /// # Safety
 /// [`piece`]'s.
+#[allow(clippy::too_many_arguments)] // one call carries the piece's whole description
 unsafe fn piece_at(
     title: usize,
     now: *const u8,

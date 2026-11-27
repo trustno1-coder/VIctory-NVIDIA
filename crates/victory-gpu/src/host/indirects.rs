@@ -15,12 +15,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// The kind of a direct mesh dispatch.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) const DIRECT: u32 = u32::MAX;
 
 /// Words of user data kept of each execution.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) const WORDS: usize = 16;
 
 /// One indirect execution.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(crate) struct Ran {
     pipeline: usize,
@@ -30,6 +33,7 @@ pub(crate) struct Ran {
     used: u8,
 }
 
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 #[derive(Default)]
 pub(crate) struct Indirects {
     names: HashMap<usize, String>,
@@ -39,8 +43,10 @@ pub(crate) struct Indirects {
 }
 
 /// A list's, shared with the report's table of lists.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) type Shared = Arc<Mutex<Indirects>>;
 
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 impl Indirects {
     /// An indirect execution of `kind` (the argument's type) of at most
     /// `count` records with `pipeline` (a host object) and user data.
@@ -85,6 +91,7 @@ impl Indirects {
 
 /// How many indirect executions come before command `at` of a history of
 /// breadcrumb operations (`is` tells them): which of a list's it is.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn before<T>(history: &[T], at: usize, is: impl Fn(&T) -> bool) -> usize {
     history[..at.min(history.len())].iter().filter(|op| is(op)).count()
 }
@@ -92,6 +99,7 @@ pub(crate) fn before<T>(history: &[T], at: usize, is: impl Fn(&T) -> bool) -> us
 /// The heap slots the user data may name, for the report to describe: the
 /// words that are slots as they are, and the slots from where a word is a
 /// table's byte offset (32 bytes a descriptor), `table` of them.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn slots(words: &[u32], count: u32, table: u32) -> Vec<(usize, u32)> {
     let mut out = Vec::new();
     for (i, &word) in words.iter().enumerate() {

@@ -319,6 +319,7 @@ mod tests {
     /// The instruction in code of a test's, changed, run: the byte, the registers and the flags
     /// are what it makes of them unchanged.
     #[test]
+    #[allow(clippy::missing_transmute_annotations)] // the function type is named on the binding
     fn a_changed_write_does_what_it_did() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualProtect};
         type F = unsafe extern "system" fn(*mut u8, *mut [u64; 3]);
@@ -334,7 +335,9 @@ mod tests {
                 code.extend([0x80, 0x88, 0x31, 0, 0, 0, constant]);
             }
             code.extend([0x9c, 0x41, 0x5a, 0x4c, 0x89, 0x12, 0x48, 0x89, 0x42, 0x08, 0x48, 0x89, 0x4a, 0x10, 0xc3]);
-            // SAFETY: fresh memory for code, twice, one of them changed before it runs.
+            // SAFETY: fresh memory for code, twice, one of them changed before it runs; the
+            // transmuted usize addresses are the committed executable pages the code was copied
+            // to, of the width of a code address, and the copied code keeps the calling convention.
             unsafe {
                 let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
                 assert_ne!(place, 0);
@@ -374,6 +377,7 @@ mod tests {
     /// Moves of registers and constants, and vector stores, in code of a test's: changed, they
     /// store what they did, leave registers and flags, and write nothing that is there already.
     #[test]
+    #[allow(clippy::missing_transmute_annotations)] // the function type is named on the binding
     fn changed_moves_and_vector_stores_do_what_they_did() {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
@@ -411,7 +415,10 @@ mod tests {
             code.extend([0xc5, 0x7a, 0x6f, 0x0c, 0x24, 0x48, 0x83, 0xc4, 0x40, 0x41, 0x5d]); // xmm9 back ; rsp ; pop r13
             // Flags, rcx and rax behind the source ; vzeroupper ; ret
             code.extend([0x4d, 0x89, 0x58, 0x40, 0x49, 0x89, 0x48, 0x48, 0x49, 0x89, 0x40, 0x50, 0xc5, 0xf8, 0x77, 0xc3]);
-            // SAFETY: fresh memory for code, twice, one of them changed before it runs; data of ours.
+            // SAFETY: fresh memory for code, twice, one of them changed before it runs; data of
+            // ours. The transmuted usize addresses are the committed executable pages the code
+            // was copied to, of the width of a code address, and the copied code keeps the
+            // calling convention.
             unsafe {
                 let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
                 assert_ne!(place, 0);
