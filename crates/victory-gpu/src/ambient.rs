@@ -177,7 +177,12 @@ pub(crate) enum Alpha {
 
 /// The multiple of the light around the alpha layer's sky light is bounded
 /// by unless `VICTORY_AMBIENT_SPECULAR_ALPHA` says another.
-const ALPHA_BOUND: f32 = 6.0;
+///
+/// 1: at 6 a player still saw eyes and glass shine too much indoors (RTX
+/// 5080, Series X, 1440p, DLSS Quality, 2026-11-27); at 1 they saw none.
+/// Without a bound the café's close-ups give the whites of the eyes a
+/// blue-violet sheen (the sky); at 1 they are as dark as the room.
+const ALPHA_BOUND: f32 = 1.0;
 
 fn parse_alpha(set: &str) -> Alpha {
     let set = set.trim();
@@ -194,7 +199,7 @@ fn parse_alpha(set: &str) -> Alpha {
 }
 
 /// `VICTORY_AMBIENT_SPECULAR_ALPHA`: unset or `bound[:<multiple>]`, the
-/// alpha layer keeps the title's sky light up to that multiple (6) of the
+/// alpha layer keeps the title's sky light up to that multiple (1) of the
 /// light around; `1`: it takes the estimate as opaque surfaces do; `0`: it
 /// is left as the title has it.
 ///
@@ -216,7 +221,12 @@ pub(crate) fn alpha() -> Alpha {
 /// The multiple of the light around the opaque layer's sky light is bounded
 /// by where the miss program has no depth of the picture to make the
 /// estimate from, per unit of `VICTORY_AMBIENT_SPECULAR`'s share.
-const OPAQUE_BOUND: f32 = 6.0;
+///
+/// 1, as [`ALPHA_BOUND`]: at 6 the same player still saw an oily look on
+/// the floors (pale patches where the rays found nothing, beside what the
+/// screen-space resolve wrote); at 1 they saw none. Without a bound the day
+/// room's floor is covered in white patches of the sky.
+const OPAQUE_BOUND: f32 = 1.0;
 
 fn parse_opaque_bound(set: &str, share: f32) -> Option<f32> {
     let set = set.trim();
@@ -226,7 +236,7 @@ fn parse_opaque_bound(set: &str, share: f32) -> Option<f32> {
     }
 }
 
-/// `VICTORY_AMBIENT_SPECULAR_NO_DEPTH=<multiple>` (6 unless set; `0`: the
+/// `VICTORY_AMBIENT_SPECULAR_NO_DEPTH=<multiple>` (1 unless set; `0`: the
 /// title's sky light): what the opaque layer's reflections that found
 /// nothing keep of the sky's light where the estimate cannot be made, as a
 /// multiple of the light around (as the alpha layer's bound: the same
