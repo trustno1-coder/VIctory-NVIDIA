@@ -15,8 +15,8 @@ $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $dir = if ($To) { $To } else { Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'target\release\D3D12' }
 # The SHA-256 of the copies tested (Microsoft.Direct3D.D3D12 1.614.1, D3D12Core.dll 1.614.1.0).
-$package = '9880AA91602DD51DD6CF7911A2BCA7A2323513B15338573CDE014B3356EEAFF2'
 $core = '8A23D826B25B4329522FF451CB52B7F2B34D7F2913CFEB878371CE8BD765FE2D'
+$package = '9880AA91602DD51DD6CF7911A2BCA7A2323513B15338573CDE014B3356EEAFF2'
 $url = "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/$Version/microsoft.direct3d.d3d12.$Version.nupkg"
 
 $target = Join-Path $dir 'D3D12Core.dll'
