@@ -24,6 +24,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+mod round16;
 
 type Why = &'static str;
 
@@ -404,6 +405,7 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    mode16: round16::Mode,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -2113,6 +2115,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            mode16: round16::Mode::Default,
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -2706,6 +2709,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        let round_modes = round16::block_entries(p);
         // A host group has 32 KiB of LDS (D3D12): the program's LDS with the meetings' and
         // exchanges' dwords past it must fit (`CS_CollectTriangles_Meshlets` uses all 32 KiB).
         if self.s.lds_dwords > HOST_LDS_DWORDS && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
@@ -2811,12 +2815,19 @@ impl<'a> Lower<'a> {
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
+            self.mode16 = round_modes.as_ref().map_or(round16::Mode::Default, |modes| modes[b]);
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
+                if round_modes.is_some() {
+                    self.mode16 = round16::after(&p.blocks[b].insts[i], self.mode16);
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
+                        if round_modes.is_some() {
+                            self.mode16 = round16::after(&p.blocks[b].insts[j], self.mode16);
+                        }
                     }
                     i = end;
                     continue;
@@ -4153,6 +4164,16 @@ impl<'a> Lower<'a> {
             46,
             &[a, b, c],
         )
+    }
+
+    fn round_half(&mut self, f: V, default_nearest: bool) -> V {
+        match self.mode16 {
+            round16::Mode::Explicit(0) => self.f16_nearest(f),
+            round16::Mode::Explicit(3) => self.f16_toward_zero(f),
+            // Keep the fork's existing behavior for modes this path does not model.
+            _ if default_nearest => self.f16_nearest(f),
+            _ => self.s.op(self.cur, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f]),
+        }
     }
 
     /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
@@ -9353,11 +9374,8 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_cvt_f16_f32" if v.opsel == 0 => {
-                // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
+                let r = self.round_half(a, false);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 16-bit result outside a VGPR");
                 };
@@ -10176,11 +10194,7 @@ impl<'a> Lower<'a> {
             // (NVIDIA's does), one step of the last place lower where the two differ.
             // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
             // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
-                l.f16_nearest(f)
-            } else {
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-            };
+            let h = l.round_half(f, f16_nearest_on());
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -13881,6 +13895,10 @@ mod tests {
     /// (s0..s3) into v1..v4, runs `body`, and stores v0 to a raw buffer from a
     /// descriptor table, so the vector instructions in `body` have an effect.
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_valu(body).map(|_| ())
+    }
+
+    fn lower_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
         let mut words = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
@@ -13913,7 +13931,18 @@ mod tests {
             vec![constants, root(RootType::Table, 4, 1)],
             vec![buffer],
         )
-        .map(|_| ())
+    }
+
+    #[test]
+    fn whole_wave_round_mode_changes_the_later_conversion() {
+        let save = 0xBE86_3DC1;
+        let restore = 0xBEFE_0306;
+        let convert = 0x7E00_1501; // v_cvt_f16_f32 v0, v1
+        let rtz = 0xBFA4_000C;
+        let nearest = 0xBFA4_0000;
+        let toward_zero = lower_valu(&[save, rtz, restore, convert]).unwrap().dxil;
+        let round_to_nearest = lower_valu(&[save, nearest, restore, convert]).unwrap().dxil;
+        assert_ne!(toward_zero, round_to_nearest);
     }
 
     #[test]
