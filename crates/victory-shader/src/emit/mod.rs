@@ -125,7 +125,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -2818,6 +2818,307 @@ mod tests {
         }).unwrap();
         for (i, case) in cases.iter().enumerate() {
             assert_eq!(out[0][i], case.3, "q={:#010x} den={:#010x} num={:#010x}", case.0, case.1, case.2);
+        }
+    }
+
+    /// Renderer port 5 (`VICTORY_PORT_CBV=1`): a table's constant buffer is
+    /// read as raw bytes through the raw twin of its slot, at a constant and
+    /// at a computed offset, and gives the dwords the constant buffer read
+    /// gives without the switch; the slot itself (a constant buffer view, of
+    /// other bytes here) is not read.
+    #[test]
+    #[cfg(windows)]
+    fn table_constant_buffers_read_as_raw_bytes_through_their_twins() {
+        let mut words: Vec<u32> = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (the constant buffer)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (the UAV)
+            0xF428_0404,
+            0xFA00_0010, // s_buffer_load_dwordx4 s[16:19], s[8:11], 0x10
+            0xF420_0504,
+            0x0000_0000, // s_buffer_load_dword s20, s[8:11], s0
+        ];
+        for (out, s) in (16..21u32).enumerate() {
+            // v_mov_b32 v1, s<s>; buffer_store_dword v1, s[12:15], offset 4 * out
+            words.push(0x7E00_0000 | 1 << 17 | 0x001 << 9 | s);
+            words.push(0x38 << 26 | 0x1C << 18 | (4 * out as u32));
+            words.push(0x80 << 24 | (12 >> 2) << 16 | 1 << 8);
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        let table = |kind, at| crate::UsedResource {
+            kind,
+            root: crate::RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![table(crate::ResourceType::Cbv, 0), table(crate::ResourceType::Uav, 8)],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        // The twins start at slot 2: the constant buffer's (slot 0) is 2, the UAV's (1) 3.
+        const TWINS: u32 = 2;
+        let lowered = |raw: bool| {
+            super::shader::CONSTANTS_RAW_HERE.set(Some(raw));
+            super::shader::RAW_VIEWS_HERE.set(Some(if raw { TWINS } else { 0 }));
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let l = super::lower::lower(&super::lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .unwrap();
+            super::shader::CONSTANTS_RAW_HERE.set(None);
+            super::shader::RAW_VIEWS_HERE.set(None);
+            l
+        };
+        let (before, after) = (lowered(false), lowered(true));
+        assert_ne!(before.dxil, after.dxil, "the switch changes the translation");
+        let data: Vec<u32> = (0..16u32).map(|i| 0x0101_0101u32.wrapping_mul(i + 3) ^ 0x4000_0000).collect();
+        let other: Vec<u32> = vec![0xdead_beef; 64];
+        let s0 = 8u32;
+        let want: Vec<u32> = vec![data[4], data[5], data[6], data[7], data[(s0 / 4) as usize]];
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (raw, l) in [(false, before), (true, after)] {
+            let mut dxil = l.dxil;
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut dxil).unwrap();
+            }
+            let Ok(host) = super::host::Host::new(true) else {
+                eprintln!("no software adapter; the dispatch is skipped");
+                return;
+            };
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let views: Vec<super::host::View> = if raw {
+                vec![
+                    super::host::View::Cbv(&other),
+                    super::host::View::RawUav(8),
+                    super::host::View::Buffer {
+                        data: &data,
+                        stride: super::host::Stride::Raw,
+                    },
+                    super::host::View::RawUav(8),
+                ]
+            } else {
+                vec![super::host::View::Cbv(&data), super::host::View::RawUav(8)]
+            };
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(0, super::host::Root::Constants(vec![s0, 0, 0, 0, 0]))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            // The UAV is written where the program reads it: its twin with the switch.
+            let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
+            assert_eq!(got.as_deref(), Some(&want[..]), "switch {raw}: {out:x?}");
+        }
+    }
+
+    /// Renderer port 5 (`VICTORY_PORT_CBV=1`): a root constant buffer becomes a
+    /// root SRV read as raw bytes (`root_srvs` instead of `root_cbvs`), and
+    /// gives the same dwords when dispatched as a root SRV on WARP.
+    #[test]
+    #[cfg(windows)]
+    fn root_constant_buffers_become_root_srvs_when_constants_raw_is_on() {
+        let mut words: Vec<u32> = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0301, // s_mov_b32 s5, s1
+            0xBE86_03C1, // s_mov_b32 s6, -1
+            0xBE87_03FF,
+            0x1101_4FAC, // s_mov_b32 s7, 0x11014fac
+            0xF428_0402,
+            0xFA00_0010, // s_buffer_load_dwordx4 s[16:19], s[4:7], 0x10
+            0xBE88_0302, // s_mov_b32 s8, s2
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xF408_0304,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[8:9], 0x0 (the UAV)
+        ];
+        for (out, s) in (16..20u32).enumerate() {
+            words.push(0x7E00_0000 | 1 << 17 | 0x001 << 9 | s);
+            words.push(0x38 << 26 | 0x1C << 18 | (4 * out as u32));
+            words.push(0x80 << 24 | (12 >> 2) << 16 | 1 << 8);
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 2,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::UsedResource {
+                    kind: crate::ResourceType::Cbv,
+                    root: crate::RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 2,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Uav,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 2,
+                    slot: 1,
+                },
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let lowered = |raw: bool| {
+            super::shader::CONSTANTS_RAW_HERE.set(Some(raw));
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let l = super::lower::lower(&super::lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .unwrap();
+            super::shader::CONSTANTS_RAW_HERE.set(None);
+            l
+        };
+        let (before, after) = (lowered(false), lowered(true));
+        assert_eq!(before.root_cbvs, vec![0]);
+        assert!(before.root_srvs.is_empty());
+        assert!(after.root_cbvs.is_empty());
+        assert_eq!(after.root_srvs, vec![0]);
+
+        let data: Vec<u32> = (0..16u32).map(|i| 0x0202_0202u32.wrapping_mul(i + 5) ^ 0x3000_0000).collect();
+        let want: Vec<u32> = data[4..8].to_vec();
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (raw, l) in [(false, before), (true, after)] {
+            let mut dxil = l.dxil;
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut dxil).unwrap();
+            }
+            let Ok(host) = super::host::Host::new(true) else {
+                eprintln!("no software adapter; the dispatch is skipped");
+                return;
+            };
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(
+                            1,
+                            super::host::Root::View {
+                                srv: raw,
+                                data: data.clone(),
+                            },
+                        )],
+                        views: &[super::host::View::RawUav(4)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(out[0][..4], want[..], "switch {raw}: {out:x?}");
         }
     }
 
