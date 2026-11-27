@@ -38,8 +38,9 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Input_XboxController",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# Diagnostics only: recording our own audio (`modules::audio::capture`).
-windows = { workspace = true, optional = true, features = [
+# Whether Windows has an audio output (`modules::audio::output`), and in
+# diagnostics builds recording our own audio (`modules::audio::capture`).
+windows = { workspace = true, features = [
     "Win32_Media_Audio",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
@@ -47,14 +48,14 @@ windows = { workspace = true, optional = true, features = [
     "Win32_System_Variant",
 ] }
 # `#[implement]` names it.
-windows-core = { workspace = true, optional = true }
+windows-core = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).
-diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
+diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics"]
 
 [lints]
 workspace = true

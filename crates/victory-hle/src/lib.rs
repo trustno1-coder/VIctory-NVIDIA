@@ -27,6 +27,9 @@ pub use victory_gpu::console;
 /// DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`).
 #[cfg(windows)]
 pub use victory_gpu::streamline;
+/// Lines the start adds to the notice at the top of the picture.
+#[cfg(windows)]
+pub use victory_gpu::start_notice;
 #[cfg(windows)]
 pub use victory_gpu::reserve_upload_space;
 #[cfg(all(windows, feature = "diagnostics"))]

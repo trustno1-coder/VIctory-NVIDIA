@@ -74,6 +74,14 @@ pub fn run(
     for (i, line) in victory_hle::streamline::notice_at_start().iter().enumerate() {
         println!("{}{line}", if i == 0 { "frame gen      " } else { "               " });
     }
+    // Without a playback device the title freezes at the story's loading screen (issue #305).
+    if victory_hle::modules::audio::output::has_playback_device() == Some(false) {
+        use victory_hle::modules::audio::output::NO_OUTPUT_NOTICE;
+        for (i, line) in NO_OUTPUT_NOTICE.iter().enumerate() {
+            println!("{}{line}", if i == 0 { "audio          " } else { "               " });
+        }
+        victory_hle::start_notice::add(&NO_OUTPUT_NOTICE);
+    }
     if fsr_path && !asked.any() {
         println!("upscaling      the title's own FidelityFX at the {} scale (VICTORY_FSR_PATH=1)", asked.mode.name());
     }
