@@ -1,8 +1,20 @@
 # Synthetic shader correctness and pressure reclamation
 
-**Pending revalidation:** upstream advanced to `64d4931b3dd90305134512b805fc98f04119fb6e` after the results below. Its allocator/list trimming, prelude pooling and shader changes have been merged, preserving both sets of changes. The new merge is being pushed before testing at the owner's request; results below apply only to the older pinned revisions. Upstream age-based idle trimming remains available; the new pressure-only path also increments its trim counter.
 
 This work supplements existing upstream fixes with four shader corrections and pressure-only reclamation of idle host lists and oversized fetch buffers. The new shader/memory tests use original synthetic fixtures; no game, captured asset, shader dump, game offset or private runtime log was supplied. Existing repository test data and its licensing caveats are unchanged; these commits add or modify no binary/table blob. No real-game correctness or FPS claim is made.
+
+## Current merged-tree validation
+
+Upstream base: `64d4931b3dd90305134512b805fc98f04119fb6e`. Final tested source: `b2a3dabad7daf0e7ba3943a0ace2515e487c25dd`. Published as [PR #479](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/479).
+
+- Full default workspace: **1095 passed, 0 failed, 52 ignored**, including **300 shader tests**. Nested HLE child results are not counted twice.
+- Both Clippy configurations passed after integration; the final helper extraction also passes all-targets/all-features Clippy. Asset policy: **294 files pass**.
+- On `e4641ee`, both unfiltered oracle seeds retain **1199 matching semantic comparisons, 1 ambiguous equal-input SCC case unchecked, 0 differences/refusals**. Relay and synchronous strict pressure and two-burst complete 32 MiB readback tests pass. The subsequent `b2a3dab` extraction moves these branch helpers without changing their statements; only visibility and whitespace differ, verified by text comparison and the full default suite.
+- Pressure counters retain the measured improvements: idle lists **68 -> 19** with relay and **64 -> 16** synchronously; fetch capacity **32 -> 16 MiB** in both modes.
+- The final all-features workspace run was **cancelled at the owner's request to reduce cost**, not completed. Its forced-termination exit is not a semantic test failure, and partial passing results are not presented as a full pass. Further optional queued compatibility runs were also cancelled. Older all-feature/steady-state/control results below belong only to their explicitly pinned revisions.
+- Compatibility with the newly merged optional `VICTORY_ALLOCATOR_TRIM=1` path has not been separately completed. Upstream's age-based trimming and allocator/prelude reuse are retained; the pressure path reuses its age calculation and updates its trim counter.
+
+Integration changes: `16fb1d7` resolves the three upstream conflicts while retaining both shader helper sets and allocator/prelude behavior; `e4641ee` reuses the upstream idle-age helper and fixes two new modulo Clippy findings; `b2a3dab` extracts branch-state helpers to meet the existing lowerer file-size limit (652482 bytes versus 655360). No policy limit was relaxed. The historical measurements below are not substituted for this merged-tree validation.
 
 ## Revisions and attribution
 
@@ -63,7 +75,7 @@ cargo test -p victory-gpu --lib --locked memory_bench_steady_state -- --ignored 
 
 Set `VICTORY_MEMBENCH_STRICT=1` for the pressure test. It simulates 1 GiB free RAM in the layer's test-only accounting; it does not exhaust physical RAM. Repeat with `VICTORY_IDLE_RECLAIM=0` for the negative control. Do not run these singleton/allocator benchmarks together in one process.
 
-## Results
+## Historical results before upstream 64d4931
 
 - Default workspace at `1e050de`: **1074 passed, 0 failed, 50 ignored**. Counts exclude the HLE test's nested child-process result, which would otherwise be counted twice. This includes **299 shader tests**, with 5 ignored.
 - All-features workspace at `6e2171f`: **1127 passed, 0 failed, 51 ignored**, also excluding the nested HLE child result. Production source matches `1e050de`; the later commit changes only the isolated regrowth fixture.
