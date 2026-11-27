@@ -299,7 +299,8 @@ impl<B: Clone> Pool<B> {
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        let rest = if self.spare <= SPARE { 250 } else { REST };
+        self.resting.push_back((now + rest, piece));
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty

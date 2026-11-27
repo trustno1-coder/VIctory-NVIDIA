@@ -110,8 +110,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         #[cfg(windows)]
         if crate::host::late() {
             drop(waiters);
+            if crate::host::render_trace::active() {
+                crate::host::render_trace::event("title_fence_request", format_args!("fence={:#x}\tvalue={value}", this as usize));
+            }
             crate::queue::before_sync();
-            crate::host::settle_for_fence();
+            crate::host::settle_for_fence(crate::host::FenceDrain::TitleFence);
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }

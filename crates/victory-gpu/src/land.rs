@@ -57,7 +57,7 @@ fn threads() -> usize {
 }
 
 /// Whether views of the title's pages are written through one of ours.
-fn beside_on() -> bool {
+pub(crate) fn beside_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_BESIDE").is_none_or(|v| v != "0"))
 }
@@ -329,6 +329,57 @@ fn take(state: &mut State) -> Option<(Work, usize)> {
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
+}
+
+/// [`Pool::each`] on threads kept for putting the title's bytes in under flights' writes,
+/// one copy a job (`crate::host`'s `stale_of`; `VICTORY_MERGE_THREADS`, 4 with this one).
+/// Others than those of [`each_under`], which a job here leaves alone (its pages are
+/// compared on its own thread then).
+pub(crate) fn each_merge(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("VICTORY_MERGE_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4usize);
+        Pool::new("victory-merge", threads.clamp(1, 16))
+    })
+    .each(count, f);
+}
+
+/// `victory bench`: lands whole 64 KiB pieces (title address, the card's bytes, the held
+/// copy) as a landing does, on `threads` threads (a pool kept per count).
+pub(crate) fn bench_land(work: &[(usize, usize, usize)], threads: usize) {
+    static POOLS: std::sync::Mutex<Vec<(usize, &'static Pool)>> = std::sync::Mutex::new(Vec::new());
+    let pool = {
+        let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+        match pools.iter().find(|p| p.0 == threads) {
+            Some(p) => p.1,
+            None => {
+                let p = Pool::new("victory-bench-land", threads.clamp(1, 32));
+                pools.push((threads, p));
+                p
+            }
+        }
+    };
+    let cut: Vec<(usize, usize)> = work.iter().map(|p| (p.0, BLOCK)).collect();
+    let jobs = jobs(&cut);
+    pool.each(jobs.len(), &|j| {
+        let mut notes = Notes::default();
+        for &(at, now, held) in &work[jobs[j].clone()] {
+            // SAFETY: each piece its own bytes, which the caller keeps.
+            unsafe { piece_at(at, now as *const u8, held as *mut u8, &[(0, BLOCK)], true, &mut notes, beside_on(), std::ptr::null()) };
+        }
+        notes.flush();
+    });
+}
+
+/// [`Pool::each`] on threads kept for resetting host lists that have run
+/// (`crate::list::recycle`; `VICTORY_RESET_THREADS`, 6 with this one).
+pub(crate) fn each_reset(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("VICTORY_RESET_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
+        Pool::new("victory-reset", threads.clamp(1, 8))
+    })
+    .each(count, f);
 }
 
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes

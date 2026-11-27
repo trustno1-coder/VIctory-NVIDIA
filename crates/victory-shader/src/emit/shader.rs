@@ -9,9 +9,14 @@ use super::container::{self, Binding, Psv, SigElement};
 pub const USER_DATA_SPACE: u32 = 0;
 /// Where immediate samplers are bound: `s<n>` in this space.
 pub const SAMPLER_SPACE: u32 = 0;
-/// Where root CBVs and SRVs are bound: `b<root parameter index>` and
-/// `t<root parameter index>` in this space.
+/// Where root views are bound: `t<root parameter index>` (root SRVs, and
+/// root constant buffers, which are read as raw bytes too) and
+/// `u<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+
+/// The bytes a root constant buffer is read in: 4,096 vectors, as many as
+/// a constant buffer view can show. Reads at or past them give zeros.
+pub const ROOT_CONSTANT_BYTES: u32 = 64 << 10;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -349,14 +354,19 @@ impl Shader {
         self.annotate(block, h, 13, u32::MAX)
     }
 
-    /// The handle of the root CBV of root parameter `slot`, made in the
-    /// entry block.
-    pub fn root_cbv_handle(&mut self, slot: u8) -> V {
+    /// The handle of the root constant buffer of root parameter `slot`,
+    /// read as raw bytes: the root SRV `t<slot>` in [`ROOT_CBV_SPACE`] (a
+    /// raw buffer), made in the entry block. The host binds it at the
+    /// title's own address, which needs 4 bytes where a constant buffer
+    /// view needs 256: constants the title placed on 16 are read where it
+    /// wrote them (`victory-gpu` `port`), with nothing copied. A root view
+    /// has no size: the code reads zeros past [`ROOT_CONSTANT_BYTES`] itself.
+    pub fn root_constants_handle(&mut self, slot: u8) -> V {
         if let Some(&(_, h)) = self.root_cbvs.iter().find(|r| r.0 == slot) {
             return h;
         }
         let r = self.m.i32(u32::from(slot));
-        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(2)];
+        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(0)];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
         let block = self.entry;
@@ -368,7 +378,8 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 13, 65536);
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
         self.root_cbvs.push((slot, h));
         h
     }
@@ -619,41 +630,22 @@ impl Shader {
                     dxil_kind: 13,
                 });
             }
-            let blob = self.m.array(16384, self.t.i32);
-            let ty = self.m.named_struct("RootCbv", vec![blob]);
-            let p = self.m.ptr(ty);
-            let u = self.m.undef(p);
-            for (slot, _) in self.root_cbvs.clone() {
-                let ops = vec![
-                    Some(i32c(&mut self, cbv_list.len() as u32)),
-                    Some(self.m.md_value(u)),
-                    Some(empty),
-                    Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                    Some(i32c(&mut self, u32::from(slot))),
-                    Some(i32c(&mut self, 1)),
-                    Some(i32c(&mut self, 65536)),
-                    None,
-                ];
-                cbv_list.push(Some(self.m.md_node(ops)));
-                bindings.push(Binding {
-                    kind: 2,
-                    space: ROOT_CBV_SPACE,
-                    register: u32::from(slot),
-                    dxil_kind: 13,
-                });
-            }
             if !cbv_list.is_empty() {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            if !self.root_srvs.is_empty() || !self.root_cbvs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                // Root constant buffers are raw buffers too
+                // ([`Shader::root_constants_handle`]); a root parameter is
+                // one or the other, so their registers never meet.
+                let views: Vec<(u8, V)> = self.root_srvs.iter().chain(&self.root_cbvs).copied().collect();
+                for (n, (slot, _)) in views.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),

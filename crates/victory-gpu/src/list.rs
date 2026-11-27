@@ -233,6 +233,17 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
+/// A thin recording's last reference went away. A submission that took its
+/// host lists also took their state via `detach_parts`.
+#[cfg(windows)]
+fn discard_thin_state(this: This) {
+    // SAFETY: the recording's private list is idle until it goes into BACKS.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    list.earlier.clear();
+    list.gate.clear();
+    list.state.get_mut().unwrap_or_else(|e| e.into_inner()).tables_done();
+}
+
 /// The host list behind a title list, if there is a host GPU, for a call
 /// that records into it: counted as a title call, which records an
 /// indirect execution held back first ([`crate::host::HostList::title_call`]).
@@ -273,8 +284,12 @@ impl Detached {
         &self.host
     }
 
-    /// Releases this list's dynamic descriptor slots once its GPU submission
-    /// has completed, without waiting for the full `bury_lag` allocator delay.
+    pub(crate) fn tables_submitted(&mut self, fence: u64) {
+        self._state.tables_submitted(fence);
+    }
+
+    /// Clears the descriptor state of a finished list. The slots of a flight
+    /// were handed off to the heap when the list was submitted.
     pub(crate) fn release_tables(&mut self) {
         self._state.tables_done();
     }
@@ -344,23 +359,78 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    // The room the idle pool has: lists past it are not reset, only let go.
+    let room = IDLE_MOST.0.saturating_sub(IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len());
+    let mut keep: Vec<crate::host::HostList> = Vec::new();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
-            continue;
+        if ran.contains(&i) && keep.len() < room {
+            keep.push(host);
         }
-        // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
-        host.reset();
-        let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    }
+    if keep.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    // As the title's reset does: what the list kept for its commands goes,
+    // its allocators stay. Each list's reset is its own allocator's and
+    // list's (the driver frees what they held), so a flight's lists are
+    // reset on several threads at once, past a few.
+    if keep.len() >= RESET_WIDE && reset_wide() {
+        struct Lists(*const crate::host::HostList);
+        // SAFETY: each job resets one list of its own, which nothing else
+        // touches until `each_reset` returns.
+        unsafe impl Sync for Lists {}
+        let lists = Lists(keep.as_ptr());
+        let count = keep.len();
+        crate::land::each_reset(count.div_ceil(RESET_JOB), &|j| {
+            let lists = &lists;
+            for n in j * RESET_JOB..((j + 1) * RESET_JOB).min(count) {
+                // SAFETY: in `keep`, alive until this returns; one job each.
+                unsafe { &*lists.0.add(n) }.reset();
+            }
+        });
+    } else {
+        keep.iter().for_each(crate::host::HostList::reset);
+    }
+    let kept: Vec<(crate::host::HostList, u64)> = keep
+        .into_iter()
+        .map(|host| {
+            let bytes = host.scratch_kept();
+            (host, bytes)
+        })
+        .collect();
+    RECYCLED[0].fetch_add(kept.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    RECYCLED[1].fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    for (host, bytes) in kept {
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
     }
+}
+
+/// Since the last frame-rate line: host lists reset and kept for reuse
+/// ([`recycle`]), and the nanoseconds (wall time) their resets took.
+#[cfg(windows)]
+pub(crate) static RECYCLED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Lists of one recycling from which they are reset on several threads
+/// ([`recycle`]), and the lists a job resets.
+#[cfg(windows)]
+const RESET_WIDE: usize = 4;
+#[cfg(windows)]
+const RESET_JOB: usize = 2;
+
+/// Whether lists are reset on several threads (`VICTORY_RESET_WIDE=0`: one
+/// after another on the calling thread, as before).
+#[cfg(windows)]
+fn reset_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESET_WIDE").is_none_or(|v| v != "0"))
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -759,7 +829,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.gate.clear();
     }
     #[cfg(windows)]
-    with_state(this, |host, state| {
+    with_state_on(host_list_held(this), this, |host, state| {
         host.reset();
         state.reset(pipeline);
     });
@@ -863,14 +933,62 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .iter()
             .filter_map(|b| host_barrier(list, b))
             .collect();
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
-            host.push(UAV_BARRIER);
-            #[cfg(feature = "diagnostics")]
+        // Buffers have host copies, not resources the barrier can name directly:
+        // transitions not leaving `UNORDERED_ACCESS` (`0x8`) need no UAV
+        // barrier, and UAV-relevant buffer barriers emit a targeted UAV
+        // barrier on `shadow.buffer` when `shadow::find_any` resolves to one,
+        // falling back to a global wait (`wait_all`) only otherwise.
+        const BEGIN_ONLY: u32 = 1;
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let mut wait_all = false;
+        for b in barriers {
+            if b.kind == 1 || b.first.is_null() {
+                continue;
+            }
+            let Some((addr, len)) = crate::resource::buffer_bytes(b.first) else {
+                continue;
+            };
+            if b.kind == 0
+                && (b.flags & BEGIN_ONLY != 0 || ((b.second >> 32) as u32 & UNORDERED_ACCESS) == 0)
+            {
+                continue;
+            }
+            if !addr.is_null()
+                && len > 0
+                && let Some(shadow) = crate::shadow::find_any(addr as u64, len)
+            {
+                list.keep(&shadow.buffer);
+                let ptr: This = windows::core::Interface::as_raw(&shadow.buffer).cast_const().cast();
+                if !host.iter().any(|h| h.kind == 2 && h.first == ptr) {
+                    host.push(Barrier { kind: 2, flags: 0, first: ptr, second: 0, last: 0 });
+                }
+            } else {
+                wait_all = true;
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        if wait_all {
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+        }
+        // The title's own waits for every shader write (UAV barriers on no
+        // resource) are that one wait too: one of them at most, and none if
+        // the last one in the list had nothing recorded after it
+        // (`VICTORY_MERGE_BARRIERS`).
+        let before = host.len();
+        host.retain(|b| !(b.kind == 2 && b.first.is_null()));
+        wait_all |= host.len() != before;
+        let transitions = host.iter().filter(|b| b.kind == 0).count() as u64;
+        let aliasing = host.iter().filter(|b| b.kind == 1).count() as u64;
+        let uav = host.iter().filter(|b| b.kind == 2).count() as u64;
+        crate::host::count_gpu_barriers(transitions, aliasing, uav);
+        if !host.is_empty() {
+            list.gpu_step(crate::host::GpuStep::Transitions, 0);
+        }
+        if wait_all && list.wait_for_writes() {
+            if host.is_empty() {
+                list.gpu_step(crate::host::GpuStep::ShaderWrites, 0);
+            }
+            host.push(UAV_BARRIER);
         }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -897,6 +1015,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        crate::host::count_gpu_step(crate::host::GpuStep::OurStates, 0);
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -927,6 +1046,7 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
     if len == 0 {
         return;
     }
+    list.gpu_step(crate::host::GpuStep::BufferCopies, len as u64);
     if list.place_copy(to as usize, from as usize, len) {
         with_state(this, |_, state| state.copied());
     } else {
@@ -987,6 +1107,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if unlike(dst, src) {
                 return;
             }
+            list.gpu_step(crate::host::GpuStep::TextureCopies, 0);
             // Two title textures over the same memory have one host
             // texture between them: the copy would be of that texture onto
             // itself, which the host does not allow, and it would change
@@ -1078,6 +1199,7 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        list.gpu_step(crate::host::GpuStep::TextureCopies, 0);
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1294,7 +1416,7 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
-    let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
+    let buffer = host.read_back_pooled(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
@@ -1361,6 +1483,7 @@ extern "system" fn resolve(
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
+        list.gpu_step(crate::host::GpuStep::Resolves, 0);
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         if unlike(dst, src) {
@@ -1430,6 +1553,7 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
+        list.gpu_step(crate::host::GpuStep::Clears, 0);
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1481,6 +1605,7 @@ extern "system" fn clear_dsv(
         else {
             return;
         };
+        list.gpu_step(crate::host::GpuStep::Clears, 0);
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1519,6 +1644,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
+        list.gpu_step(crate::host::GpuStep::MemoryCopies, len as u64);
         if list.place_copy(dst as usize, src as usize, len) {
             with_state(this, |_, state| state.copied());
             return;
@@ -1653,10 +1779,15 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
-            // SAFETY: the same layout; no resource named.
-            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-            // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            // (none where the last one in the list had nothing recorded after
+            // it: `VICTORY_MERGE_BARRIERS`)
+            if list.wait_for_writes() {
+                list.gpu_step(crate::host::GpuStep::ShaderWrites, 0);
+                // SAFETY: the same layout; no resource named.
+                let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[barrier]) };
+            }
         }
     }
     let _ = (this, flags, control, address, size);
@@ -1931,7 +2062,7 @@ mod state {
 }
 
 fn count_draw() {
-    DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DRAWS.add(1);
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
@@ -2010,20 +2141,21 @@ pub(crate) fn take_indirect() -> u64 {
 }
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
-    DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DISPATCHES.add(1);
 }
 #[cfg(not(windows))]
 extern "system" fn dispatch(_: This) {
     count_dispatch();
 }
-static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// (Added to by every draw on every recording and translating thread: one
+/// place per thread, `crate::sharded`.)
+static DRAWS: crate::sharded::Counter = crate::sharded::Counter::new();
+static DISPATCHES: crate::sharded::Counter = crate::sharded::Counter::new();
 
 /// Draws (any kind, mesh and indirect included) and compute dispatches
 /// recorded since the last call.
 pub(crate) fn take_counts() -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
+    (DRAWS.take(), DISPATCHES.take())
 }
 
 /// A GPU wait for a memory value: the list's commands after it run when
@@ -2222,10 +2354,15 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // (none where the last one in the list had nothing recorded after it:
+        // `VICTORY_MERGE_BARRIERS`)
+        if list.wait_for_writes() {
+            list.gpu_step(crate::host::GpuStep::ShaderWrites, 0);
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, count);

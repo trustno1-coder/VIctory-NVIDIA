@@ -60,14 +60,25 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
-    // Those earlier runs drew with first, the others in no order (by key).
+    // Those earlier runs drew with first, in the order they first drew with
+    // them (`pipeline-order.txt`, the line is the place), then those listed
+    // without a place, then the others in no order (by key).
+    let order = std::fs::read_to_string(dir.join("pipeline-order.txt")).unwrap_or_default();
+    let mut place: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for key in order.lines().filter_map(|l| l.split_whitespace().next()) {
+        let next = place.len();
+        place.entry(key).or_insert(next);
+    }
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
             (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
         })
         .collect();
-    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+    all.sort_by_key(|&n| {
+        let key = keys[n].as_str();
+        (!early.contains(key), place.get(key).copied().unwrap_or(usize::MAX), &keys[n])
+    });
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);

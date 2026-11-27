@@ -21,8 +21,8 @@
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,8 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// Made ahead of the title's own creation of it ([`prewarm_add`]).
+    prewarmed: AtomicBool,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -172,6 +174,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            prewarmed: AtomicBool::new(false),
         }
     }
 
@@ -184,6 +187,9 @@ impl Pending {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            if self.prewarmed.load(Ordering::Relaxed) {
+                PRE_MADE.fetch_add(1, Ordering::Relaxed);
+            }
             made
         });
         let (lock, done) = &DONE;
@@ -278,6 +284,7 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    note_draw();
     if p.left_out.is_some() {
         LEFT_OUT.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -288,6 +295,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        if p.prewarmed.load(Ordering::Relaxed) {
+            LATE.fetch_add(1, Ordering::Relaxed);
+        }
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
@@ -418,26 +428,66 @@ fn slow_limit() -> usize {
     })
 }
 
+/// An early pipeline in the queue: the one an earlier run first used soonest
+/// goes first (`rank`, see `library::rank`); those with no recorded place
+/// (`u64::MAX`) and equal places keep the order they were queued in (`n`).
+struct Ranked {
+    rank: u64,
+    n: u64,
+    p: Arc<Pending>,
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        (self.rank, self.n) == (other.rank, other.n)
+    }
+}
+
+impl Eq for Ranked {}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ranked {
+    /// Reversed: a `BinaryHeap` gives the greatest first.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (other.rank, other.n).cmp(&(self.rank, self.n))
+    }
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
-    early: VecDeque<Arc<Pending>>,
+    /// In the order earlier runs first used them (`VICTORY_PIPELINE_ORDER=0`:
+    /// the title's creation order, as before).
+    early: BinaryHeap<Ranked>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
-    slow: VecDeque<Arc<Pending>>,
+    slow: BinaryHeap<Ranked>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    queued: u64,
+}
+
+/// Whether early pipelines are made in the order earlier runs first used them.
+fn by_first_use() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_ORDER").is_none_or(|v| v != "0"))
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
-            early: VecDeque::new(),
-            slow: VecDeque::new(),
+            early: BinaryHeap::new(),
+            slow: BinaryHeap::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            queued: 0,
         }
     }
 
@@ -457,34 +507,62 @@ impl Queue {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
-        } else if slow {
-            self.slow.push_back(p.clone());
         } else {
-            self.early.push_back(p.clone());
+            self.queued += 1;
+            let rank = if by_first_use() { super::library::rank(&p.key) } else { u64::MAX };
+            let entry = Ranked { rank, n: self.queued, p: p.clone() };
+            if slow {
+                self.slow.push(entry);
+            } else {
+                self.early.push(entry);
+            }
         }
         Some(prev == NOT_QUEUED)
     }
 
+    /// Whether the next known-slow pipeline is one an earlier run used before
+    /// the next other early one.
+    fn slow_is_sooner(&self) -> bool {
+        matches!((self.early.peek(), self.slow.peek()), (Some(early), Some(slow)) if slow > early)
+    }
+
+    /// The next known-slow pipeline, if fewer than `limit` are being made.
+    fn take_slow(&mut self, limit: usize) -> Option<Arc<Pending>> {
+        if self.slow_now >= limit {
+            return None;
+        }
+        let p = unclaimed(&mut self.slow)?;
+        p.was_slow.store(true, Ordering::Relaxed);
+        self.slow_now += 1;
+        Some(p)
+    }
+
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
-        // An early entry can have been promoted and claimed already.
-        let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
-            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
-            if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
-                if let Some(p) = &p {
-                    p.was_slow.store(true, Ordering::Relaxed);
-                    self.slow_now += 1;
-                }
+            p = self.requested.pop_front();
+            // While the title loads, all go in the order earlier runs used
+            // them in, the slow ones among them (as many at once as the limit
+            // allows); otherwise the slow ones wait behind the others.
+            if p.is_none() && LOADING.load(Ordering::Relaxed) && by_first_use() && self.slow_is_sooner() {
+                p = self.take_slow(slow_limit);
+            }
+            if p.is_none() {
+                p = unclaimed(&mut self.early);
+            }
+            if p.is_none() {
+                p = self.take_slow(slow_limit);
             }
         }
         let p = p?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
+}
+
+/// The next entry of `list` that was not promoted and claimed already.
+fn unclaimed(list: &mut BinaryHeap<Ranked>) -> Option<Arc<Pending>> {
+    std::iter::from_fn(|| list.pop().map(|r| r.p)).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
@@ -505,7 +583,11 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
-            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            let waiting = WAITING.fetch_add(1, Ordering::Relaxed) + 1;
+            PEAK.fetch_max(waiting, Ordering::Relaxed);
+            if waiting >= BOOST_PENDING && boost_level().is_some() {
+                BOOST.store(true, Ordering::Relaxed);
+            }
         }
         // (One woken could be a worker that takes passes over the screen
         // alone: it would leave the pipeline to nobody.)
@@ -516,10 +598,45 @@ fn start(p: &Arc<Pending>, priority: u8) {
 /// Workers that make passes over the screen alone, besides the others.
 const SCREEN_WORKERS: usize = 2;
 
+/// Pipelines waiting at once from which the workers are in a hurry (a world
+/// entry or a cold cache queues hundreds; a draw or two does not).
+const BOOST_PENDING: u64 = 32;
+
+/// Whether the workers are in a hurry: set when [`BOOST_PENDING`] pipelines
+/// wait, cleared when they are all made ([`drained`]). Then the workers run
+/// above their usual priority and may all take the pipelines known to take long.
+static BOOST: AtomicBool = AtomicBool::new(false);
+
+/// How many workers there are (0 until started).
+static WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// The priority of workers in a hurry: `VICTORY_PIPELINE_BOOST` unset or
+/// `below`: below normal, `normal`: normal, `0`: none (as before).
+fn boost_level() -> Option<i32> {
+    use windows::Win32::System::Threading::{THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL};
+    static LEVEL: OnceLock<Option<i32>> = OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_PIPELINE_BOOST").ok().as_deref().map(str::trim) {
+        Some("0") => None,
+        Some("normal") => Some(THREAD_PRIORITY_NORMAL.0),
+        _ => Some(THREAD_PRIORITY_BELOW_NORMAL.0),
+    })
+}
+
+/// The most workers that take known-slow pipelines now: the usual limit, or
+/// while [`BOOST`] all but one (that one is left for what draws ask for).
+fn slow_limit_now() -> usize {
+    let usual = slow_limit();
+    let hurry = LOADING.load(Ordering::Relaxed) || (BOOST.load(Ordering::Relaxed) && boost_level().is_some());
+    if usual == usize::MAX || !hurry {
+        return usual;
+    }
+    usual.max(WORKERS.load(Ordering::Relaxed).saturating_sub(1))
+}
+
 fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop(screens_only, slow_limit()) {
+        if let Some(p) = queue.pop(screens_only, slow_limit_now()) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -553,6 +670,7 @@ fn workers() -> bool {
             std::thread::available_parallelism().map_or(2, |n| n.get()),
             crate::residency::limited_host_ram(),
         );
+        WORKERS.store(workers, Ordering::Relaxed);
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
@@ -564,14 +682,31 @@ fn workers() -> bool {
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
                     let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
+                    use windows::Win32::System::Threading::*;
+                    let usual = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+                    let set = |priority: THREAD_PRIORITY| {
+                        // SAFETY: a plain call on our own thread.
+                        let _ = unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+                    };
+                    set(usual);
+                    let mut now = usual.0;
                     loop {
                         let p = next(screens_only);
+                        // In a hurry (a world's worth of pipelines waiting, the
+                        // title's thread waiting for them): above the usual
+                        // lowest, until they are all made.
+                        // While the title loads and pipelines of earlier runs are
+                        // being made ahead ([`LOADING`]): all workers but the
+                        // first at normal priority.
+                        let wanted = match boost_level() {
+                            _ if lowest && i != 0 && LOADING.load(Ordering::Relaxed) => THREAD_PRIORITY_NORMAL.0,
+                            Some(level) if lowest && BOOST.load(Ordering::Relaxed) => level.max(usual.0),
+                            _ => usual.0,
+                        };
+                        if wanted != now {
+                            set(THREAD_PRIORITY(wanted));
+                            now = wanted;
+                        }
                         p.make();
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
@@ -602,6 +737,8 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 /// the cache saved (at most every 20 s).
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
+    BOOST.store(false, Ordering::Relaxed);
+    loading_over("everything queued is made");
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
@@ -609,8 +746,145 @@ fn drained() {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipelines all made"
         );
+        super::library::log_summary(true);
     }
     super::library::save(false);
+}
+
+/// Whether the title is loading and pipelines of earlier runs are being made
+/// ahead of its asking for them ([`prewarm_begin`]): the workers but the first
+/// run at normal priority, all but one of them may be in known-slow pipelines,
+/// and the queue goes in the order earlier runs first used pipelines in, slow
+/// ones included. Cleared by [`loading_over`].
+static LOADING: AtomicBool = AtomicBool::new(false);
+static LOADING_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Pipelines planned from earlier runs, queued by the prewarm, made so far,
+/// found by the title's creation of the same pipeline, and asked for by a draw
+/// before they were made.
+pub(super) static PLANNED: AtomicU64 = AtomicU64::new(0);
+pub(super) static QUEUED: AtomicU64 = AtomicU64::new(0);
+static PRE_MADE: AtomicU64 = AtomicU64::new(0);
+static ADOPTED: AtomicU64 = AtomicU64::new(0);
+static LATE: AtomicU64 = AtomicU64::new(0);
+
+/// By key: the planned pipelines, `None` until one exists (made by the prewarm
+/// or created by the title, whichever came first). The title's creation of a
+/// pipeline gets the one that is here ([`adopt`]), made or in the queue.
+static PREWARMED: Mutex<Option<HashMap<String, Option<Arc<Pending>>>>> = Mutex::new(None);
+
+/// A frame in which this many draws and dispatches are asked for is a world's
+/// (the menu and loading screen draw 1 to 11); two in a row end the loading.
+const WORLD_DRAWS: u64 = 300;
+static DRAW_FRAME: AtomicU64 = AtomicU64::new(0);
+static DRAW_COUNT: AtomicU64 = AtomicU64::new(0);
+static WORLD_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// The prewarm starts: counts as a pipeline waiting until [`prewarm_end`], so
+/// that the workers do not run out of work between the loader's entries.
+pub(super) fn prewarm_begin() {
+    *LOADING_SINCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    WAITING.fetch_add(1, Ordering::Relaxed);
+    LOADING.store(true, Ordering::Relaxed);
+}
+
+/// The loader has queued all it will.
+pub(super) fn prewarm_end() {
+    if QUEUED.load(Ordering::Relaxed) == 0 {
+        loading_over("nothing to make ahead");
+    }
+    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        drained();
+    }
+}
+
+/// The keys the prewarm will queue.
+pub(super) fn prewarm_plan(keys: &[String]) {
+    let mut map = PREWARMED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_default();
+    for key in keys {
+        map.entry(key.clone()).or_insert(None);
+    }
+    PLANNED.store(keys.len() as u64, Ordering::Relaxed);
+}
+
+/// Queues a pipeline of an earlier run, before the title creates it; `false`
+/// if the title created it first (its own is the one that is made).
+pub(super) fn prewarm_add(p: Pending) -> bool {
+    p.prewarmed.store(true, Ordering::Relaxed);
+    let p = Arc::new(p);
+    {
+        let mut map = PREWARMED.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = map.get_or_insert_default().entry(p.key.clone()).or_insert(None);
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(p.clone());
+    }
+    if p.left_out.is_none() && !p.shaders.is_empty() {
+        QUEUED.fetch_add(1, Ordering::Relaxed);
+        start(&p, EARLY);
+    }
+    true
+}
+
+/// The pipeline the title's creation of `p` gets: the one the prewarm made or
+/// queued for the same key, else `p` itself.
+pub(crate) fn adopt(p: Pending) -> Arc<Pending> {
+    let mut map = PREWARMED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = map.as_mut().and_then(|m| m.get_mut(&p.key)) {
+        if let Some(there) = slot.as_ref() {
+            ADOPTED.fetch_add(1, Ordering::Relaxed);
+            return there.clone();
+        }
+        let p = Arc::new(p);
+        *slot = Some(p.clone());
+        return p;
+    }
+    Arc::new(p)
+}
+
+/// Counts a draw or dispatch of the title while it loads: a frame of a
+/// world's worth of them ends the loading.
+fn note_draw() {
+    if !LOADING.load(Ordering::Relaxed) {
+        return;
+    }
+    let frame = crate::frame::current();
+    let last = DRAW_FRAME.load(Ordering::Relaxed);
+    if frame != last && DRAW_FRAME.compare_exchange(last, frame, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        if DRAW_COUNT.swap(0, Ordering::Relaxed) >= WORLD_DRAWS {
+            if WORLD_FRAMES.fetch_add(1, Ordering::Relaxed) >= 1 {
+                loading_over("the title draws a world");
+            }
+        } else {
+            WORLD_FRAMES.store(0, Ordering::Relaxed);
+        }
+    }
+    DRAW_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The title has loaded (or everything planned is made): the workers go back
+/// to their usual priority and limits.
+fn loading_over(why: &str) {
+    if !LOADING.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let seconds = LOADING_SINCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map_or(0.0, |t| t.elapsed().as_secs_f64());
+    tracing::info!(
+        why,
+        seconds = (seconds * 10.0).round() / 10.0,
+        planned = PLANNED.load(Ordering::Relaxed),
+        queued = QUEUED.load(Ordering::Relaxed),
+        made = PRE_MADE.load(Ordering::Relaxed),
+        found_by_the_title = ADOPTED.load(Ordering::Relaxed),
+        asked_before_made = LATE.load(Ordering::Relaxed),
+        waiting = waiting(),
+        "pipeline prewarm: loading over, workers back to their usual priority"
+    );
 }
 
 #[cfg(test)]
@@ -680,6 +954,31 @@ mod tests {
         assert!(super::super::library::wanted_early(&p.key));
     }
 
+    /// The title's creation of a pipeline gets the one made ahead for its key,
+    /// or its own if it came first (and then the prewarm leaves it alone).
+    #[test]
+    fn the_title_gets_the_pipeline_made_ahead() {
+        let named = |key: &str| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.key = key.to_owned();
+            p
+        };
+        prewarm_plan(&["ahead-test".to_owned(), "title-first-test".to_owned()]);
+        assert!(prewarm_add(named("ahead-test")));
+        let got = adopt(named("ahead-test"));
+        assert!(got.prewarmed.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(&got, &adopt(named("ahead-test"))));
+
+        let own = adopt(named("title-first-test"));
+        assert!(!own.prewarmed.load(Ordering::Relaxed));
+        assert!(!prewarm_add(named("title-first-test")));
+        assert!(Arc::ptr_eq(&own, &adopt(named("title-first-test"))));
+
+        // Not planned: not kept.
+        let (a, b) = (adopt(named("unplanned-test")), adopt(named("unplanned-test")));
+        assert!(!Arc::ptr_eq(&a, &b));
+    }
+
     #[test]
     fn draws_promote_early_pipelines_without_claiming_them_twice() {
         let earlier = Arc::new(Pending::new(Vec::new(), None));
@@ -721,6 +1020,22 @@ mod tests {
         queue.slow_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    /// Early pipelines come out by the place earlier runs first used them in,
+    /// those with none after them, and equal places in the order queued.
+    #[test]
+    fn early_pipelines_go_in_first_use_order() {
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let mut heap = BinaryHeap::new();
+        let ps = [new(), new(), new(), new()];
+        for (n, (rank, p)) in [(u64::MAX, &ps[0]), (5, &ps[1]), (1, &ps[2]), (u64::MAX, &ps[3])].into_iter().enumerate() {
+            heap.push(Ranked { rank, n: n as u64, p: p.clone() });
+        }
+        let order: Vec<_> = std::iter::from_fn(|| heap.pop()).map(|r| r.p).collect();
+        for (got, want) in order.iter().zip([&ps[2], &ps[1], &ps[0], &ps[3]]) {
+            assert!(Arc::ptr_eq(got, want));
+        }
     }
 
     /// Passes over the screen go before all others, and workers of their own

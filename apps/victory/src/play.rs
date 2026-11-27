@@ -55,7 +55,8 @@ const FSR_FILES: [&str; 2] = ["amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_
 const SETTINGS: &[(&str, &str)] = &[
     // Submission and copy machinery
     ("VICTORY_THIN", "1"),
-    ("VICTORY_JOIN_PARTS", "8"),
+    ("VICTORY_JOIN_PARTS", "16"),
+    ("VICTORY_JOIN_LISTS", "96"),
     ("VICTORY_RELAY", "2"),
     ("VICTORY_RELAY_COPY", "1"),
     ("VICTORY_WIDE_BACK", "1"),
@@ -69,16 +70,13 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_UPLOAD_AHEAD", "1"),
     ("VICTORY_SHOW_AFTER", "1"),
     ("VICTORY_MAP_THREADS", "1"),
-    // Shader writes into big write-combined copies stay on the card
-    ("VICTORY_WC_NO_BACK", "1"),
-    ("VICTORY_WC_NO_BACK_MIN_KB", "1024"),
     // The title's page-mapping copies kept without Windows views
     ("VICTORY_SOFT_VIEWS", "copies"),
     // Textures
     ("VICTORY_TEXTURE_POOL", "1"),
     ("VICTORY_RIPE_BLOCKS", "0"),
     ("VICTORY_TEXTURE_NO_WAIT", "1"),
-    ("VICTORY_TEXTURE_CATCHUP", "0"),
+    ("VICTORY_TEXTURE_CATCHUP", "1"),
     ("VICTORY_TEXTURE_STAGE_MS", "16"),
     ("VICTORY_LEVELS_ON_DEMAND", "0"),
     ("VICTORY_PRELUDE_UPLOADS", "1"),
@@ -298,10 +296,8 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         if let Some(x) = framegen_x {
             set("VICTORY_FRAMEGEN", "1");
             set("VICTORY_FRAMEGEN_X", &x.to_string());
-            // Frame generation takes 1.5 to 2 GB of the card's memory, which the layer
-            // otherwise fills with textures: on from the start it is left a fifth of the
-            // budget; ready but off, a little less is held back.
-            set("VICTORY_TEXTURE_ROOM_PERCENT", if framegen { "80" } else { "86" });
+            // (The texture line leaves frame generation its room by itself:
+            // `resource::room_line`, a constant there, not a switch here.)
         }
     }
     // AMD FSR 3 frame generation, made ready as DLSS frame generation is: auto, the layer uses
@@ -898,7 +894,7 @@ mod tests {
         assert_eq!(get("VICTORY_STREAMLINE_DIR"), Some(r"C:\nvidia"));
         // frame generation ready, off, with a little memory held back for it
         assert_eq!((get("VICTORY_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
-        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
+        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), None);
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("1000"));
         assert_eq!((get("VICTORY_MENU_DLSS"), get("VICTORY_MENU_FRAMEGEN")), (Some("quality"), Some("0")));
         assert_eq!((get("VICTORY_MENU_CONSOLE"), get("VICTORY_MENU_FPS")), (Some("series-x"), Some("1000")));
@@ -945,7 +941,7 @@ mod tests {
         // the Series S profile has no picture size of its own
         assert_eq!(get("VICTORY_NATIVE_1440P"), None);
         assert_eq!((get("VICTORY_DLSS_MODE"), get("VICTORY_FRAMEGEN_X")), (Some("performance"), Some("6")));
-        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("80"));
+        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), None);
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("16667"));
         // a switch with a value is set, an empty one unset; the menu's own choices are not switches
         assert_eq!((get("VICTORY_AMBIENT"), get("VICTORY_EARLY_DEPTH")), (Some("0.5"), None));

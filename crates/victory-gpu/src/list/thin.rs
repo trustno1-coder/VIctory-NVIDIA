@@ -144,7 +144,7 @@ impl Front {
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
-            held(&READY).push_back(recording.clone());
+            held(&READY).push(recording.clone());
             WORK.notify_one();
         }
     }
@@ -161,8 +161,38 @@ impl Front {
 
 /// Streams' memory to use again.
 static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
-/// Recordings with words to translate.
-static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
+/// Recordings with words to translate. Finish submitted work before taking
+/// another speculative recording that will hold descriptor slots.
+static READY: Mutex<Ready> = Mutex::new(Ready { submitted: VecDeque::new(), ahead: VecDeque::new() });
+
+struct Ready {
+    submitted: VecDeque<Arc<Recording>>,
+    ahead: VecDeque<Arc<Recording>>,
+}
+
+impl Ready {
+    fn push(&mut self, recording: Arc<Recording>) {
+        if recording.submitted.load(Relaxed) {
+            self.submitted.push_back(recording);
+        } else {
+            self.ahead.push_back(recording);
+        }
+    }
+
+    fn prioritize(&mut self, recordings: &[Arc<Recording>]) {
+        for recording in recordings {
+            if !recording.submitted.swap(true, Relaxed)
+                && let Some(index) = self.ahead.iter().position(|other| Arc::ptr_eq(other, recording))
+            {
+                self.submitted.push_back(self.ahead.remove(index).unwrap());
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<Arc<Recording>> {
+        self.submitted.pop_front().or_else(|| self.ahead.pop_front())
+    }
+}
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
@@ -185,6 +215,8 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    /// Accessed under READY while scheduling translation.
+    submitted: AtomicBool,
 }
 
 #[derive(Default)]
@@ -208,6 +240,7 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            submitted: AtomicBool::new(false),
         }
     }
 
@@ -243,9 +276,18 @@ impl Recording {
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
+            let trace_start = crate::host::render_trace::active().then(crate::host::now_us);
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+            if let Some(start) = trace_start {
+                let list = super::host_list_held(back).map_or(0, |host| windows::core::Interface::as_raw(&host.list) as usize);
+                crate::host::render_trace::event(
+                    "translate_list",
+                    format_args!("recording={:#x}\tlist={list:#x}\tstart_us={start}\tduration_us={}\tcalls={calls}\tclosed={closed}",
+                        std::ptr::from_ref(self) as usize, began.elapsed().as_micros()),
+                );
+            }
             let mut inner = held(&self.inner);
             inner.kept.push(chunk);
             if closed {
@@ -272,6 +314,7 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
+            super::discard_thin_state(inner.back as This);
             held(&BACKS).push(inner.back);
         }
     }
@@ -309,7 +352,7 @@ fn start() {
                 let recording = {
                     let mut ready = held(&READY);
                     loop {
-                        match ready.pop_front() {
+                        match ready.pop() {
                             Some(r) => break r,
                             None => ready = WORK.wait(ready).unwrap_or_else(|e| e.into_inner()),
                         }
@@ -330,7 +373,7 @@ fn start() {
 /// The recordings of submitted lists, in order (one that was not begun is left
 /// out).
 pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
-    lists
+    let recordings: Arc<[_]> = lists
         .iter()
         .filter(|l| !l.is_null())
         .filter_map(|&l| {
@@ -340,7 +383,9 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
             front.submitted = true;
             front.recording.clone()
         })
-        .collect()
+        .collect();
+    held(&READY).prioritize(&recordings);
+    recordings
 }
 
 /// For the frame-rate line.
@@ -883,6 +928,22 @@ const MINE: [(usize, *const ()); 50] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submitted_recordings_take_priority_in_submission_order() {
+        let first = Arc::new(Recording::new(0));
+        let second = Arc::new(Recording::new(0));
+        let ahead = Arc::new(Recording::new(0));
+        let mut ready = Ready { submitted: VecDeque::new(), ahead: VecDeque::new() };
+        ready.push(ahead.clone());
+        ready.push(second.clone());
+        ready.push(first.clone());
+        ready.prioritize(&[first.clone(), second.clone(), first.clone()]);
+        assert!(Arc::ptr_eq(&ready.pop().unwrap(), &first));
+        assert!(Arc::ptr_eq(&ready.pop().unwrap(), &second));
+        assert!(Arc::ptr_eq(&ready.pop().unwrap(), &ahead));
+        assert!(ready.pop().is_none());
+    }
 
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.

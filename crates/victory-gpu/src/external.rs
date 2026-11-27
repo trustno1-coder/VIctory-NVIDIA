@@ -47,5 +47,5 @@ pub(crate) fn output_written(resource: This) {
 /// settles it, before a library lets go of resources the GPU may still use.
 pub(crate) fn finish_submitted() {
     crate::queue::before_sync();
-    crate::host::settle_for_fence();
+    crate::host::settle_for_fence(crate::host::FenceDrain::ExternalUpscaler);
 }

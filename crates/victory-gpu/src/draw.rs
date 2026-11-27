@@ -543,9 +543,8 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The dynamic slots the list holds: title heap, host heap id, first,
-    /// count; given back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u64, u32, u32)>,
+    /// The dynamic slots owned by this recording, grouped by host heap.
+    dynamic: Vec<crate::descriptor::host::DynamicTables>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -562,15 +561,13 @@ pub(crate) struct State {
     rebinds: [u64; 2],
 }
 
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, id, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, id, first, n);
+impl State {
+    pub(crate) fn tables_submitted(&mut self, fence: u64) {
+        for tables in self.dynamic.drain(..) {
+            tables.submitted(fence);
         }
     }
-}
 
-impl State {
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -586,9 +583,7 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, id, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, id, first, n);
-        }
+        self.dynamic.clear();
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
@@ -650,11 +645,13 @@ fn mesh_kept(pipeline: usize) -> bool {
 }
 
 /// Draws recorded on the host GPU since the last frame line.
-static DRAWN: AtomicU64 = AtomicU64::new(0);
+/// (One place per thread, `crate::sharded`: every draw on every recording
+/// and translating thread adds to it.)
+static DRAWN: crate::sharded::Counter = crate::sharded::Counter::new();
 
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
-    DRAWN.load(Ordering::Relaxed)
+    DRAWN.load()
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -671,13 +668,13 @@ pub(crate) fn take_frame() -> Vec<String> {
 /// The draws dropped since [`take_dropped`].
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn dropped_now() -> u64 {
-    DROPPED.load(Ordering::Relaxed)
+    DROPPED.load()
 }
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
 pub(crate) fn take_dropped() -> u64 {
-    DROPPED.swap(0, Ordering::Relaxed)
+    DROPPED.take()
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
@@ -840,6 +837,32 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// The same waits in milliseconds, at about 20 frames a second: the title
+/// fills memory by the clock, not by the frame, and at 3-10 frames a second
+/// 400 frames were 40-130 s. A wait is the shorter of the two.
+const RECHECK_MS: [u64; 5] = [200, 600, 2_000, 6_000, 20_000];
+
+/// Frames after which look number `stage` (0 for the first) is made, with a
+/// frame taking `frame_ms` lately.
+fn recheck_in(stage: usize, frame_ms: u64) -> u64 {
+    RECHECK_FRAMES[stage].min((RECHECK_MS[stage] / frame_ms.max(1)).max(1))
+}
+
+/// Milliseconds a frame took over the last second or so (16 until known).
+fn frame_ms(frame: u64, now: u64) -> u64 {
+    static WINDOW: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(16)];
+    let (began, first) = (WINDOW[0].load(Ordering::Relaxed), WINDOW[1].load(Ordering::Relaxed));
+    if first == 0 || frame < first {
+        WINDOW[0].store(now, Ordering::Relaxed);
+        WINDOW[1].store(frame, Ordering::Relaxed);
+    } else if frame > first && now.saturating_sub(began) >= 1000 {
+        WINDOW[2].store(((now - began) / (frame - first)).clamp(1, 1000), Ordering::Relaxed);
+        WINDOW[0].store(now, Ordering::Relaxed);
+        WINDOW[1].store(frame, Ordering::Relaxed);
+    }
+    WINDOW[2].load(Ordering::Relaxed)
+}
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1083,7 +1106,7 @@ fn before<T>(slot: usize, f: impl FnOnce() -> T) -> T {
 /// bake draw), their loops' nanoseconds by kind, and the passes that stopped
 /// at their time and at their bytes.
 pub(crate) static HEAP_TEXTURE_PASSES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-static DROPPED: AtomicU64 = AtomicU64::new(0);
+static DROPPED: crate::sharded::Counter = crate::sharded::Counter::new();
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -1095,25 +1118,29 @@ fn dropped(pipeline: usize) {
 }
 
 /// Dispatches run on the host so far.
-static DISPATCHED: AtomicU64 = AtomicU64::new(0);
+static DISPATCHED: crate::sharded::Counter = crate::sharded::Counter::new();
 
 pub(crate) fn dispatched() -> u64 {
-    DISPATCHED.load(Ordering::Relaxed)
+    DISPATCHED.load()
 }
 
 /// What a render target or depth view of the host is made from: the host
 /// texture, and [`crate::descriptor::RtvRecord::key`].
 type TargetKey = (usize, (usize, [u32; 7]));
 
-/// The host address of a root view: its buffer's host copy, or for a
-/// constant buffer not 256-byte aligned there (the console needs 16) a
-/// copy in upload memory.
-/// shortcut: a root view has no size; constant buffers are taken as 64 KiB
-/// (cut at their buffer's end), other views as all that is left of their
-/// buffer. (They were taken as 1 MiB: 1,452 of the 2,021 mesh vertex
-/// streams of a cutscene frame reach further, and what lay past the first
-/// megabyte was never brought up to date - meshes without bodies, exploded
-/// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// The host address of a root view: a raw root SRV's (constant buffers are
+/// read as raw bytes too, `victory_shader::emit::HostShader::root_cbvs`),
+/// which needs 4 bytes, not the 256 of a CBV. For constants: the title's
+/// memory itself where `crate::port` reads them in place (nothing refreshed,
+/// filled or waited for); else the buffer's host copy; a copy in upload
+/// memory only for an address not on 4 bytes.
+/// shortcut: a root view has no size: constant buffers are taken as 64 KiB
+/// (cut at their buffer's end; the shader reads zeros past 64 KiB), other
+/// views as all that is left of their buffer. (They were taken as 1 MiB:
+/// 1,452 of the 2,021 mesh vertex streams of a cutscene frame reach further,
+/// and what lay past the first megabyte was never brought up to date -
+/// meshes without bodies, exploded triangles. `VICTORY_ROOT_VIEW_MB` sets a
+/// limit again.)
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -1122,12 +1149,19 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
+    // Constants no shader writes, in the title's graphics heap: read where
+    // the title wrote them (`crate::port`), with nothing refreshed, filled
+    // or waited for. The list holds the buffer.
+    if !srv && let Some((buffer, gpu)) = crate::port::constants(address, 1 << 16, crate::port::Use::Root) {
+        list.keep(&buffer);
+        return Some(gpu);
+    }
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
+    if srv || gpu % crate::port::ALIGN == 0 {
         shadow.refresh(list, address, len);
         #[cfg(feature = "diagnostics")]
         crate::book::root(gpu, len);
@@ -1507,6 +1541,7 @@ impl State {
         self.host_targets = Some(now);
         let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        list.gpu_pass_break();
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1800,6 +1835,15 @@ impl State {
             if v.address == 0 || v.size == 0 {
                 continue;
             }
+            if let Some((buffer, gpu)) = crate::port::stream_bytes(v.address, u64::from(v.size)) {
+                list.keep(&buffer);
+                *view = D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: gpu,
+                    SizeInBytes: v.size,
+                    StrideInBytes: v.stride,
+                };
+                continue;
+            }
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 continue;
             };
@@ -1818,25 +1862,85 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+            let (gpu, size) = if let Some((buffer, gpu)) = crate::port::stream_bytes(v.address, u64::from(v.size)) {
+                list.keep(&buffer);
+                (gpu, v.size)
+            } else {
+                let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                    return false;
+                };
+                shadow.refresh(list, v.address, u64::from(v.size));
+                (
+                    shadow.gpu(v.address),
+                    v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                )
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                BufferLocation: gpu,
+                SizeInBytes: size,
                 Format: DXGI_FORMAT(v.format as i32),
             };
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
-        const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);
+        }
+        const RENDER_TARGET: u32 = 0x4;
+        // Batch all target and depth state transitions into a single ResourceBarrier call.
+        let mut barriers = [const { std::mem::MaybeUninit::<D3D12_RESOURCE_BARRIER>::uninit() }; 9];
+        let mut barrier_count = 0usize;
+        let flush_barriers = |barriers: &mut [std::mem::MaybeUninit<D3D12_RESOURCE_BARRIER>; 9], count: &mut usize| {
+            if *count > 0 {
+                // SAFETY: `barriers[..*count]` were initialized below.
+                let slice = unsafe { std::slice::from_raw_parts(barriers.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(), *count) };
+                // SAFETY: an open list and live textures.
+                unsafe { l.ResourceBarrier(slice) };
+                *count = 0;
+            }
+        };
+        let mut push_state = |resource: This, wanted: u32| {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+            use windows::core::Interface;
+            if let Some((texture, before)) = list.transition(resource, wanted) {
+                let state = crate::host::legal_state(texture, wanted);
+                let raw = texture.as_raw();
+                // SAFETY: `barriers[..barrier_count]` are initialized Transition barriers.
+                let existing = (0..barrier_count).find(|&i| unsafe {
+                    barriers[i]
+                        .assume_init_ref()
+                        .Anonymous
+                        .Transition
+                        .pResource
+                        .as_ref()
+                        .map(Interface::as_raw)
+                        == Some(raw)
+                });
+                if let Some(i) = existing {
+                    // Combine consecutive transitions of the same resource in this draw.
+                    // SAFETY: initialized Transition barrier at `i`.
+                    unsafe {
+                        (*barriers[i].assume_init_mut().Anonymous.Transition).StateAfter = State(state as i32);
+                    }
+                    return;
+                }
+                if barrier_count == barriers.len() {
+                    flush_barriers(&mut barriers, &mut barrier_count);
+                }
+                barriers[barrier_count].write(crate::host::transition(
+                    texture,
+                    State(before as i32),
+                    State(state as i32),
+                ));
+                barrier_count += 1;
+                crate::host::count_gpu_step(crate::host::GpuStep::OurStates, 0);
+            }
+        };
+        for &t in &self.targets {
+            push_state(t as This, RENDER_TARGET);
+        }
+        if self.depth != 0 {
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1852,8 +1956,9 @@ impl State {
             } else {
                 DEPTH_WRITE
             };
-            crate::list::ensure_state(list, self.depth as This, state);
+            push_state(self.depth as This, state);
         }
+        flush_barriers(&mut barriers, &mut barrier_count);
         true
     }
 
@@ -1878,6 +1983,7 @@ impl State {
             && let Some(heap) = crate::descriptor::lent_heap()
         {
             once!("a dispatch without a view heap that needs one gets the title's");
+            list.note_heap_picked();
             self.heaps[0] = heap;
         }
         // Heaps first: a root signature with directly indexed heaps must be
@@ -2112,13 +2218,14 @@ impl State {
                             None,
                         ));
                     }
+                    // Constant buffers too: the translation reads them as
+                    // raw bytes through a root SRV (`root_view`).
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        if compute {
+                            l.SetComputeRootShaderResourceView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootShaderResourceView(param, gpu);
                         }
                     }
                 }
@@ -2194,13 +2301,17 @@ impl State {
             }
             Some(s)
         };
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
-                s.gpu_writes(list, a, len);
+                crate::host::wide_write(a, len, pipeline);
+                // The footprint this pipeline's shader wrote through this
+                // parameter, once learned (`VICTORY_TIGHT_WRITES=1`).
+                let (from, n) = crate::tight::declare(pipeline, param, s.id(), s.span().0, a, len);
+                s.gpu_writes(list, a + from, n);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -2236,13 +2347,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = host.dynamic(1, &mut self.dynamic) else {
                     return false;
                 };
-                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2310,13 +2417,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = host.dynamic(1, &mut self.dynamic) else {
                     return false;
                 };
-                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -2376,6 +2479,7 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        list.note_heap_picked();
         let heap = self
             .heaps
             .iter()
@@ -2436,6 +2540,7 @@ impl State {
     /// running the bindless heap buffer/texture sweep (for shaders that only
     /// inspect descriptors already mirrored via their descriptor tables).
     fn heap_strides(&self, list: &HostList) -> Option<u64> {
+        list.note_heap_picked();
         let heap = self
             .heaps
             .iter()
@@ -2472,7 +2577,7 @@ impl State {
             let need_settle = host.needs_gpu_settle_for_bake();
             if need_settle {
                 settled = true;
-                crate::host::settle_for_fence();
+                crate::host::settle_for_fence(crate::host::FenceDrain::BakeTextureFlip);
             }
             flipped += host.texture_views_remade();
             flipped += host.texture_slots_flip();
@@ -2893,7 +2998,7 @@ impl State {
                     gpu.execute_sync_internal(bake_list);
                     bake_list.reset();
                 } else if !sync.publish.is_empty() {
-                    crate::host::settle_for_fence();
+                    crate::host::settle_for_fence(crate::host::FenceDrain::BakePublish);
                 }
                 for (index, handle, key) in sync.publish {
                     let _ = host.publish_uploaded_slot(index, handle, key);
@@ -3062,7 +3167,7 @@ impl State {
             Some(mb) => mb << 20,
             None => {
                 let base = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
-                if crate::residency::limited_host_ram() {
+                if crate::residency::textures_limited_by_ram() {
                     base.min(128 << 20)
                 } else {
                     base
@@ -3075,6 +3180,9 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
+        // The loading gate and the texture book's housekeeping (it limits
+        // itself to twice a second).
+        crate::texture::ledger::tick(frame, drawn());
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
         // staged (4 GB in all, after which later textures stayed empty for
@@ -3159,6 +3267,8 @@ impl State {
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
         let most = (4000 / took).clamp(16, 256);
+        // What a frame takes lately: the looks again are counted in time.
+        let per_frame_ms = frame_ms(frame, now);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -3183,7 +3293,22 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        // While a backlog is due the pass is a loading pass: frames are 100-300 ms then,
+        // so a 16 ms slice drained 20,000 slots in minutes (measured, docs/performance).
+        // `VICTORY_TEXTURE_BACKLOG_MS` is the slice then (default 200); it falls back to
+        // the plain one under 1024 due slots.
+        let backlog = std::time::Duration::from_millis(200);
+        let (per_frame, span) =
+            if catchup && on_time >= 1024 { (per_frame * 3, (span * 3).max(backlog)) } else { (per_frame, span) };
+        // On a loading screen (seen in the title's DirectStorage stream while
+        // it draws little: `texture::ledger::loading`) frames are not what
+        // matters: four times the bytes and a slice of at least 120 ms. The
+        // ceilings that follow (`prefetch_limit`, `room`, commit) still hold.
+        let (per_frame, span) = if !required && asked.is_none() && crate::texture::ledger::loading() {
+            (per_frame.saturating_mul(4), span.max(std::time::Duration::from_millis(120)))
+        } else {
+            (per_frame, span)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -3202,7 +3327,7 @@ impl State {
                 bytes_at_most,
                 crate::residency::pressured(),
                 crate::residency::critical_commit(),
-                crate::residency::limited_host_ram(),
+                crate::residency::textures_limited_by_ram(),
                 crate::texture::live_staging_bytes(),
             )
         };
@@ -3254,7 +3379,7 @@ impl State {
             // title paints all the time through another view of their pages
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
-            let mut again_in = RECHECK_FRAMES[0];
+            let mut again_in = recheck_in(0, per_frame_ms);
             // What the queue knew of it when the slots due were taken, while
             // its marks say it holds the write handed out still; else (or with
             // `VICTORY_QUEUE_BATCH=0`) asked now.
@@ -3267,7 +3392,8 @@ impl State {
                 if looked == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     outcome(slot_outcome::UNCHANGED);
-                    tells.tell(index, write, match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                    let next = usize::from(looks) + 1;
+                    tells.tell(index, write, match (next < RECHECK_FRAMES.len()).then(|| recheck_in(next, per_frame_ms)) {
                         Some(wait) => Told::Recheck(frame + wait, (at, len), print, looks + 1, uploaded),
                         None => Told::Done(None),
                     });
@@ -3310,12 +3436,20 @@ impl State {
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     outcome(slot_outcome::AWAY);
+                    // Not what the title kept (the texture book drops it).
+                    crate::texture::ledger::gone(address);
                     // Streamed out: what the slot showed is let go.
                     rest(0, || host.texture_slot_gone(index));
                     tells.tell(index, write, Told::Later(frame, most));
                     continue;
                 }
                 rest(0, || host.texture_slot_here(index));
+                // Named and all there: the texture book links the request
+                // that filled it to this description (and counts a texture it
+                // made ready as adopted).
+                if mapped >= len {
+                    crate::texture::ledger::named(address, resource, first);
+                }
                 there = Some(mapped);
                 if mapped < len {
                     if mapped <= rest(0, || host.texture_slot_mapped(index)) {
@@ -3683,17 +3817,18 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, crate::host::render_trace::Command("dispatch", [x.into(), y.into(), z.into(), flags.into(), 0]));
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3706,7 +3841,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3719,7 +3854,7 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3751,10 +3886,13 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        list.gpu_pass(true, self.pipeline, crate::host::render_trace::Command("dispatch", [x.into(), y.into(), z.into(), flags.into(), 0]), || p.name.clone());
+        trace.recorded();
+        list.gpu_uav_work();
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        list.water_dispatch(Some(p), || unsafe { list.list.Dispatch(x, y, z) });
         self.buffers_written();
-        DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        DISPATCHED.add(1);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
@@ -4275,6 +4413,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, crate::host::render_trace::Command("dispatch_mesh", [x.into(), 1, 1, 0, 0]));
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -4295,17 +4434,19 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
+                    list.gpu_pass(false, self.pipeline, crate::host::render_trace::Command("dispatch_mesh", [x.min(65_535).into(), 1, 1, 0, 0]), || gpu_pass_name(self.pipeline));
+                    trace.recorded();
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                    DRAWN.add(1);
                     true
                 }
                 Err(_) => false,
             };
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4410,10 +4551,12 @@ impl State {
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
+    /// constant buffer are made afresh for the draw in dynamic slots. The
+    /// shaders read constant buffers as structured buffers of dwords (any 4
+    /// bytes, where a CBV needs 256 and the console only 16): one
+    /// in the title's graphics heap that no shader writes is shown where the
+    /// title wrote it (`crate::port`); any other has its data copied to
+    /// upload memory when the list is submitted. Returns those tables' new byte offsets by root
     /// parameter; the other tables' slots are made from the title's.
     ///
     /// Within a list, the same table holding the same descriptors is made
@@ -4554,18 +4697,13 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
-            }) else {
+            let Some(first) = host.dynamic(n, &mut self.dynamic) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -4591,56 +4729,67 @@ impl State {
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && host
+                        .use_listed(recording, words, index, |listed, target| {
+                            let kind = group
+                                .entry(k)
+                                .map(|u| u.kind)
+                                .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+                            if let Some(kind) = kind {
+                                let tested = TESTED_DEPTH.get();
+                                if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                                    if listed.ready.2 {
+                                        TESTED_DEPTH.set((tested.0, true));
+                                    }
+                                } else {
+                                    let _ = crate::residency::take_staging_deferred();
+                                    TESTED_DEPTH.set((tested.0, false));
+                                    readable_listed(list, kind, target);
+                                    let depth = TESTED_DEPTH.get().1;
+                                    TESTED_DEPTH.set((tested.0, tested.1 || depth));
+                                    if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
+                                        listed.ready = (list.epoch(), tested.0, depth);
+                                    }
+                                }
+                            }
+                            // (Told once per record and recording; with
+                            // `VICTORY_TABLED_REREAD=1` also of a slot the queue
+                            // holds again since: written after its first read.)
+                            if let Some(title) = title_first
+                                && listed.texture
+                                && (listed.tabled != Some((title + k, kind.is_some()))
+                                    || (crate::descriptor::host::tabled_reread()
+                                        && kind.is_some()
+                                        && host.texture_slot_queued(title + k)))
+                            {
+                                listed.tabled = Some((title + k, kind.is_some()));
+                                host.texture_slot_tabled(title + k, kind.is_some());
+                                if kind.is_some() {
+                                    host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                                }
+                            }
+                        })
+                        .is_some()
                 {
-                    let kind = group
-                        .entry(k)
-                        .map(|u| u.kind)
-                        .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
-                    let was = (listed.ready, listed.tabled);
-                    if let Some(kind) = kind {
-                        let tested = TESTED_DEPTH.get();
-                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
-                            if listed.ready.2 {
-                                TESTED_DEPTH.set((tested.0, true));
-                            }
-                        } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
-                            let _ = crate::residency::take_staging_deferred();
-                            TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
-                            let depth = TESTED_DEPTH.get().1;
-                            TESTED_DEPTH.set((tested.0, tested.1 || depth));
-                            if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
-                                listed.ready = (list.epoch(), tested.0, depth);
-                            }
-                        }
-                    }
-                    // (Told once per record and recording; with
-                    // `VICTORY_TABLED_REREAD=1` also of a slot the queue
-                    // holds again since: written after its first read.)
-                    if let Some(title) = title_first
-                        && listed.texture
-                        && (listed.tabled != Some((title + k, kind.is_some()))
-                            || (crate::descriptor::host::tabled_reread()
-                                && kind.is_some()
-                                && host.texture_slot_queued(title + k)))
-                    {
-                        listed.tabled = Some((title + k, kind.is_some()));
-                        host.texture_slot_tabled(title + k, kind.is_some());
-                        if kind.is_some() {
-                            host.mirror_after(list, title + k, table + u64::from(k) * 32);
-                        }
-                    }
-                    if was != (listed.ready, listed.tabled) {
-                        crate::descriptor::host::note_listed(recording, words, listed);
-                    }
                     continue;
                 }
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // In the title's graphics heap and written by no
+                        // shader: the slot shows the title's bytes
+                        // themselves (`crate::port`); the slot and the list
+                        // hold the buffer. Else a fill of upload memory at
+                        // submission, as before. Shaders read it as a
+                        // structured buffer of dwords (`HostHeap::constant_at`),
+                        // whose view begins on any 4 bytes.
+                        if let Some((buffer, gpu)) = crate::port::constants(address, u64::from(size), crate::port::Use::Table) {
+                            list.keep(&buffer);
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
+                            host.null_constant_at(index);
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
@@ -4670,7 +4819,12 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        // Read as constants: a null view of their kind.
+                        if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            host.null_constant_at(index);
+                        } else {
+                            host.make_null(index);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
@@ -4756,6 +4910,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, crate::host::render_trace::Command("draw", [vertices.into(), instances.into(), first.into(), first_instance.into(), 0]));
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -4780,6 +4935,8 @@ impl State {
             if let Some(viewport) = frontend {
                 viewports(list, &[viewport]);
             }
+            list.gpu_pass(false, self.pipeline, crate::host::render_trace::Command("draw", [count.into(), instances.into(), from.into(), first_instance.into(), 0]), || gpu_pass_name(self.pipeline));
+            trace.recorded();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4788,11 +4945,11 @@ impl State {
             if frontend.is_some() {
                 viewports(list, &self.viewports);
             }
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            DRAWN.add(1);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4950,6 +5107,8 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        let command = crate::host::render_trace::Command("draw_indexed", [indices.into(), instances.into(), first.into(), base.into(), first_instance.into()]);
+        let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, command);
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -4966,16 +5125,18 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.gpu_pass(false, self.pipeline, command, || gpu_pass_name(self.pipeline));
+            trace.recorded();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            DRAWN.add(1);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4994,8 +5155,14 @@ impl State {
 
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
-    fn drew(&mut self, p: Option<&HostPipeline>) {
-        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+    fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
+        if p.is_none_or(|p| {
+            p.stages.iter().any(|stage| {
+                let t = stage.translated();
+                t.stores || t.stores_by_address
+            })
+        }) {
+            list.gpu_uav_work();
             self.batch = None;
         }
     }
@@ -5066,6 +5233,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, crate::host::render_trace::Command("execute_indirect", [kind.into(), max.into(), arguments as i64, i64::from(count.is_some()), stride.into()]));
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -5313,9 +5481,10 @@ impl State {
                 if kind == MESH {
                     self.mesh_scissor(list, true);
                 }
+                list.gpu_pass(kind == DISPATCH, self.pipeline, crate::host::render_trace::Command("execute_indirect", [kind.into(), max.into(), at as i64, i64::from(counter.is_some()), 0]), || p.name.clone());
                 // SAFETY: an open list with everything set; the scratch buffer and
                 // host copies are kept alive by the list, and the signature is cached.
-                unsafe {
+                list.water_dispatch((kind == DISPATCH).then_some(p), || unsafe {
                     list.list.ExecuteIndirect(
                         &signature,
                         max,
@@ -5324,7 +5493,7 @@ impl State {
                         counter.as_ref().map(|(s, _)| &s.buffer),
                         counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
                     )
-                };
+                });
                 if kind == MESH {
                     self.mesh_scissor(list, false);
                 }
@@ -5338,9 +5507,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
         if kind == DISPATCH {
+            list.gpu_uav_work();
             self.buffers_written();
         } else {
-            self.drew(Some(p));
+            self.drew(list, Some(p));
         }
         // The stand-in for reflections after the program that gives rays
         // that found nothing the sky (`crate::ambient`, `Role::Miss`): the
@@ -5361,10 +5531,11 @@ impl State {
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
         if kind == DISPATCH {
-            DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            DISPATCHED.add(1);
         } else {
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            DRAWN.add(1);
         }
+        trace.recorded();
         true
     }
 }
@@ -5572,86 +5743,124 @@ impl RecordHash {
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+fn refresh_buffer_view(
+    list: &HostList,
+    kind: ResourceType,
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    len: u64,
+) {
+    shadow.refresh(list, address, len);
+    if kind == ResourceType::Uav {
+        // A shader that cannot store to buffers leaves the range as
+        // the title has it: nothing to find afterwards.
+        if STORES.get() || !write_skip() {
+            #[cfg(feature = "diagnostics")]
+            crate::host::wide_write(address, len, 0);
+            shadow.gpu_writes(list, address, len);
+        } else {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
+                crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
+            }
+        }
+    }
+}
+
+fn readable_shader_texture(list: &HostList, resource: usize, first: u32, uploadable: Option<bool>) {
+    // A view the title placed, in another format, in the memory of
+    // a texture the host writes: that texture's texels, copied on
+    // the host (title memory does not have them).
+    let aliased = crate::resource::alias_of(resource as This)
+        .is_some_and(|source| crate::texture::alias(list, resource as This, source));
+    let can_upload = uploadable.unwrap_or_else(|| {
+        crate::resource::host_copy(resource as This).is_some_and(|t| t.flags() & 0x7 == 0)
+    });
+    if !aliased && can_upload {
+        // (A texture the title writes: no target, depth or unordered
+        // access, `crate::texture::title_written`.)
+        crate::texture::upload_from(list, resource as This, first);
+    }
+    // A depth texture shaders also write: what they wrote, first.
+    list.twin_use(resource as This, false, false);
+    // The depth target the draw only tests is read in both ways at
+    // once: both read states, which its preparation asks for too.
+    let (tested, _) = TESTED_DEPTH.get();
+    let state = if tested != 0 && tested == resource {
+        TESTED_DEPTH.set((tested, true));
+        DEPTH_READ | SHADER_RESOURCE
+    } else {
+        SHADER_RESOURCE
+    };
+    crate::list::ensure_state(list, resource as This, state);
+    #[cfg(feature = "diagnostics")]
+    if tracing::enabled!(tracing::Level::DEBUG)
+        && let Some(t) = crate::resource::host_resource(resource as This)
+    {
+        // SAFETY: a live resource.
+        let d = unsafe { t.GetDesc() };
+        if d.Flags.0 & 7 == 0 {
+            tracing::debug!(
+                resource = format_args!("{resource:#x}"),
+                ?d,
+                "a shader reads a texture the title fills"
+            );
+        }
+    }
+}
+
+fn readable_unordered_texture(list: &HostList, resource: usize) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    #[cfg(feature = "diagnostics")]
+    crate::capture::note_target(resource as This);
+    // Some compute-written textures are also read by the title CPU.
+    list.texture_written(resource as This);
+    // Unordered access to a depth texture is its colour twin's.
+    if !list.twin_use(resource as This, true, true) {
+        crate::list::ensure_state(list, resource as This, UNORDERED_ACCESS);
+    }
+}
+
+fn readable_listed(list: &HostList, kind: ResourceType, target: &crate::descriptor::host::ListedTarget) {
+    use crate::descriptor::host::ListedTarget;
+    match target {
+        ListedTarget::Buffer { shadow, address, len } => {
+            refresh_buffer_view(list, kind, shadow, *address, *len);
+        }
+        ListedTarget::ShaderTexture { resource, placed, first_mip, uploadable } => {
+            if kind == ResourceType::Srv {
+                let first = if *placed { *first_mip } else { 0 };
+                readable_shader_texture(list, *resource, first, Some(*uploadable));
+            }
+        }
+        ListedTarget::UnorderedTexture { resource } => {
+            if kind == ResourceType::Uav {
+                readable_unordered_texture(list, *resource);
+            }
+        }
+        ListedTarget::None => {}
+    }
+}
+
+fn readable(list: &HostList, kind: ResourceType, view: &View) {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
-        shadow.refresh(list, address, len);
-        if kind == ResourceType::Uav {
-            // A shader that cannot store to buffers leaves the range as
-            // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
-                #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(address, len, 0);
-                shadow.gpu_writes(list, address, len);
-            } else {
-                #[cfg(feature = "diagnostics")]
-                {
-                    crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
-                    crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
-                }
-            }
-        }
+        refresh_buffer_view(list, kind, &shadow, address, len);
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
-            // A view the title placed, in another format, in the memory of
-            // a texture the host writes: that texture's texels, copied on
-            // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
-                && let Some(t) = crate::resource::host_copy(*resource as This)
-                && t.flags() & 0x7 == 0
-            {
-                // (A texture the title writes: no target, depth or unordered
-                // access, `crate::texture::title_written`.)
-                // Of a texture the title placed, the levels the view shows.
-                let first = match (&placed, view) {
-                    (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
-                    _ => 0,
-                };
-                crate::texture::upload_from(list, *resource as This, first);
-            }
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(*resource as This, false, false);
-            // The depth target the draw only tests is read in both ways at
-            // once: both read states, which its preparation asks for too.
-            let (tested, _) = TESTED_DEPTH.get();
-            let state = if tested != 0 && tested == *resource {
-                TESTED_DEPTH.set((tested, true));
-                DEPTH_READ | SHADER_RESOURCE
-            } else {
-                SHADER_RESOURCE
+            let first = match (&placed, view) {
+                (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
+                _ => 0,
             };
-            crate::list::ensure_state(list, *resource as This, state);
-            #[cfg(feature = "diagnostics")]
-            if tracing::enabled!(tracing::Level::DEBUG)
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-            {
-                // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                if d.Flags.0 & 7 == 0 {
-                    tracing::debug!(
-                        resource = format_args!("{resource:#x}"),
-                        ?d,
-                        "a shader reads a texture the title fills"
-                    );
-                }
-            }
+            readable_shader_texture(list, *resource, first, None);
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
-            // Some compute-written textures are also read by the title CPU.
-            list.texture_written(*resource as This);
-            // Unordered access to a depth texture is its colour twin's.
-            if !list.twin_use(*resource as This, true, true) {
-                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
-            }
+            readable_unordered_texture(list, *resource);
         }
         _ => {}
     }
@@ -5957,4 +6166,10 @@ mod record_hash_tests {
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
+}
+
+/// The name a GPU pass beginning with this pipeline is logged by (the
+/// runtime's name of its shaders; `crate::host` `gpu_time`).
+fn gpu_pass_name(pipeline: usize) -> String {
+    crate::pipeline::host_pipeline(pipeline as This).map_or_else(|| format!("pipeline {pipeline:#x}"), |p| p.name.clone())
 }

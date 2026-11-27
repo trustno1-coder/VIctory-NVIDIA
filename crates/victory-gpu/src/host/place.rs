@@ -47,8 +47,68 @@ pub(super) fn on() -> bool {
 const MOST: usize = 8 << 20;
 
 /// Since the last frame-rate line: copies at their place, their bytes, those
-/// out of a host copy, and texture copies out of one.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// out of a host copy, texture copies out of one, and constants read on the
+/// card behind such copies ([`HostList::placed_constants`]).
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The destinations of copies at their place of this frame and the one
+/// before (from, to, frame): constants read out of them are read on the card
+/// ([`HostList::placed_constants`]).
+static LATELY: Mutex<Vec<(usize, usize, u64)>> = Mutex::new(Vec::new());
+/// Whether [`LATELY`] may hold one (most constants are not looked up).
+static ANY_LATELY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_placed(dst: usize, len: usize) {
+    // Bytes the card writes there and lands later: not constants read in
+    // place (`crate::port`) until they have landed.
+    crate::port::copy_bound(dst, len);
+    let frame = crate::frame::current();
+    let mut lately = LATELY.lock().unwrap_or_else(|e| e.into_inner());
+    lately.retain(|e| e.2 + 1 >= frame);
+    lately.push((dst, dst + len, frame));
+    ANY_LATELY.store(true, Ordering::Relaxed);
+}
+
+/// Whether a copy at its place lately wrote a byte of `[from, to)`.
+fn placed_lately(from: usize, to: usize) -> bool {
+    if !ANY_LATELY.load(Ordering::Relaxed) {
+        return false;
+    }
+    let frame = crate::frame::current();
+    let mut lately = LATELY.lock().unwrap_or_else(|e| e.into_inner());
+    lately.retain(|e| e.2 + 1 >= frame);
+    if lately.is_empty() {
+        ANY_LATELY.store(false, Ordering::Relaxed);
+    }
+    lately.iter().any(|e| e.0 < to && from < e.1)
+}
+
+/// The bytes of a buffer of ours that [`HostList::placed_constants`] copies
+/// constants into, one after the other (each 256-aligned; a root view reads
+/// 64 KiB, so a buffer holds sixteen of those).
+const CONSTANTS_ROOM: u64 = 1 << 20;
+
+/// A descriptor slot pointed at constants on the card when the list is
+/// submitted (the draw pointed it at upload memory when it was recorded).
+struct PointSlot {
+    heap: usize,
+    index: u32,
+    buffer: ID3D12Resource,
+    gpu: u64,
+    len: u32,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the slot is written by the
+// submitting thread.
+unsafe impl Send for PointSlot {}
+unsafe impl Sync for PointSlot {}
+
+impl PointSlot {
+    fn point(&self) {
+        // (A heap that is gone: nothing reads the slot.)
+        crate::descriptor::constant_slot(self.heap, self.index, &self.buffer, self.gpu, self.len);
+    }
+}
 
 /// What the CPU does at submission for a copy at its place in a list.
 pub(super) struct Placed {
@@ -109,22 +169,23 @@ pub(super) enum Waits {
     Yes,
 }
 
-/// Whether a step of `runs` reads one of `ranges` on the CPU.
-pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bool {
-    join_ranges(&mut ranges, []);
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
-            Step::Texture(staging) => {
-                let (at, len) = staging.memory();
-                touches(&ranges, at, at + len)
-            }
-            &Step::Plane((at, len), _) => touches(&ranges, at, at.saturating_add(len)),
-            Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
-            Step::Placed(p) => p.from.is_some() && touches(&ranges, p.src, p.src + p.len),
-            _ => false,
-        })
-    })
+/// Whether `step` reads, on the CPU at submission, one of `ranges` (the
+/// destinations of copies at their place that stand ahead of it in the
+/// submission: a step that stands before such a copy never sees its bytes,
+/// with the flights waited for or not, so it is not in their way).
+pub(super) fn reads(step: &Step, ranges: &[(usize, usize)]) -> bool {
+    let meets = |from: usize, to: usize| from < to && ranges.iter().any(|r| r.0 < to && from < r.1);
+    match step {
+        &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => meets(src, src.saturating_add(len)),
+        Step::Texture(staging) => {
+            let (at, len) = staging.memory();
+            meets(at, at.saturating_add(len))
+        }
+        &Step::Plane((at, len), _) => meets(at, at.saturating_add(len)),
+        &Step::Host(_, (from, to)) => meets(from, to),
+        Step::Placed(p) => p.from.is_some() && meets(p.src, p.src.saturating_add(p.len)),
+        _ => false,
+    }
 }
 
 /// Everything recorded so far is done, and seen, before what follows.
@@ -248,6 +309,7 @@ impl HostList {
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
+        note_placed(dst, len);
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Placed(Placed {
             dst,
@@ -281,6 +343,79 @@ impl HostList {
             wait_for_all(host, &self.list);
         }
         Some(between)
+    }
+
+    /// Constants of `len` bytes at `src` that a copy at its place lately wrote
+    /// a byte of, read at this place of the list: a buffer of ours and the
+    /// card address they are at (256-aligned), copied there on the card out of
+    /// the host copy that holds them. `None`: read them as before, on the CPU
+    /// at submission (a fill).
+    ///
+    /// Why: with flights in the air that may write the copy's source or
+    /// destination, the copy is not put into title memory at submission
+    /// ([`Placed::prepare`]: it lands later), so a fill behind it that read it
+    /// on the CPU waited for those flights to land: 0.8 waits and 18.6 ms a
+    /// frame in a chase (run play-20261127-104020, "a step that reads where a
+    /// copy at its place writes"). Read here, on the card, the constants are
+    /// what the copy and every write ahead of them on the queue left there,
+    /// as for any view of a buffer's host copy; the title's own bytes around
+    /// them are brought up to date by the refresh, as for those
+    /// (`stale_under_flights` looks at it like at any other).
+    pub(crate) fn placed_constants(&self, src: usize, len: usize) -> Option<(ID3D12Resource, u64)> {
+        if !on() || len == 0 || !placed_lately(src, src + len) {
+            return None;
+        }
+        let size = (len as u64).next_multiple_of(256);
+        if size > CONSTANTS_ROOM {
+            return None;
+        }
+        let host = host()?;
+        let from = shaders_own(src, len)?;
+        let (start, span) = from.span();
+        if (src as u64) < start || src as u64 + len as u64 > start + span {
+            return None;
+        }
+        let read = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        let held = self.deferred().constants.clone();
+        let (buffer, at, fresh) = match held {
+            Some((buffer, used)) if used + size <= CONSTANTS_ROOM => (buffer, used, false),
+            _ => (self.between(host, CONSTANTS_ROOM)?, 0, true),
+        };
+        from.refresh(self, src as u64, len as u64);
+        // SAFETY: an open list; live buffers (the list keeps both), ranges
+        // inside them. A new buffer is in the common state and promoted by
+        // the copy; one used before was left readable below.
+        unsafe {
+            wait_for_all(host, &self.list);
+            if !fresh {
+                self.list.ResourceBarrier(&[transition(&buffer, read, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            }
+            self.list.CopyBufferRegion(&buffer, at, &from.buffer, from.offset(src as u64), len as u64);
+            self.list.ResourceBarrier(&[transition(&buffer, D3D12_RESOURCE_STATE_COPY_DEST, read)]);
+        }
+        self.deferred().constants = Some((buffer.clone(), at + size));
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
+        Some((buffer, gpu))
+    }
+
+    /// [`HostList::placed_constants`] for a descriptor slot of a title heap
+    /// (heap address, slot) that the draw points at upload memory: the slot
+    /// is pointed at them when the list is submitted. Whether it was done.
+    pub(crate) fn place_constants_slot(&self, src: usize, len: usize, slot: (usize, u32)) -> bool {
+        let Some((buffer, gpu)) = self.placed_constants(src, len) else {
+            return false;
+        };
+        let point = PointSlot {
+            heap: slot.0,
+            index: slot.1,
+            buffer,
+            gpu,
+            len: len as u32,
+        };
+        self.defer_host(move || point.point());
+        true
     }
 
     /// A buffer on the card for this recording alone.

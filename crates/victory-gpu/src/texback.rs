@@ -126,7 +126,7 @@ impl Target {
 
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    buffer: Option<ID3D12Resource>,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -137,6 +137,13 @@ pub(crate) struct Back {
 impl Back {
     pub(crate) fn range(&self) -> (usize, usize) {
         (self.ticket.at, self.ticket.end)
+    }
+
+    /// Takes the readback buffer once its texels have landed, so the caller can
+    /// return it to the host buffer pool.
+    #[allow(dead_code)]
+    pub(crate) fn take_buffer(&mut self) -> Option<ID3D12Resource> {
+        self.buffer.take()
     }
 }
 
@@ -177,7 +184,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = host.read_back_pooled(total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -194,7 +201,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back { buffer: Some(buffer), footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
@@ -210,6 +217,9 @@ pub(crate) fn land(back: &Back) {
         }
         return;
     }
+    let Some(buffer) = back.buffer.as_ref() else {
+        return;
+    };
     let (at, end) = back.range();
     let size = end - at;
     let mut tiled = vec![0u8; size];
@@ -220,7 +230,7 @@ pub(crate) fn land(back: &Back) {
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+        if buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
             return;
         }
     }
@@ -235,12 +245,12 @@ pub(crate) fn land(back: &Back) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
+            unsafe { buffer.Unmap(0, None) };
             return;
         }
     }
     // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
+    unsafe { buffer.Unmap(0, None) };
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {

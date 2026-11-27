@@ -106,7 +106,30 @@ pub(super) trait Work: Send {
     /// Told just before [`Work::go`] of a submission: the highest mark of
     /// what it is made of and of the waits its queue went past.
     fn marked(&mut self, _mark: u64) {}
+    /// What `ask` stands at, for the line's report of a stall ([`stall_limit`]).
+    fn describe(_ask: &Self::Ask) -> String {
+        String::new()
+    }
 }
+
+/// How long the line may stand with nothing free to run and no present in it
+/// before its oldest entry goes regardless (`VICTORY_LINE_STALL_MS`, 1500 by
+/// default; 0: never), as a present makes it go every frame
+/// (`super::forces`). The title's threads stand at a fence on the CPU while
+/// the signal it waits for stands behind a queue's wait: no present comes,
+/// and the line stood for good until the title's own watchdog ended it
+/// ("Unsignaled CrossQueueBarrier" in its crash report, a write to address 0
+/// after some 30 s without a frame: run of 2026-11-27 15:29, and 25 more
+/// crash reports since 2026-11-24). On the console a wait of the card's lasts
+/// microseconds; a line that stood this long would never move on its own.
+fn stall_limit() -> Option<Duration> {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    let ms = *LIMIT.get_or_init(|| number("VICTORY_LINE_STALL_MS").map_or(1500, |n| n as u64));
+    (ms > 0 && super::forces()).then(|| Duration::from_millis(ms))
+}
+
+/// Stalls of the line broken since the start ([`stall_limit`]).
+static STALLS: AtomicU64 = AtomicU64::new(0);
 
 struct Entry<W> {
     number: u64,
@@ -265,6 +288,8 @@ impl<W: Work> Lane<W> {
 
     /// Looks at the line for as long as the process runs.
     fn serve(&self) -> ! {
+        // When the line last moved (or was empty).
+        let mut moved_at = Instant::now();
         loop {
             let (asked, limit) = {
                 let mut state = self.lock();
@@ -284,7 +309,19 @@ impl<W: Work> Lane<W> {
                 }
                 (state.asked, state.next)
             };
-            self.look(limit);
+            if self.look(limit) > 0 || self.lock().items.is_empty() {
+                moved_at = Instant::now();
+            } else if let Some(stall) = stall_limit()
+                && moved_at.elapsed() >= stall
+            {
+                // Nothing free to run for this long and no present to make
+                // the oldest go: it goes now (see [`stall_limit`]).
+                self.report_stall(limit, moved_at.elapsed());
+                if self.step(limit, true) {
+                    self.look(limit);
+                }
+                moved_at = Instant::now();
+            }
             let mut state = self.lock();
             state.served = state.served.max(asked);
             drop(state);
@@ -292,9 +329,49 @@ impl<W: Work> Lane<W> {
         }
     }
 
-    /// Does what is free to run of the entries before number `limit`.
-    pub(super) fn look(&self, limit: u64) {
-        while self.step(limit) {}
+    /// Does what is free to run of the entries before number `limit`: how
+    /// many entries were done.
+    pub(super) fn look(&self, limit: u64) -> usize {
+        let mut done = 0;
+        while self.step(limit, false) {
+            done += 1;
+        }
+        done
+    }
+
+    /// Says what each queue's first entry stands at when the line stood
+    /// `stood` with nothing free to run ([`stall_limit`]).
+    fn report_stall(&self, limit: u64, stood: Duration) {
+        let n = STALLS.fetch_add(1, Relaxed) + 1;
+        let state = self.lock();
+        let mut heads: Vec<String> = Vec::new();
+        let mut seen: Vec<usize> = Vec::new();
+        for e in state.items.iter().take_while(|e| e.number < limit) {
+            if seen.contains(&e.queue) {
+                continue;
+            }
+            seen.push(e.queue);
+            let what = match e.what.ask() {
+                Some(ask) => format!("stands at {}", W::describe(&ask)),
+                None if e.what.shows() => "a present".to_owned(),
+                None => "free to go".to_owned(),
+            };
+            heads.push(format!("queue {:#x} (kind {:?}) #{}: {what}", e.queue, super::kind_of(e.queue), e.number));
+        }
+        let (items, presents, runs) = (state.items.len(), state.presents, state.runs);
+        drop(state);
+        // (Every stall while there are few; then one in a hundred.)
+        if n <= 32 || n.is_multiple_of(100) {
+            tracing::warn!(
+                stalls = n,
+                stood_ms = stood.as_millis() as u64,
+                items,
+                presents,
+                runs,
+                heads = %heads.join("; "),
+                "the line of submissions stood with nothing free to run and no present to move it: its oldest entry goes (VICTORY_LINE_STALL_MS)"
+            );
+        }
     }
 
     /// The parts of `entry`, which stands for them, in place `at`.
@@ -311,8 +388,9 @@ impl<W: Work> Lane<W> {
     }
 
     /// Does one entry: the oldest that is the first of its queue and free to
-    /// run. Whether there was one. Only one thread calls this.
-    fn step(&self, limit: u64) -> bool {
+    /// run (`stalled`: the oldest, free or not, as a present would make it
+    /// go). Whether there was one. Only one thread calls this.
+    fn step(&self, limit: u64, stalled: bool) -> bool {
         // Each queue's first entry, oldest first.
         let mut heads: Vec<(u64, usize, Option<W::Ask>, bool)> = Vec::new();
         // Whether one of them stands for others not known yet.
@@ -345,7 +423,7 @@ impl<W: Work> Lane<W> {
                     return false;
                 }
                 let state = self.lock();
-                if !super::forces() || !state.items.iter().any(|e| e.number < limit && e.what.shows()) {
+                if !stalled && (!super::forces() || !state.items.iter().any(|e| e.number < limit && e.what.shows())) {
                     return false;
                 }
                 (first, true)
@@ -546,6 +624,20 @@ impl Work for Job {
         }
     }
 
+    fn describe(ask: &Ask) -> String {
+        match ask {
+            &Ask::Wait(fence, value) => {
+                format!("a fence {fence:#x} to reach {value} (it is at {})", crate::fence::completed(fence as This))
+            }
+            Ask::Value(wait) => format!("a memory value {wait:?} (met: {})", super::value_met(wait)),
+            Ask::Lists(recordings) => format!(
+                "lists being translated ({} of {} done)",
+                recordings.iter().filter(|r| r.done()).count(),
+                recordings.len()
+            ),
+        }
+    }
+
     fn shows(&self) -> bool {
         matches!(self, Job::Present(..))
     }
@@ -619,6 +711,12 @@ impl Work for Job {
 
     fn go(self, forced: bool) {
         let began = Instant::now();
+        // Where the thread's time goes (the frame line): showing frames, signals and waits.
+        let kind = match &self {
+            Job::Present(..) => Some(BUSY_PRESENT),
+            Job::Signal(..) | Job::Wait(..) | Job::Value(..) => Some(BUSY_SIGNALS),
+            _ => None,
+        };
         let _doing = crate::timeline::span(match self {
             Job::Run(..) => "the line: a submission",
             Job::Joined(..) => "the line: submissions joined",
@@ -690,7 +788,11 @@ impl Work for Job {
         }
         // (The mark was this submission's alone.)
         crate::heap_marks::set_mark(0);
-        STATS[BUSY].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        let took = began.elapsed().as_micros() as u64;
+        STATS[BUSY].fetch_add(took, Relaxed);
+        if let Some(kind) = kind {
+            STATS[kind].fetch_add(took, Relaxed);
+        }
     }
 }
 
@@ -706,7 +808,7 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present; parts joined; what our thread spent taking the
 /// lists of submissions whose translation was done out of the line.
-static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -722,6 +824,10 @@ const JOINED: usize = 10;
 /// Microseconds of [`Lane::unfold`] (the lists detached, new host lists
 /// given to the title's lists), under the line's lock and not in [`BUSY`].
 const UNFOLDING: usize = 11;
+/// Of [`BUSY`]: presents (the swap chain's Present, unless it is on the presenting thread,
+/// `crate::host` `shown`), and signals and met waits.
+const BUSY_PRESENT: usize = 12;
+const BUSY_SIGNALS: usize = 13;
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -833,17 +939,32 @@ pub(super) fn drain() {
     }
     let began = Instant::now();
     LANE.drain();
-    STATS[DRAINING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    let elapsed = began.elapsed().as_micros() as u64;
+    STATS[DRAINING].fetch_add(elapsed, Relaxed);
+    if crate::host::render_trace::active() {
+        crate::host::render_trace::event("title_queue_drained", format_args!("duration_us={elapsed}"));
+    }
     STATS[DRAINS].fetch_add(1, Relaxed);
 }
 
 /// A submission of `lists` to queue `this`.
 pub(super) fn submit(this: This, lists: &[This]) {
     let queue = this as usize;
+    if crate::host::render_trace::active() {
+        crate::host::render_trace::event("title_submit", format_args!("queue={queue:#x}\tlists={}\tqueued={}", lists.len(), QUEUED.load(Relaxed)));
+    }
     if crate::list::thin::on() {
         let recordings = crate::list::thin::submitted(lists);
         if recordings.is_empty() {
             return;
+        }
+        if crate::host::render_trace::active() {
+            for (index, recording) in recordings.iter().enumerate() {
+                crate::host::render_trace::event(
+                    "title_submit_list",
+                    format_args!("queue={queue:#x}\tindex={index}\trecording={:#x}", std::sync::Arc::as_ptr(recording) as usize),
+                );
+            }
         }
         let before = QUEUED.fetch_add(1, Relaxed);
         STATS[DEPTH].fetch_add(before, Relaxed);
@@ -937,7 +1058,8 @@ pub(super) fn present(
     LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
-    LANE.wait_presents(frames_most());
+    let most = if crate::memory::take_sizes_frame() { 0 } else { frames_most() };
+    LANE.wait_presents(most);
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
 }
 
@@ -947,7 +1069,8 @@ pub(super) fn line(frames: f64) {
     let ms = |i: usize| s[i] / 1000.0 / frames;
     tracing::info!(
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
-         when one was added (at most {:.0}); that thread worked {:.1} ms, and {:.2} ms more taking translated lists out of the \
+         when one was added (at most {:.0}); that thread worked {:.1} ms (of it {:.1} ms showing frames and {:.2} ms signals and \
+         met waits), and {:.2} ms more taking translated lists out of the \
          line (under its lock); threads of the title waited {:.1} ms for room in the \
          line, {:.1} ms at presents, {:.1} ms in {:.1} drains; waits not met at a present {:.2}; {:.1} of the \
          submissions were prepared together with the one before them (VICTORY_JOIN_PARTS)",
@@ -956,6 +1079,8 @@ pub(super) fn line(frames: f64) {
         s[DEPTH] / s[RUNS].max(1.0),
         s[DEEPEST],
         ms(BUSY),
+        ms(BUSY_PRESENT),
+        ms(BUSY_SIGNALS),
         ms(UNFOLDING),
         ms(ROOM),
         ms(AT_PRESENT),
@@ -1204,6 +1329,30 @@ mod tests {
         look(&lane);
         assert_eq!(log.lock().unwrap().last().unwrap(), "held again");
         assert_eq!(FORCED_HERE.get(), 1);
+        let state = lane.lock();
+        assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
+    }
+
+    /// A queue stands at a wait nothing meets, its signal behind it, and no
+    /// present comes (the title stands at that signal on the CPU): a look
+    /// leaves it, a stalled step makes the wait go and the signal follow, as a
+    /// present would have (`stall_limit`).
+    #[test]
+    fn a_stalled_line_goes_on_without_a_present() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let (never, signalled) = (fence(), fence());
+        lane.push(2, [T::Wait(never, 1), T::Run("held", log.clone()), T::Signal(signalled, 1, log.clone())]);
+        look(&lane);
+        assert!(log.lock().unwrap().is_empty(), "the wait holds its queue");
+        assert_eq!(value(signalled), 0);
+        let forced = FORCED_HERE.get();
+        let limit = lane.lock().next;
+        assert!(lane.step(limit, true), "the oldest goes");
+        assert_eq!(lane.look(limit), 2, "what was behind it is free now");
+        assert_eq!(*log.lock().unwrap(), ["held", "signal 1"]);
+        assert_eq!(value(signalled), 1);
+        assert_eq!(FORCED_HERE.get(), forced + 1);
         let state = lane.lock();
         assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
     }

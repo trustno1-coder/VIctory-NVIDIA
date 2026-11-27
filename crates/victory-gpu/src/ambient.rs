@@ -737,31 +737,32 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
-        let run = |pso: &ID3D12PipelineState, x, y, z| {
+        let run = |name, pso: &ID3D12PipelineState, x: u32, y: u32, z: u32| {
+            list.trace_gpu_pass(name, [x.into(), y.into(), z.into(), 0, 0]);
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
             uav_barrier(l);
         };
         match role {
             Role::Radiance => {
-                run(&pass.keep, 8, 9, 1);
-                run(&pass.mean, 1, 1, 1);
+                run("ambient: keep", &pass.keep, 8, 9, 1);
+                run("ambient: mean", &pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
-            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Air => run("ambient: air", &pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
-                    run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    run("ambient: place", &pass.place, 8, 9, 1);
+                    run("ambient: gather", &pass.gather, 20, 45, 1);
                 }
-                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                run("ambient: raise", &pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
             Role::Miss => {
                 // The points afresh, from this frame's depth: the diffuse
                 // stand-in makes them later in the frame.
-                run(&pass.place, 8, 9, 1);
-                run(&pass.gather, 20, 45, 1);
-                run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                run("ambient: place", &pass.place, 8, 9, 1);
+                run("ambient: gather", &pass.gather, 20, 45, 1);
+                run("ambient: reflect", &pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
     }

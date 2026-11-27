@@ -95,6 +95,33 @@ pub(crate) fn limited_host_ram() -> bool {
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
+/// [`limited_host_ram`] for the texture queue and its uploads: a 32 GB
+/// machine is not limited here. The title's working set peaks near 21 GB
+/// there (measured), and what is left is sized from what is free
+/// ([`staging_ceiling`]), not from the installed total. 16 GB machines are.
+/// (The other users of [`limited_host_ram`] keep its 32 GB line.)
+pub(crate) fn textures_limited_by_ram() -> bool {
+    static LIMITED: OnceLock<bool> = OnceLock::new();
+    *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys < 24 * GIB))
+}
+
+/// Bytes of title memory the copy queue's uploads may have on their way:
+/// `floor` when host memory is short or pressured; otherwise a third of what
+/// is free (half while a loading screen is up), between `floor` and 6 GiB.
+pub(crate) fn staging_ceiling(floor: u64, loading: bool) -> u64 {
+    if textures_limited_by_ram() {
+        return 32 * MIB;
+    }
+    if pressured() {
+        return floor.min(64 * MIB);
+    }
+    let Some(free) = headroom() else {
+        return floor;
+    };
+    let share = if loading { free / 2 } else { free / 3 };
+    share.clamp(floor, 6 * GIB)
+}
+
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     if was {
         physical < 5 * GIB || commit < 6 * GIB

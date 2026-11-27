@@ -30,11 +30,19 @@ const PENDING: u8 = 1;
 const DONE: u8 = 2;
 pub(crate) const LISTED: u8 = 3;
 
-/// Bytes of title memory on their way at most: past it uploads go into the
-/// lists, as before.
+/// Bytes of title memory on their way at most when nothing says more (a
+/// machine short of memory, or none measured yet): past it uploads go into
+/// the lists, as before. With memory to spare it is
+/// [`crate::residency::staging_ceiling`].
 const MOST: u64 = 96 << 20;
 /// Bytes and textures of one submission at most.
-const BATCH: (u64, usize) = (16 << 20, 64);
+const BATCH: (u64, usize) = (32 << 20, 128);
+
+/// Threads that read, detile and copy: a quarter of the cores, 2 to 4 (the
+/// copy queue is one; the detiling before it is what parallelises).
+fn worker_count() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 4).clamp(2, 4))
+}
 
 /// Whether it is on (`VICTORY_UPLOAD_AHEAD`; off).
 pub(crate) fn on() -> bool {
@@ -104,7 +112,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
-    let most = if crate::residency::limited_host_ram() { 32 << 20 } else { MOST };
+    let most = crate::residency::staging_ceiling(MOST, super::ledger::loading());
     if !crate::residency::allow_staging_growth(false)
         || BYTES.load(Relaxed) >= most
         || copy.flags() & 0x7 != 0
@@ -203,7 +211,7 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
+            for n in 0..worker_count() {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }
@@ -273,10 +281,18 @@ impl Worker {
                 job.record(&self.list);
             }
             self.list.Close()?;
-            self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
+            let lists = [Some(self.list.cast()?)];
+            let trace_start = crate::host::render_trace::active().then(crate::host::now_us);
+            if trace_start.is_some() {
+                crate::host::render_trace::execute(&self.queue, &lists, Some((self.fence.as_raw() as usize, value)));
+            }
+            self.queue.ExecuteCommandLists(&lists);
             self.queue.Signal(&self.fence, value)?;
             // (Without an event: this waits.)
             self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            if let Some(start) = trace_start {
+                crate::host::render_trace::event("texture_copy_queue_complete", format_args!("fence={:#x}\tvalue={value}\tstart_us={start}\tduration_us={}\tjobs={}", self.fence.as_raw() as usize, crate::host::now_us().saturating_sub(start), jobs.len()));
+            }
         }
         Ok(())
     }

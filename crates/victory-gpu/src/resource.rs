@@ -1824,7 +1824,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            // Only count a small fraction of free pool blocks as headroom: DXGI
+            // already counts the whole 64 MiB blocks against `budget`, and
+            // subtracting up to ~1.8 GiB of fragmented pool space hid real
+            // VRAM exhaustion (DLSS `out of VRAM` + device loss).
+            let usable_pool = crate::pool::texture_room().min(budget / 32);
+            used.saturating_sub(usable_pool) + crate::shadow::card_room_kept() + targets_room_kept()
                 < room_line(budget)
         }
         None => filled < WITHOUT_BUDGET,
@@ -1987,8 +1992,34 @@ pub(crate) fn room_line(budget: u64) -> u64 {
     if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
         budget / 100 * room_percent()
     } else {
-        line_for(budget)
+        match framegen_planned() {
+            // Frame generation takes 1.5 to 2 GB of the card's memory when on;
+            // the targets' own reserve (`targets_room_kept`) is on top of this.
+            Some(true) => line_for(budget).min(budget / 100 * LINE_FRAMEGEN_PERCENT),
+            Some(false) => line_for(budget).min(budget / 100 * LINE_FRAMEGEN_READY_PERCENT),
+            None => line_for(budget),
+        }
     }
+}
+
+/// The texture line's share of the budget with frame generation on from the
+/// start, and ready but off. (The launcher set 80 and 86 by a switch; the
+/// textures the title asks for are the budget now, and 4.7 GB of 9 GB was
+/// used at the 80 % line in the last measured run, so these are nearer 90.)
+#[cfg(windows)]
+const LINE_FRAMEGEN_PERCENT: u64 = 83;
+#[cfg(windows)]
+const LINE_FRAMEGEN_READY_PERCENT: u64 = 87;
+
+/// Whether frame generation was planned at the start (`Some(true)`: on,
+/// `Some(false)`: ready but off), from what the launcher told the GPU side.
+#[cfg(windows)]
+fn framegen_planned() -> Option<bool> {
+    static PLANNED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *PLANNED.get_or_init(|| {
+        (std::env::var("VICTORY_FRAMEGEN").is_ok_and(|v| v.trim() == "1"))
+            .then(|| !std::env::var("VICTORY_FRAMEGEN_X").is_ok_and(|x| x.trim() == "0"))
+    })
 }
 
 /// The budget less what is left free for the host's own needs that are
@@ -2000,7 +2031,7 @@ pub(crate) fn room_line(budget: u64) -> u64 {
 /// to textures there, and keeps 90 % on cards of 7.5 GB or less.
 #[cfg(any(windows, test))]
 fn line_for(budget: u64) -> u64 {
-    budget.saturating_sub((768u64 << 20).max(budget / 20)).max(budget / 100 * 90)
+    budget.saturating_sub((768u64 << 20).max(budget / 10)).max(budget / 100 * 88)
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -2268,7 +2299,8 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
+            let usable_pool = crate::pool::texture_room().min(budget / 32);
+            let used = used.saturating_sub(usable_pool)
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
             crate::host::vram_keep_below(budget, used, room_line(budget))
@@ -3320,6 +3352,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    // What lives at that address is known from now on: a DirectStorage
+    // request landing there later can be made ready (`texture::ledger`).
+    crate::texture::ledger::desc_known(address, desc);
     crate::texture::placed_in_host_written(address, desc);
     placed_inside_target(address, out);
     resource(out)
@@ -4810,17 +4845,17 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
     }
 
-    /// The texture queue's line: the budget less 768 MiB or 5 %, never under
-    /// 90 % of it.
+    /// The texture queue's line: the budget less 768 MiB or 10 %, never under
+    /// 88 % of it.
     #[test]
     fn room_line_follows_the_budget() {
         const MIB: u64 = 1 << 20;
-        // 10,600 MB: 768 MiB free (92.8 %), not 1,060 MB.
-        assert_eq!(line_for(10_600 * MIB), 9_832 * MIB);
-        // 24 GB: 5 % free.
-        assert_eq!(line_for(24_000 * MIB), 22_800 * MIB);
-        // 6 GB: 90 % (768 MiB would be more than a tenth).
-        assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
+        // 10,600 MB: 10 % free (1,060 MiB), matching the headroom needed before DXGI paging/OOM.
+        assert_eq!(line_for(10_600 * MIB), 9_540 * MIB);
+        // 24 GB: 10 % free.
+        assert_eq!(line_for(24_000 * MIB), 21_600 * MIB);
+        // 6 GB: 88 % floor (768 MiB would leave 87.2 %).
+        assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 88);
         assert_eq!(line_for(0), 0);
     }
 

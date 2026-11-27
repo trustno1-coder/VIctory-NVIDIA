@@ -260,10 +260,129 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     }
 }
 
+/// The pipelines earlier runs requested are made from the moment this is
+/// called (the title not yet started), in the order they first requested
+/// them, on the pipeline workers, in this process: the title's own creation of
+/// each finds it made or queued ([`super::make::adopt`]). A first run (nothing
+/// recorded) only records. Called once, with the cache folders in place
+/// (`use_pipeline_cache`), by the run of a title; not by `victory warm`.
+///
+/// While the title loads ([`super::make`]'s `LOADING`) the workers but one run
+/// at normal priority; a frame of a world's worth of draws ends that.
+pub fn prewarm() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(dir) = super::library::folder() else { return };
+        super::make::prewarm_begin();
+        let spawned = std::thread::Builder::new().name("victory-prewarm".into()).spawn(move || {
+            queue_earlier(&dir);
+            super::make::prewarm_end();
+        });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "pipelines of earlier runs are not made ahead");
+            super::make::prewarm_end();
+        }
+    });
+}
+
+/// The 16 bytes of a pipeline's key.
+fn id_of(key: &str) -> Option<[u8; 16]> {
+    let mut id = [0u8; 16];
+    for (at, b) in id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(key.get(2 * at..2 * at + 2)?, 16).ok()?;
+    }
+    (key.len() == 32).then_some(id)
+}
+
+/// Reads the earlier runs' pipelines from the books and queues them in the
+/// order of first use ([`prewarm`]).
+fn queue_earlier(dir: &Path) {
+    let began = std::time::Instant::now();
+    let keys = super::library::plan();
+    if keys.is_empty() {
+        tracing::info!("pipeline prewarm: no pipeline recorded by earlier runs (a first run only records)");
+        return;
+    }
+    super::make::prewarm_plan(&keys);
+    // The host device, as the title's first pipeline would make it.
+    if crate::host::host().is_none() {
+        return;
+    }
+    let mut places = HashMap::new();
+    walk_shaders(dir, |_, hash, at, len| drop(places.insert(hash, (at, len))));
+    let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else {
+        tracing::info!("pipeline prewarm: no book of the title's shaders (VICTORY_PIPELINE_BOOK=1 writes it)");
+        return;
+    };
+    let ids: Vec<Option<[u8; 16]>> = keys.iter().map(|k| id_of(k)).collect();
+    let wanted: HashSet<[u8; 16]> = ids.iter().flatten().copied().collect();
+    let mut entries: HashMap<[u8; 16], Vec<u8>> = HashMap::new();
+    walk_pipelines(dir, |_, bytes| {
+        if let Some(id) = bytes.first_chunk::<16>()
+            && wanted.contains(id)
+        {
+            entries.insert(*id, bytes.to_vec());
+        }
+    });
+    let (mut queued, mut missing, mut unreadable, mut changed, mut by_the_title) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut shaders: HashMap<[u8; 32], Arc<Shader>> = HashMap::new();
+    for (key, id) in keys.iter().zip(&ids) {
+        let Some(entry) = id.and_then(|id| entries.get(&id)) else {
+            missing += 1;
+            continue;
+        };
+        let parsed = parse_by(entry, &mut |stage, hash| {
+            if let Some(s) = shaders.get(hash) {
+                return Some(s.clone());
+            }
+            let &(at, len) = places.get(hash)?;
+            let mut bytes = vec![0; len as usize];
+            file.seek(SeekFrom::Start(at)).ok()?;
+            file.read_exact(&mut bytes).ok()?;
+            let s = super::shader(STAGES.get(usize::from(stage))?, &bytes);
+            shaders.insert(*hash, s.clone());
+            Some(s)
+        });
+        let Some((parsed, graphics)) = parsed else {
+            unreadable += 1;
+            continue;
+        };
+        let pending = super::make::Pending::new(parsed, graphics);
+        if pending.key() != key.as_str() {
+            changed += 1;
+            continue;
+        }
+        if super::make::prewarm_add(pending) {
+            queued += 1;
+        } else {
+            by_the_title += 1;
+        }
+    }
+    tracing::info!(
+        planned = keys.len(),
+        queued,
+        not_in_the_books = missing,
+        unreadable,
+        key_changed = changed,
+        created_by_the_title_first = by_the_title,
+        ms = began.elapsed().as_millis() as u64,
+        "pipeline prewarm: pipelines of earlier runs queued, first used first"
+    );
+}
+
 #[allow(clippy::type_complexity)]
 fn parse(
     entry: &[u8],
     read: &mut impl FnMut(&[u8; 32]) -> Option<Vec<u8>>,
+) -> Option<(Vec<Arc<Shader>>, Option<Box<GraphicsState>>)> {
+    parse_by(entry, &mut |stage, hash| Some(super::shader(STAGES.get(usize::from(stage))?, &read(hash)?)))
+}
+
+/// As [`parse`], the shaders (by stage number and hash) from `get`.
+#[allow(clippy::type_complexity)]
+fn parse_by(
+    entry: &[u8],
+    get: &mut impl FnMut(u8, &[u8; 32]) -> Option<Arc<Shader>>,
 ) -> Option<(Vec<Arc<Shader>>, Option<Box<GraphicsState>>)> {
     let mut rest = entry.get(16..)?;
     let (&count, after) = rest.split_first()?;
@@ -274,7 +393,7 @@ fn parse(
         rest = after;
         let mut hash = [0; 32];
         hash.copy_from_slice(&head[1..]);
-        shaders.push(super::shader(STAGES.get(usize::from(head[0]))?, &read(&hash)?));
+        shaders.push(get(head[0], &hash)?);
     }
     let (&graphics, rest) = rest.split_first()?;
     let g = match graphics {
@@ -463,6 +582,15 @@ mod tests {
         assert_eq!(back.describe(), g.describe());
         assert!(GraphicsState::get(&bytes[..bytes.len() - 1]).is_none());
         assert!(GraphicsState::get(&bytes[..9]).is_none());
+    }
+
+    #[test]
+    fn a_key_is_sixteen_bytes() {
+        let id = id_of("000102030405060708090a0b0c0d0e0f").unwrap();
+        assert_eq!(id[..3], [0, 1, 2]);
+        assert_eq!(id[15], 15);
+        assert!(id_of("0001").is_none());
+        assert!(id_of(&"zz".repeat(16)).is_none());
     }
 
     #[test]

@@ -48,6 +48,23 @@ enum Val {
     Missing(Why),
 }
 
+/// How a constant buffer is read ([`Lower::constant_view`]).
+#[derive(Debug, Clone, Copy)]
+enum ConstantView {
+    /// As raw bytes through this handle (a raw view of the host): byte 0 is
+    /// the title's address. With a size, bytes at or past it read zeros by
+    /// the code's own test (a root view has no size); without one, the
+    /// view's own size bounds the reads (zeros past it).
+    Raw(V, Option<u32>),
+    /// As a structured buffer of dwords (stride 4) through this handle: the
+    /// view slot holds a structured view whose first element is the title's
+    /// address (any 4 bytes) and whose size is the CBV's (zeros past it).
+    Structured(V),
+    /// Through a constant buffer view (a descriptor neither a root view nor
+    /// in the view heap: none the host binds).
+    Cbuffer(V),
+}
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is a comparison sampler.
@@ -114,9 +131,17 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    lower_with_options(parts, counted, &[])
+}
+
+pub(super) fn lower_with_lds_seed(parts: &Parts, seed: &[u32]) -> Result<Lowered, ShaderError> {
+    lower_with_options(parts, false, seed)
+}
+
+fn lower_with_options(parts: &Parts, counted: bool, lds_seed: &[u32]) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        match Lower::new(parts, &bad).run(counted, lds_seed) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -2599,12 +2624,36 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::Or, first, total))
     }
 
-    fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
+    fn run(mut self, counted: bool, lds_seed: &[u32]) -> Result<Lowered, Stop> {
         let p = self.x.p;
         // A host group has 32 KiB of LDS (D3D12): the program's LDS with the meetings' and
         // exchanges' dwords past it must fit (`CS_CollectTriangles_Meshlets` uses all 32 KiB).
         if self.pairs.is_some() && self.s.lds_dwords > HOST_LDS_DWORDS {
             return Err(unsupported(0, "LDS for the console waves' meetings past the host's 32 KiB"));
+        }
+        if !lds_seed.is_empty() {
+            let StageIo::Cs(cs) = self.x.native.io else {
+                return Err(unsupported(0, "LDS initialization outside compute"));
+            };
+            if lds_seed.len() > (cs.lds_bytes() / 4) as usize {
+                return Err(unsupported(0, "LDS initialization past the guest allocation"));
+            }
+            let entry = self.s.entry;
+            self.cur = entry;
+            let thread = self.s.op(entry, "flattenedThreadIdInGroup.i32", Attr::ReadNone, self.s.t.i32, 96, &[]);
+            let zero = self.s.m.i32(0);
+            let first = self.s.m.cmp(entry, pred::EQ, thread, zero);
+            let branch = self.begin_guarded(Some(first));
+            let lds = self.s.lds();
+            for (index, &word) in lds_seed.iter().enumerate() {
+                let index = self.s.m.i32(index as u32);
+                let ptr = self.s.m.element(self.cur, lds, index);
+                let value = self.s.m.i32(word);
+                self.s.m.store(self.cur, ptr, value);
+            }
+            self.end_guarded(branch, &[]);
+            self.group_sync(self.cur);
+            self.s.entry = self.cur;
         }
         if counted {
             // Before anything else, so that wave counts, reads of the first
@@ -3429,13 +3478,14 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
-        let places = k(self, MEMORY_FAULTS - 1);
+        let mask = k(self, MEMORY_FAULTS - 1);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let noting = self.begin_guarded(Some(missing));
         let c = self.cur;
-        let place = self.s.m.bin(c, Bin::URem, page, places);
+        let masked = self.s.m.bin(c, Bin::And, page, mask);
         let one = k(self, 1);
-        let place = self.s.m.bin(c, Bin::Add, place, one);
+        let zero_slot = self.s.m.cmp(c, pred::EQ, masked, zero);
+        let place = self.s.m.select(c, zero_slot, one, masked);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
         let void = self.s.t.void;
@@ -3459,9 +3509,9 @@ impl<'a> Lower<'a> {
         };
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        // The builder's threads read what others of the dispatch wrote (a
-        // refit climbs from children to parents): globally coherent.
-        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
+        // The builder's stores write through to L2; its loads hit L1 and
+        // reload at the fences around its atomics.
+        let coherent = if store && crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
@@ -5826,6 +5876,19 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        if std::env::var_os("VICTORY_LDS_WHY").is_some()
+            && matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
+        {
+            eprintln!(
+                "LDS-WHY {:#x} {name} block={b} split={} all={:?} meet_at={:?} unordered={}",
+                offset,
+                self.split_lds,
+                self.lds_meet.as_ref().map(|(all, _)| all[b]),
+                self.lds_meet.as_ref().map(|(_, m)| m[b]),
+                self.lds_unordered.contains(&(b, i)),
+            );
+        }
         if self.split_lds
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
@@ -6727,13 +6790,13 @@ impl<'a> Lower<'a> {
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let view = self.constant_view(site, src)?;
             let mut both = Vec::new();
             for (k, &r) in raw.iter().enumerate() {
                 let b = self.cur;
                 let off = self.s.m.i32(4 * k as u32);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let x = self.cbuffer_dword(h, a);
+                let x = self.constant_dword(view, a);
                 both.push((x, r));
             }
             let both = self.end_guarded(at, &both);
@@ -6790,7 +6853,18 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let h = self.handle(site, src, false, (13, 0x1_0000))?;
+        let h = match self.constant_view(site, src)? {
+            ConstantView::Cbuffer(h) => h,
+            raw => {
+                for k in 0..count {
+                    let off = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, addr, off);
+                    let x = self.constant_dword(raw, a);
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
+        };
         let constant = match addr {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
@@ -7286,6 +7360,125 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// How the constant buffer `src` read at `site` is read. Never through a
+    /// constant buffer view: its address must lie on 256 bytes on the host,
+    /// the console's constants lie on 16, and the host reads them where the
+    /// title wrote them (`victory-gpu` `port`) only through views that begin
+    /// on any 4 bytes:
+    ///
+    /// - A root constant buffer: raw bytes through the root SRV `t<slot>`
+    ///   ([`super::shader::Shader::root_constants_handle`]) at the title's
+    ///   address; zeros past [`super::shader::ROOT_CONSTANT_BYTES`].
+    /// - One in a table: a structured buffer of dwords through its own slot,
+    ///   which the host makes a structured view (stride 4) of the CBV's bytes
+    ///   (`HostHeap::constant_at`, the mirror's `make_twinned`); zeros past
+    ///   it. No raw twin is needed (NVIDIA's heaps have no room for them).
+    /// - One picked from the heap by a computed index: where the host keeps
+    ///   raw twins ([`super::shader::raw_views`]), raw bytes through the twin
+    ///   of its slot ([`Lower::raw_twin`]: an index from wrong data meets a
+    ///   null raw view there, not a texture); else as in a table.
+    fn constant_view(&mut self, site: Site, src: &Source) -> Result<ConstantView, Why> {
+        if self.root_copy.is_none()
+            && let Source::Built { address, .. } = src
+            && let Some(rp) = self.x.native.layout.get(address.param).copied()
+            && rp.root == RootType::Descriptor
+        {
+            let kind = self
+                .x
+                .native
+                .used
+                .iter()
+                .find(|u| u.user_data == rp.user_data)
+                .map(|u| u.kind);
+            if matches!(kind, Some(ResourceType::Cbv) | None) {
+                let h = self.s.root_constants_handle(rp.slot);
+                return Ok(ConstantView::Raw(h, Some(super::shader::ROOT_CONSTANT_BYTES)));
+            }
+        }
+        // The root parameter kind each leaf's descriptor is loaded through.
+        let roots: Vec<Option<RootType>> = src
+            .leaves()
+            .iter()
+            .map(|leaf| {
+                let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = leaf else {
+                    return None;
+                };
+                self.scalar
+                    .get(load)
+                    .and_then(|a| self.x.native.layout.get(a.param))
+                    .map(|p| p.root)
+            })
+            .collect();
+        let tables = roots.iter().all(|r| *r == Some(RootType::Table));
+        let in_heap = roots
+            .iter()
+            .all(|r| matches!(r, Some(RootType::Table | RootType::ResourceHeap)));
+        if in_heap && !tables && super::shader::raw_views() != 0 {
+            let h = self.handle(site, src, false, (11, 0))?;
+            return Ok(ConstantView::Raw(h, None));
+        }
+        if in_heap {
+            return Ok(ConstantView::Structured(self.handle(site, src, false, (12, 4))?));
+        }
+        Ok(ConstantView::Cbuffer(self.handle(site, src, false, (13, 0x1_0000))?))
+    }
+
+    /// The dword at a computed byte address `a` of a constant buffer read as
+    /// [`Lower::constant_view`] says. As the console's: the address's low
+    /// two bits are not looked at.
+    fn constant_dword(&mut self, view: ConstantView, a: V) -> V {
+        let (h, most) = match view {
+            ConstantView::Cbuffer(h) => return self.cbuffer_dword(h, a),
+            ConstantView::Structured(h) => {
+                // Element `a / 4`, its only dword.
+                let c = self.cur;
+                let two = self.s.m.i32(2);
+                let element = self.s.m.bin(c, Bin::LShr, a, two);
+                let zero = self.s.m.i32(0);
+                let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, element, zero, mask, al],
+                );
+                let x = self.s.m.extract(c, r, 0);
+                return self.as_int(x);
+            }
+            ConstantView::Raw(h, most) => (h, most),
+        };
+        let c = self.cur;
+        let dword = self.s.m.i32(!3u32);
+        let mut at = self.s.m.bin(c, Bin::And, a, dword);
+        let zero = self.s.m.i32(0);
+        // A root view has no size: nothing past the bytes a constant buffer
+        // shows is read at all.
+        let inside = most.map(|n| {
+            let n = self.s.m.i32(n);
+            self.s.m.cmp(c, pred::IULT, at, n)
+        });
+        if let Some(inside) = inside {
+            at = self.s.m.select(c, inside, at, zero);
+        }
+        let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, u, mask, al],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        let x = self.as_int(x);
+        match inside {
+            Some(inside) => self.s.m.select(self.cur, inside, x, zero),
+            None => x,
+        }
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -7736,8 +7929,10 @@ impl<'a> Lower<'a> {
                     .find(|u| u.user_data == rp.user_data)
                     .map(|u| u.kind);
                 match (rp.root, kind, props.0) {
+                    // Root constant buffers are read as raw bytes
+                    // (`constant_view`), never through a view of this kind.
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
-                        Ok(self.s.root_cbv_handle(rp.slot))
+                        Err("a root constant buffer read through a constant buffer view")
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
@@ -7795,9 +7990,11 @@ impl<'a> Lower<'a> {
     /// for a buffer read as raw bytes, through a table or picked from the
     /// heap itself (or picked and read as a constant buffer), the host's raw
     /// twin of that slot ([`super::shader::raw_views`]), whose reads end where
-    /// the view does. Everything else (textures, typed buffers, tables'
-    /// constant buffers) stays in place. And whether it is a twin's (inside
-    /// the host's heap).
+    /// the view does. Constant buffers (tables' and picked ones) are read as
+    /// raw bytes this way too ([`Lower::constant_view`]): the host makes the
+    /// twin of a constant buffer's slot a raw view of its bytes. Everything
+    /// else (textures, typed buffers) stays in place. And whether it is a
+    /// twin's (inside the host's heap).
     ///
     /// Tables too: a view that does not begin on 16 bytes cannot be raw, and
     /// a pixel program of the main pass (3711fdad456538a1, stopped at in the
@@ -12295,7 +12492,7 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let view = self.constant_view(site, src)?;
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -12310,7 +12507,7 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = self.constant_dword(view, a);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

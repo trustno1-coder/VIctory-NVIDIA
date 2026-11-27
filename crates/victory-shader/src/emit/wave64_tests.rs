@@ -105,21 +105,22 @@ fn lowered_on(
     wide: &HashSet<usize>,
     host_wave: u32,
 ) -> Result<HostShader, ShaderError> {
-    lowered_counted(native, p, wide, host_wave, false)
+    lowered_with_options(native, p, wide, host_wave, false, &[])
 }
 
-fn lowered_counted(
+fn lowered_with_options(
     native: &NativeProgram,
     p: &ir::Program,
     wide: &HashSet<usize>,
     host_wave: u32,
     counted: bool,
+    lds_seed: &[u32],
 ) -> Result<HostShader, ShaderError> {
     let st = structure::structure_wide(p, wide).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
-    let lowered = lower::lower_counted(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st: &st,
@@ -129,7 +130,12 @@ fn lowered_counted(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    }, counted);
+    };
+    let lowered = if lds_seed.is_empty() {
+        lower::lower_counted(&parts, counted)
+    } else {
+        lower::lower_with_lds_seed(&parts, lds_seed)
+    };
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
     Ok(HostShader {
@@ -511,6 +517,149 @@ fn a_wave_or_inside_a_lane_branch_needs_the_branch_wave_wide() {
     }
 }
 
+/// Like the tiled water kernels, scalar state flows across a branch whose
+/// mask can be nonempty on just one of the host wave's two halves.
+#[test]
+fn a_guest_mask_branch_updates_scalar_state_for_both_halves() {
+    let native = native(&[
+        0xBE85_0381, // s_mov_b32 s5, 1
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBF86_0001, // s_cbranch_vccz skip
+        0xBE85_0382, // s_mov_b32 s5, 2
+        0x7E04_0205, // skip: v_mov_b32 v2, s5
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let wide = super::guest_wave_branches(&st);
+    assert_eq!(wide.len(), 1);
+    let shader = lowered(&native, &p, &wide).expect("lower");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("guest mask branch PSO");
+    for (below, expected) in [(0, 1), (1, 2), (32, 2), (33, 2), (64, 2)] {
+        let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 0) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(ud))],
+            views: &[View::RawUav(64)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).expect("guest mask branch dispatch");
+        assert_eq!(out[0], vec![expected; 64], "{below} lanes in the guest mask");
+    }
+    eprintln!("ran on the hardware device: both host waves saw the same scalar value");
+}
+
+#[test]
+fn tile_depth_extrema_are_initialized_when_lane_zero_is_masked_out() {
+    let mut native = native(&[
+        0x7E02_0280, // v_mov_b32 v1, 0: LDS address
+        0x4A04_0081, // v_add_nc_u32 v2, 1, v0: distinct depth per lane
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7DA4_0481, // v_cmpx_eq_u32 exec, 1, v2: select lane zero
+        0x8AFE_7E0C, // s_andn2_b64 exec, s[12:13], exec: drop lane zero
+        0xD81C_0004, 0x0000_0201, // ds_min_u32 v1, v2 offset:4
+        0xD820_0000, 0x0000_0201, // ds_max_u32 v1, v2
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD8DC_0100, 0x0300_0001, // ds_read2_b32 v[3:4], v1 offset1:1
+        0x4A06_0903, // v_add_nc_u32 v3, v3, v4
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000, 0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+    ]);
+    let StageIo::Cs(cs) = &mut native.io else { unreachable!() };
+    cs.rsrc2 |= 1 << 15;
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_with_options(&native, &p, &HashSet::new(), 32, false, &[0, u32::MAX])
+        .expect("lower seeded reduction");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("tile depth reduction PSO");
+    let out = host.dispatch(&root, &pso, &Dispatch {
+        roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+        views: &[View::RawUav(64)],
+        samplers: &[],
+        groups: [1, 1, 1],
+    }).expect("tile depth reduction dispatch");
+    assert_eq!(out[0], vec![64 + 2; 64]);
+    eprintln!("hardware tile reduction: min 2, max 64");
+}
+
+/// The tiled water kernels' lane pick (`CS_TransmissionVolumetrics_Tiled`, 0x53c and 0x2d94):
+/// a 64-bit mask of one lane is kept in lanes 0 and 1 of a VGPR, read back, made EXEC, and
+/// that lane's value is read with `v_readfirstlane` for the whole wave. On a host of 32-lane
+/// waves the lane may sit in either half; both halves must read its value.
+#[test]
+fn a_lane_picked_by_a_kept_mask_is_read_by_both_halves() {
+    let native = native(&[
+        0x7D84_0000, // v_cmp_eq_u32 vcc, s0, v0
+        0xBE86_046A, // s_mov_b64 s[6:7], vcc
+        0xD761_0003, 0x0001_0006, // v_writelane_b32 v3, s6, 0
+        0xD761_0003, 0x0001_0207, // v_writelane_b32 v3, s7, 1
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xBE94_03C1, // s_mov_b32 s20, -1
+        0xD760_0006, 0x0001_0103, // v_readlane_b32 s6, v3, 0
+        0xD760_0007, 0x0001_0303, // v_readlane_b32 s7, v3, 1
+        0xBE8C_2406, // s_and_saveexec_b64 s[12:13], s[6:7]
+        0xBF88_0003, // s_cbranch_execz past the read
+        0x4A04_00FF, 0x0000_0064, // v_add_nc_u32 v2, 100, v0
+        0x7E28_0502, // v_readfirstlane_b32 s20, v2
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E08_0214, // v_mov_b32 v4, s20
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000, 0x8002_0401, // buffer_store_dword v4, v1, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let wide = super::guest_wave_branches(&st);
+    let shader = lowered(&native, &p, &wide).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("lane pick PSO");
+    let mut wrong = Vec::new();
+    for lane in [0u32, 5, 31, 32, 40, 63] {
+        let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 0) {
+                ud[u.index as usize] = lane;
+            }
+        }
+        let out = host
+            .dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            })
+            .expect("lane pick dispatch");
+        if out[0] != vec![lane + 100; 64] {
+            wrong.push((lane, out[0][0], out[0][32]));
+        }
+    }
+    assert!(wrong.is_empty(), "(picked lane, lane 0 read, lane 32 read): {wrong:x?}");
+    eprintln!("ran on the hardware device: both halves read the picked lane");
+}
+
 fn a_wave_or_inside(skip: u32, name: &str) {
     let native = program(skip);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
@@ -708,7 +857,7 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         0xe0c8_1000, 0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
     ]);
     let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let shader = lowered_counted(&native, &p, &HashSet::new(), 64, true).unwrap();
+    let shader = lowered_with_options(&native, &p, &HashSet::new(), 64, true, &[]).unwrap();
     let limit = shader
         .user_data
         .iter()

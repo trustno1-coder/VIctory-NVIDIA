@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -75,7 +75,17 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+const RETIRED_SHARDS: usize = 32;
+static RETIRED: [Mutex<std::collections::VecDeque<(u64, Retired)>>; RETIRED_SHARDS] =
+    [const { Mutex::new(std::collections::VecDeque::new()) }; RETIRED_SHARDS];
+static NEXT_RETIRED_SHARD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn retired_shard() -> usize {
+    thread_local! {
+        static SHARD: usize = NEXT_RETIRED_SHARD.fetch_add(1, Ordering::Relaxed) % RETIRED_SHARDS;
+    }
+    SHARD.with(|&s| s)
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -462,6 +472,14 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// Whether the periodic sweep behind flights drains them first, as it did
+/// (`VICTORY_SWEEP_SETTLE=1`). Off by default: what the sweep drops is
+/// retired by submission number.
+fn sweep_settles() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SWEEP_SETTLE"))
+}
+
 /// The number of the newest submission begun, and of the newest of which all
 /// before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {
@@ -480,7 +498,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
+    RETIRED[retired_shard()]
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push_back((started, Retired::Any(Box::new(object))));
@@ -496,7 +514,10 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    RETIRED[retired_shard()]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back((started, Retired::Resource(object)));
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -518,16 +539,64 @@ fn bury_lag() -> u64 {
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut done: Vec<(u64, Retired)> = Vec::new();
+    for shard in &RETIRED {
+        let mut retired = shard.lock().unwrap_or_else(|e| e.into_inner());
         let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
+        if n > 0 {
+            done.extend(retired.drain(..n));
         }
-        retired.drain(..n).collect()
-    };
-    drop(done);
+    }
+    if done.is_empty() {
+        return;
+    }
+    BURIED[0].fetch_add(done.len() as u64, Ordering::Relaxed);
+    // Dropping is where the time goes: the last reference to a resource
+    // frees its memory in the graphics kernel, tens of microseconds each,
+    // and a sweep lets go of thousands at once (run of 2026-11-27 16:05:
+    // 90 ms of the helper's time a frame in `bury`). The helper also
+    // resets the landed lists the submitting thread waits for, so the
+    // dropping goes to a thread of its own ([`burier`]).
+    match burier() {
+        Some(to) => {
+            if let Err(back) = to.send(done) {
+                drop(back.0);
+            }
+        }
+        None => drop(done),
+    }
 }
+
+/// The thread that drops what [`bury`] let go (`VICTORY_BURY_THREAD=0`:
+/// dropped where it is let go, as before).
+fn burier() -> Option<&'static std::sync::mpsc::Sender<Vec<(u64, Retired)>>> {
+    static TO: OnceLock<Option<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>> = OnceLock::new();
+    TO.get_or_init(|| {
+        if std::env::var_os("VICTORY_BURY_THREAD").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        let spawned = std::thread::Builder::new().name("victory-bury".into()).spawn(move || {
+            for batch in from {
+                let started = std::time::Instant::now();
+                drop(batch);
+                BURIED[1].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        });
+        match spawned {
+            Ok(_) => Some(to),
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread to drop retired objects: dropped where they are let go");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Since the last frame-rate line: objects [`bury`] let go, and the
+/// nanoseconds their dropping took.
+static BURIED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
@@ -623,14 +692,57 @@ pub(crate) fn removal_context() -> String {
 /// host device removed.
 pub(crate) fn log_removal_context() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !(trail_on() || dred_any()) || SAID.swap(true, Ordering::Relaxed) {
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if let Some(host) = host() {
+        // SAFETY: a plain query.
+        let reason = unsafe { host.device.GetDeviceRemovedReason() };
+        tracing::error!("device removed reason: {reason:?}; {}", features_on());
+    }
+    if !(trail_on() || dred_any() || dred_release()) {
         return;
     }
     tracing::error!("when the host device went: {}", removal_context());
-    if dred_any() {
+    if dred_any() || dred_release() {
         let data = host().map(|h| h.removal_data(&[])).unwrap_or_default();
         tracing::error!("device-removed data{}", if data.is_empty() { "; none" } else { &data });
     }
+}
+
+/// The switches of ours that change what reaches the card or when, as they
+/// were set in this run: said when the device is removed.
+fn features_on() -> String {
+    let set = |name: &str| std::env::var(name).unwrap_or_else(|_| "(unset)".into());
+    let names = [
+        "VICTORY_PRESENT_THREAD",
+        "VICTORY_PRESENT_HOLD_MS",
+        "VICTORY_LINE_STALL_MS",
+        "VICTORY_WAIT_FORCE",
+        "VICTORY_MERGE_ACROSS",
+        "VICTORY_GPU_SUBMITS",
+        "VICTORY_GPU_PASSES",
+        "VICTORY_CPU_STAGES",
+        "VICTORY_CARD_TABLE",
+        "VICTORY_PREFETCH",
+        "VICTORY_TAKE_APART",
+        "VICTORY_RELAY",
+        "VICTORY_CARD_STEPS",
+        "VICTORY_ASYNC_SUBMIT",
+        "VICTORY_THIN",
+        "VICTORY_FRAMEGEN",
+        "VICTORY_DLSS",
+        "VICTORY_LIBRARY_STATIC_SAMPLERS",
+        "VICTORY_DRED",
+    ];
+    let list: Vec<String> = names.iter().map(|n| format!("{n}={}", set(n))).collect();
+    format!(
+        "features: present on its own thread {}, GPU timing of lists {}, relay {}; switches {}",
+        shown::on(),
+        std::env::var_os("VICTORY_GPU_SUBMITS").is_none_or(|v| v != "0"),
+        relay(),
+        list.join(" ")
+    )
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -835,9 +947,21 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it is made already.
+pub(crate) fn existing() -> Option<&'static Host> {
+    HOST.get()?.as_ref()
+}
+
+/// The direct queue fence used to retire descriptors from detached lists.
+pub(crate) fn completed_descriptor_fence() -> Option<u64> {
+    // SAFETY: a query on the live host fence. Device removal returns u64::MAX.
+    let completed = unsafe { existing()?.fence.GetCompletedValue() };
+    (completed != u64::MAX).then_some(completed)
+}
+
+/// The host GPU if it is made already.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
-    HOST.get()?.as_ref()
+    existing()
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -884,19 +1008,19 @@ fn create() -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_any() {
+        if dred_any() || dred_release() {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
-                if dred_on() || dred_light() {
+                if dred_on() || dred_light() || dred_release() {
                     dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 }
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 tracing::info!(
-                    breadcrumbs = dred_on() || dred_light(),
+                    breadcrumbs = dred_on() || dred_light() || dred_release(),
                     markers = dred_on(),
-                    "crash tracing on (device-removed data)"
+                    "crash tracing on (device-removed data; VICTORY_DRED=0 turns it off in release builds)"
                 );
             } else {
                 tracing::warn!("crash tracing asked for and not there: no device-removed data settings");
@@ -919,6 +1043,9 @@ fn create() -> windows::core::Result<Host> {
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
+        // The static samplers of earlier runs, in their order, before any
+        // other: pipelines with them then come from the library.
+        crate::pipeline::replay_static_samplers(&device);
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
@@ -1296,6 +1423,9 @@ pub(crate) struct HostList {
     /// The copy of the colour without the interface (`crate::streamline`)
     /// recorded in the list, noted likewise; 0 for none.
     hudless: std::sync::atomic::AtomicU64,
+    /// Whether any draw or dispatch recorded into this list picks
+    /// descriptors from the shader-visible heap (needs `sync_heaps`).
+    heap_picked: std::sync::atomic::AtomicBool,
     /// Left open and empty, as made or reset, for the title's next reset
     /// ([`HostList::leave_open`]): that reset finds nothing to undo. The
     /// list's title calls and epoch then, each plus one (0: not left open).
@@ -1310,6 +1440,9 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    water_timing: water_timing::List,
+    /// Its GPU timing ([`gpu_time`]): its start and end on the card, its passes.
+    gpu_time: gpu_time::List,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -1498,7 +1631,7 @@ pub(crate) fn compile(
             None,
             entry,
             target,
-            0,
+            1 << 15,
             0,
             &mut code,
             Some(&mut errors),
@@ -1805,6 +1938,23 @@ pub(crate) fn dred_light() -> bool {
     })
 }
 
+/// Release builds: breadcrumbs and page faults for the device-removed report,
+/// unless `VICTORY_DRED=0` (no markers, no command texts: the runtime keeps
+/// one 32-bit counter per list and the ops' kinds, cheap enough to leave on
+/// while playing). Lists are named "victory host list <n>" so a stopped list
+/// can be told and the pipelines it binds said.
+pub(crate) fn dred_release() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_DRED").is_none_or(|v| v != "0"))
+}
+
+/// The lists named for [`dred_release`], by their number, with the
+/// pipelines they bind.
+#[allow(clippy::type_complexity)]
+#[cfg_attr(feature = "diagnostics", allow(dead_code))]
+static RELEASE_LISTS: Mutex<std::collections::BTreeMap<u32, std::sync::Weak<Mutex<std::collections::BTreeSet<String>>>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
 /// Any of the three.
 pub(crate) fn dred_any() -> bool {
     dred_on() || dred_light() || dred_faults()
@@ -1838,7 +1988,6 @@ static LIST_NOTES: Mutex<
 
 /// The number in the name of a list of ours ("victory host list 7", which the
 /// debug layer ends with a note of its own in brackets).
-#[cfg(feature = "diagnostics")]
 fn list_number(name: &str) -> Option<u32> {
     let rest = name.strip_prefix("victory host list ")?;
     let digits = rest.split(' ').next()?;
@@ -1901,7 +2050,7 @@ fn name_it(object: &impl Interface, text: impl FnOnce() -> String) {
         }
         return;
     }
-    if dred_any()
+    if (dred_any() || dred_release())
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
         // SAFETY: a plain call on a live object.
@@ -2025,6 +2174,118 @@ impl<T> Spare<T> {
 
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+
+/// A buffer of [`BUFFER_POOL`]: the buffer and, for an upload buffer, where
+/// it is mapped (it stays mapped).
+struct Pooled(ID3D12Resource, usize);
+// SAFETY: free-threaded D3D12 objects; a mapping written only by the list
+// that took the buffer, until it gives it back.
+unsafe impl Send for Pooled {}
+
+/// The smallest size class of [`BUFFER_POOL`] (a buffer smaller than it
+/// takes one of this size) and the number of classes, each twice the one
+/// before: 64 KiB to 64 MiB. Larger buffers are made and dropped as before.
+const POOL_CLASS_MIN: u64 = 64 << 10;
+const POOL_CLASSES: usize = 11;
+
+/// Upload buffers of copies into textures and buffers (`HostList::upload`)
+/// and read-back buffers (`HostList::defer_read_back`), by size class, that
+/// lists which have run gave back: each was made with
+/// `CreateCommittedResource` for one copy and freed at the list's reset,
+/// on the threads that translate lists and the helper that resets them
+/// (run of 2026-11-27 16:05, per frame by sampling: `upload_buffer` 280
+/// ms on the list threads, half of it waiting in the graphics kernel,
+/// `read_back_buffer` 110 ms, and the frees in `HostList::reset` and
+/// `bury`). `VICTORY_BUFFER_POOL=0`: made and dropped each time, as before.
+struct BufferPool {
+    uploads: [Vec<Pooled>; POOL_CLASSES],
+    backs: [Vec<Pooled>; POOL_CLASSES],
+    bytes: u64,
+}
+
+static BUFFER_POOL: Mutex<BufferPool> = Mutex::new(BufferPool {
+    uploads: [const { Vec::new() }; POOL_CLASSES],
+    backs: [const { Vec::new() }; POOL_CLASSES],
+    bytes: 0,
+});
+
+/// Since the last frame-rate line: buffers taken from [`BUFFER_POOL`],
+/// made for it, given back, and dropped as the pool was full.
+static POOL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn buffer_pool_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The most bytes [`BUFFER_POOL`] keeps.
+fn buffer_pool_most() -> u64 {
+    if crate::residency::limited_host_ram() { 128 << 20 } else { 512 << 20 }
+}
+
+/// The class of a buffer of `size` bytes and its bytes, if it has one.
+fn pool_class(size: u64) -> Option<(usize, u64)> {
+    if !buffer_pool_on() {
+        return None;
+    }
+    let class = size.max(POOL_CLASS_MIN).checked_next_power_of_two()?;
+    let i = (class.trailing_zeros() - POOL_CLASS_MIN.trailing_zeros()) as usize;
+    (i < POOL_CLASSES).then_some((i, class))
+}
+
+/// Gives buffers of a list that has run back to [`BUFFER_POOL`] (uploads,
+/// read-backs), past its limit dropped; one lock for all of them.
+fn give_pooled(uploads: Vec<Pooled>, backs: Vec<ID3D12Resource>) {
+    if uploads.is_empty() && backs.is_empty() {
+        return;
+    }
+    let class_of = |b: &ID3D12Resource| {
+        // SAFETY: a plain query of a live buffer.
+        let width = unsafe { b.GetDesc() }.Width;
+        pool_class(width).filter(|&(_, class)| class == width)
+    };
+    let backs: Vec<(Pooled, Option<(usize, u64)>)> = backs.into_iter().map(|b| {
+        let c = class_of(&b);
+        (Pooled(b, 0), c)
+    }).collect();
+    let uploads: Vec<(Pooled, Option<(usize, u64)>)> = uploads.into_iter().map(|p| {
+        let c = class_of(&p.0);
+        (p, c)
+    }).collect();
+    let mut dropped = Vec::new();
+    {
+        let most = buffer_pool_most();
+        let mut pool = BUFFER_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        for (upload, list) in [(true, uploads), (false, backs)] {
+            for (buffer, class) in list {
+                match class {
+                    Some((i, bytes)) if pool.bytes + bytes <= most => {
+                        pool.bytes += bytes;
+                        if upload { pool.uploads[i].push(buffer) } else { pool.backs[i].push(buffer) }
+                        POOL_STATS[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        POOL_STATS[3].fetch_add(1, Ordering::Relaxed);
+                        dropped.push(buffer);
+                    }
+                }
+            }
+        }
+    }
+    // (Freed outside the lock.)
+    drop(dropped);
+}
+
+/// A buffer of class `i` (`bytes` bytes) from [`BUFFER_POOL`], if one is kept.
+fn take_pooled(i: usize, bytes: u64, upload: bool) -> Option<Pooled> {
+    let mut pool = BUFFER_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let taken = if upload { pool.uploads[i].pop() } else { pool.backs[i].pop() };
+    if taken.is_some() {
+        pool.bytes -= bytes;
+        POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+    }
+    taken
+}
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
@@ -2156,7 +2417,10 @@ cbuffer Span : register(b0) {
     uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
     uint pieces;
     uint out_at;   // the first piece's dword in `differs`, in bytes
-    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+    // Bits 0-1 — 0: the hashes are stored; else compared with those stored (2: and then
+    // stored). Bit 2: a table pass: group g's piece is the number the CPU put in its dword of
+    // `differs` (`first` unused), so one pass takes a copy's scattered pieces.
+    uint compare;
 };
 ByteAddressBuffer now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
@@ -2164,10 +2428,18 @@ ByteAddressBuffer now : register(t0);
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
 groupshared uint4 parts[64];
+groupshared uint g_piece;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
-    uint piece = first + id.x;
+    // (Thread 0 reads its table dword once and broadcasts via groupshared;
+    // thread 0 overwrites it only after all hashes met in `parts`.)
+    if (thread == 0u) {
+        g_piece = (compare & 4u) != 0u ? differs.Load(out_at + id.x * 4u) : first + id.x;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint piece = g_piece;
+    uint mode = compare & 3u;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
@@ -2210,20 +2482,24 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     }
     parts[thread] = h;
     GroupMemoryBarrierWithGroupSync();
-    if (thread != 0u) return;
-    h = parts[0];
-    [loop]
-    for (uint i = 1u; i < 64u; ++i) {
-        h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+    [unroll]
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (thread < stride) {
+            uint4 other = parts[thread + stride];
+            h = (h ^ other) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+            parts[thread] = h;
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
-    if (compare != 0u) {
+    if (thread != 0u) return;
+    if (mode != 0u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
         differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (mode == 2u) hashes.Store4(piece * 16u, h);
     } else {
         hashes.Store4(piece * 16u, h);
     }
@@ -2258,6 +2534,48 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::Card
     }
 }
 
+/// Whether a copy's scattered piece runs go to the card as one pass of
+/// [`CARD_COMPARE`] over a table of their pieces (`VICTORY_CARD_TABLE`, on;
+/// `=0`: a pass per run, as before). The table is the passes' own dwords of
+/// `differs`, which the CPU fills with piece numbers before the list runs:
+/// the hashes before a submission were some 200 passes a frame over 670
+/// pieces, the compares after it about 400 over 12,400, each a dispatch with
+/// its own root constants, most of a group or two.
+fn card_table() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_TABLE").is_none_or(|v| v != "0"))
+}
+
+/// One table pass of [`CARD_COMPARE`] (see [`card_table`]): `pieces` of one
+/// copy (whose start lies `skew` into its piece 0) are put from dword `slot`
+/// of `differs` on, mapped at `data`, and hashed or compared there (`mode` as
+/// the shader's `compare`, without its table bit).
+///
+/// # Safety
+/// The list is open with the compare's root signature, pipeline and buffers
+/// set; `differs` holds `slot + pieces.len()` dwords, which no list in the air
+/// reads or writes; the pieces lie in the buffer.
+unsafe fn card_table_pass(list: &ID3D12GraphicsCommandList, data: usize, slot: u32, pieces: &[u32], skew: u32, size: u32, mode: u32) {
+    const MOST: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+    let table = data as *mut u32;
+    for (i, &piece) in pieces.iter().enumerate() {
+        // SAFETY: the caller's: these dwords are the pass's.
+        unsafe { table.add(slot as usize + i).write_volatile(piece) };
+    }
+    let n = pieces.len() as u32;
+    let mut done = 0;
+    while done < n {
+        let k = (n - done).min(MOST);
+        let constants = [0u32, skew, size, k, (slot + done) * 4, mode | 4];
+        // SAFETY: the caller's.
+        unsafe {
+            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            list.Dispatch(k, 1, 1);
+        }
+        done += k;
+    }
+}
+
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
 /// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
@@ -2277,6 +2595,20 @@ fn rehash_runs() -> bool {
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Since the last frame-rate line, microseconds of [`Host::card_before`] by
+/// part: what changed (the dirty lists and the copies made whole), taking
+/// the bytes out (`send::take`), the list that sends them and hashes again
+/// (recorded and sent), the compares planned and recorded. The preparing
+/// line's "for copies in the card's memory" is their sum and a little more.
+static CARD_TIME: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Adds the time since `from` to [`CARD_TIME`]`[part]`; the time now.
+fn card_time(part: usize, from: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    CARD_TIME[part].fetch_add(now.duration_since(from).as_micros() as u64, Ordering::Relaxed);
+    now
+}
 
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
@@ -2305,6 +2637,72 @@ struct CardRange {
     /// Looked at by `crate::picked`, and not declared: what is found changed
     /// there was written through a view nobody declared. Not landed.
     picked: bool,
+}
+
+struct CardCompare {
+    /// First declaration using this dispatch, for its buffer and compare mode.
+    range: usize,
+    span: crate::shadow::CardSpan,
+    at: u32,
+}
+
+/// Allocate results for a declared range. Declarations stay byte-exact for
+/// landing, while the GPU hashes whole pieces. Overlapping or adjacent
+/// piece runs in the same copy can share one dispatch and result interval.
+fn queue_card_compare(
+    compares: &mut Vec<CardCompare>,
+    first_for_copy: usize,
+    range: usize,
+    span: crate::shadow::CardSpan,
+    next: &mut u32,
+    capacity: u64,
+) -> Option<u32> {
+    if let Some(last) = compares[first_for_copy..].last_mut()
+        && span.first <= last.span.first + last.span.pieces
+    {
+        let pieces = last.span.pieces.max(span.first + span.pieces - last.span.first);
+        let extra = pieces - last.span.pieces;
+        if u64::from(*next + extra) > capacity {
+            return None;
+        }
+        last.span.pieces = pieces;
+        last.span.to = last.span.to.max(span.to);
+        *next += extra;
+        return Some(last.at + span.first - last.span.first);
+    }
+    if u64::from(*next + span.pieces) > capacity {
+        return None;
+    }
+    let at = *next;
+    compares.push(CardCompare { range, span, at });
+    *next += span.pieces;
+    Some(at)
+}
+
+#[cfg(test)]
+mod card_compare_tests {
+    use super::queue_card_compare;
+    use crate::shadow::CardSpan;
+
+    #[test]
+    fn declarations_share_flags_for_touching_pieces_of_the_same_copy() {
+        let span = |first, pieces| CardSpan { from: 0, to: 0, first, pieces, skew: 0 };
+        let mut compares = Vec::new();
+        let mut next = 4;
+        assert_eq!(queue_card_compare(&mut compares, 0, 0, span(3, 2), &mut next, 9), Some(4));
+        assert_eq!(queue_card_compare(&mut compares, 0, 1, span(4, 2), &mut next, 9), Some(5));
+        assert_eq!(queue_card_compare(&mut compares, 0, 2, span(6, 1), &mut next, 9), Some(7));
+        assert_eq!(compares.len(), 1);
+        assert_eq!(compares[0].span.pieces, 4);
+        assert_eq!(next, 8);
+        // A failed allocation leaves the earlier dispatch intact.
+        assert_eq!(queue_card_compare(&mut compares, 0, 3, span(7, 2), &mut next, 9), None);
+        assert_eq!(compares[0].span.pieces, 4);
+        // A different buffer gets its own flags, even at the same offset.
+        assert_eq!(queue_card_compare(&mut compares, 1, 4, span(4, 1), &mut next, 9), Some(8));
+        assert_eq!(compares.len(), 2);
+        assert_eq!(next, 9);
+    }
 }
 
 impl CardPlan {
@@ -2338,6 +2736,8 @@ struct CardPlan {
     looks: Option<upcheck::Looks>,
     /// With [`send`]: the memory its sends come from.
     sends: Option<send::Memory>,
+    /// With [`prefetch`]: where the pieces its compare flagged came down.
+    prefetch: Option<prefetch::Spill>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -2415,6 +2815,9 @@ struct Deferred {
     back_wanted: Vec<crate::texback::Target>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
+    /// Upload buffers taken from [`BUFFER_POOL`] for this recording, given
+    /// back to it when the list is reset ([`HostList::upload`]).
+    pooled_uploads: Vec<Pooled>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -2423,6 +2826,9 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// The buffer of ours that constants read behind copies at their place
+    /// go into, and the bytes of it used ([`HostList::placed_constants`]).
+    constants: Option<(ID3D12Resource, u64)>,
 }
 
 impl Deferred {
@@ -2441,6 +2847,31 @@ impl Deferred {
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
+    }
+
+    /// Empties all lists and sets in place, keeping their backing capacity.
+    fn clear(&mut self) {
+        give_chunks(std::mem::take(&mut self.plane_uploads));
+        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        self.copies.clear();
+        self.uploads.clear();
+        self.prelude_uploads.clear();
+        self.upload_bytes = 0;
+        self.kept.clear();
+        self.bound.clear();
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
+        self.textures.clear();
+        self.writes.clear();
+        self.backs.clear();
+        self.back_wanted.clear();
+        self.texture_backs.clear();
+        self.pooled_uploads.clear();
+        self.budget_zeroed = false;
+        self.indirect_readable = 0;
+        self.constants = None;
     }
 }
 
@@ -2858,7 +3289,12 @@ const WHY_FENCE: usize = 10;
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
 /// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+static LATE_STATS: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+/// [`LATE_STATS`] 18 and 19: settles for title memory read by a step that reads the
+/// destination of a copy at its place ([`place::reads`]), and by a refresh, host step or plane
+/// reading the destination of a copy done on the card ([`card_steps::copied_read`]).
+const READ_PLACED: usize = 18;
+const READ_REFRESH: usize = 19;
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -2910,12 +3346,21 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         (line.written.clone(), card_steps::copies(&line))
     };
-    blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+    blocked_by(&written, runs, true).or_else(|| {
+        card_steps::copied_read(&copies, runs).then(|| {
+            LATE_STATS[READ_REFRESH].fetch_add(1, Ordering::Relaxed);
+            WHY_READ
+        })
+    })
 }
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
 /// flights when the title itself wrote the memory since they were given it
-/// (`VICTORY_FILL_TITLE=1`; off by default).
+/// (always; the switch `VICTORY_FILL_TITLE` is gone. It was off until the
+/// 480-byte constants ring was found to drain the card once a frame: 43-59 ms of a
+/// 70-84 ms frame, docs/performance/AGENT_REPORTS/06-cpu-threading.md). Constants
+/// 256-aligned in the title's graphics heap are no fill at all any more: they
+/// are read in place (`crate::port::constants`); this is for the rest.
 ///
 /// The title's 174 MB heap is declared written as a whole (a root view has
 /// no size), and the title keeps a ring of constants in it: one fill of 480
@@ -2934,9 +3379,7 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// for the first time, is read as it was before that flight.
 fn fill_is_titles(src: usize, len: usize) -> bool {
     const SMALL: usize = 64 << 10;
-    static ON: OnceLock<bool> = OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_TITLE").is_some_and(|v| v == "1"));
-    on && len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
+    len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
 }
 
 /// Diagnostics: the waits for flights, by what waited, why it was not done
@@ -3085,10 +3528,18 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
-    // Destinations of copies at their place, if a step reads them.
+    // Destinations of copies at their place that stand ahead of the step looked
+    // at, if the step reads them: the copy's bytes are not in title memory when
+    // the flights are not waited for (steps ahead of the copy read what was there).
     let mut placed: Vec<(usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
+            if !placed.is_empty() && place::reads(step, &placed) {
+                if count {
+                    LATE_STATS[READ_PLACED].fetch_add(1, Ordering::Relaxed);
+                }
+                return Some(WHY_READ);
+            }
             match step {
                 &Step::Copy(dst, src, len) => {
                     if let Some(_read) = copy_blocked(written, dst, src, len) {
@@ -3152,7 +3603,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    None
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -3187,6 +3638,16 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     stale_of(spans)
 }
 
+/// From this many copies on, [`stale_of`] merges them on several threads.
+const MERGE_ACROSS_FROM: usize = 2;
+
+/// Whether [`stale_of`] merges copies on several threads (`VICTORY_MERGE_ACROSS=0`:
+/// one after the other on the submitting thread, as before).
+fn merge_across() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_ACROSS").is_none_or(|v| v != "0"))
+}
+
 /// Of `spans` (a copy shaders may be writing, and the span of what a
 /// submission refreshes of it), those [`stale_under_flights`] answers.
 fn stale_of(
@@ -3200,6 +3661,32 @@ fn stale_of(
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
         let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        if spans.len() >= MERGE_ACROSS_FROM && merge_across() {
+            // Copies apart, on several threads (each copy takes its own
+            // locks; what they share, the write watch's journal and the
+            // count of runs, is safe to share). The count may go a little
+            // past its line between two copies' takings: it is a line of
+            // cost, not of correctness.
+            use std::sync::atomic::{AtomicBool, AtomicI64};
+            let left = AtomicI64::new(runs_left as i64);
+            let keep: Vec<AtomicBool> = spans.iter().map(|_| AtomicBool::new(false)).collect();
+            let spans_ref = &spans;
+            crate::land::each_merge(spans.len(), &|i| {
+                let (shadow, from, to) = &spans_ref[i];
+                let mut mine = left.load(Ordering::Relaxed).max(0) as usize;
+                let had = mine;
+                let settle = crate::shadow::merge_across(|| shadow.merge_under_writes(*from, *to - *from, &mut mine));
+                left.fetch_sub(had.saturating_sub(mine) as i64, Ordering::Relaxed);
+                keep[i].store(settle, Ordering::Relaxed);
+            });
+            let mut i = 0;
+            spans.retain(|_| {
+                let k = keep[i].load(Ordering::Relaxed);
+                i += 1;
+                k
+            });
+            return spans;
+        }
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
     }
@@ -3394,23 +3881,78 @@ pub(crate) fn tiles_mapped_on(queue: &ID3D12CommandQueue) {
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
 /// `why` (one of the `WHY_` places). Not from inside a submission.
 pub(crate) fn settle_now(why: usize) {
+    settle_now_for(why, None);
+}
+
+fn settle_now_for(why: usize, reason: Option<FenceDrain>) {
     if !late() {
         return;
     }
     let Some(host) = host() else {
         return;
     };
+    let began = reason.map(|_| now_us());
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let acquired = began.map(|_| now_us());
+    let value = *submitted;
     host.settle(&mut submitted, why);
+    drop(submitted);
+    if let (Some(reason), Some(began), Some(acquired)) = (reason, began, acquired) {
+        let lock = acquired.saturating_sub(began);
+        let drain = now_us().saturating_sub(acquired);
+        let [calls, lock_us, drain_us] = &FENCE_DRAINS[reason as usize];
+        calls.fetch_add(1, Ordering::Relaxed);
+        lock_us.fetch_add(lock, Ordering::Relaxed);
+        drain_us.fetch_add(drain, Ordering::Relaxed);
+        if render_trace::active() {
+            render_trace::event("fence_drain", format_args!("reason={}\tstart_us={began}\tlock_us={lock}\tdrain_us={drain}\thost_fence={value}", reason.name()));
+        }
+    }
 }
 
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
 }
-pub(crate) fn settle_for_fence() {
-    settle_now(WHY_FENCE);
+#[derive(Clone, Copy)]
+pub(crate) enum FenceDrain {
+    TitleFence,
+    BakeTextureFlip,
+    BakePublish,
+    ExternalUpscaler,
 }
+
+impl FenceDrain {
+    const ALL: [Self; 4] = [Self::TitleFence, Self::BakeTextureFlip, Self::BakePublish, Self::ExternalUpscaler];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::TitleFence => "title_fence",
+            Self::BakeTextureFlip => "bake_texture_flip",
+            Self::BakePublish => "bake_publish",
+            Self::ExternalUpscaler => "external_upscaler",
+        }
+    }
+}
+
+static FENCE_DRAINS: [[AtomicU64; 3]; FenceDrain::ALL.len()] = [const { [const { AtomicU64::new(0) }; 3] }; FenceDrain::ALL.len()];
+
+pub(crate) fn settle_for_fence(reason: FenceDrain) {
+    settle_now_for(WHY_FENCE, Some(reason));
+}
+
+/// Whether the submitting thread is currently preparing a submission.
+pub(crate) fn submitting_active() -> bool {
+    SUBMITTING[0].load(Ordering::Relaxed) == 1
+}
+
+/// Landed flights (beyond [`bury_lag`]) past which the submitting thread
+/// resets their lists itself instead of leaving them to [`late_helper`].
+const LAND_INLINE: usize = 256;
+
+/// Since the last frame-rate line: times the submitting thread reset landed
+/// lists itself ([`LAND_INLINE`]).
+static LANDED_INLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
@@ -3424,6 +3966,8 @@ fn land() {
         crate::list::recycle(lists, &order);
     }
 }
+
+static RELAY_HELPER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
@@ -3440,6 +3984,10 @@ fn late_helper() {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
         return;
     };
+    let relayed = relay();
+    if relayed {
+        RELAY_HELPER_READY.store(true, Ordering::Release);
+    }
     loop {
         let target = {
             let mut line = line();
@@ -3449,7 +3997,7 @@ fn late_helper() {
                     break None;
                 }
                 // (With the relay the flights are another thread's.)
-                if !relay() && !line.line.is_empty() && !line.settling {
+                if !relayed && !line.line.is_empty() && !line.settling {
                     break Some(line.target);
                 }
                 line = LINE_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
@@ -3460,6 +4008,10 @@ fn late_helper() {
             land();
             helping.next("helper: looking at what queues hold");
             crate::queue::release_held(false);
+            if relayed {
+                helping.next("helper: dropping retired resources");
+                bury(FINISHED.load(Ordering::Acquire));
+            }
             continue;
         };
         // The card first, without the submission lock: the submitting
@@ -3748,7 +4300,8 @@ fn late_line(frames: f64) {
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
-         a texture {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
+         a texture {:.1}, a step that reads where a copy at its place writes {:.1}, a refresh or host read of where a copy done on the card writes {:.1}), \
+         a step of ours {:.1}, {} lists in the air {:.1}, \
          bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
          {:.1} waits for memory values met by a flight's bottom-of-pipe write, {:.1} fence signals set behind flights",
         s[0],
@@ -3763,6 +4316,8 @@ fn late_line(frames: f64) {
         s[15],
         s[16],
         s[17],
+        s[READ_PLACED],
+        s[READ_REFRESH],
         s[WHY_RUN],
         late_most(),
         s[WHY_MOST],
@@ -3802,14 +4357,16 @@ fn late_line(frames: f64) {
             r[4] / 1000.0,
         );
         if send::own() {
-            let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            let t = send::STATS.each_ref().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
                 "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
-                 taking them out of the CPU sides",
+                 taking them out of the CPU sides; {:.1} MB sent directly, {:.1} MB via VRAM staging",
                 t[0] / (1 << 20) as f64,
                 t[1],
                 t[2],
                 t[3] / 1000.0,
+                t[4] / (1 << 20) as f64,
+                t[5] / (1 << 20) as f64,
             );
         }
         let t: Vec<f64> = torn::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -3823,18 +4380,32 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    prefetch::log(frames);
+    water_timing::log(frames);
+    gpu_time::log(frames);
+    crate::descriptor::host::dynamic_line(frames);
+    for reason in FenceDrain::ALL {
+        let [calls, lock_us, drain_us] = FENCE_DRAINS[reason as usize].each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+        if calls != 0 {
+            tracing::info!(reason = reason.name(), calls, calls_per_frame = calls as f64 / frames,
+                lock_ms_per_frame = lock_us as f64 / (1000.0 * frames), drain_ms_per_frame = drain_us as f64 / (1000.0 * frames),
+                "blocking fence by origin");
+        }
+    }
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.1} constants read on the card behind them",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            t[4],
         );
     }
     card_steps::log(frames);
     crate::port::log(frames);
+    crate::demand::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -3856,8 +4427,12 @@ mod font;
 mod menu;
 mod panel;
 mod place;
+mod prefetch;
+#[cfg(test)]
+pub(crate) use prefetch::{CARD_SPILL, STRIDE as SPILL_STRIDE};
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
+mod shown;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
@@ -3867,6 +4442,10 @@ pub(crate) mod two_queues;
 pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
 mod stamps;
+mod water_timing;
+mod gpu_time;
+pub(crate) mod render_trace;
+pub(crate) use gpu_time::{Step as GpuStep, count_barriers as count_gpu_barriers, count_step as count_gpu_step};
 #[cfg(feature = "diagnostics")]
 pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
@@ -4017,6 +4596,7 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    list.water_timing.collect();
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
     for back in &list.deferred().texture_backs {
@@ -4262,6 +4842,20 @@ impl Host {
                     ),
                 );
             }
+            #[cfg(not(feature = "diagnostics"))]
+            if dred_release() {
+                static NUMBER: AtomicU32 = AtomicU32::new(0);
+                let number = NUMBER.fetch_add(1, Ordering::Relaxed);
+                name(&list, || format!("victory host list {number}"));
+                let mut all = RELEASE_LISTS.lock().unwrap_or_else(|e| e.into_inner());
+                if number.is_multiple_of(256) {
+                    all.retain(|_, l| l.strong_count() > 0);
+                }
+                all.insert(number, std::sync::Arc::downgrade(&pipelines));
+            }
+            // (made open: it is recorded from here on)
+            let gpu_time = gpu_time::List::default();
+            gpu_time.start(&list);
             Ok(HostList {
                 allocator,
                 list,
@@ -4284,12 +4878,15 @@ impl Host {
                 holding: std::sync::atomic::AtomicBool::new(false),
                 upscale: std::sync::atomic::AtomicU64::new(0),
                 hudless: std::sync::atomic::AtomicU64::new(0),
+                heap_picked: std::sync::atomic::AtomicBool::new(false),
                 left_open: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                water_timing: water_timing::List::default(),
+                gpu_time,
             })
         }
     }
@@ -4326,8 +4923,8 @@ impl Host {
         };
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         state.0 += 1;
-        // SAFETY: our queue and the clock's fence.
-        let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        // (Behind what was sent, also when that is held behind a present: [`shown`].)
+        let _ = self.queue_send(&[], &[], Some((&clock.fence, state.0)));
         if let Some((since, worked_then)) = state.1.take() {
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
             CARD_CLOCK_US[1].fetch_add(worked().saturating_sub(worked_then), Ordering::Relaxed);
@@ -4368,7 +4965,7 @@ impl Host {
                 None,
                 windows::core::s!("main"),
                 windows::core::s!("cs_5_1"),
-                0,
+                1 << 15,
                 0,
                 &mut code,
                 None,
@@ -4379,7 +4976,7 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let (differs, data) = self.shared_buffer_cpu(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -4444,9 +5041,11 @@ impl Host {
             None => 0,
         };
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
+        let began = std::time::Instant::now();
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
+            card_time(0, began);
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4469,9 +5068,16 @@ impl Host {
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
+        let mark = card_time(0, began);
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
+        let mark = card_time(1, mark);
+        // Dwords of `differs` the hash passes' tables take (`card_table`), ahead of the
+        // compare's results: given back with them.
+        let mut hash_slot = work.taken;
+        let capacity = work.differs.2 / 4;
+        let differs_data = work.differs.1;
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4485,6 +5091,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let mut timed = gpu_time::Ours::begin(list, "ours: title bytes sent up to the card's copies, then hashed");
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4525,6 +5132,7 @@ impl Host {
                     if !sent.is_empty() {
                         list.ResourceBarrier(&sent);
                     }
+                    timed.pass(list, "ours: hashes of the pieces sent up");
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -4557,14 +5165,29 @@ impl Host {
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            card_pass(list, &run, size as u32, 0, 0);
+                        let pieces: u32 = runs.iter().map(|r| r.pieces).sum();
+                        CARD_PASSES[1].fetch_add(u64::from(pieces), Ordering::Relaxed);
+                        // Scattered runs of the copy: one table pass (`card_table`), in
+                        // dwords of `differs` taken ahead of the compare's results.
+                        let table = card_table()
+                            && runs.len() > 1
+                            && runs.iter().all(|r| r.skew == runs[0].skew)
+                            && u64::from(hash_slot) + u64::from(pieces) <= capacity;
+                        if table {
+                            let numbers: Vec<u32> = runs.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
+                            card_table_pass(list, differs_data, hash_slot, &numbers, runs[0].skew, size as u32, 0);
+                            hash_slot += pieces;
+                            CARD_PASSES[0].fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            for run in runs {
+                                card_pass(list, &run, size as u32, 0, 0);
+                            }
                         }
                     }
+                    timed.end(list);
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    self.queue_send(&[Some(list.cast()?)], &[], None)?;
                     Ok(())
                 })()
             };
@@ -4574,6 +5197,7 @@ impl Host {
             used.push((false, sync));
         }
         drop(order);
+        let mark = card_time(2, mark);
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -4582,10 +5206,14 @@ impl Host {
             sent_as,
             looks,
             sends: own.map(send::Own::memory),
+            prefetch: None,
         };
+        work.taken = hash_slot;
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
+        let first_result = at;
+        let mut compares = Vec::new();
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -4596,31 +5224,32 @@ impl Host {
                     _ => spans.push((from, to)),
                 }
             }
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let twin = shadow.card_has_before();
+            let first_for_copy = compares.len();
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                let compared = twin.then(|| {
+                    queue_card_compare(&mut compares, first_for_copy, plan.ranges.len(), span, &mut at, capacity)
+                }).flatten();
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
                     span,
-                    at,
-                    compared,
+                    at: compared.unwrap_or(0),
+                    compared: compared.is_some(),
                     picked: false,
                 });
-                if compared {
-                    at += span.pieces;
-                }
             }
         }
         for (shadow, from, len) in looked {
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let twin = shadow.card_has_before();
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
-                && u64::from(at + span.pieces) * 4 <= work.differs.2
+                && u64::from(at + span.pieces) <= capacity
             {
+                compares.push(CardCompare { range: plan.ranges.len(), span, at });
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (*from, from + len),
@@ -4633,7 +5262,7 @@ impl Host {
             }
         }
         work.taken = at;
-        if plan.ranges.iter().any(|r| r.compared) {
+        if !compares.is_empty() {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -4645,6 +5274,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let mut timed = gpu_time::Ours::begin(list, "ours: compares of the card's copies after the lists");
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -4658,17 +5288,53 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    let mut i = 0;
+                    while i < compares.len() {
+                        let pass = &compares[i];
+                        let r = &plan.ranges[pass.range];
+                        // (What is only looked at keeps its hashes: what
+                        // changed there is the next declared range's to land.)
+                        let mode = if flown && !r.picked { 2 } else { 1 };
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                            i += 1;
                             continue;
                         };
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        // (What is only looked at keeps its hashes: what
-                        // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                        // The compares after it of the same copy, mode and skew whose results
+                        // follow its own: one table pass (`card_table`).
+                        let mut j = i + 1;
+                        if card_table() {
+                            while j < compares.len() {
+                                let (q, p) = (&compares[j], &compares[j - 1]);
+                                let s = &plan.ranges[q.range];
+                                let same_mode = (if flown && !s.picked { 2 } else { 1 }) == mode;
+                                if Arc::ptr_eq(&s.shadow, &r.shadow)
+                                    && same_mode
+                                    && q.span.skew == pass.span.skew
+                                    && q.at == p.at + p.span.pieces
+                                {
+                                    j += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        if j - i > 1 {
+                            let numbers: Vec<u32> =
+                                compares[i..j].iter().flat_map(|c| c.span.first..c.span.first + c.span.pieces).collect();
+                            card_table_pass(list, work.differs.1, pass.at, &numbers, pass.span.skew, size as u32, mode);
+                        } else {
+                            card_pass(list, &pass.span, size as u32, pass.at, mode);
+                        }
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        i = j;
                     }
+                    if flown && prefetch::on() {
+                        timed.pass(list, "ours: flagged pieces copied down (prefetch)");
+                        plan.prefetch = prefetch::record(self, list, &plan.ranges, &compares, &work.differs.0, first_result, at);
+                    }
+                    timed.end(list);
                     list.Close()?;
                     list.cast()
                 })()
@@ -4680,6 +5346,7 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
+        card_time(3, mark);
         Some(plan)
     }
 
@@ -4705,6 +5372,9 @@ impl Host {
         if let Some(memory) = plan.sends {
             send::give_back(memory);
         }
+        if let Some(spill) = plan.prefetch {
+            prefetch::give_back(spill);
+        }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
@@ -4718,6 +5388,108 @@ impl Host {
         if !relay() || work.out == 0 {
             work.taken = 0;
         }
+    }
+
+    /// Fetches `len` bytes from a carded resource at `offset` into `out`
+    /// synchronously for C2 demand landing (`crate::demand`).
+    pub(crate) fn demand_fetch(&self, src: &ID3D12Resource, offset: u64, len: usize, out: &mut Vec<u8>) -> bool {
+        struct DemandFetch {
+            list: Prelude,
+            queue: ID3D12CommandQueue,
+            fence: ID3D12Fence,
+            event: HANDLE,
+            sent: u64,
+            staging: Option<(ID3D12Resource, usize, u64)>,
+        }
+        // SAFETY: serialized behind `DEMAND_FETCH`; its D3D12 objects and event
+        // handle may move across threads under that mutex.
+        unsafe impl Send for DemandFetch {}
+        static DEMAND_FETCH: Mutex<Option<DemandFetch>> = Mutex::new(None);
+        if len == 0 {
+            out.clear();
+            return true;
+        }
+        let mut guard = DEMAND_FETCH.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            // SAFETY: creating dedicated copy/fallback objects on live `self.device`.
+            let created = unsafe {
+                (|| -> windows::core::Result<DemandFetch> {
+                    let copying = (|| -> windows::core::Result<(Prelude, ID3D12CommandQueue)> {
+                        let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                        let list: ID3D12GraphicsCommandList =
+                            self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                        list.Close()?;
+                        let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                            Priority: D3D12_COMMAND_QUEUE_PRIORITY_HIGH.0,
+                            ..Default::default()
+                        })?;
+                        Ok(((allocator, list), queue))
+                    })();
+                    let (list, queue) = match copying {
+                        Ok(pair) => pair,
+                        Err(_) => {
+                            let Some(list) = self.make_prelude() else {
+                                return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+                            };
+                            (list, self.queue.clone())
+                        }
+                    };
+                    let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                    let event = CreateEventW(None, false, false, None)?;
+                    let staging = self.shared_buffer_cpu(256 << 10).map(|(r, p)| (r, p as usize, 256 << 10));
+                    Ok(DemandFetch {
+                        list,
+                        queue,
+                        fence,
+                        event,
+                        sent: 0,
+                        staging,
+                    })
+                })()
+            };
+            let Ok(df) = created else {
+                return false;
+            };
+            *guard = Some(df);
+        }
+        let Some(df) = guard.as_mut() else {
+            return false;
+        };
+        let need = len as u64;
+        if df.staging.as_ref().is_none_or(|b| b.2 < need) {
+            let size = need.next_multiple_of(64 << 10);
+            df.staging = self.shared_buffer_cpu(size).map(|(r, p)| (r, p as usize, size));
+        }
+        let Some((staging, data, _)) = df.staging.clone() else {
+            return false;
+        };
+        df.sent += 1;
+        let sent = df.sent;
+        let (allocator, list) = &df.list;
+        // SAFETY: `df` is exclusively held and waited for `df.sent - 1`; live buffers.
+        let ok = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                list.CopyBufferRegion(&staging, 0, src, offset, need);
+                list.Close()?;
+                let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                df.queue.ExecuteCommandLists(&lists);
+                df.queue.Signal(&df.fence, sent)?;
+                df.fence.SetEventOnCompletion(sent, df.event)?;
+                WaitForSingleObject(df.event, INFINITE);
+                Ok(())
+            })()
+        }
+        .is_ok();
+        if !ok {
+            return false;
+        }
+        out.resize(len, 0);
+        // SAFETY: staging buffer holds `len` bytes written by the completed copy.
+        unsafe { std::ptr::copy_nonoverlapping(data as *const u8, out.as_mut_ptr(), len) };
+        true
     }
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
@@ -4776,13 +5548,20 @@ impl Host {
     /// there is one.
     fn relay_card_back(&self, plans: &[(&CardPlan, u64)], fetch: &mut Option<RelayFetch>, meanwhile: &mut dyn FnMut()) {
         use crate::land;
+        /// Where a piece's bytes are: fetched now (offset in the fetch's
+        /// memory), or come down with a flight (address, and the send that
+        /// flight ran behind).
+        #[derive(Clone, Copy)]
+        enum From {
+            Fetch(u64),
+            Slot(usize, u64),
+        }
         let gathering = std::time::Instant::now();
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
+        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, From)> = Vec::new();
         if let (Some(fetch), Some(first)) = (fetch.as_mut(), plans.iter().map(|p| p.1).min()) {
             fetch.had.landing(first);
         }
@@ -4790,6 +5569,9 @@ impl Host {
         // have run, and their dwords are given to no other plan before these
         // are done with (`card_done`).
         let differs = differs.map(|(differs, dwords)| unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) });
+        // Per piece (copy, number): where the last flight of the landing
+        // that wants it left it (`prefetch`), or nowhere (fetched).
+        let mut slots: std::collections::HashMap<(usize, u32), Option<(usize, u64)>> = std::collections::HashMap::new();
         if let Some(differs) = differs {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
@@ -4809,6 +5591,27 @@ impl Host {
                     })
                     .collect();
                 let fetched = flagged_pieces(&flags);
+                // What came down with this flight: any range's result of
+                // the piece may hold its slot (the first compare of it that
+                // flagged it).
+                if let Some(spill) = &plan.prefetch {
+                    let mut came: std::collections::HashMap<(usize, u32), usize> = std::collections::HashMap::new();
+                    for r in plan.ranges.iter().filter(|r| r.compared && !r.picked) {
+                        let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                        for p in 0..r.span.pieces {
+                            if let Some(at) = spill.slot(r.at + p) {
+                                came.entry((copy, r.span.first + p)).or_insert(at);
+                            }
+                        }
+                    }
+                    for piece in &fetched {
+                        slots.insert(*piece, came.get(piece).map(|&at| (at, plan.sent_as)));
+                    }
+                } else {
+                    for piece in &fetched {
+                        slots.insert(*piece, None);
+                    }
+                }
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
@@ -4828,12 +5631,14 @@ impl Host {
                                     continue;
                                 }
                             }
+                            if crate::demand::park(&r.shadow, lo, hi, plan.sent_as) {
+                                continue;
+                            }
                             if upcheck::on() {
                                 upcheck::fetched(r.shadow.id(), lo);
                             }
                             seen.insert((copy, lo, hi));
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                            pieces.push((r.shadow.clone(), lo, hi, From::Fetch(0)));
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -4841,20 +5646,45 @@ impl Host {
             }
         }
         if land::on() {
-            // In the order they are landed, each byte of a copy once.
+            // In the order they are landed, each byte of a copy once. (Parts
+            // joined are of one piece: they come from the same place.)
             let keys: Vec<land::Piece> =
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)).collect();
-            total = 0;
             pieces = land::ordered(&keys)
                 .into_iter()
                 .map(|(i, title, len)| {
                     let shadow = &pieces[i].0;
                     let lo = title - shadow.span().0 as usize;
-                    let at = total;
-                    total += len as u64;
-                    (shadow.clone(), lo, lo + len, at)
+                    (shadow.clone(), lo, lo + len, From::Fetch(0))
                 })
                 .collect();
+        }
+        // Where each comes from, by the last flight that wanted its piece.
+        for (shadow, lo, hi, from) in &mut pieces {
+            let number = shadow.card_piece_of(*lo);
+            let slot = slots.get(&(std::sync::Arc::as_ptr(shadow) as usize, number)).copied().flatten();
+            if let Some((at, sent_as)) = slot {
+                let hashed = shadow.card_hashed(number).0;
+                if hashed <= *lo {
+                    *from = From::Slot(at + (*lo - hashed), sent_as);
+                }
+            }
+            if prefetch::on() {
+                prefetch::landed(matches!(from, From::Slot(..)), (*hi - *lo) as u64);
+            }
+        }
+        // What is fetched now: those with no slot, one after the other.
+        let mut fetching: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        let mut fetched_as: Vec<Option<usize>> = Vec::with_capacity(pieces.len());
+        let mut total = 0u64;
+        for (shadow, lo, hi, from) in &pieces {
+            if let From::Fetch(_) = from {
+                fetched_as.push(Some(fetching.len()));
+                fetching.push((shadow.clone(), *lo, *hi, total));
+                total += (hi - lo) as u64;
+            } else {
+                fetched_as.push(None);
+            }
         }
         land::spent(land::stat::GATHER, gathering);
         if fetch.is_none() {
@@ -4862,10 +5692,15 @@ impl Host {
         }
         // On the copy queue a later flight may be at a piece while it is
         // fetched: the pieces come down whole, to be hashed.
-        let check = (torn::on() && fetch.as_ref().is_some_and(|f| f.queue.is_some()))
-            .then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces));
+        let check = (torn::on() && !fetching.is_empty() && fetch.as_ref().is_some_and(|f| f.queue.is_some()))
+            .then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut fetching));
         if let Some(check) = &check {
             total = check.total;
+        }
+        for (i, k) in fetched_as.iter().enumerate() {
+            if let Some(k) = *k {
+                pieces[i].3 = From::Fetch(fetching[k].3);
+            }
         }
         #[cfg(feature = "diagnostics")]
         for (shadow, lo, hi, _) in &pieces {
@@ -4874,88 +5709,108 @@ impl Host {
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.
         let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
+        // Every send so far is older than the next fetch, if that goes to
+        // the queue the sends went to. With slots, flights in the air ran
+        // behind sends after `behind` and are merged with those: the notes
+        // of sends up to `behind` alone go.
+        let older = |fetch: &Option<RelayFetch>| match prefetch::on() || fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
+            true => behind,
+            false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
+        };
         if pieces.is_empty() {
-            // Nothing to fetch: every send so far is older than the next
-            // fetch, if that goes to the queue the sends went to.
-            let after = match fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
-                true => behind,
-                false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
-            };
-            crate::shadow::relay_fetched(after);
+            crate::shadow::relay_fetched(older(fetch));
             return;
         }
-        let Some(f) = fetch.as_mut() else {
-            fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
-        };
-        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
-        }
-        let Some((buffer, data, _)) = f.buffer.clone() else {
-            fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
-        };
-        f.sent += 1;
-        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
-        let copy_queue = f.queue.clone();
-        let waiting = std::time::Instant::now();
-        // The flights the fetch runs behind: those in the line by now have
-        // been given to the queue. On the copy queue, those landed here.
-        let ahead = match copy_queue {
-            Some(_) => 0,
-            None => line().target,
-        };
-        // SAFETY: the list's last run was waited for by this thread; live
-        // buffers (the copies are held by the plans); the fence and the
-        // event are this thread's.
-        let ran = unsafe {
-            (|| -> windows::core::Result<u64> {
-                allocator.Reset()?;
-                list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
-                }
-                list.Close()?;
-                let lists = [Some(list.cast::<ID3D12CommandList>()?)];
-                let _fetching = crate::timeline::span("landing: fetching pieces");
-                if let Some(queue) = &copy_queue {
-                    queue.ExecuteCommandLists(&lists);
-                    queue.Signal(&fence, sent)?;
+        let (mut data, mut after) = (0usize, older(fetch));
+        if !fetching.is_empty() {
+            let Some(f) = fetch.as_mut() else {
+                fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
+            };
+            if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
+                let size = total.next_multiple_of(16 << 20);
+                f.buffer = self.shared_buffer_cpu(size).map(|(buffer, data)| (buffer, data as usize, size));
+            }
+            let Some((buffer, mapped, _)) = f.buffer.clone() else {
+                fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
+            };
+            data = mapped;
+            f.sent += 1;
+            let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+            let copy_queue = f.queue.clone();
+            let waiting = std::time::Instant::now();
+            // The flights the fetch runs behind: those in the line by now
+            // have been given to the queue. On the copy queue, those landed
+            // here.
+            let ahead = match copy_queue {
+                Some(_) => 0,
+                None => line().target,
+            };
+            // SAFETY: the list's last run was waited for by this thread;
+            // live buffers (the copies are held by the plans); the fence and
+            // the event are this thread's.
+            let ran = unsafe {
+                (|| -> windows::core::Result<u64> {
+                    allocator.Reset()?;
+                    list.Reset(&allocator, None)?;
+                    // (timed on the host queue only: a copy queue's clock is another)
+                    let timed = copy_queue.is_none().then(|| gpu_time::Ours::begin(&list, "ours: the relay's fetch of what shaders wrote"));
+                    for (shadow, lo, hi, at) in check.as_ref().map_or(&fetching, |c| &c.copies) {
+                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
+                    if let Some(timed) = timed {
+                        timed.end(&list);
+                    }
+                    list.Close()?;
+                    let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    let _fetching = crate::timeline::span("landing: fetching pieces");
+                    if let Some(queue) = &copy_queue {
+                        queue.ExecuteCommandLists(&lists);
+                        queue.Signal(&fence, sent)?;
+                        meanwhile();
+                        fence.SetEventOnCompletion(sent, event)?;
+                        #[cfg(feature = "diagnostics")]
+                        let _card = crate::timeline::card_wait(None);
+                        WaitForSingleObject(event, INFINITE);
+                        return Ok(behind);
+                    }
+                    // In the order of the queue: the sends of title bytes so
+                    // far are ahead of this fetch, every later one behind it.
+                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    self.queue_send(&lists, &[], Some((&fence, sent)))?;
+                    let after = *order;
+                    drop(order);
+                    self.card_sent();
                     meanwhile();
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
-                    return Ok(behind);
-                }
-                // In the order of the queue: the sends of title bytes so
-                // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
-                drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
-                meanwhile();
-                fence.SetEventOnCompletion(sent, event)?;
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
-                Ok(after)
-            })()
-        };
-        let after = match ran {
-            Ok(after) => after,
-            Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
-        };
-        let us = waiting.elapsed().as_micros() as u64;
-        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
-        {
-            use crate::shadow::CARD_STATS;
-            CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
-            CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
-            CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
-            CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+                    Ok(after)
+                })()
+            };
+            after = match ran {
+                Ok(after) => after,
+                Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
+            };
+            let us = waiting.elapsed().as_micros() as u64;
+            RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+            {
+                use crate::shadow::CARD_STATS;
+                CARD_STATS[3].fetch_add(fetching.len() as u64, Ordering::Relaxed);
+                CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
+                CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
+                CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+            }
+            f.had.fetched(
+                ahead,
+                fetching.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
+            );
         }
+        // Each piece: where its bytes are, and the send they ran behind.
+        let source = |from: From| match from {
+            From::Fetch(at) => (data + at as usize, after),
+            From::Slot(at, sent_as) => (at, sent_as),
+        };
         let merging = std::time::Instant::now();
         let _merging = crate::timeline::span("landing: merging fetched pieces");
         let mut written = 0;
@@ -4968,18 +5823,22 @@ impl Host {
                 let working = std::time::Instant::now();
                 if let Some(check) = &check {
                     for i in jobs[j].clone() {
-                        // SAFETY: as below.
-                        unsafe { check.look(i, data) };
+                        if let Some(k) = fetched_as[i] {
+                            // SAFETY: as below.
+                            unsafe { check.look(k, data) };
+                        }
                     }
                 }
                 let mut notes = land::Notes::default();
-                for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    let addressed: Vec<(usize, usize, usize)> =
-                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
-                    // SAFETY: the mapping of the fetched bytes, `total` of
-                    // them; the copy into it has run, and the next waits
-                    // for this call.
-                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+                let job = &pieces[jobs[j].clone()];
+                for run in job.chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0) && source(a.3).1 == source(b.3).1) {
+                    let (_, merged_after) = source(run[0].3);
+                    let addressed: Vec<(usize, usize, usize)> = run.iter().map(|(_, lo, hi, from)| (*lo, *hi, source(*from).0)).collect();
+                    // SAFETY: the mapping of the fetched bytes (`total` of
+                    // them; the copy into it has run, and the next waits for
+                    // this call), or of a plan's slots (its flight has run,
+                    // and the plan is done with after this).
+                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, merged_after, &mut notes) }, Ordering::Relaxed);
                 }
                 notes.flush();
                 land::spent(land::stat::CARD_ALL, working);
@@ -4988,32 +5847,27 @@ impl Host {
             written = put.into_inner();
         } else {
             let mut title = Vec::new();
-            for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
-                if let Some(check) = &check {
+            for (i, (shadow, lo, hi, from)) in pieces.iter().enumerate() {
+                if let (Some(check), Some(k)) = (&check, fetched_as[i]) {
                     // SAFETY: as below.
-                    unsafe { check.look(i, data) };
+                    unsafe { check.look(k, data) };
                 }
-                // SAFETY: the mapping of the fetched bytes, `total` of them;
-                // the copy into it has run.
-                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                let (at, merged_after) = source(*from);
+                // SAFETY: as above: the fetched bytes or a plan's slot.
+                let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, merged_after, &mut title);
                 shadow.walls_merged(gpu.len(), merged);
                 written += merged as u64;
             }
         }
         land::spent(land::stat::CARD, merging);
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
-        if let Some(f) = fetch.as_mut() {
-            if let Some(check) = &check {
-                check.done(&mut f.suspects);
-            }
-            f.had.fetched(
-                ahead,
-                pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
-            );
+        if let (Some(f), Some(check)) = (fetch.as_mut(), &check) {
+            check.done(&mut f.suspects);
         }
-        // Sends up to `after` are of no use to any later merge.
-        crate::shadow::relay_fetched(after);
+        // Sends up to `after` are of no use to any later merge (with slots:
+        // up to `behind`, as above).
+        crate::shadow::relay_fetched(if prefetch::on() { after.min(behind) } else { after });
     }
 
     /// [`relay`], on the thread that lands flights: `items` are the first
@@ -5026,6 +5880,7 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        let trace_start = render_trace::active().then(now_us);
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5046,6 +5901,9 @@ impl Host {
                         self.removal_data(&runs),
                         last_notes(&runs)
                     ));
+                }
+                if let Some(flight) = flights.last() {
+                    crate::descriptor::reclaim_dynamic(flight.fence);
                 }
                 let plans: Vec<(&CardPlan, u64)> = flights.iter().filter_map(|f| Some((f.card.as_ref()?, f.fence))).collect();
                 // (Each byte once: the ranges are joined.)
@@ -5092,6 +5950,9 @@ impl Host {
             telling = match item {
                 Late::Run(mut flight) => {
                     last = flight.number;
+                    if trace_start.is_some() {
+                        render_trace::event("relay_readback", format_args!("submission={}\thost_fence={}\tlists={}", flight.number, flight.fence, flight.order.len()));
+                    }
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
@@ -5113,18 +5974,28 @@ impl Host {
                 }
                 Late::Signal(fence, value) => {
                     crate::fence::set(fence as crate::object::This, value);
+                    if trace_start.is_some() {
+                        render_trace::event("title_fence_published", format_args!("fence={fence:#x}\tvalue={value}"));
+                    }
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            // Driver releases can stall. Keep them off the thread that
+            // publishes completions and unblocks the in-flight list limit.
+            if !RELAY_HELPER_READY.load(Ordering::Acquire) {
+                bury(last);
+            }
         }
         stage.next("landing: the rest");
         self.log_messages();
         crate::land::spent(crate::land::stat::REST, telling);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(start) = trace_start {
+            render_trace::event("relay_complete", format_args!("last_submission={last}\tstart_us={start}\tduration_us={}", landing.elapsed().as_micros()));
+        }
         {
             let mut line = line();
             let Line {
@@ -5154,8 +6025,8 @@ impl Host {
             }
             join_ranges(written, ranges);
             *settling = false;
-            // The landed lists are reset, and what queues hold looked at,
-            // by the helper thread (they take locks a waiter may hold).
+            // The helper resets the lists and releases retired resources
+            // after the waiters can make progress.
             *poke = true;
         }
         LINE_MOVED.notify_all();
@@ -5207,7 +6078,7 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                work.fetched = self.shared_buffer_cpu(size).map(|(buffer, data)| (buffer, data as usize, size));
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -5220,14 +6091,15 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let timed = gpu_time::Ours::begin(list, "ours: pieces of the card's copies fetched");
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
+                    timed.end(list);
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    self.card_sent();
                     *submitted += 1;
-                    self.queue.Signal(&self.fence, *submitted)?;
+                    self.queue_send(&[Some(list.cast()?)], &[], Some((&self.fence, *submitted)))?;
+                    self.card_sent();
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -5350,7 +6222,7 @@ impl Host {
         self.send_late(lists, order, parts);
     }
 
-    fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+    fn send_late(&self, mut lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, parts, true)
@@ -5361,6 +6233,9 @@ impl Host {
             return;
         };
         let after = std::time::Instant::now();
+        for list in &mut lists {
+            list.tables_submitted(*submitted);
+        }
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
@@ -5390,6 +6265,8 @@ impl Host {
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
+        let noted = std::time::Instant::now();
+        AFTER_PARTS[1].fetch_add((noted - after).as_nanos() as u64, Ordering::Relaxed);
         if told && !late_writes() {
             self.settle(&mut submitted, WHY_WRITES);
         } else if sizes {
@@ -5399,12 +6276,29 @@ impl Host {
             relay_wait(WHY_MOST, |line| line.lists < late_most());
         } else if most {
             self.settle(&mut submitted, WHY_MOST);
-        } else {
-            LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        let waited = std::time::Instant::now();
+        AFTER_PARTS[2].fetch_add((waited - noted).as_nanos() as u64, Ordering::Relaxed);
+        // The landed lists are reset and given back by the helper thread
+        // ([`late_helper`], which does so when poked), not here: resetting
+        // some 230 host lists a frame was most of the submitting thread's
+        // time after each sending, which is the critical path. A backlog
+        // past [`LAND_INLINE`] is still done here so the pool of idle lists
+        // never runs dry behind a helper that fell behind.
+        let backlog = {
+            let mut line = line();
+            line.poke = true;
+            line.landed.len()
+        };
+        LINE_MOVED.notify_one();
+        if backlog > bury_lag() as usize + LAND_INLINE {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            let landing = std::time::Instant::now();
+            land();
+            AFTER_PARTS[3].fetch_add(landing.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            LANDED_INLINE.fetch_add(1, Ordering::Relaxed);
+        }
         AFTER_SEND.fetch_add(after.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
@@ -5542,6 +6436,9 @@ impl Host {
                     ));
                 }
                 submitting(3, flights);
+                if let Some(completed) = completed_descriptor_fence() {
+                    crate::descriptor::reclaim_dynamic(completed);
+                }
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
@@ -5653,6 +6550,7 @@ impl Host {
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         let called = std::time::Instant::now();
+        let trace_start = render_trace::active().then(now_us);
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
@@ -5676,9 +6574,10 @@ impl Host {
         // The round of the heaps' records asked for when the title submitted
         // these lists, if that is known (`crate::heap_marks`, 0: not).
         let heaps_mark = if late { crate::heap_marks::needed() } else { 0 };
+        let needs_heaps = late && runs.iter().any(|l| l.heap_picked());
         // Else with [`heap_sync_first`]: the heaps' records begun now, beside
         // the planning of steps done on the card and the look at flights.
-        let first_heaps = (late && heaps_mark == 0 && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
+        let first_heaps = (needs_heaps && heaps_mark == 0 && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         let ahead = Split::begin();
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
         stage.next("submit: steps given to the card");
@@ -5713,22 +6612,26 @@ impl Host {
         // as the round began here saw them; the first is not waited for.)
         // With a mark (`crate::heap_marks`): that round, unless the
         // submission waited for flights, whose landings came after it.
-        let heaps_synced = match first_heaps {
-            Some(first) if !waited_for_flights => {
-                HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
-                first
-            }
-            first => {
-                if let Some(first) = first {
-                    HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
-                    std::mem::forget(first);
+        let heaps_synced = if !needs_heaps {
+            None
+        } else {
+            Some(match first_heaps {
+                Some(first) if !waited_for_flights => {
+                    HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
+                    first
                 }
-                if heaps_mark != 0 && !waited_for_flights {
-                    crate::descriptor::begin_sync_heaps_after(heaps_mark)
-                } else {
-                    crate::descriptor::begin_sync_heaps()
+                first => {
+                    if let Some(first) = first {
+                        HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
+                        std::mem::forget(first);
+                    }
+                    if heaps_mark != 0 && !waited_for_flights {
+                        crate::descriptor::begin_sync_heaps_after(heaps_mark)
+                    } else {
+                        crate::descriptor::begin_sync_heaps()
+                    }
                 }
-            }
+            })
         };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
@@ -5758,8 +6661,16 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
+            // with nothing in the air. What the sweep lets go of goes
+            // through [`retire`], which holds it until every submission
+            // started so far has finished (the submission numbers are the
+            // fence values), and what only a list names has a count above
+            // one while the list is in a flight; so no drain is needed
+            // (`VICTORY_SWEEP_SETTLE=1`, or the up-check, which needs a
+            // card at rest: as before, 10 to 30 ms every 1.5 s).
+            if sweep_settles() || upcheck::on() {
+                self.settle(&mut submitted, WHY_SYNC);
+            }
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
@@ -5769,6 +6680,9 @@ impl Host {
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(start) = trace_start {
+            render_trace::event("submission_preparing", format_args!("submission={this_submission}\tstart_us={start}\tlists={}\tparts={}\tasynchronous={late}", runs.len(), parts.len()));
+        }
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -5781,15 +6695,19 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::reused();
-        let split = Split::begin();
+        let split = Split::begin().trace(trace_start.map(|_| this_submission));
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
-        if crate::watch::once() {
-            batch.copy_spans(runs);
+        let once = crate::watch::once();
+        let front = refresh_front();
+        if once || front {
+            batch.copy_spans(runs, front.then_some(parts.as_slice()));
+        }
+        if once {
             let Batch { spans, ranges, .. } = &mut batch;
             ranges.clear();
             ranges.extend(spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
@@ -5823,8 +6741,8 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
-        if refresh_front() {
-            batch.refresh_front(runs, &parts);
+        if front {
+            batch.refresh_front();
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
@@ -5910,6 +6828,9 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
+        if let Some(start) = trace_start {
+            render_trace::event("submission_ready", format_args!("submission={this_submission}\tstart_us={start}\tprepare_us={}\tsettled_us={}\tlists={}\tnext_host_fence={}", called.elapsed().as_micros(), settled.as_micros(), lists.len(), *submitted + 1));
+        }
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
@@ -5918,16 +6839,10 @@ impl Host {
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
-                }
-                self.queue.Signal(&self.fence, *submitted)
-            };
+            // All lists of this submission are already ordered on the host queue
+            // and refreshed ahead of them; submit them in one ExecuteCommandLists call.
+            let _ = &parts;
+            let signalled = self.queue_send(&lists, &[], Some((&self.fence, *submitted)));
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
@@ -5937,6 +6852,8 @@ impl Host {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             split.part(5);
+            // (Counted with the time after the sending: it was on no line before.)
+            let tail = std::time::Instant::now();
             let back = crate::picked::with(declared, &picked.written);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
@@ -5957,6 +6874,9 @@ impl Host {
             };
             batch.give_back();
             working(was_working);
+            let tail = tail.elapsed().as_nanos() as u64;
+            AFTER_SEND.fetch_add(tail, Ordering::Relaxed);
+            AFTER_PARTS[0].fetch_add(tail, Ordering::Relaxed);
             return Some((submitted, sent));
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
@@ -5978,12 +6898,9 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                let sent = self.queue_send(group, &[], Some((&self.fence, *submitted)));
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                let waited = sent.and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
                 match waited {
@@ -6215,7 +7132,11 @@ impl Host {
                     });
                     #[cfg(not(feature = "diagnostics"))]
                     #[allow(clippy::type_complexity)]
-                    let by_name: Option<(Option<()>, Option<std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>>)> = None;
+                    let by_name: Option<(Option<()>, Option<std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>>)> =
+                        list_number(&named).and_then(|n| {
+                            let all = RELEASE_LISTS.lock().unwrap_or_else(|e| e.into_inner());
+                            all.get(&n).map(|pipelines| (None, pipelines.upgrade()))
+                        });
                     #[cfg(feature = "diagnostics")]
                     let noted = run.map(|r| r.notes.clone()).or_else(|| by_name.as_ref().and_then(|b| b.0.clone()));
                     let bound = run.map(|r| r.pipelines.clone()).or_else(|| by_name.as_ref().and_then(|b| b.1.clone()));
@@ -6400,6 +7321,77 @@ impl Host {
 }
 
 impl HostList {
+    /// The draws and dispatches recorded next: a new GPU pass where the
+    /// work's key changes ([`gpu_time`]): draws keep one until the render
+    /// targets change ([`Self::gpu_pass_break`]), each compute pipeline's
+    /// run of dispatches is one. `name` is asked only for a new pass.
+    pub(crate) fn gpu_pass(&self, compute: bool, pipeline: usize, command: render_trace::Command, name: impl FnOnce() -> String) {
+        self.gpu_time.work();
+        let (key, kind) = if compute { (pipeline as u64 | 1, gpu_time::COMPUTE) } else { (2, gpu_time::DRAW) };
+        self.gpu_time.pass(&self.list, key, kind, command, name);
+    }
+
+    /// The render targets changed: the next draw begins a GPU pass.
+    pub(crate) fn gpu_pass_break(&self) {
+        // (counted as work: what setting targets records stands between two
+        // waits for shader writes)
+        self.gpu_time.work();
+        self.gpu_time.break_pass();
+        self.trace_gpu_pass("render targets changed", [0; 5]);
+    }
+
+    /// A pass of ours in this list (`n` tells them apart).
+    fn gpu_pass_ours(&self, n: u64, name: &'static str) {
+        self.gpu_time.work();
+        self.gpu_time.pass(&self.list, u64::MAX - n, gpu_time::OURS, render_trace::Command("host_pass", [0; 5]), || name.to_owned());
+    }
+
+    pub(crate) fn trace_gpu_pass(&self, name: &'static str, args: [i64; 5]) {
+        if render_trace::active() {
+            self.gpu_time.pass(&self.list, u64::MAX, gpu_time::OURS, render_trace::Command("host_pass", args), || name.to_owned());
+        }
+    }
+
+    /// A step that is not a draw or dispatch is recorded next (the title's
+    /// copies, clears, resolves, barriers): counted, and timed on the card as
+    /// a pass of its kind if the list has drawn nothing yet. Anything but a
+    /// barrier is work ([`Self::gpu_work`]).
+    pub(crate) fn gpu_step(&self, kind: gpu_time::Step, bytes: u64) {
+        if !matches!(kind, gpu_time::Step::Transitions | gpu_time::Step::ShaderWrites) {
+            self.gpu_time.work();
+        }
+        if matches!(kind, gpu_time::Step::BufferCopies | gpu_time::Step::TextureCopies | gpu_time::Step::MemoryCopies) {
+            self.gpu_time.uav_work();
+        }
+        gpu_time::count_step(kind, bytes);
+        self.gpu_time.step(&self.list, kind, bytes);
+    }
+
+    /// Work was recorded into the list (for list start timing).
+    pub(crate) fn gpu_work(&self) {
+        self.gpu_time.work();
+    }
+
+    /// Shader or copy UAV-producing work was recorded into the list (for [`Self::wait_for_writes`]).
+    pub(crate) fn gpu_uav_work(&self) {
+        self.gpu_time.uav_work();
+    }
+
+    /// Whether a wait for every shader write (a UAV barrier on no resource)
+    /// is to be recorded now: not where no shader/copy UAV work ran since
+    /// the last one in this list (`VICTORY_MERGE_BARRIERS=0`: always).
+    pub(crate) fn wait_for_writes(&self) -> bool {
+        self.gpu_time.wait_for_uav_writes()
+    }
+
+    pub(crate) fn water_dispatch(&self, pipeline: Option<&crate::pipeline::host::HostPipeline>, dispatch: impl FnOnce()) {
+        let index = pipeline.and_then(water_timing::kind).and_then(|kind| self.water_timing.begin(&self.list, kind));
+        dispatch();
+        if let Some(index) = index {
+            self.water_timing.end(&self.list, index);
+        }
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -6480,15 +7472,29 @@ impl HostList {
         let _closing = crate::timeline::span("closing a host list");
         self.left_open[0].store(0, Ordering::Release);
         self.flush_indirect();
-        self.twins_to_depth();
-        self.textures_back();
+        if self.twins.lock().unwrap_or_else(|e| e.into_inner()).values().any(|u| u.behind[0] == Some(true) || u.late) {
+            self.gpu_pass_ours(1, "ours: depth twins at the list's end");
+            self.twins_to_depth();
+        }
+        if !self.deferred().back_wanted.is_empty() {
+            self.gpu_pass_ours(2, "ours: textures copied back at the list's end");
+            self.textures_back();
+        }
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some((scratch, _)) = scratch {
+        if let Some((scratch, _)) = scratch
+            && self.deferred().indirect_readable == scratch.as_raw() as usize
+        {
+            self.gpu_pass_ours(3, "ours: indirect argument clamps");
             self.indirect_common(&scratch);
         }
-        self.batches_common();
+        if self.batch_args.lock().unwrap_or_else(|e| e.into_inner()).1 > 0 {
+            self.gpu_pass_ours(4, "ours: indirect argument clamps in batches");
+            self.batches_common();
+        }
         self.card_budget_out();
         self.take_coming();
+        self.water_timing.resolve(&self.list);
+        self.gpu_time.end(&self.list);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6592,8 +7598,24 @@ impl HostList {
         self._alive.used();
         self.upscale.store(0, Ordering::Relaxed);
         self.hudless.store(0, Ordering::Relaxed);
+        self.heap_picked.store(false, Ordering::Relaxed);
+        self.water_timing.reset();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.deferred() = Deferred::default();
+        {
+            // Every submission of the list has run: its pooled upload buffers
+            // and its read-back buffers (read when it landed) go back to
+            // [`BUFFER_POOL`] for the next lists.
+            let mut deferred = self.deferred();
+            let uploads = std::mem::take(&mut deferred.pooled_uploads);
+            let mut backs: Vec<ID3D12Resource> =
+                if buffer_pool_on() { deferred.backs.drain(..).map(|(b, _, _)| b).collect() } else { Vec::new() };
+            if buffer_pool_on() {
+                backs.extend(deferred.texture_backs.drain(..).filter_map(|mut b| b.take_buffer()));
+            }
+            deferred.clear();
+            drop(deferred);
+            give_pooled(uploads, backs);
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6624,6 +7646,7 @@ impl HostList {
             if let Err(e) = reset {
                 fail(format_args!("a host command list did not reset ({e})"));
             }
+            self.gpu_time.start(&self.list);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
@@ -6634,6 +7657,14 @@ impl HostList {
     /// refreshed.
     pub(crate) fn changed_something(&self) {
         self.epoch.store(next_epoch(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_heap_picked(&self) {
+        self.heap_picked.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn heap_picked(&self) -> bool {
+        self.heap_picked.load(Ordering::Relaxed)
     }
 
     /// See [`HostList::changed_something`].
@@ -6672,6 +7703,12 @@ impl HostList {
             && let Some(held) = held.take()
         {
             self.holding.store(false, Ordering::Relaxed);
+            // (an indirect execution: shader work)
+            if render_trace::active() {
+                self.gpu_pass(run.kind == 2, run.pipeline, render_trace::Command("execute_indirect_merged", [run.kind.into(), run.records.into(), run.at as i64, 0, run.step.into()]), || format!("indirect pipeline {:#x}", run.pipeline));
+            } else {
+                self.gpu_time.work();
+            }
             held.record(&self.list, run);
         }
     }
@@ -7070,6 +8107,7 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                let mut timed = gpu_time::Ours::begin(list, "ours: a list's state prelude (states, depth twins)");
                 if !aliasing.is_empty() {
                     list.ResourceBarrier(&aliasing);
                 }
@@ -7079,12 +8117,16 @@ impl HostList {
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
+                if !uploads.is_empty() {
+                    timed.pass(list, "ours: texture uploads in a list's prelude");
+                }
                 for (upload, _) in uploads {
                     upload.record(list);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                timed.end(list);
                 list.Close()
             })
         };
@@ -7199,6 +8241,9 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        // `card_steps` may do it on the card, landing after the flight:
+        // constants there are not read in place meanwhile (`crate::port`).
+        crate::port::copy_bound(dst as usize, len);
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
@@ -7232,6 +8277,10 @@ impl HostList {
     /// memory at `src` as of the list's submission: one fill for every ask
     /// until the list next writes title memory.
     pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        // Behind a copy at its place: read on the card, not waited for.
+        if let Some((_, gpu)) = self.placed_constants(src as usize, len as usize) {
+            return Some(gpu);
+        }
         let key = (src as usize, len as usize);
         let known = self.deferred().filled.get(&key).copied();
         if known.is_some() {
@@ -7246,6 +8295,10 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+        // Behind a copy at its place: read on the card, not waited for.
+        if self.place_constants_slot(src as usize, len, slot) {
+            return;
+        }
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
@@ -7299,6 +8352,8 @@ impl HostList {
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
+        // The card's bytes go there: not constants read in place (`crate::port`).
+        crate::port::gpu_bound(dst as usize, rows.saturating_sub(1).saturating_mul(pitch).saturating_add(row));
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
     }
 
@@ -7307,15 +8362,35 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// A mapped upload buffer of `size` bytes or more, alive until the list
+    /// is reset: one of [`BUFFER_POOL`]'s, given back then.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        if card_steps::stage() > 1 {
+            let (buffer, data) = host.shared_buffer_cpu(size)?;
+            name(&buffer, || format!("list upload {size:#x}"));
+            self.deferred().hold_upload(buffer.clone(), size);
+            return Some((buffer, data));
+        }
+        let Some((i, class)) = pool_class(size) else {
+            let (buffer, data) = host.upload_buffer(size)?;
+            name(&buffer, || format!("list upload {size:#x}"));
+            self.deferred().hold_upload(buffer.clone(), size);
+            return Some((buffer, data));
+        };
+        // One kept from a list that has run, or a new one of the class.
+        let (buffer, data) = match take_pooled(i, class, true) {
+            Some(Pooled(buffer, data)) => (buffer, data as *mut u8),
+            None => {
+                POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+                let (buffer, data) = host.upload_buffer(class)?;
+                name(&buffer, || format!("list upload (pooled) {class:#x}"));
+                (buffer, data)
+            }
+        };
+        let mut deferred = self.deferred();
+        deferred.hold_upload(buffer.clone(), class);
+        deferred.pooled_uploads.push(Pooled(buffer.clone(), data as usize));
         Some((buffer, data))
     }
 
@@ -7382,7 +8457,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_buffer_cpu(256)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -7871,10 +8946,17 @@ impl HostList {
     }
 }
 
-/// The numbers of [`HostList::epoch`].
+/// The numbers of [`HostList::epoch`]: unique, never 0. Only compared for
+/// equality, so each thread takes them from a block of its own
+/// (`crate::sharded::Numbers`): a list's epoch moves at state changes of
+/// the draws every translating thread records, and one count for all of
+/// them was a line the threads took from each other at each.
 fn next_epoch() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    static NEXT: crate::sharded::Numbers = crate::sharded::Numbers::new(1);
+    thread_local! {
+        static OWN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    OWN.try_with(|own| NEXT.next(own)).unwrap_or_else(|_| NEXT.one())
 }
 
 /// A table by a copy's address.
@@ -7932,6 +9014,14 @@ static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::
 /// reset and given back.
 static AFTER_SEND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// [`AFTER_SEND`] by part, nanoseconds since the last frame-rate line: the
+/// submission's tail on the submitting thread (what its lists' shaders and
+/// read-backs write, noted for the flight; its batch given back), the
+/// flight noted in the line, the waits for the card that followed (a settle
+/// or a wait for fewer lists in the air: the card's time showing through,
+/// not work), and landed lists reset here behind a helper that fell behind.
+static AFTER_PARTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Whether a submission sent ahead begins the round of the heaps' records
 /// (`crate::descriptor::begin_sync_heaps`) as soon as it holds the
 /// submission lock, before the steps done on the card are planned and
@@ -7958,11 +9048,16 @@ fn heap_sync_first() -> bool {
 static HEAP_SYNC_FIRST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Counts into [`SPLIT`].
-struct Split(std::cell::Cell<std::time::Instant>);
+struct Split(std::cell::Cell<std::time::Instant>, Option<u64>);
 
 impl Split {
     fn begin() -> Split {
-        Split(std::cell::Cell::new(std::time::Instant::now()))
+        Split(std::cell::Cell::new(std::time::Instant::now()), None)
+    }
+
+    fn trace(mut self, submission: Option<u64>) -> Self {
+        self.1 = submission;
+        self
     }
 
     /// Nanoseconds since the last part.
@@ -7973,7 +9068,21 @@ impl Split {
     /// What came since the last part was part `i`.
     fn part(&self, i: usize) {
         let now = std::time::Instant::now();
-        SPLIT[i].fetch_add((now - self.0.replace(now)).as_nanos() as u64, Ordering::Relaxed);
+        let elapsed = now - self.0.replace(now);
+        SPLIT[i].fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        if let Some(submission) = self.1 {
+            let phase = match i {
+                0 => "write_watch",
+                1 => "writes_under_flights",
+                2 => "refresh_and_deferred_steps",
+                3 => "snapshots",
+                4 => "card_copies",
+                5 => "queue_send",
+                15 => "heap_records",
+                _ => "other",
+            };
+            render_trace::event("submission_stage", format_args!("submission={submission}\tphase={phase}\tduration_us={}", elapsed.as_micros()));
+        }
     }
 }
 
@@ -7985,6 +9094,8 @@ fn submit_split_line(frames: f64) {
     let ms: [f64; 16] = std::array::from_fn(|i| SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
     let f: [f64; 4] = std::array::from_fn(|i| FLUSHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
     let after = AFTER_SEND.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+    let parts: [f64; 4] = std::array::from_fn(|i| AFTER_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+    let inline = LANDED_INLINE.swap(0, Ordering::Relaxed) as f64 / frames;
     let all: f64 = [0, 1, 2, 3, 4, 5, 11, 12, 13, 14, 15].iter().map(|&i| ms[i]).sum();
     if all + after <= 0.0 {
         return;
@@ -7997,7 +9108,7 @@ fn submit_split_line(frames: f64) {
          in the card's memory, {:.1} sending the lists (VICTORY_LIGHT_REFRESH is {}); ahead of these {:.1} waiting for the \
          submission lock, {:.1} planning steps done on the card, {:.1} waiting for flights, {:.1} the heaps' records and what is \
          swept; at the end {:.1} waiting for the heaps' records; after the sending {after:.1} (the flight noted, landed lists \
-         reset and given back)",
+         reset and given back: {:.1} the submission's tail, {:.1} the flight noted, {:.1} waiting for the card (settles, fewer lists in the air), {:.1} lists reset here in {:.1} times behind a helper that fell behind)",
         ms[0],
         ms[8],
         ms[1],
@@ -8019,6 +9130,29 @@ fn submit_split_line(frames: f64) {
         ms[13],
         ms[14],
         ms[15],
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[3],
+        inline,
+    );
+    let pool: [f64; 4] = std::array::from_fn(|i| POOL_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let kept_mb = BUFFER_POOL.lock().unwrap_or_else(|e| e.into_inner()).bytes as f64 / (1 << 20) as f64;
+    let [buried, burying] = [0, 1].map(|i| BURIED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let [reset, resetting] =
+        [0, 1].map(|i| crate::list::RECYCLED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "host lists' buffers and resets per frame: upload and read-back buffers {:.1} taken from the pool, {:.1} made for it, \
+         {:.1} given back, {:.1} let go past its {:.0} MB (VICTORY_BUFFER_POOL; {kept_mb:.0} MB kept); lists reset {reset:.1} \
+         in {:.2} ms (VICTORY_RESET_WIDE); retired objects {buried:.0} dropped on a thread of their own in {:.2} ms \
+         (VICTORY_BURY_THREAD)",
+        pool[0],
+        pool[1],
+        pool[2],
+        pool[3],
+        buffer_pool_most() as f64 / (1 << 20) as f64,
+        resetting / 1e6,
+        burying / 1e6,
     );
     let [first, again] = [0, 1].map(|i| HEAP_SYNC_FIRST[i].swap(0, Ordering::Relaxed) as f64 / frames);
     if first + again > 0.0 {
@@ -8160,10 +9294,14 @@ struct Batch {
     /// copy (by address) is in it.
     spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     spans_at: ByCopy<usize>,
-    /// Room for the submission's one asking's ranges, and for
-    /// [`Batch::refresh_front`]'s walk over the steps.
+    /// Room for the submission's one asking's ranges and for the ranges
+    /// that can be refreshed before running the deferred steps.
     ranges: Vec<(usize, usize)>,
-    touches: Vec<Touch>,
+    front_spans: FrontSpans,
+    /// The submission's one asking's ranges, copied once per asking: every
+    /// refresh step asks whether they cover it ([`crate::watch::kept_covers_cached`]),
+    /// some 13,000 a frame, each of which took the journal's lock.
+    kept: crate::watch::KeptView,
 }
 
 thread_local! {
@@ -8206,50 +9344,59 @@ fn refresh_front() -> bool {
 
 /// Per copy what is refreshed in front of a submission's steps, as
 /// [`written_spans`]'s but of all copies, up to the copy's first write by
-/// shaders in each part of the submission (`Touch::Part`: another begins).
+/// shaders in each part of the submission.
 /// What a part refreshes of a copy it has given to its shaders stays where it
 /// stands: around what they write. What a later part refreshes is the
 /// title's bytes of before either.
+#[derive(Default)]
+struct FrontSpans {
+    at: ByCopy<usize>,
+    // (Copy, from, to, last part that gave the copy to shaders).
+    spans: Vec<(usize, usize, usize, Option<usize>)>,
+    last: usize,
+}
+
+impl FrontSpans {
+    fn span(&mut self, copy: usize) -> &mut (usize, usize, usize, Option<usize>) {
+        if !self.spans.get(self.last).is_some_and(|span| span.0 == copy) {
+            self.last = *self.at.entry(copy).or_insert_with(|| {
+                self.spans.push((copy, usize::MAX, 0, None));
+                self.spans.len() - 1
+            });
+        }
+        &mut self.spans[self.last]
+    }
+
+    fn refresh(&mut self, copy: usize, from: usize, to: usize, part: usize) {
+        let span = self.span(copy);
+        if span.3 != Some(part) {
+            (span.1, span.2) = (span.1.min(from), span.2.max(to));
+        }
+    }
+
+    fn write(&mut self, copy: usize, part: usize) {
+        self.span(copy).3 = Some(part);
+    }
+
+    fn take(&mut self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        self.at.clear();
+        self.spans.drain(..).filter_map(|(key, from, to, _)| (from < to).then_some((key, from, to)))
+    }
+}
+
+#[cfg(test)]
 fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
-    // (Copy, from, to), in the order they come, and the part that gave it to
-    // shaders last.
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-    let mut given: Vec<u32> = Vec::new();
-    let (mut part, mut last) = (1, usize::MAX);
+    let mut spans = FrontSpans::default();
+    let mut part = 0;
     for step in steps {
         match step {
-            Touch::Refresh(copy, from, to) => {
-                // (Most come several times on end.)
-                let i = if spans.get(last).is_some_and(|s| s.0 == copy) {
-                    last
-                } else {
-                    *at.entry(copy).or_insert_with(|| {
-                        spans.push((copy, usize::MAX, 0));
-                        given.push(0);
-                        spans.len() - 1
-                    })
-                };
-                last = i;
-                if given[i] != part {
-                    let span = &mut spans[i];
-                    (span.1, span.2) = (span.1.min(from), span.2.max(to));
-                }
-            }
-            Touch::Write(copy) => {
-                let i = *at.entry(copy).or_insert_with(|| {
-                    spans.push((copy, usize::MAX, 0));
-                    given.push(0);
-                    spans.len() - 1
-                });
-                given[i] = part;
-            }
+            Touch::Refresh(copy, from, to) => spans.refresh(copy, from, to, part),
+            Touch::Write(copy) => spans.write(copy, part),
             Touch::Part => part += 1,
             Touch::Title | Touch::Nothing => {}
         }
     }
-    spans.retain(|s| s.1 < s.2);
-    spans
+    spans.take().collect()
 }
 
 /// What a step is to the copies' refreshes, for [`written_spans`].
@@ -8262,6 +9409,7 @@ enum Touch {
     Title,
     Nothing,
     /// Another part of the submission begins.
+    #[cfg(test)]
     Part,
 }
 
@@ -8285,7 +9433,9 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
                 }
             }
             Touch::Title => break,
-            Touch::Nothing | Touch::Part => {}
+            Touch::Nothing => {}
+            #[cfg(test)]
+            Touch::Part => {}
         }
     }
     spans.into_iter().filter(|(_, s)| s.2).map(|(copy, (from, to, _))| (copy, from, to)).collect()
@@ -8411,7 +9561,6 @@ impl Batch {
         self.spans.clear();
         self.spans_at.clear();
         self.ranges.clear();
-        self.touches.clear();
         SPARE_BATCH.set(Some(self));
     }
 
@@ -8419,20 +9568,38 @@ impl Batch {
     /// [`Batch::spans`]: the submission's one asking asks about those
     /// ([`crate::watch::ask_once`]), and behind flights those of copies
     /// shaders may be writing are looked at ([`Batch::stale_under_flights`]).
-    /// One walk over the steps for both, where there were two, each with a
-    /// table of its own.
-    fn copy_spans(&mut self, runs: &[&HostList]) {
+    /// With `front` also find which ranges can be refreshed before running
+    /// the deferred steps and which textures they will need.
+    fn copy_spans(&mut self, runs: &[&HostList], front: Option<&[usize]>) {
         self.spans.clear();
         self.spans_at.clear();
-        // (Most come several times on end.)
+        let textures = front.is_some() && wide_textures();
+        let mut part = 0;
         let mut last = (0, 0);
-        for list in runs {
+        for (n, list) in runs.iter().enumerate() {
+            if front.is_some_and(|parts| parts.contains(&n)) {
+                part += 1;
+            }
             for step in &list.deferred().copies {
-                let Step::Refresh(shadow, address, len) = step else {
-                    continue;
+                let (shadow, address, len) = match step {
+                    Step::Refresh(shadow, address, len) => (shadow, address, len),
+                    Step::GpuWrite(shadow, ..) if front.is_some() => {
+                        self.front_spans.write(std::sync::Arc::as_ptr(shadow) as usize, part);
+                        continue;
+                    }
+                    Step::Texture(staging) if textures => {
+                        if self.texture_due(staging) {
+                            self.due.push(staging.clone());
+                        }
+                        continue;
+                    }
+                    _ => continue,
                 };
                 let (from, to) = (*address, *address + *len);
                 let key = std::sync::Arc::as_ptr(shadow) as usize;
+                if front.is_some() {
+                    self.front_spans.refresh(key, from, to, part);
+                }
                 let at = if last.0 == key && key != 0 {
                     last.1
                 } else {
@@ -8464,6 +9631,14 @@ impl Batch {
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
             return;
+        }
+        if crate::watch::light() {
+            let kept = &mut self.kept;
+            if shadow.fast_nothing_new_known(address, len, |from, to| crate::watch::kept_covers_cached(kept, from, to)) {
+                FLUSHES[1].fetch_add(1, Ordering::Relaxed);
+                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
         match self.index.get(&key) {
             Some(&at) => {
@@ -8529,38 +9704,10 @@ impl Batch {
         self.textures.clear();
     }
 
-    /// Before the steps of `runs` ([`refresh_front`]), a new part of the
-    /// submission beginning at each of `parts`.
-    fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
-        // The copies refreshed, by address: as the submission's one asking
-        // found them, or found here.
-        if self.spans.is_empty() {
-            self.copy_spans(runs);
-        }
-        let mut due = Vec::new();
-        self.touches.clear();
-        for (n, list) in runs.iter().enumerate() {
-            if parts.contains(&n) {
-                self.touches.push(Touch::Part);
-            }
-            for step in &list.deferred().copies {
-                match step {
-                    Step::Refresh(shadow, at, len) => {
-                        self.touches.push(Touch::Refresh(std::sync::Arc::as_ptr(shadow) as usize, *at, *at + *len));
-                    }
-                    Step::GpuWrite(shadow, ..) => self.touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
-                    Step::Texture(staging) if wide_textures() => {
-                        if self.texture_due(staging) {
-                            due.push(staging.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let found = front_spans(self.touches.drain(..));
-        let spans: Vec<_> = found
-            .into_iter()
+    /// Bring the planned front spans and textures up to date in parallel.
+    fn refresh_front(&mut self) {
+        let due = std::mem::take(&mut self.due);
+        let spans: Vec<_> = self.front_spans.take()
             .filter_map(|(key, from, to)| Some((self.spans.get(*self.spans_at.get(&key)?)?.0.clone(), from, to)))
             .collect();
         self.front = true;
@@ -8572,43 +9719,70 @@ impl Batch {
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
-        // Those known to copy nothing are said so here, unless they are very
-        // many: then beside the others.
+        // With a standing write-watch answer there is no second kernel ask
+        // to plan. Check the known-clean spans in the same worker jobs that
+        // perform the updates, instead of walking them on the submitter first.
         const FEW: usize = 256;
         let mut spans = spans;
+        let light = crate::watch::light();
+        let worker_kept = if light && spans.len() > FEW { self.kept.snapshot() } else { None };
+        if light && worker_kept.is_none() {
+            let all = spans.len();
+            let kept = &mut self.kept;
+            spans.retain(|(shadow, from, to)| {
+                !shadow.fast_nothing_new_known(*from, *to - *from, |a, b| crate::watch::kept_covers_cached(kept, a, b))
+            });
+            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+        }
         let many = spans.len() > FEW;
         if !many {
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && !crate::watch::kept();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        // Claim short groups of buffer checks together. In the large
+        // flushes most checks do no copying, so claiming and counting
+        // them one at a time makes the workers contend on two counters.
+        const GROUP: usize = 8;
+        let group = if many { GROUP } else { 1 };
+        crate::shadow::wide_each(spans.len().div_ceil(group) + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
                 return;
             };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+            let from_index = i * group;
+            let mut clean = 0;
+            for (shadow, from, to) in &spans[from_index..(from_index + group).min(spans.len())] {
+                let len = *to - *from;
+                let known = worker_kept.as_ref().is_some_and(|kept| {
+                    shadow.fast_nothing_new_known(*from, len, |a, b| kept.covers_current(a, b))
+                });
+                if known || (many && shadow.nothing_new(*from, len)) {
+                    clean += 1;
+                } else {
+                    Self::update(shadow, *from, *to);
+                }
             }
-            Self::update(shadow, *from, *to);
+            if clean != 0 {
+                FLUSHES[2].fetch_add(clean, Ordering::Relaxed);
+            }
         });
         if ahead {
             crate::watch::ask_ahead_done();
         }
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
-        let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
-        PREPARING[2].fetch_sub(summed[1], Ordering::Relaxed);
-        PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
+        let copies = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before[0]);
+        let textures = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before[1]);
+        PREPARING[2].fetch_sub(textures, Ordering::Relaxed);
+        PREPARING[0].fetch_sub(copies, Ordering::Relaxed);
         PREPARING[0].fetch_add(took, Ordering::Relaxed);
         SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
@@ -8719,16 +9893,22 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
-        if light && self.refreshes.len() <= FEW {
+        if light {
             let started = std::time::Instant::now();
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let kept = &mut self.kept;
+            self.refreshes.retain(|(shadow, from, to)| {
+                !shadow.fast_nothing_new_known(*from, *to - *from, |a, b| crate::watch::kept_covers_cached(kept, a, b))
+            });
+            if self.refreshes.len() <= FEW {
+                self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // not one per copy (`ask_once` already covers the submission when `kept`).
+        let ahead = self.refreshes.len() > 1 && !crate::watch::kept();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -8748,15 +9928,26 @@ impl Batch {
             let before = PREPARING[0].load(Ordering::Relaxed);
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
-                // A number to a free thread, not a job to each copy.
+                // A number to a free thread, not a job to each copy; in a
+                // big flush (most of whose copies turn out as they were) a
+                // short group of them, as `refresh_front` claims them: one
+                // claim of the shared counter, one count of the clean ones.
+                const GROUP: usize = 8;
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
+                let many = refreshes.len() > FEW;
+                let group = if many { GROUP } else { 1 };
+                crate::shadow::wide_each(refreshes.len().div_ceil(group), move |i| {
+                    let mut clean = 0;
+                    for (shadow, from, to) in &refreshes[i * group..((i + 1) * group).min(refreshes.len())] {
+                        if many && shadow.nothing_new(*from, *to - *from) {
+                            clean += 1;
+                            continue;
+                        }
+                        Self::update(shadow, *from, *to);
                     }
-                    Self::update(shadow, *from, *to);
+                    if clean != 0 {
+                        FLUSHES[2].fetch_add(clean, Ordering::Relaxed);
+                    }
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
@@ -8777,6 +9968,37 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// `victory bench`: submissions' refreshes run as a submission runs them.
+/// Each of `submissions` (copy, title address, bytes per refresh step, in
+/// step order) asks the write watch once for all it refreshes
+/// ([`crate::watch::ask_once`]), then its steps go into a [`Batch`] (those
+/// known to copy nothing are told so as they come) and the batch is flushed:
+/// what is left is checked and copied on the refreshing threads. Returns the
+/// milliseconds of the askings and of the refreshes.
+pub(crate) fn bench_refreshes(
+    submissions: &[Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>],
+) -> (f64, f64) {
+    let (mut asking, mut refreshing) = (0.0, 0.0);
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for steps in submissions {
+        ranges.clear();
+        ranges.extend(steps.iter().map(|s| (s.1, s.1 + s.2)));
+        let started = std::time::Instant::now();
+        crate::watch::ask_once(&ranges);
+        asking += started.elapsed().as_secs_f64() * 1e3;
+        let started = std::time::Instant::now();
+        let mut batch = Batch::reused();
+        for (shadow, at, len) in steps {
+            batch.add(shadow, *at, *len);
+        }
+        batch.flush();
+        batch.give_back();
+        refreshing += started.elapsed().as_secs_f64() * 1e3;
+        crate::watch::ask_once_end();
+    }
+    (asking, refreshing)
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -8886,6 +10108,12 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if size != size_of_val(&info) || n == 0 {
             read_pieces(at, to, remaining);
             break;
+        }
+        if info.State == MEM_COMMIT
+            && info.Protect == PAGE_NOACCESS
+            && crate::demand::fulfill_range(at as usize, n, false)
+        {
+            continue;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
@@ -9163,6 +10391,20 @@ impl Host {
         }
     }
 
+    /// [`Host::read_back_buffer`] of `size` bytes or more, from
+    /// [`BUFFER_POOL`] when it keeps one of the size's class (given back
+    /// when the list that holds it is reset, `HostList::defer_read_back`).
+    pub(crate) fn read_back_pooled(&self, size: u64) -> Option<ID3D12Resource> {
+        let Some((i, class)) = pool_class(size) else {
+            return self.read_back_buffer(size);
+        };
+        if let Some(Pooled(buffer, _)) = take_pooled(i, class, false) {
+            return Some(buffer);
+        }
+        POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+        self.read_back_buffer(class)
+    }
+
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
@@ -9190,7 +10432,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -9198,7 +10440,6 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9338,6 +10579,7 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         late_line(frames);
         crate::queue::behind_line(frames);
+        shown::line(frames);
         crate::streamline::line(frames);
         card_clock_line(frames, ms);
         two_queues::line(frames);
@@ -9358,6 +10600,14 @@ impl Meter {
                      ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \
                      {wc_left:.1} MB declared written in write-combined memory left on the card (VICTORY_WC_NO_BACK)",
                     if rehash_runs() { "on" } else { "off" }
+                );
+            }
+            let [changed, taken, sent, compared] = [0, 1, 2, 3].map(|i| CARD_TIME[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            if changed + taken + sent + compared > 0.0 {
+                tracing::info!(
+                    "copies in the card's memory, the submitting thread per frame: {changed:.2} ms what changed, {taken:.2} taking \
+                     the bytes out, {sent:.2} the list that sends and hashes again (recorded and sent), {compared:.2} the \
+                     compares planned and recorded"
                 );
             }
         }
@@ -9656,6 +10906,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            crate::copystat_footprint::log();
             let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
@@ -9688,6 +10939,9 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            // Where every thread's time went since the last line (`VICTORY_CPU_STAGES`).
+            #[cfg(target_arch = "x86_64")]
+            crate::stages::frame_line(frames);
             #[cfg(feature = "diagnostics")]
             {
                 let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -9767,6 +11021,10 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        // The present before is over (its Present may be on the presenting thread,
+        // [`shown`]): the swap chain, its back buffer index and the frame's markers go in
+        // order.
+        self.present_wait();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {
@@ -9887,6 +11145,7 @@ impl Host {
             let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
                 copy.keep(over);
                 if let Some(composer) = p.composer.as_mut() {
+                    copy.trace_gpu_pass("present: composite display planes", [width.into(), height.into(), 0, 0, 0]);
                     let mut pre = Vec::with_capacity(3);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         pre.push(transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
@@ -9943,6 +11202,9 @@ impl Host {
                 false
             };
             if !composed {
+                if render_trace::active() {
+                    copy.gpu_pass_ours(5, "present: copy to the swap chain");
+                }
                 let mut pre = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
                     pre.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
@@ -9988,6 +11250,9 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
+            if render_trace::active() {
+                copy.gpu_pass_ours(6, "present: performance panel and menu");
+            }
             p.panel.draw(self, copy, &back, (width, height), format);
             p.notice.draw(self, copy, &back, (width, height), format);
             p.menu.draw(self, copy, &back, (width, height), format);
@@ -10056,8 +11321,27 @@ impl Host {
                     size: [width, height],
                 },
             );
+            // The Present on the presenting thread ([`shown`]): with frame generation it
+            // blocks while frames are paced, and this thread prepares the next frame's
+            // submissions meanwhile (they reach the queue after it, in order). Only with the
+            // copy sent ahead, which nothing here waits for.
+            if shown::on() && slot.is_some() {
+                showing.end();
+                let job = shown::Job { swap_chain: p.swap_chain.clone(), presenting, frame };
+                drop(back);
+                drop(presenter);
+                shown::hand_over(job);
+                #[cfg(feature = "diagnostics")]
+                return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+                #[cfg(not(feature = "diagnostics"))]
+                return Some(false);
+            }
             let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let trace_start = render_trace::active().then(now_us);
+            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if let Some(start) = trace_start {
+                render_trace::event("present", format_args!("present_frame={frame}\tstart_us={start}\tduration_us={}\tstatus={:#x}\tasync=false", now_us().saturating_sub(start), result.0));
+            }
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
@@ -10076,6 +11360,7 @@ impl Host {
     /// sent has run (`victory upscaler-check`: before Streamline is shut
     /// down; nothing presents afterwards).
     pub(crate) fn drop_presenter(&self) {
+        self.present_wait();
         settle_now(WHY_SYNC);
         *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -10295,6 +11580,17 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_with(size, true)
+    }
+
+    /// Like [`Host::shared_buffer`], without synchronous `MakeResident` /
+    /// copy-queue `mapped()` waits for CPU staging, readback, and relay buffers
+    /// that are only referenced by command lists submitted after creation.
+    pub(crate) fn shared_buffer_cpu(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_with(size, false)
+    }
+
+    fn shared_buffer_with(&self, size: u64, wait_map: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10324,7 +11620,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    if wait_map { not_resident() } else { D3D12_HEAP_FLAG_NONE },
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -10332,8 +11628,10 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if wait_map {
+                        resident(&self.device, b)?;
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };

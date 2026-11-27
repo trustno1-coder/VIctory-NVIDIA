@@ -143,6 +143,12 @@ pub fn run(
         cfg.cache_subdir("images")?
     };
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    // The pipelines earlier runs used are made from here on, not when the
+    // title creates each (its loading screen is the time to make them).
+    #[cfg(windows)]
+    if execute {
+        victory_hle::known_pipelines::prewarm();
+    }
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the

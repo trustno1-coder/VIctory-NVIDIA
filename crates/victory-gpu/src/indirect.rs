@@ -440,6 +440,7 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
+    list.trace_gpu_pass("indirect argument clamp", [spec.0.into(), spec.1.into(), spec.2.into(), i64::from(ahead), 0]);
     let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
     if recorded {
         list.indirect_readable(dst);
@@ -513,8 +514,8 @@ fn record_clamp_as(
     // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`. Moving
     // it out of `INDIRECT_ARGUMENT` orders this clamp's writes after every
     // earlier execution's reads of the scratch buffer; nothing else writes it.
-    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
-    // waits for every earlier shader write out (the state changes stay).
+    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the wait
+    // for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
@@ -525,14 +526,14 @@ fn record_clamp_as(
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
+    // The state transition on `dst` already orders UAV writes to `dst` before
+    // `ExecuteIndirect` reads it; `budget` is only read/written by the next
+    // clamp/batch pass, which begins with `first[0]` (`uav_barrier()`).
+    let after = transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    );
     let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
@@ -547,7 +548,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&[after]);
     }
     true
 }
@@ -603,6 +604,7 @@ pub(crate) fn open_batch(
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    list.trace_gpu_pass("indirect argument clamp batch", [0; 5]);
     batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
@@ -960,6 +962,170 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// A table pass of the compare (`crate::host::card_table`): the pieces are
+    /// the numbers put in the result dwords, in any order, and each result is
+    /// that piece's, as a pass over the piece alone gives it; a hashing table
+    /// pass stores the hashes a later compare finds unchanged.
+    #[test]
+    fn warp_card_table_pass_takes_the_pieces_named() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 4;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 13 + i / 97) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let order = [3u32, 0, 2];
+        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for (slot, piece) in order.iter().enumerate() {
+                    differs_ptr.cast::<u32>().add(slot).write_volatile(*piece);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, 0, size as u32, order.len() as u32, 0, mode | 4];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(order.len() as u32, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2].map(|slot| unsafe { differs_ptr.cast::<u32>().add(slot).read_volatile() })
+        };
+        // Hashed through the table: the dwords keep the numbers.
+        assert_eq!(run(&mut warp, 0), order);
+        // Compared through it: unchanged, and each the hash of its own piece.
+        let found = run(&mut warp, 1);
+        for (slot, &piece) in order.iter().enumerate() {
+            assert_eq!(found[slot] & 1, 0, "piece {piece}");
+            // SAFETY: inside the mapping, which the card has read.
+            let bytes = unsafe { std::slice::from_raw_parts(now_ptr.add(piece as usize * PIECE).cast_const(), PIECE) };
+            assert_eq!(found[slot] >> 1, crate::host::piece_hash(bytes), "piece {piece}");
+        }
+        // A change in piece 2 (slot 2) only.
+        // SAFETY: inside the mapping.
+        unsafe { now_ptr.add(2 * PIECE + 77).write_volatile(content[2 * PIECE + 77] ^ 0x10) };
+        assert_eq!(run(&mut warp, 1).map(|d| d & 1), [0, 0, 1]);
+    }
+
+    /// The pass that brings flagged pieces down with their flight
+    /// (`crate::host::prefetch`), on the software adapter, after the
+    /// compare: each flagged piece takes a slot (noted at its place in the
+    /// header, 1 on) and comes down whole; the others are noted 0; past the
+    /// slots a flagged piece is noted 0 and counted.
+    #[test]
+    fn warp_card_spill_brings_down_the_flagged_pieces_whole() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let spill = compile_cs(&warp.device, crate::host::CARD_SPILL).expect("the card spill must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 4;
+        // The copy begins 100 bytes into its first piece (the skew).
+        const SKEW: u32 = 100;
+        // (A multiple of 16: the card's buffers are of 64 KiB.)
+        let size = PIECE * PIECES as usize - 96;
+        let stride = crate::host::SPILL_STRIDE as usize;
+        const HEADER: u32 = 256;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, _, differs_gpu) = warp.shared_buffer(64);
+        let (_slots, slots_ptr, slots_gpu) = warp.shared_buffer(u64::from(HEADER) + 4 * stride as u64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 7 + i / 509) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32, capacity: u32| {
+            // SAFETY: our open list, live buffers, each pass's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                slots_ptr.cast::<u32>().write_volatile(0);
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, SKEW, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+                warp.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
+                }]);
+                if mode != 0 {
+                    warp.list.SetComputeRootSignature(&spill.root);
+                    warp.list.SetPipelineState(&spill.pso);
+                    let constants = [0u32, SKEW, size as u32, PIECES, 0, 0, capacity, HEADER];
+                    warp.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, differs_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, slots_gpu);
+                    warp.list.Dispatch(PIECES, 1, 1);
+                }
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            let count = unsafe { slots_ptr.cast::<u32>().read_volatile() };
+            let slots: Vec<u32> = (0..PIECES as usize).map(|p| unsafe { slots_ptr.cast::<u32>().add(1 + p).read_volatile() }).collect();
+            (count, slots)
+        };
+        // Hashed first; then nothing flagged.
+        run(&mut warp, 0, 4);
+        assert_eq!(run(&mut warp, 2, 4), (0, vec![0, 0, 0, 0]));
+        // Pieces 0 and 2 changed: both come down, whole.
+        let changed = [10usize, 2 * PIECE + 5000 - SKEW as usize];
+        for &at in &changed {
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x5A) };
+        }
+        let (count, slots) = run(&mut warp, 2, 4);
+        assert_eq!(count, 2);
+        assert_eq!(slots[1], 0);
+        assert_eq!(slots[3], 0);
+        let mut taken: Vec<u32> = vec![slots[0], slots[2]];
+        taken.sort_unstable();
+        assert_eq!(taken, [1, 2]);
+        for piece in [0usize, 2] {
+            // The piece's offsets in the copy, widened to 16 bytes, as the
+            // compare hashes them.
+            let lo = (piece * PIECE).saturating_sub(SKEW as usize) & !15;
+            let hi = (((piece + 1) * PIECE - SKEW as usize).min(size) + 15) & !15;
+            let at = HEADER as usize + (slots[piece] as usize - 1) * stride;
+            // SAFETY: inside both mappings.
+            let (down, now) = unsafe {
+                (
+                    std::slice::from_raw_parts(slots_ptr.add(at).cast_const(), hi - lo),
+                    std::slice::from_raw_parts(now_ptr.add(lo).cast_const(), hi - lo),
+                )
+            };
+            assert!(down == now, "piece {piece} came down whole");
+        }
+        // One slot: the second flagged piece is counted, noted 0.
+        for &at in &changed {
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(content[at]) };
+        }
+        let (count, slots) = run(&mut warp, 2, 1);
+        assert_eq!(count, 2);
+        assert_eq!(slots.iter().filter(|&&s| s == 1).count(), 1);
+        assert_eq!(slots.iter().filter(|&&s| s == 0).count(), 3);
     }
 
     /// What the passes over copies in the card's memory cost on the card

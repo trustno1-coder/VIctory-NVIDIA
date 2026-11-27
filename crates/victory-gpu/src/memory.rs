@@ -87,7 +87,7 @@ const PIECE: usize = 4096;
 /// Pages held, at most (3 GiB).
 const MOST: usize = 3 << 14;
 /// Pages of title memory with small title buffers in them, at most.
-const WINDOWS: usize = 512;
+const WINDOWS: usize = 2048;
 /// The biggest packed structure taken for one.
 const PACKED: u64 = 64 << 20;
 /// For so many frames what a page holds may still be on its way.
@@ -435,13 +435,31 @@ impl Memory {
         }
     }
 
+    /// Coalesces sorted `pages` into contiguous runs and calls [`Memory::bring`]
+    /// on each run.
+    fn bring_pages(&mut self, pages: &[u64]) {
+        let Some(&first) = pages.first() else { return };
+        let (mut run_start, mut run_end) = (first, first + 1);
+        for &page in &pages[1..] {
+            if page == run_end {
+                run_end += 1;
+            } else {
+                self.bring(run_start, run_end);
+                run_start = page;
+                run_end = page + 1;
+            }
+        }
+        self.bring(run_start, run_end);
+    }
+
     /// Looks at some of the pages and packed structures again.
     fn look_again(&mut self) {
+        let mut sweep_pages = Vec::new();
         for _ in 0..self.order.len().div_ceil(SWEEP) {
             self.sweep = (self.sweep + 1) % self.order.len();
             let page = self.order[self.sweep];
             if self.pages.contains_key(&page) {
-                self.bring(page, page + 1);
+                sweep_pages.push(page);
             } else {
                 self.order.swap_remove(self.sweep);
                 if self.order.is_empty() {
@@ -449,6 +467,9 @@ impl Memory {
                 }
             }
         }
+        sweep_pages.sort_unstable();
+        sweep_pages.dedup();
+        self.bring_pages(&sweep_pages);
         for _ in 0..self.packed_order.len().div_ceil(SWEEP) {
             self.packed_sweep = (self.packed_sweep + 1) % self.packed_order.len();
             let address = self.packed_order[self.packed_sweep];
@@ -675,13 +696,15 @@ impl Memory {
         }
         pages.sort_unstable();
         let mut made = 0;
+        let mut mapped = Vec::new();
         for &page in &pages {
             if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
                 made += 1;
                 self.faulted += 1;
-                self.bring(page, page + 1);
+                mapped.push(page);
             }
         }
+        self.bring_pages(&mapped);
         self.stats.faults += pages.len() as u64;
         // Each is an access that read 0 or was dropped.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -796,36 +819,34 @@ impl Memory {
 /// A list with this key ([`HostList::used`]) asks the builder for sizes.
 const SIZES: usize = usize::MAX - (9 << 33);
 
+/// Whether the current frame recorded a dispatch that asks for BVH sizes.
+static SIZES_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Returns and clears whether the frame recorded a BVH size query, so `present`
+/// drains submissions before the next frame reads the compacted-size slot.
+pub(crate) fn take_sizes_frame() -> bool {
+    SIZES_FRAME.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
 /// Whether a submission that asks for the sizes of structures is waited for,
-/// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off).
-///
-/// Off: it does not help. In run light-15, with it, 33 of 154 copies had the
-/// slot's old size still (all of them recorded one frame after the size was
-/// asked for) against 53 of 230 in light-11, 48 of 275 dynamic structures
-/// were good, and the title asks in every frame, so every frame waits (109 ms
-/// against 90). The title reads the slot before our submission of the asking
-/// list is through, or reads it for another purpose; not known.
-///
-/// The title asks for a new structure's compacted size (a program of one
-/// thread stores it into a small buffer), reads it a frame or two later
-/// without looking whether it is there, takes memory of that size and copies
-/// the structure into it. With submissions that land up to two frames late it
-/// read what the slot held before, some other structure's size, and the copy
-/// wrote over its neighbours: of 230 such copies of run light-11, 99 were
-/// asked for two frames earlier and landed in that frame, none of those with
-/// the right size.
+/// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT`; on with
+/// `VICTORY_BVH_BUILDER=1` unless `=0`).
 fn sizes_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_BVH_SIZES_WAIT").ok().as_deref().map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => crate::pipeline::builder_runs(),
+    })
 }
 
 /// Whether a dispatch of the builder is its program of a structure's size:
 /// one thread, the structure's address and what to store (1: the compacted
-/// size) as constants, a small title buffer to store into.
+/// size) as constants, a title buffer to store into.
 fn asks_size(written: &[u64], constants: &[u32], threads: Option<[u32; 3]>) -> bool {
     threads == Some([1, 1, 1])
         && matches!(*constants, [_, hi, 1..=3, ..] if (1..0x20).contains(&hi))
-        && written.first().is_some_and(|&at| crate::shadow::in_buffer(at, 1).is_some_and(|b| b.1 <= BACK))
+        && written.first().is_some_and(|&at| crate::shadow::in_buffer(at, 1).is_some())
 }
 
 /// Whether one of `lists` asks for sizes.
@@ -923,8 +944,10 @@ pub(crate) fn ready(
         m.trace.dispatch(frame, list, addresses, written, constants, threads);
     }
     let builds = use_ != Use::Reads;
-    if builds && sizes_wait() && asks_size(written, constants, threads) {
+    let asked_size = builds && sizes_wait() && asks_size(written, constants, threads);
+    if asked_size {
         list.first_use(SIZES);
+        SIZES_FRAME.store(true, std::sync::atomic::Ordering::Release);
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
@@ -984,15 +1007,21 @@ pub(crate) fn ready(
                     m.land(at);
                 }
             });
-            m.bring_up(list);
+            if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
+                m.bring_up(list);
+            }
         }
         if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
-            if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
-                && len <= BACK
-                && use_ == (Use::Builds { back: true })
-                && list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
+            if use_ == (Use::Builds { back: true })
+                && let Some((start, len)) = crate::shadow::in_buffer(at, 1)
             {
-                m.small(list, start, len);
+                if len <= BACK {
+                    if list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize) {
+                        m.small(list, start, len);
+                    }
+                } else if asked_size {
+                    m.small(list, at & !0xFF, 256);
+                }
             }
             m.opens(at);
             if !packed && crate::shadow::in_buffer(at, 1).is_none() {
@@ -1030,7 +1059,7 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let base = heap.reserve_dynamic(COPIES + 1)?;
             // Every slot of the run: a number shows no view of another kind.
             for n in 0..=COPIES {
                 heap.null_raw_uav_at(base + n);

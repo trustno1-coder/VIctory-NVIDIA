@@ -29,6 +29,9 @@ pub use victory_gpu::console;
 pub use victory_gpu::streamline;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::replay;
+/// A frame-rate estimate from a run's log without the title (`victory bench`).
+#[cfg(windows)]
+pub use victory_gpu::bench;
 
 #[cfg(windows)]
 pub use victory_gpu::pipeline::known as known_pipelines;

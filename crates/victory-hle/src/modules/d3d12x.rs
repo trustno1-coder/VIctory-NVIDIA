@@ -66,12 +66,16 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
 }
 
 /// Keeps the host's translations of the title's shaders in `dir` (a
-/// folder of the cache) across runs, and its compiled pipelines beside it
-/// (`pipelines`).
+/// folder of the cache) across runs, its compiled pipelines beside it
+/// (`pipelines`), and the texture book and converted DirectStorage outputs
+/// (`textures`).
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
         victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
+        // The texture book and the converted cache beside them (`textures`):
+        // a folder of the same checked cache root, never the repository's.
+        victory_gpu::texture_book::use_dir(dir.with_file_name("textures"));
         victory_gpu::shader_cache::use_shader_cache(dir);
     }
     #[cfg(not(windows))]

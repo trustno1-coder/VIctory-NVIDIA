@@ -150,7 +150,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    // What the texture book and the converted cache know the file's requests
+    // by (a `.rpf` opening is also a sign of a loading screen).
+    let key = victory_gpu::texture_book::file_opened(&kept);
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, key });
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -278,6 +281,8 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    /// [`victory_gpu::texture_book::file_opened`]'s number for its path.
+    key: u64,
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -321,9 +326,13 @@ struct Files {
     io: Io,
 }
 
+fn worker_count() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
+}
+
 impl Files {
     fn new(first: std::fs::File, io: Io) -> Files {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let others = match io {
             Io::One => 0,
             Io::Overlapped => 1,
@@ -629,12 +638,22 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(|| {
+                        // Keep background streaming/decompression below translation and submit threads.
+                        #[cfg(windows)]
+                        unsafe {
+                            use windows_sys::Win32::System::Threading::{
+                                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                            };
+                            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
+                        work(scheduler);
+                    })
                     .is_ok()
             })
             .count();
@@ -786,6 +805,9 @@ fn work(scheduler: &'static Scheduler) {
         let reading = victory_gpu::timeline::span("streaming: a request");
         let result = execute(&job.request);
         reading.end();
+        if result.is_ok() {
+            landed(&job.request);
+        }
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
         if let Some(traced) = traced {
@@ -1408,6 +1430,24 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    // Decoded before (in this run or an earlier one): read, not decoded.
+    let cached = converted_key(request, size).map(|key| (key, victory_gpu::converted_cache::source_hash(&source)));
+    if let Some((key, hash)) = cached
+        && let Some(hit) = victory_gpu::converted_cache::open(&key, hash)
+    {
+        let n = hit.bytes();
+        let mut hit = Some(hit);
+        let served = into_destination(request, size, |out| match hit.take() {
+            Some(hit) if n <= out.len() => {
+                if hit.read_into(&mut out[..n]) { Ok(n) } else { Err(INVALID_DATA) }
+            }
+            _ => Err(INVALID_DATA),
+        });
+        if served.is_ok() {
+            return Ok(());
+        }
+        tracing::debug!("dstorage: a converted cache entry could not be read; decoded");
+    }
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -1417,11 +1457,18 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    into_destination(request, size, |out| {
+        let n = match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string()))?,
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib"))?,
+        };
+        // Write-through: kept for the next time this request comes.
+        if let Some((key, hash)) = cached {
+            victory_gpu::converted_cache::store(key, hash, out[..n].to_vec());
+        }
+        Ok(n)
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1430,6 +1477,49 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         "dstorage: request done"
     );
     Ok(())
+}
+
+/// The converted cache's key for a decoding request from a file whose
+/// output (`size` bytes) is worth keeping: BCPack requests (the costly
+/// decode), zlib ones only from 1 MiB up. `None` for memory sources.
+fn converted_key(request: &Request, size: usize) -> Option<victory_gpu::texture_book::Key> {
+    let worth = request.options & BCPACK != 0 || size >= 1 << 20;
+    (worth && victory_gpu::converted_cache::wanted(size)).then(|| request_key(request)).flatten()
+}
+
+/// What a request is known by across runs; `None` for a memory source.
+fn request_key(request: &Request) -> Option<victory_gpu::texture_book::Key> {
+    if request.options & MEMORY_SOURCE != 0 || request.source.is_null() {
+        return None;
+    }
+    // SAFETY: a file object we created; the title keeps it open.
+    let file = unsafe { &*request.source.cast::<Instance<File>>() }.state.key;
+    Some(victory_gpu::texture_book::Key {
+        file,
+        offset: request.offset,
+        source_size: request.source_size,
+        dest_size: request.destination_size,
+        options: request.options,
+    })
+}
+
+/// A request finished well: the texture book is told where its bytes are
+/// in title memory, so that a texture it filled is made ready for the card
+/// at once (`victory_gpu::texture_book`).
+fn landed(request: &Request) {
+    let len = if request.options & (ZLIB | BCPACK) != 0 { request.destination_size } else { request.source_size } as usize;
+    let key = request_key(request);
+    let at = if request.options & PAGE_DESTINATION == 0 {
+        request.destination as usize
+    } else if len >= 4096 {
+        // Where the title sees the pages written: one run covering them all.
+        let offset = (request.page_offset & 0xffff) as usize;
+        let pages = read_list(request.destination.cast(), offset, len);
+        super::xmem::shown_at(&pages, offset, len).into_iter().find(|&(_, n)| n >= len).map_or(0, |(at, _)| at)
+    } else {
+        0
+    };
+    victory_gpu::texture_book::request_done(key, at, len);
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream

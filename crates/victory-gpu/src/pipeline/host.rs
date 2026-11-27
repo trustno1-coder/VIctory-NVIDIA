@@ -361,6 +361,7 @@ pub(crate) struct Stage {
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
+    /// Constant buffers are raw root SRVs (`victory_shader::emit::HostShader::root_cbvs`).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
     /// Root UAVs: one-view tables like the SRVs (or root descriptors with
@@ -498,21 +499,29 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
-            for (slots, kind, out) in [
+            // Root constant buffers are raw root SRVs (`t<slot>`): the
+            // translation reads them as raw bytes, at the title's address,
+            // which needs 4 bytes where a CBV needs 256 (the title's lie on
+            // 16), and reads zeros past the 64 KiB a CBV shows itself. So
+            // they stay root descriptors, never one-view tables.
+            for (slots, kind, out, constants) in [
                 (
                     &t.root_cbvs,
-                    D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_cbvs,
+                    true,
                 ),
                 (
                     &t.root_srvs,
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
+                    false,
                 ),
                 (
                     &t.root_uavs,
                     D3D12_ROOT_PARAMETER_TYPE_UAV,
                     &mut stage.root_uavs,
+                    false,
                 ),
             ] {
                 for &slot in slots {
@@ -527,7 +536,7 @@ impl HostPipeline {
                             || slot == victory_shader::emit::SLOT_TABLE_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
-                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && !constants && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the
                         // reads (and a root UAV's writes), which a root
                         // descriptor leaves unbounded.
@@ -599,9 +608,9 @@ impl HostPipeline {
                 return None;
             }
         };
-        // Not from the library if it has static samplers (their places in the
-        // driver's table differ between runs: `library::with_static_samplers`).
-        let _samplers = super::library::with_static_samplers(!samplers.is_empty());
+        // From the library with static samplers only where their places in
+        // the driver's table are those of earlier runs (`pipeline::samplers`).
+        let _samplers = super::library::with_static_samplers(super::samplers::admit(&samplers));
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),

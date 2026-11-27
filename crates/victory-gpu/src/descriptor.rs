@@ -289,7 +289,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                 let mut r = rounds();
                 let mut asked = r.0 != r.1;
                 while !asked {
-                    let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
+                    let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 100) else {
                         r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
                         asked = r.0 != r.1;
                         continue;
@@ -434,6 +434,11 @@ pub(crate) fn sync_heaps() {
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
     let mut spent = [0u64; 3];
+    // Calls to the kernel's write watch (`Tracked::take`), ns of those that found nothing,
+    // ns of those that found pages, calls that found nothing.
+    let mut ask = [0u64; 4];
+    // Ring pages, their bytes, changed records on them.
+    let mut ring = [0u64; 3];
     let since = |at: std::time::Instant| at.elapsed().as_nanos() as u64;
     let mut kinds = [0u64; 5];
     let mut short = 0u64;
@@ -474,7 +479,12 @@ pub(crate) fn sync_heaps() {
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
-        spent[0] += since(began);
+        let asking = since(began);
+        spent[0] += asking;
+        // (E4) the asking, split by whether it found anything.
+        ask[0] += 1;
+        ask[if taken.is_empty() { 1 } else { 2 }] += asking;
+        ask[3] += u64::from(taken.is_empty());
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
             let mut page = range_from & !(crate::watch::PAGE - 1);
@@ -545,6 +555,8 @@ pub(crate) fn sync_heaps() {
                     unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
                     records
                 };
+                let tabled_before = out.tabled;
+                let changed_here = changed.len() as u64;
                 for &index in &changed {
                     let at = (u64::from(index) - first) as usize * step as usize;
                     let word = |n: usize| {
@@ -587,6 +599,14 @@ pub(crate) fn sync_heaps() {
                         2
                     }] += 1;
                 }
+                // (E5) a ring page: nearly all of the records that changed on it
+                // are of draws' tables (the title's table ring).
+                let tabled_here = out.tabled - tabled_before;
+                if changed_here > 0 && tabled_here * 10 > changed_here * 9 {
+                    out.ring[0] += 1;
+                    out.ring[1] += (to - from) as u64;
+                    out.ring[2] += changed_here;
+                }
             }
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
         });
@@ -606,6 +626,9 @@ pub(crate) fn sync_heaps() {
             make.append(&mut part.make);
             for (kind, n) in kinds.iter_mut().zip(part.kinds) {
                 *kind += n;
+            }
+            for (sum, n) in ring.iter_mut().zip(part.ring) {
+                *sum += n;
             }
         }
         spent[1] += since(began);
@@ -633,7 +656,32 @@ pub(crate) fn sync_heaps() {
         count.fetch_add(n, Relaxed);
     }
     SYNC_SHORT.fetch_add(short, Relaxed);
+    for (count, n) in SYNC_ASK.iter().zip(ask) {
+        count.fetch_add(n, Relaxed);
+    }
+    for (count, n) in SYNC_RING.iter().zip(ring) {
+        count.fetch_add(n, Relaxed);
+    }
+    SYNC_ROUNDS_DONE[0].fetch_add(1, Relaxed);
+    SYNC_ROUNDS_DONE[1].fetch_add(u64::from(pages == 0), Relaxed);
 }
+
+/// Since the last frame line, of [`sync_heaps`]: rounds run, rounds in which no
+/// heap page had changed.
+#[cfg(windows)]
+static SYNC_ROUNDS_DONE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Since the last frame line: asks of the kernel's write watch (one per heap per
+/// round), nanoseconds of those that found nothing, of those that found pages,
+/// and how many found nothing.
+#[cfg(windows)]
+static SYNC_ASK: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Since the last frame line: ring pages (changed pages on which more than 90%
+/// of the changed records were of draws' tables), their bytes, the records that
+/// changed on them.
+#[cfg(windows)]
+static SYNC_RING: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Pages [`sync_heaps`] read in place of which a part could not be read
 /// ([`sync_in_place`]), since the last frame line.
@@ -682,6 +730,8 @@ struct SyncPart {
     kinds: [u64; 5],
     /// Pages read in place not all there ([`SYNC_SHORT`]).
     short: u64,
+    /// Ring pages, their bytes, the records that changed on them.
+    ring: [u64; 3],
 }
 
 /// Pages [`sync_heaps`] gives a thread at a time.
@@ -761,6 +811,34 @@ pub(crate) fn sync_line(frames: f64) {
             quick[0],
             quick[1],
             sync_jobs().0
+        );
+    }
+    let rounds = [0, 1].map(|i| SYNC_ROUNDS_DONE[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let ask = [0, 1, 2, 3].map(|i| SYNC_ASK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    let ring = [0, 1, 2].map(|i| SYNC_RING[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    let [made, made_ns, twin_made, twin_ns] =
+        [0, 1, 2, 3].map(|i| host::VIEW_MAKE[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    if made > 0.0 {
+        tracing::info!(
+            "view creation per frame (VICTORY_DESCRIPTOR_TIMING=0: counted, not timed): {:.0} buffer views in {:.2} ms,              {:.0} raw twins in {:.2} ms (thread time, all threads)",
+            made / frames,
+            made_ns / 1e6 / frames,
+            twin_made / frames,
+            twin_ns / 1e6 / frames
+        );
+    }
+    if rounds[0] > 0 {
+        tracing::info!(
+            "the heaps' records, rounds per frame: {:.1} run, {:.1} of them with no changed page; {:.1} asks of the write              watch, {:.2} ms in those that found nothing ({:.1}), {:.2} ms in those that found pages; {:.1} ring pages              (over 90% of their changed records of draws' tables), {:.2} MB of them read, {:.0} records changed on them",
+            rounds[0] as f64 / frames,
+            rounds[1] as f64 / frames,
+            ask[0] / frames,
+            ask[1] / 1e6 / frames,
+            ask[3] / frames,
+            ask[2] / 1e6 / frames,
+            ring[0] / frames,
+            ring[1] / (1 << 20) as f64 / frames,
+            ring[2] / frames
         );
     }
     if pages == 0 {
@@ -846,16 +924,16 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
     heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that host heap instance (`id`) still exists.
+/// Give back the slots of completed command lists before readbacks and merges.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(id, first, n);
+pub(crate) fn reclaim_dynamic(completed: u64) {
+    // Allocation can also reclaim completed ranges if a heap is being registered.
+    let Ok(heaps) = SHADER_HEAPS.try_read() else { return };
+    for &(_, _, heap) in heaps.iter() {
+        // SAFETY: registered heaps are live for the read guard.
+        if let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get() {
+            host.reclaim_dynamic(completed);
+        }
     }
 }
 
@@ -1019,7 +1097,7 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
 /// A shader view or sampler as the title described it (descriptions in the
 /// host's layout, kept as words), for the host to build its own from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
@@ -1076,30 +1154,110 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
-struct Views {
-    /// Each entry's view and generation.
-    list: Vec<(View, u32)>,
-    index: std::collections::BTreeMap<View, u32>,
-    /// Entries naming each resource.
-    by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
-    free: Vec<u32>,
-    /// The shapes of views of placed memory, and where each is.
-    shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
+struct FastHash(u64);
+
+impl std::hash::Hasher for FastHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut i = 0;
+        while i + 8 <= bytes.len() {
+            let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+            self.write_u64(chunk);
+            i += 8;
+        }
+        if i < bytes.len() {
+            let mut tail = 0u64;
+            for &b in &bytes[i..] {
+                tail = (tail << 8) | u64::from(b);
+            }
+            self.write_u64(tail);
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+    fn write_u64(&mut self, n: u64) {
+        let h = (self.0.rotate_left(5) ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(u64::from(n));
+    }
 }
 
-/// Read far more often than written: every slot a draw reads through a
-/// table is looked up here, on several recording threads at once in the
-/// world. Readers share it; only a view not seen before (a new table entry
-/// or shape) and a released resource take it alone.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
+#[derive(Default, Clone, Copy)]
+struct FastBuildHasher;
+
+impl std::hash::BuildHasher for FastBuildHasher {
+    type Hasher = FastHash;
+    fn build_hasher(&self) -> FastHash {
+        FastHash(0)
+    }
+}
+
+type FastMap<K, V> = std::collections::HashMap<K, V, FastBuildHasher>;
+
+const VIEW_SHARD_BITS: u32 = 5;
+const VIEW_SHARD_COUNT: usize = 1 << VIEW_SHARD_BITS;
+const VIEW_SHARD_MASK: usize = VIEW_SHARD_COUNT - 1;
+
+struct ViewShard {
+    /// Each entry's view and generation.
+    list: Vec<(View, u32)>,
+    index: FastMap<View, u32>,
+    /// Local entries naming each resource.
+    by_resource: FastMap<usize, Vec<u32>>,
+    free: Vec<u32>,
+}
+
+struct Shapes {
+    /// The shapes of views of placed memory, and where each is.
+    list: Vec<Shape>,
+    index: FastMap<Shape, u32>,
+}
+
+/// Sharded by resource/view so a writer adding an entry or releasing a resource
+/// only blocks readers on that single shard instead of stalling every thread
+/// across the process. Placed shapes live apart in [`SHAPES_TABLE`].
+static VIEW_SHARDS: [crate::sharded::ReadMostly<ViewShard>; VIEW_SHARD_COUNT] = [const {
+    crate::sharded::ReadMostly::new(ViewShard {
+        list: Vec::new(),
+        index: std::collections::HashMap::with_hasher(FastBuildHasher),
+        by_resource: std::collections::HashMap::with_hasher(FastBuildHasher),
+        free: Vec::new(),
+    })
+}; VIEW_SHARD_COUNT];
+
+static SHAPES_TABLE: crate::sharded::ReadMostly<Shapes> = crate::sharded::ReadMostly::new(Shapes {
     list: Vec::new(),
-    index: std::collections::BTreeMap::new(),
-    by_resource: std::collections::BTreeMap::new(),
-    free: Vec::new(),
-    shapes: Vec::new(),
-    shape_index: std::collections::BTreeMap::new(),
+    index: std::collections::HashMap::with_hasher(FastBuildHasher),
 });
+
+/// Extra shards holding an unordered-access view whose counter resource hashes
+/// to another shard than its primary resource.
+static COUNTER_SHARDS: std::sync::RwLock<FastMap<usize, u32>> =
+    std::sync::RwLock::new(std::collections::HashMap::with_hasher(FastBuildHasher));
+static HAS_COUNTER_SHARDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn shard_index(key: usize) -> usize {
+    let h = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    ((h ^ (h >> 32)) as usize) & VIEW_SHARD_MASK
+}
+
+fn view_shard(view: &View) -> usize {
+    match view {
+        View::Shader(r, _) | View::Unordered(r, _, _) if *r != 0 => shard_index(*r),
+        _ => {
+            use std::hash::{Hash, Hasher};
+            let mut h = FastHash(0);
+            view.hash(&mut h);
+            (h.finish() as usize) & VIEW_SHARD_MASK
+        }
+    }
+}
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -1191,19 +1349,19 @@ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
     kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
 }
 
-impl Views {
+impl Shapes {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
     fn shape(&mut self, shape: Shape) -> Option<u32> {
-        if let Some(&at) = self.shape_index.get(&shape) {
+        if let Some(&at) = self.index.get(&shape) {
             return Some(at);
         }
-        if self.shapes.len() >= SHAPES {
+        if self.list.len() >= SHAPES {
             return None;
         }
-        let at = self.shapes.len() as u32;
-        self.shapes.push(shape);
-        self.shape_index.insert(shape, at);
+        let at = self.list.len() as u32;
+        self.list.push(shape);
+        self.index.insert(shape, at);
         Some(at)
     }
 
@@ -1211,30 +1369,43 @@ impl Views {
     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
         let payload = payload(i, generation);
         let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-        let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+        let &(unordered, resource, rest) = self.list.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
         let mut desc = [0u32; 16];
         desc[..10].copy_from_slice(&rest[..10]);
         (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
         desc[12..].copy_from_slice(&rest[10..]);
         Some(View::Placed(unordered, resource, desc))
     }
+}
 
+impl ViewShard {
     /// The record words of `view` as a table entry, if it has one.
-    fn entry_of(&self, view: &View) -> Option<[u32; 2]> {
-        let &i = self.index.get(view)?;
-        Some([i, self.list[i as usize].1])
+    fn entry_of(&self, shard: usize, view: &View) -> Option<[u32; 2]> {
+        let &local = self.index.get(view)?;
+        Some([
+            (local << VIEW_SHARD_BITS) | (shard as u32),
+            self.list[local as usize].1,
+        ])
     }
 
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
-    fn entry(&mut self, view: View) -> [u32; 2] {
-        let i = match self.index.get(&view) {
-            Some(&i) => i,
+    fn entry(&mut self, shard: usize, view: View) -> [u32; 2] {
+        let local = match self.index.get(&view) {
+            Some(&local) => local,
             None => {
-                let i = match self.free.pop() {
-                    Some(i) => {
-                        self.list[i as usize].0 = view.clone();
-                        i
+                if let View::Unordered(_, counter, _) = &view
+                    && *counter != 0
+                    && shard_index(*counter) != shard
+                {
+                    let mut counters = COUNTER_SHARDS.write().unwrap_or_else(|e| e.into_inner());
+                    *counters.entry(*counter).or_insert(0) |= 1u32 << shard;
+                    HAS_COUNTER_SHARDS.store(true, std::sync::atomic::Ordering::Release);
+                }
+                let local = match self.free.pop() {
+                    Some(local) => {
+                        self.list[local as usize].0 = view.clone();
+                        local
                     }
                     None => {
                         self.list.push((view.clone(), 1));
@@ -1242,18 +1413,21 @@ impl Views {
                     }
                 };
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
-                    self.by_resource.entry(r).or_default().push(i);
+                    self.by_resource.entry(r).or_default().push(local);
                 }
-                self.index.insert(view, i);
-                i
+                self.index.insert(view, local);
+                local
             }
         };
-        [i, self.list[i as usize].1]
+        [
+            (local << VIEW_SHARD_BITS) | (shard as u32),
+            self.list[local as usize].1,
+        ]
     }
 }
 
 /// The two words that name `view` in a record: the view itself where its
-/// kind allows ([`Views`]), else its table entry.
+/// kind allows ([`ViewShard`]), else its table entry.
 fn words_for(view: View) -> [u32; 2] {
     use std::sync::atomic::Ordering::Relaxed;
     if inline() {
@@ -1268,8 +1442,8 @@ fn words_for(view: View) -> [u32; 2] {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
-                    let shape = known.or_else(|| views_write().shape(shape));
+                    let known = shapes_read().index.get(&shape).copied();
+                    let shape = known.or_else(|| shapes_write().shape(shape));
                     if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
@@ -1279,41 +1453,66 @@ fn words_for(view: View) -> [u32; 2] {
             _ => {}
         }
     }
+    let shard = view_shard(&view);
     // A view written before keeps its entry and generation.
-    if let Some(words) = views_read().entry_of(&view) {
+    if let Some(words) = shard_read(shard).entry_of(shard, &view) {
         return words;
     }
-    views_write().entry(view)
+    shard_write(shard).entry(shard, view)
 }
 
-fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    match VIEWS.try_read() {
-        Ok(views) => views,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
+fn shard_read(shard: usize) -> crate::sharded::ReadGuard<'static, ViewShard> {
+    let table = &VIEW_SHARDS[shard];
+    match table.try_read() {
+        Some(views) => views,
+        None => {
             let started = std::time::Instant::now();
-            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            let views = table.read();
             waited(1, started);
             views
         }
     }
 }
 
-fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    match VIEWS.try_write() {
-        Ok(views) => views,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
+fn shard_write(shard: usize) -> crate::sharded::WriteGuard<'static, ViewShard> {
+    let table = &VIEW_SHARDS[shard];
+    match table.try_write() {
+        Some(views) => views,
+        None => {
             let started = std::time::Instant::now();
-            let views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+            let views = table.write();
             waited(1, started);
             views
         }
     }
 }
 
-/// For the memory line: the distinct views kept ([`Views`]), those of them
-/// free for reuse, and the bytes the table and its index hold for them (an
+fn shapes_read() -> crate::sharded::ReadGuard<'static, Shapes> {
+    match SHAPES_TABLE.try_read() {
+        Some(shapes) => shapes,
+        None => {
+            let started = std::time::Instant::now();
+            let shapes = SHAPES_TABLE.read();
+            waited(1, started);
+            shapes
+        }
+    }
+}
+
+fn shapes_write() -> crate::sharded::WriteGuard<'static, Shapes> {
+    match SHAPES_TABLE.try_write() {
+        Some(shapes) => shapes,
+        None => {
+            let started = std::time::Instant::now();
+            let shapes = SHAPES_TABLE.write();
+            waited(1, started);
+            shapes
+        }
+    }
+}
+
+/// For the memory line: the distinct views kept ([`VIEW_SHARDS`]), those of
+/// them free for reuse, and the bytes the table and its index hold for them (an
 /// estimate: an entry of the table, and one of the index with its share of
 /// a tree node; the shapes likewise); then the entries that are constant
 /// buffer views and views of placed memory (those that did not fit a
@@ -1323,27 +1522,35 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn views_kept() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
-    let views = views_read();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
-    let (mut constants, mut placed) = (0, 0);
-    for (view, _) in &views.list {
-        match view {
-            View::Constant(..) => constants += 1,
-            View::Placed(..) => placed += 1,
-            _ => {}
+    let (mut list_len, mut free_len, mut list_cap, mut index_len) = (0u64, 0u64, 0u64, 0u64);
+    let (mut constants, mut placed) = (0u64, 0u64);
+    for s in 0..VIEW_SHARD_COUNT {
+        let views = shard_read(s);
+        list_len += views.list.len() as u64;
+        free_len += views.free.len() as u64;
+        list_cap += views.list.capacity() as u64;
+        index_len += views.index.len() as u64;
+        for (view, _) in &views.list {
+            match view {
+                View::Constant(..) => constants += 1,
+                View::Placed(..) => placed += 1,
+                _ => {}
+            }
         }
     }
+    let shapes = shapes_read();
     [
-        views.list.len() as u64,
-        views.free.len() as u64,
-        views.list.capacity() as u64 * each
-            + views.index.len() as u64 * each * 3 / 2
-            + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+        list_len,
+        free_len,
+        list_cap * each
+            + index_len * each * 3 / 2
+            + shapes.list.capacity() as u64 * shape
+            + shapes.index.len() as u64 * shape * 3 / 2,
         constants,
         placed,
-        views.shapes.len() as u64,
+        shapes.list.len() as u64,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
     ]
@@ -1474,6 +1681,34 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+fn forget_in_shard(shard: usize, resource: usize) {
+    // Most released resources have no entry (buffers, textures whose views
+    // are named whole): those take no writer's lock, which stops every
+    // reader. (A view of a resource made while it is released is a title's
+    // fault; as before, such an entry stays if it comes after.)
+    if !shard_read(shard).by_resource.contains_key(&resource) {
+        return;
+    }
+    let mut views = shard_write(shard);
+    let Some(entries) = views.by_resource.remove(&resource) else {
+        return;
+    };
+    for local in entries {
+        let (view, generation) = views.list[local as usize].clone();
+        // Entries freed through a view's other resource may hold another
+        // view by now.
+        if views.index.get(&view) != Some(&local) || !view.resources().contains(&resource) {
+            continue;
+        }
+        views.index.remove(&view);
+        // (Below the bits that say a record is no table entry.)
+        views.list[local as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        // The view's other resource (a counter) keeps a stale entry, which
+        // `forget` of that resource skips.
+        views.free.push(local);
+    }
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
@@ -1481,23 +1716,25 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
-    let mut views = views_write();
-    let Some(entries) = views.by_resource.remove(&resource) else {
-        return;
-    };
-    for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
-            continue;
+    let primary = shard_index(resource);
+    forget_in_shard(primary, resource);
+    if HAS_COUNTER_SHARDS.load(std::sync::atomic::Ordering::Acquire) {
+        let has = COUNTER_SHARDS
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&resource);
+        if has {
+            let mask = COUNTER_SHARDS
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&resource)
+                .unwrap_or(0);
+            for s in 0..VIEW_SHARD_COUNT {
+                if s != primary && (mask & (1u32 << s)) != 0 {
+                    forget_in_shard(s, resource);
+                }
+            }
         }
-        views.index.remove(&view);
-        // (Below the bits that say a record is no table entry.)
-        views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
-        // The view's other resource (a counter) keeps a stale entry, which
-        // `forget` of that resource skips.
-        views.free.push(i);
     }
 }
 
@@ -1506,12 +1743,14 @@ pub(crate) fn forget(resource: usize) {
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
+            let shard = (i as usize) & VIEW_SHARD_MASK;
+            let local = (i as usize) >> VIEW_SHARD_BITS;
+            let views = shard_read(shard);
+            let (view, current) = views.list.get(local)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => shapes_read().placed_of(i, generation),
         _ => None,
     }
 }
@@ -1995,8 +2234,12 @@ mod tests {
             View::Placed(_, r, _) => *r == resource,
             _ => false,
         };
-        let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let entries = || {
+            (0..VIEW_SHARD_COUNT)
+                .map(|s| shard_read(s).list.iter().filter(|(v, _)| mine(v)).count())
+                .sum::<usize>()
+        };
+        let shapes = || shapes_read().list.iter().filter(|s| s.1 == resource).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);

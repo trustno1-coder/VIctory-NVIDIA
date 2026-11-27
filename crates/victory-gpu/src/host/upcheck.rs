@@ -499,8 +499,10 @@ fn run(host: &Host, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> Option<()> {
         list.Close().ok()?;
         let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
         let event = CreateEventW(None, false, false, None).ok()?;
-        host.queue.ExecuteCommandLists(&[Some(list.cast().ok()?)]);
-        let done = host.queue.Signal(&fence, 1).and_then(|()| fence.SetEventOnCompletion(1, event));
+        // (In order with what waits behind a present: `super::shown`.)
+        let done = host
+            .queue_send(&[Some(list.cast().ok()?)], &[], Some((&fence, 1)))
+            .and_then(|()| fence.SetEventOnCompletion(1, event));
         if done.is_ok() {
             WaitForSingleObject(event, INFINITE);
         }

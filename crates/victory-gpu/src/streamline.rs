@@ -1234,6 +1234,7 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
         }
         textures[i] = Some((texture, legal));
     }
+    host.trace_gpu_pass("DLSS Super Resolution", [camera.render[0].into(), camera.render[1].into(), camera.output[0].into(), camera.output[1].into(), id as i64]);
     let recorded = match record(host.list.as_raw(), &textures, &camera, up.pre_exposure, id) {
         Ok(recorded) => recorded,
         Err(why) => return fail(&why),
@@ -2171,7 +2172,7 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
             host.present_planes(&base, 0, None, frame);
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
-        crate::host::settle_for_fence();
+        crate::host::settle_for_fence(crate::host::FenceDrain::ExternalUpscaler);
         lines.push(format!(
             "frame generation: 180 presents, {} with it on, {} frames shown by it, {} presents tagged with a colour without the interface, status {:#x} (0 is fine){}",
             FG_ON_ALL.load(Relaxed) - on,

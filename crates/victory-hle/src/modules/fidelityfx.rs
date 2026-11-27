@@ -187,11 +187,17 @@ fn contexts<T>(f: impl FnOnce(&mut HashMap<usize, Created>) -> T) -> T {
 /// divides by zero at its first upscaling (2026-11-26, 4070 SUPER).
 const SHIPPING_MAX_OUTPUT: [u32; 2] = [1920, 1080];
 const SHIPPING_MAX_RENDER: [u32; 2] = [1280, 720];
+/// The legacy allocation's render size, which the shipping FSR4 accepts too
+/// (DLAA: rendered at the output size). Made smaller than this, the title's
+/// queries on the context disagree with the sizes it asked for and it breaks
+/// into its crash handler at start (2026-11-27, VICTORY_DLSS_MODE=dlaa).
+const SHIPPING_LEGACY_RENDER: [u32; 2] = [1920, 1080];
 
 /// The sizes the title's shipping FSR4 accepts for a context, if `render` and
-/// `output` are not those: (render, output).
+/// `output` are not ones it accepts: (render, output).
 fn shipping_sizes(render: [u32; 2], output: [u32; 2]) -> Option<([u32; 2], [u32; 2])> {
-    ((render, output) != (SHIPPING_MAX_RENDER, SHIPPING_MAX_OUTPUT)).then_some((SHIPPING_MAX_RENDER, SHIPPING_MAX_OUTPUT))
+    let accepted = output == SHIPPING_MAX_OUTPUT && (render == SHIPPING_MAX_RENDER || render == SHIPPING_LEGACY_RENDER);
+    (!accepted).then_some((SHIPPING_MAX_RENDER, SHIPPING_MAX_OUTPUT))
 }
 
 extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, memory: *const c_void) -> u32 {
@@ -476,6 +482,7 @@ mod tests {
         assert_eq!(shipping_sizes([2560, 1440], [2560, 1440]), shipping);
         assert_eq!(shipping_sizes([1280, 720], [2560, 1440]), shipping);
         assert_eq!(shipping_sizes([1280, 720], [1920, 1080]), None);
+        assert_eq!(shipping_sizes([1920, 1080], [1920, 1080]), None);
     }
 
     struct Fixed;

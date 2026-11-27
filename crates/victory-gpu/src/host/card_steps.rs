@@ -537,6 +537,94 @@ enum To {
     Buffer(ID3D12Resource),
 }
 
+/// One copy command: buffer, offset in it, offset in the buffer between, bytes.
+type Run<'a> = (&'a ID3D12Resource, u64, u64, u64);
+
+/// `runs` as fewer commands that leave the same bytes in the same places
+/// (`VICTORY_JOIN_STEPS=0`: one command each, as before). See [`join_runs`].
+fn joined<'a>(runs: &[Run<'a>], reads: bool) -> Vec<Run<'a>> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_STEPS").is_none_or(|v| v != "0")) {
+        return runs.to_vec();
+    }
+    let keyed: Vec<(usize, u64, u64, u64)> = runs.iter().map(|r| (r.0.as_raw() as usize, r.1, r.2, r.3)).collect();
+    // (The buffers by address: one of each is at hand for every key.)
+    let by_key: std::collections::HashMap<usize, &ID3D12Resource> = runs.iter().map(|r| (r.0.as_raw() as usize, r.0)).collect();
+    join_runs(&keyed, reads)
+        .into_iter()
+        .map(|(key, offset, at, len)| (by_key[&key], offset, at, len))
+        .collect()
+}
+
+/// Joins runs (buffer key, offset, offset in between, bytes): one that starts
+/// where the one before it ended, in both buffers, goes on in the same
+/// command. Reads each have a place of their own between, so they may be taken
+/// in the order of their sources, and where the gap between two in the source
+/// is the gap in `between` (under 256 bytes: the padding of a place) the
+/// command reads across it, which puts source bytes into padding nothing
+/// reads. Writes keep their order and join only where they touch.
+fn join_runs(runs: &[(usize, u64, u64, u64)], reads: bool) -> Vec<(usize, u64, u64, u64)> {
+    let mut sorted = runs.to_vec();
+    if reads {
+        sorted.sort_by_key(|&(key, offset, ..)| (key, offset));
+    }
+    let mut out: Vec<(usize, u64, u64, u64)> = Vec::with_capacity(sorted.len());
+    for run in sorted {
+        if let Some(last) = out.last_mut()
+            && last.0 == run.0
+            && run.1 >= last.1 + last.3
+            && run.2 >= last.2 + last.3
+        {
+            let (gap, at_gap) = (run.1 - (last.1 + last.3), run.2 - (last.2 + last.3));
+            if gap == at_gap && (gap == 0 || (reads && gap < 256)) {
+                last.3 += gap + run.3;
+                continue;
+            }
+        }
+        out.push(run);
+    }
+    out
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::join_runs;
+
+    #[test]
+    fn touching_runs_join_in_order() {
+        let runs = [(1, 0, 0, 16), (1, 16, 16, 16), (1, 32, 32, 8)];
+        assert_eq!(join_runs(&runs, false), vec![(1, 0, 0, 40)]);
+    }
+
+    #[test]
+    fn other_buffers_and_places_do_not_join() {
+        let runs = [(1, 0, 0, 16), (2, 16, 16, 16), (2, 40, 32, 8), (2, 48, 40, 8)];
+        assert_eq!(join_runs(&runs, false), vec![(1, 0, 0, 16), (2, 16, 16, 16), (2, 40, 32, 16)]);
+    }
+
+    #[test]
+    fn writes_do_not_cross_a_gap_and_keep_their_order() {
+        let runs = [(1, 512, 512, 480), (1, 0, 0, 480)];
+        assert_eq!(join_runs(&runs, false), runs.to_vec());
+        let runs = [(1, 0, 0, 480), (1, 512, 512, 480)];
+        assert_eq!(join_runs(&runs, false), runs.to_vec());
+    }
+
+    #[test]
+    fn reads_cross_equal_padding_in_any_order() {
+        let runs = [(1, 1024, 1024, 480), (1, 0, 0, 480), (1, 512, 512, 480)];
+        assert_eq!(join_runs(&runs, true), vec![(1, 0, 0, 1504)]);
+    }
+
+    #[test]
+    fn reads_with_different_gaps_stay_apart() {
+        let runs = [(1, 0, 0, 480), (1, 520, 512, 480)];
+        assert_eq!(join_runs(&runs, true), runs.to_vec());
+        let runs = [(1, 0, 0, 16), (1, 4096, 16, 16)];
+        assert_eq!(join_runs(&runs, true), runs.to_vec());
+    }
+}
+
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
 /// are copied into `between` (source, offset in it, offset in `between`,
 /// bytes), then `writes` out of it (destination, offset in it, offset in
@@ -584,11 +672,11 @@ fn record(
         } else {
             list.ResourceBarrier(&[transition(between, constants, dest)]);
         }
-        for &(buffer, offset, at, len) in reads {
+        for (buffer, offset, at, len) in joined(reads, true) {
             list.CopyBufferRegion(between, at, buffer, offset, len);
         }
         list.ResourceBarrier(&barriers);
-        for &(buffer, offset, at, len) in writes {
+        for (buffer, offset, at, len) in joined(writes, false) {
             list.CopyBufferRegion(buffer, offset, between, at, len);
         }
         if !done.is_empty() {

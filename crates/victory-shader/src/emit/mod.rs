@@ -25,10 +25,20 @@
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
-//!   address the title sets is the buffer's.
+//! * **Root CBVs and root SRVs** as root descriptors `t<i>` (raw buffers)
+//!   in [`ROOT_CBV_SPACE`], `i` the title's root parameter index
+//!   ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the address the
+//!   title sets is the buffer's. Constant buffers are read as raw bytes
+//!   (changed 2026-11-27): a CBV's address must lie on 256 bytes on the host,
+//!   the console's on 16, and a raw view lets the host read the title's
+//!   constants where it wrote them. Root ones read zeros past
+//!   [`ROOT_CONSTANT_BYTES`]. Ones in the view heap are read as structured
+//!   buffers of dwords through their own slot: the host makes a constant
+//!   buffer's slot a structured view (`DXGI_FORMAT_UNKNOWN`, stride 4) of
+//!   the CBV's bytes (size rounded to 256, at most 64 KiB), which begins on
+//!   any 4 bytes and reads zeros past its end. Ones picked from the heap by
+//!   a computed index read the raw twin of their slot instead where the
+//!   host keeps twins ([`raw_views`]).
 //! * **Vertex fetch** (added 2026-11-23). The title's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -123,7 +133,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, ROOT_CONSTANT_BYTES, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -425,8 +435,11 @@ pub struct HostShader {
     /// The same samplers decoded, `s<n>` at position n: the static sampler
     /// descriptions the host's root signature declares.
     pub static_samplers: Vec<StaticSampler>,
-    /// Root CBVs the shader reads: root parameter indices, each bound as
-    /// `b<index>` in [`ROOT_CBV_SPACE`].
+    /// Root constant buffers the shader reads: root parameter indices, each
+    /// read as raw bytes through the root SRV `t<index>` in
+    /// [`ROOT_CBV_SPACE`] (a root descriptor at the title's address, which
+    /// needs 4 bytes where a CBV needs 256; zeros past
+    /// [`ROOT_CONSTANT_BYTES`]). The host binds an SRV there, not a CBV.
     pub root_cbvs: Vec<u8>,
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
@@ -622,6 +635,25 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        let tiled_water = tiled_water(c);
+        if tiled_water
+            && wide_option.as_ref().is_none_or(|v| v == "1")
+            && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+        {
+            // These shaders share tile depth and select a lane with scalar
+            // state carried across EXEC branches. Preserve the guest's
+            // wave-wide decisions throughout the original program, while
+            // keeping every vector side effect predicated by guest EXEC.
+            let lowered = (|| {
+                let wave = structure::structure_wide(p, &guest_wave_branches(st))?;
+                let res = resource::track(p, &native.layout, native.stage, Some(&wave))?;
+                emit_program(c, native, p, &wave, io, &res)
+            })();
+            report("tiled water with guest wave branches", &lowered);
+            if done(&lowered) {
+                return lowered.map(|(shader, _)| shader);
+            }
+        }
         // Both archived kernels use one logical wave per group and have
         // validated wave32 PSOs on RTX. Explicit policy wins.
         // The volumetric light's two tiled programs (`CS_TransmissionVolumetrics_Tiled`
@@ -629,21 +661,23 @@ pub fn emit(
         // an LDS read and write in one lane-branch region, so no other form translates
         // them on 32-lane hosts and their dispatches were dropped (no volumetric light
         // or fog on NVIDIA). Widened, they translate (4 and 7 branches taken wave-wide).
-        // The underwater one (`CS_TransmissionVolumetricsSubmerged`) likewise (29 branches).
+        // The full volume and portals-only variants also share LDS within one wave.
+        // Both need the widening retry on wave32 even when the tiled shaders compile.
+        // The underwater variant needs the same retry.
         // The triangle clip's heap defragmentation (`vfx_triangleClip:CS_DefragHeap_
         // ComputeRelocations`, groups of 128) holds two console waves, which walk the heap
         // each its own way: their host waves meet per console wave ([`widen`]). (Its
         // `CS_CollectTriangles_Meshlets`, groups of 1024, does not fit that way: its own LDS
         // is the host group's whole 32 KiB.)
         let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
-            && matches!(
+            && (tiled_water || matches!(
                 c.digest,
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
-                    | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
-                    | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+                    | [0xc4, 0x0b, 0xd9, 0x53, 0x09, 0x6e, 0x88, 0x25, 0xce, 0x64, 0x50, 0xb5, 0x53, 0xf1, 0x23, 0x5c]
+                    | [0x4f, 0xa5, 0x83, 0x20, 0xd7, 0x61, 0xbf, 0x55, 0x81, 0x20, 0xf9, 0x2c, 0x19, 0xd3, 0x84, 0xaa]
                     | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
-            )
+            ))
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
@@ -779,6 +813,18 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+}
+
+fn guest_wave_branches(st: &structure::Structured) -> std::collections::HashSet<usize> {
+    st.wave_any.iter().enumerate().filter_map(|(block, kind)| kind.is_some().then_some(block)).collect()
+}
+
+fn tiled_water(c: &Container) -> bool {
+    matches!(
+        c.digest,
+        [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+            | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+    )
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -975,7 +1021,7 @@ fn emit_program(
         }
         _ => EarlyDepth::NotAsked,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -985,7 +1031,15 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    let l = if tiled_water(c) && lower::host_max_wave() == 32 {
+        // Lane (0, 0) initializes these extrema after the depth tests. If
+        // just that lane has left EXEC, the rest of the tile reduces into
+        // undefined LDS. Initialize the same max and min before masking.
+        lower::lower_with_lds_seed(&parts, &[0, u32::MAX])
+    } else {
+        lower::lower(&parts)
+    }?;
     let counted = match early {
         EarlyDepth::NotAsked => None,
         EarlyDepth::Given => Some(0),

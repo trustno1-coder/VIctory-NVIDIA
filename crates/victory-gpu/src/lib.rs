@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod ambient;
+pub mod bench;
+mod bench_gpu;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -24,10 +26,16 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod copystat_footprint;
+#[cfg(windows)]
+mod tight;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
 mod cores;
+#[cfg(windows)]
+mod demand;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -83,6 +91,9 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+mod sharded;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod stages;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
@@ -107,6 +118,14 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// The texture book: the title's DirectStorage requests followed as they
+/// finish, and what they fill made ready for the card (`texture::ledger`).
+#[cfg(windows)]
+pub use texture::ledger as texture_book;
+/// Decoded DirectStorage outputs kept across runs (`texture::converted`).
+#[cfg(windows)]
+pub use texture::converted as converted_cache;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

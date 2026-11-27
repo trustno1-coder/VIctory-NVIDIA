@@ -439,7 +439,10 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let p = pipeline(this);
-    if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    // Looked at first: a swap writes the pipeline's line on every bind, on
+    // every thread that binds it, and the lookups of its host pipeline
+    // (`host_pipeline`) read that line.
+    if p.bound.load(std::sync::atomic::Ordering::Relaxed) || p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let frame = crate::frame::current();
@@ -574,7 +577,8 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    // (The pipeline of earlier runs made ahead for this one, if there is one.)
+    let host = make::adopt(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
@@ -770,6 +774,16 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod samplers;
+
+/// Makes the static sampler states of earlier runs on the host device, in
+/// their order, before anything else makes one (`samplers::replay`): called
+/// right after the device is made.
+#[cfg(windows)]
+pub(crate) fn replay_static_samplers(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
+    samplers::replay(device);
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

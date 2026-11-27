@@ -251,26 +251,64 @@ impl<'a> Lower<'a> {
         (handle, byte, mapped)
     }
 
-    /// The second 64 bytes of a 128-byte node: in a page, and in a copy, of
-    /// their own maybe. Goes on in another block.
-    fn bvh_second_half(&mut self, at: NodeAt) -> NodeAt {
+    /// Reads the 12 dwords at offset +64 of a 128-byte node and returns
+    /// `(words, mapped)`. On `NodeAt::Memory`, skips the second directory
+    /// lookup when the 64-byte-aligned second half lies in the same 64 KiB page.
+    fn bvh_second_half_words(&mut self, at: NodeAt) -> (Vec<V>, V) {
         match at {
             NodeAt::Buffer { handle, byte } => {
                 let size = self.s.m.i32(64);
                 let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
-                NodeAt::Buffer { handle, byte }
+                let second = NodeAt::Buffer { handle, byte };
+                let i1t = self.s.m.int(1);
+                let one = self.s.m.int_const(i1t, 1);
+                (self.bvh_node_words(second, None, 0, 12), one)
             }
-            NodeAt::Memory { low, high, .. } => {
-                let (low, high) = self.address_plus(low, high, 64);
-                // Every lane in this block runs the instruction.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, None);
-                NodeAt::Memory {
-                    handle,
-                    byte,
-                    low,
-                    high,
-                    mapped,
+            NodeAt::Memory { handle, byte, low, high, mapped } => {
+                let head = self.cur;
+                let page_mask = self.s.m.i32(0xFFFF);
+                let limit = self.s.m.i32(0xFFC0);
+                let within = self.s.m.bin(head, Bin::And, low, page_mask);
+                let cross = self.s.m.cmp(head, pred::IUGE, within, limit);
+                let (same_block, cross_block, join) =
+                    (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(head, Term::CondBr(cross, cross_block, same_block));
+
+                self.cur = same_block;
+                let k64 = self.s.m.i32(64);
+                let same_byte = self.s.m.bin(same_block, Bin::Add, byte, k64);
+                let same_words = self.bvh_node_words(
+                    NodeAt::Memory { handle, byte: same_byte, low, high, mapped },
+                    None,
+                    0,
+                    12,
+                );
+                let same_end = self.cur;
+                self.s.m.terminate(same_end, Term::Br(join));
+
+                self.cur = cross_block;
+                let (low2, high2) = self.address_plus(low, high, 64);
+                let (h2, b2, m2) = self.bvh_memory(low2, high2, None);
+                let cross_words = self.bvh_node_words(
+                    NodeAt::Memory { handle: h2, byte: b2, low: low2, high: high2, mapped: m2 },
+                    None,
+                    0,
+                    12,
+                );
+                let cross_end = self.cur;
+                self.s.m.terminate(cross_end, Term::Br(join));
+
+                self.cur = join;
+                let (i32t, i1t) = (self.s.t.i32, self.s.m.int(1));
+                let mut merged = Vec::with_capacity(12);
+                for (sw, cw) in same_words.into_iter().zip(cross_words) {
+                    let phi = self.s.m.phi(join, i32t);
+                    self.s.m.set_phi(phi, vec![(sw, same_end), (cw, cross_end)]);
+                    merged.push(phi);
                 }
+                let mapped_phi = self.s.m.phi(join, i1t);
+                self.s.m.set_phi(mapped_phi, vec![(mapped, same_end), (m2, cross_end)]);
+                (merged, mapped_phi)
             }
         }
     }
@@ -346,8 +384,18 @@ impl<'a> Lower<'a> {
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
         let mut words = self.bvh_node_words(at, None, 16, 12);
-        let second = self.bvh_second_half(at);
-        words.extend(self.bvh_node_words(second, None, 0, 12));
+        let (second_words, second_mapped) = self.bvh_second_half_words(at);
+        words.extend(second_words);
+        let second = match at {
+            NodeAt::Buffer { handle, byte } => NodeAt::Buffer { handle, byte },
+            NodeAt::Memory { handle, byte, low, high, .. } => NodeAt::Memory {
+                handle,
+                byte,
+                low,
+                high,
+                mapped: second_mapped,
+            },
+        };
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
         // (The look for the second half goes on in another block.)
         let wide_block = self.cur;

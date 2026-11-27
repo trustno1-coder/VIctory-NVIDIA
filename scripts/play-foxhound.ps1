@@ -74,8 +74,6 @@ $settings = @{
     VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_CARD_AWAKE = '1'
     VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_INDIRECT_BATCH = '2'
     VICTORY_UPLOAD_AHEAD = '1'; VICTORY_SHOW_AFTER = '1'; VICTORY_MAP_THREADS = '1'
-    # Shader writes into big write-combined copies stay on the card (-5 ms a frame)
-    VICTORY_WC_NO_BACK = '1'; VICTORY_WC_NO_BACK_MIN_KB = '1024'
     # The title's page-mapping copies kept without Windows views (no cutscene freezes at scene cuts)
     VICTORY_SOFT_VIEWS = 'copies'
     # Textures: pool with no blocks made ahead, 16 ms a pass, no catch-up, levels not on demand (sharp)

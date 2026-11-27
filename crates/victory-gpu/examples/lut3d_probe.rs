@@ -148,6 +148,67 @@ fn main() -> windows::core::Result<()> {
             }
         }
         let device = device.expect("an NVIDIA adapter");
+        // PRELOAD=1: the composite's three samplers made first, each in a root signature
+        // of its own (register 0, visible to all stages), kept: the fixed order a run
+        // makes its known static samplers in before any pipeline
+        // (`pipeline::samplers`). PRELOAD=rev: in the other order.
+        let mut preloaded: Vec<ID3D12RootSignature> = Vec::new();
+        if let Some(order) = std::env::var_os("PRELOAD") {
+            let mut filters = vec![
+                D3D12_FILTER_MIN_MAG_MIP_POINT,
+                D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+                D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            ];
+            if order == "rev" {
+                filters.reverse();
+            }
+            // PRELOAD=lin: the linear one first (another place than PRELOAD=1 gives it).
+            if order == "lin" {
+                filters.swap(0, 1);
+            }
+            // PRELOAD_ODD=1: made at another register and visible to the pixel stage only
+            // (does the driver's table tell samplers apart by their state alone?).
+            let odd = std::env::var_os("PRELOAD_ODD").is_some();
+            for filter in filters {
+                let sampler = D3D12_STATIC_SAMPLER_DESC {
+                    Filter: filter,
+                    AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    MaxAnisotropy: 1,
+                    ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                    BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+                    MaxLOD: 12.0,
+                    ShaderRegister: if odd { 5 } else { 0 },
+                    RegisterSpace: if odd { 7 } else { 0 },
+                    ShaderVisibility: if odd {
+                        D3D12_SHADER_VISIBILITY_PIXEL
+                    } else {
+                        D3D12_SHADER_VISIBILITY_ALL
+                    },
+                    ..Default::default()
+                };
+                let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                    Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+                    Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                        Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                            NumStaticSamplers: 1,
+                            pStaticSamplers: &sampler,
+                            ..Default::default()
+                        },
+                    },
+                };
+                let mut blob: Option<ID3DBlob> = None;
+                D3D12SerializeVersionedRootSignature(&desc, &mut blob, None)?;
+                let blob = blob.unwrap();
+                let bytes = std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                );
+                preloaded.push(device.CreateRootSignature(0, bytes)?);
+            }
+            println!("the composite's samplers made first, one root signature each");
+        }
         let fill = compile(s!("fill"));
         let probe = compile(s!("probe"));
         // SHIFT=<n>: n root signatures with static point samplers of their own made (and

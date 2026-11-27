@@ -223,6 +223,20 @@ enum Command {
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
     Replay(replay::Replay),
+    /// Estimate the frame rate without the title: a run's log says what work
+    /// each frame had; this build runs the steps it can (write watch,
+    /// refreshes' copies, sending up, landing) on stand-in title memory, puts
+    /// them with the rest of the log's times and compares with the run's
+    /// frame rate. Without a log: the newest run's with gameplay.
+    #[cfg(windows)]
+    Bench {
+        /// A run's log (`%LOCALAPPDATA%\victory\logs\play-*.log`).
+        log: Option<PathBuf>,
+        /// An earlier report of `victory bench` (saved output, another
+        /// build, the same log): prints the change of the estimate.
+        #[arg(long)]
+        compare: Option<PathBuf>,
+    },
     /// Show the resolved configuration and check it.
     Config,
     /// Check NVIDIA Streamline, DLSS and DLSS Frame Generation on this PC
@@ -377,6 +391,15 @@ fn main() -> Result<()> {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
+        #[cfg(windows)]
+        Command::Bench { log, compare } => {
+            let log = match log {
+                Some(log) => log,
+                None => newest_gameplay_log()?,
+            };
+            print!("{}", victory_hle::bench::run(&log, compare.as_deref())?);
+            Ok(())
+        }
         Command::Config => show_config(),
         #[cfg(windows)]
         Command::UpscalerCheck { output, device, present } => {
@@ -390,6 +413,26 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The newest play log with gameplay frame-rate lines (`victory bench` without a log).
+#[cfg(windows)]
+fn newest_gameplay_log() -> Result<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA").ok_or_else(|| anyhow::anyhow!("no %LOCALAPPDATA%"))?;
+    let dir = PathBuf::from(base).join("victory").join("logs");
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("play-"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in logs {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        if !victory_hle::bench::gameplay(&victory_hle::bench::windows(&text)).is_empty() {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("no play log with gameplay in {}", dir.display())
 }
 
 fn show_config() -> Result<()> {
