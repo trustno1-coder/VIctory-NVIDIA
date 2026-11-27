@@ -1982,3 +1982,110 @@ fn oracle_compares_in_lane_branches_zero_the_lanes_left_out() {
     eprintln!("{refused} of 140 cases refused as before (wave32, nested, masks as data)");
     assert!(failures.is_empty(), "{} of 140 cases differ:\n{}", failures.len(), failures.join("\n"));
 }
+
+fn mov_s(dst: u8, x: i8) -> Item {
+    Item::I(Inst::S1 { op: S1::Mov, dst, a: Src::Int(x) })
+}
+
+/// Class 1 of the oracle's findings: a scalar a lane-divergent branch writes is the wave's
+/// after the join, as on the console (`lower::scalar_splits`). Every shape for all, some and
+/// no lanes in the branch, waves of 32 and of 64 (two host waves of 32 with
+/// `VICTORY_WAVE_WIDE=1`).
+#[test]
+fn oracle_scalars_written_in_lane_branches_reach_every_lane() {
+    use Src::*;
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let gpu = Gpu { host };
+    let shapes: Vec<(&str, Vec<Item>)> = vec![
+        ("else writes", vec![lane_split(vec![], Some(vec![mov_s(21, -3)]))]),
+        ("then writes", vec![lane_split(vec![Item::I(Inst::S2 { op: S2::SubU, dst: 20, a: S(17), b: S(16) })], None)]),
+        ("both write", vec![lane_split(vec![mov_s(22, 7)], Some(vec![mov_s(22, 9)]))]),
+        // (a copy of a value from before the branch: still a different value at the join)
+        ("then copies an older scalar", vec![lane_split(vec![Item::I(Inst::S1 { op: S1::Mov, dst: 27, a: S(19) })], None)]),
+        (
+            "nested, read after the outer join",
+            vec![lane_split(
+                vec![],
+                Some(vec![Item::If { cmp: Cmp::Gt, signed: false, a: S(1), b: 5, then: vec![mov_s(23, 5)], els: None }]),
+            )],
+        ),
+        (
+            "SCC set in the branch, read after it",
+            vec![
+                lane_split(vec![Item::I(Inst::SCmp { cmp: Cmp::Eq, signed: false, a: S(16), b: S(16) })], None),
+                Item::I(Inst::S2 { op: S2::Cselect, dst: 24, a: Int(1), b: Int(2) }),
+            ],
+        ),
+        ("first lane read in the branch", vec![lane_split(vec![Item::I(Inst::FirstLane { dst: 25, v: 5 })], None)]),
+        ("lane read in the branch", vec![lane_split(vec![Item::I(Inst::ReadLane { dst: 25, v: 5, lane: Int(0) })], None)]),
+        (
+            "branch in a uniform loop",
+            vec![Item::Loop {
+                n: 2,
+                body: vec![lane_split(vec![Item::I(Inst::S2 { op: S2::AddU, dst: 27, a: S(27), b: Int(1) })], None)],
+            }],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for wave64 in [false, true] {
+        // (on this thread only: other tests translate meanwhile)
+        lower::THREAD_WAVE_WIDE.set(true);
+        for (name, body) in &shapes {
+            // On the thread id, s0: -1 every lane, 9 some lanes, 40 some (wave64) or none
+            // (wave32), 70 none. On the hash, s0: 0 nearly all, 2^31 about half, 2^32-1 none.
+            let cases = [(false, u32::MAX), (false, 9), (false, 40), (false, 70), (true, 0), (true, 0x8000_0000), (true, u32::MAX)];
+            // (VCC also stored as numbers: a mask read as data, which lowers branches as the
+            // console's lanes take them instead of as guarded code)
+            for ((hash, s0), raw_masks) in cases.into_iter().flat_map(|c| [(c, false), (c, true)]) {
+                let body = if hash { by_hash(body) } else { body.clone() };
+                let name = format!("{name}{}{}", if hash { " (on a hash)" } else { "" }, if raw_masks { " (masks as data)" } else { "" });
+                let p = Prog { wave64, seeds: [s0, 3, 0x1234, 0x5678], body, raw_masks };
+                match check(&gpu, &p) {
+                    Outcome::Same => {}
+                    other => failures.push(format!(
+                        "wave{} {name}, s0 = {s0:#x}: {}",
+                        if wave64 { 64 } else { 32 },
+                        match other {
+                            Outcome::Differs(d) => describe(&d),
+                            o => format!("{o:?}"),
+                        }
+                    )),
+                }
+            }
+        }
+        lower::THREAD_WAVE_WIDE.set(false);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `VICTORY_SCALAR_SPLITS=0` reaches every caller of `widen`, the fallbacks included, which
+/// start from no branch: with the switch off a scalar written in a lane branch keeps the
+/// per-lane form there, with it on that branch is taken wave-wide. (No GPU: translation only.)
+#[test]
+fn widen_takes_scalar_splits_only_when_asked() {
+    let p = Prog {
+        wave64: false,
+        seeds: [9, 3, 0x1234, 0x5678],
+        body: vec![lane_split(vec![mov_s(21, -3)], None)],
+        raw_masks: false,
+    };
+    let (words, _) = encode(&p);
+    let native = native_of(&p, &words);
+    let container = dxbc::build(&[]);
+    let c = dxbc::Container::parse(&container).unwrap();
+    let ir = spill::build(&native).unwrap();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let off = super::widen(&c, &native, &ir, None, false, false, false).map(|(s, _)| s.dxil);
+    let on = super::widen(&c, &native, &ir, Some(&[]), false, false, false).map(|(s, _)| s.dxil);
+    let plain = structure::structure(&ir).map(|st| lower::scalar_splits(&ir, &st));
+    lower::TEST_HOST_WAVE.set(was);
+    assert!(matches!(plain, Ok(Some(ref s)) if !s.is_empty()), "the program has a scalar split: {plain:?}");
+    let on = on.expect("with the switch on, the branch is taken wave-wide and translates");
+    // (with it off this program stays per lane, which `widen` alone refuses: a lane mask read as
+    // data, retried later on the full path)
+    assert!(!matches!(&off, Ok(d) if *d == on), "with the switch off the branch is not taken for its scalar: {off:?}");
+}

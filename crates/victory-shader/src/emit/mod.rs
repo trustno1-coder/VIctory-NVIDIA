@@ -525,6 +525,33 @@ pub fn emit(
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
+    // A scalar a per-lane branch's region writes and a join after it reads
+    // (`lower::scalar_splits`): the console's wave runs that region once for every lane, so
+    // those branches are taken wave-wide, as the console takes them. A console wave run as
+    // two host waves needs group barriers inside them (`VICTORY_WAVE_WIDE=1`, see below);
+    // without it, and wherever the branches cannot be widened, the per-lane form stays.
+    // `VICTORY_SCALAR_SPLITS=0`: not looked for. (Found by the RDNA2 oracle, `oracle_tests`.)
+    if native.stage == HwStage::Cs && lower::scalar_splits_on() {
+        let splits = lower::scalar_splits(p, st).unwrap_or_default();
+        let halves = native.wave64 && lower::host_max_wave() == 32;
+        let wide_on = lower::wave_wide_on();
+        if !splits.is_empty() && (!halves || wide_on) {
+            let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+            match widen(c, native, p, Some(&splits), why, false, wide_on) {
+                Ok((shader, wave)) if !(halves && wave == Some(64)) => {
+                    if why {
+                        eprintln!("SCALAR-SPLITS {} branches taken wave-wide", splits.len());
+                    }
+                    return Ok(shader);
+                }
+                other => {
+                    if why {
+                        eprintln!("SCALAR-SPLITS not widened: {:?}", other.err());
+                    }
+                }
+            }
+        }
+    }
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -686,7 +713,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop, wide_on);
+                        let again = widen(c, native, base, lower::scalar_splits_on().then_some(&[]), why, driver_loop, wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -750,7 +777,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false, false);
+            let again = widen(c, native, p, lower::scalar_splits_on().then_some(&[]), std::env::var_os("VICTORY_WAVE_WHY").is_some(), false, false);
             match again {
                 Ok(_) => again,
                 Err(_) => {
@@ -795,10 +822,14 @@ pub fn emit(
 /// waves, those decide differently and a group barrier inside such a branch would wait for
 /// threads that never come: the host waves of each console wave meet on their own there
 /// ([`lower::with_pair_meetings`]; whole console waves only), when `groups` allows it.
+/// `scalar_splits`: `Some(branches)` takes those wave-wide from the start and, each round, the
+/// branches around scalars a lane branch writes ([`lower::scalar_splits`]); `None`
+/// (`VICTORY_SCALAR_SPLITS=0`) neither.
 fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
+    scalar_splits: Option<&[usize]>,
     why: bool,
     active_loop_only: bool,
     groups: bool,
@@ -824,9 +855,20 @@ fn widen(
     let pairs = native.wave64
         && lower::host_max_wave() == 32
         && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
-    let mut wide = std::collections::HashSet::new();
+    let mut wide: std::collections::HashSet<usize> = scalar_splits.unwrap_or_default().iter().copied().collect();
     loop {
         let st = structure::structure_wide(p, &wide)?;
+        // Branches around scalars the wave writes once (`lower::scalar_splits`) that this
+        // round's structure still has per lane: wave-wide too, unless `VICTORY_SCALAR_SPLITS=0`
+        // (`scalar_splits` None, in every caller).
+        if scalar_splits.is_some() {
+            let scalars: Vec<usize> =
+                lower::scalar_splits(p, &st).unwrap_or_default().into_iter().filter(|b| !wide.contains(b)).collect();
+            if !scalars.is_empty() {
+                wide.extend(scalars);
+                continue;
+            }
+        }
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
