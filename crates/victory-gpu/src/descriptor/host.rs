@@ -4380,7 +4380,7 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
 /// without the raw flag, with strides the host has no structured buffers
 /// for. Since every buffer view of the heap is made for shaders that pick
 /// them by index, one such view ended the run (2026-11-24, run 10).
-fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64) -> bool {
+fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64, uav: bool) -> bool {
     use crate::resource::family;
     let f = format.0 as u32;
     let element = if raw {
@@ -4408,6 +4408,49 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .checked_add(u64::from(count))
             .and_then(|end| end.checked_mul(element))
             .is_some_and(|end| end <= width)
+        && (raw || stride > 0 || {
+            let required = if uav {
+                D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW
+            } else {
+                D3D12_FORMAT_SUPPORT1_BUFFER
+            };
+            buffer_format_support(format).0 & required.0 == required.0
+        })
+}
+
+/// Typed buffer views need the device's format support as well as a legal
+/// byte range. In particular, sRGB and depth formats have an element size
+/// but no buffer support; some buffer formats support SRVs but not UAVs.
+fn buffer_format_support(format: DXGI_FORMAT) -> D3D12_FORMAT_SUPPORT1 {
+    // All formats whose size `resource::element` knows fit here. Each is
+    // queried once for the process's host device, with no lock afterwards.
+    static FORMATS: [std::sync::OnceLock<D3D12_FORMAT_SUPPORT1>; 256] =
+        [const { std::sync::OnceLock::new() }; 256];
+    let Some(slot) = FORMATS.get(format.0 as usize) else {
+        return D3D12_FORMAT_SUPPORT1_NONE;
+    };
+    *slot.get_or_init(|| {
+        let Some(host) = host() else {
+            return D3D12_FORMAT_SUPPORT1_NONE;
+        };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: a plain query into our own structure.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        if asked.is_ok() {
+            support.Support1
+        } else {
+            D3D12_FORMAT_SUPPORT1_NONE
+        }
+    })
 }
 
 /// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
@@ -4526,7 +4569,7 @@ fn buffer_srv(
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     let width = shadow.width();
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+    if !buffer_view_ok(desc.Format, first, count, stride, raw, width, false) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
             format = desc.Format.0,
@@ -4653,7 +4696,7 @@ fn buffer_uav(
     }
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+    if !buffer_view_ok(desc.Format, first, count, stride, raw, width, true) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
             format = desc.Format.0,
@@ -5969,15 +6012,85 @@ mod tests {
         // bytes before the view's memory: bytes 192..2192.
         let (first, count) = raw_window(32, 8, 100, 20).unwrap();
         assert_eq!((first, count), (48, 500));
-        assert!(buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 4096));
+        assert!(buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 4096, false));
         // the format a raw view must name; the structured one's is refused
-        assert!(!buffer_view_ok(DXGI_FORMAT_UNKNOWN, first, count, 0, true, 4096));
+        assert!(!buffer_view_ok(DXGI_FORMAT_UNKNOWN, first, count, 0, true, 4096, false));
         // past the buffer, not on 16 bytes, no elements
-        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 2000));
+        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 2000, false));
         assert!(raw_window(4, 0, 100, 20).is_none());
-        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
+        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096, false));
         // a structured view the host takes as it is
-        assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+        assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096, false));
+    }
+
+    #[test]
+    fn formats_without_buffer_support_fail_the_host_check() {
+        let Some(host) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        for format in [DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_D32_FLOAT] {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: format,
+                ..Default::default()
+            };
+            // SAFETY: a plain query into our own structure.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            }
+            .unwrap();
+            assert_eq!(support.Support1.0 & D3D12_FORMAT_SUPPORT1_BUFFER.0, 0);
+            assert!(
+                !buffer_view_ok(format, 0, 16, 0, false, 4096, false),
+                "format {} has no buffer support, but its view passed validation",
+                format.0
+            );
+        }
+    }
+
+    #[test]
+    fn a_srv_buffer_format_is_not_necessarily_a_uav_format() {
+        let Some(host) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let format = DXGI_FORMAT_R32G32B32_FLOAT;
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: a plain query into our own structure.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .unwrap();
+        assert_ne!(support.Support1.0 & D3D12_FORMAT_SUPPORT1_BUFFER.0, 0);
+        let uav = support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0;
+        assert!(buffer_view_ok(format, 0, 16, 0, false, 4096, false));
+        assert_eq!(buffer_view_ok(format, 0, 16, 0, false, 4096, true), uav);
+    }
+
+    #[test]
+    fn supported_typed_buffer_views_stay_available() {
+        let Some(_) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        for format in [DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT] {
+            for uav in [false, true] {
+                assert!(buffer_view_ok(format, 2, 16, 0, false, 4096, uav));
+                assert!(!buffer_view_ok(format, 1020, 16, 0, false, 4096, uav));
+                assert!(!buffer_view_ok(format, 0, 0, 0, false, 4096, uav));
+            }
+        }
     }
 
     /// The raw twin of a view shows the same bytes: typed and structured ones
