@@ -128,9 +128,13 @@ frame number, the latency markers (simulation, render submit, present), the
 constants and the depth and motion-vector tags in the states the submissions
 left them in (viewport 0), and frame generation is switched on; a present
 without a new upscaling (menus, loads) switches it off and clears the tags.
-Reflex low latency is on (frame generation needs it); `slReflexSleep` is not
-called. On Series S, whose interface is a second plane, the scene plane is the
-colour without the interface and the interface plane its colour and alpha
+Reflex low latency is on while frame generation is asked for (it needs it),
+and off while it is ready but off: its pacing put the submitting thread to
+sleep in the present, with the card idle behind it (first boat mission, RTX
+4080, 4K with DLSS Performance, frame generation ready but off: 25.0 frames a
+second with Reflex on, 26.8 with it off, three runs each); `slReflexSleep` is
+not called. On Series S, whose interface is a second plane, the scene plane is
+the colour without the interface and the interface plane its colour and alpha
 (premultiplied, as our composer blends them).
 
 **The colour without the interface on Series X.** There the title keeps the
@@ -215,7 +219,7 @@ Before it, once: `victory upscaler-check --present` (below, line 1).
    (Fewer than 360 shown, 291 in one run of 2026-11-27, when the PC is busy:
    frame generation drops a generated frame that comes too late.)
 2. It started: `Streamline loaded … dlss=true framegen=true`, `Streamline: DLSS
-   Frame Generation loaded`, `Streamline: Reflex low latency on … code=0`,
+   Frame Generation loaded`, `Streamline: Reflex low latency … on=true code=0`,
    `the direct queue was made through the device proxy`, `our swap chain is
    Streamline's proxy`. `frame generation stays off` or `not running (see
    above)` anywhere: it does not run; the line before says why.

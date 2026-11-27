@@ -14,8 +14,9 @@
 //!   device's direct queue and the swap chain are made through Streamline's
 //!   proxies; every present tags the depth and motion vectors of the last
 //!   upscaling submitted before it, with constants made from it, and sends
-//!   the latency markers Frame Generation needs (Reflex on). Needs the line
-//!   of submissions (`VICTORY_THIN=1` or `VICTORY_ASYNC_SUBMIT=1`).
+//!   the latency markers Frame Generation needs (Reflex on while it is).
+//!   Needs the line of submissions (`VICTORY_THIN=1` or
+//!   `VICTORY_ASYNC_SUBMIT=1`).
 //! - `VICTORY_STREAMLINE_DIR`: the folder of `sl.interposer.dll`, its plugins
 //!   and NGX's DLLs (default [`DEFAULT_DIR`]).
 //!
@@ -283,6 +284,8 @@ struct Calls {
     framegen_on: bool,
     framegen_times: u32,
     simulating: Option<u32>,
+    /// Whether Reflex low latency is on ([`set_reflex`]).
+    reflex_on: bool,
 }
 
 static CALLS: Mutex<Calls> = Mutex::new(Calls {
@@ -291,6 +294,7 @@ static CALLS: Mutex<Calls> = Mutex::new(Calls {
     framegen_on: false,
     framegen_times: 0,
     simulating: None,
+    reflex_on: false,
 });
 
 fn calls() -> std::sync::MutexGuard<'static, Calls> {
@@ -879,18 +883,12 @@ pub(crate) fn device_made(device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
             && functions.reflex_set_options.is_some()
             && functions.pcl_set_marker.is_some();
         if have {
-            if let Some(reflex) = functions.reflex_set_options {
-                let options = abi::ReflexOptions {
-                    base: abi::BaseStructure::new(abi::REFLEX_OPTIONS, 1),
-                    mode: abi::REFLEX_LOW_LATENCY,
-                    frame_limit_us: 0,
-                    use_markers_to_optimize: false,
-                    virtual_key: 0,
-                    id_thread: 0,
-                };
-                // SAFETY: filled options.
-                let code = unsafe { reflex(&options) };
-                tracing::info!(code, result = abi::result_name(code), "Streamline: Reflex low latency on (needed by frame generation)");
+            // Only while frame generation is on: ready but off, Reflex's
+            // pacing put our submitting thread to sleep in the present
+            // (about a sixth of its time), with the card idle behind it.
+            if framegen_times() != 0 {
+                set_reflex(&functions, true);
+                calls().reflex_on = true;
             }
             queue = proxied_queue(sl, device);
         }
@@ -901,6 +899,22 @@ pub(crate) fn device_made(device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
     }
     let _ = FUNCTIONS.set(functions);
     queue
+}
+
+/// Reflex low latency on (frame generation needs it) or off.
+fn set_reflex(functions: &Functions, on: bool) {
+    let Some(reflex) = functions.reflex_set_options else { return };
+    let options = abi::ReflexOptions {
+        base: abi::BaseStructure::new(abi::REFLEX_OPTIONS, 1),
+        mode: if on { abi::REFLEX_LOW_LATENCY } else { abi::REFLEX_OFF },
+        frame_limit_us: 0,
+        use_markers_to_optimize: false,
+        virtual_key: 0,
+        id_thread: 0,
+    };
+    // SAFETY: filled options.
+    let code = unsafe { reflex(&options) };
+    tracing::info!(on, code, result = abi::result_name(code), "Streamline: Reflex low latency (needed by frame generation, only while it is on)");
 }
 
 fn log_version(sl: &Sl, feature: u32, name: &str) {
@@ -1750,6 +1764,10 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         }
     }
     let wanted = framegen_wanted();
+    if (wanted != 0) != calls.reflex_on {
+        set_reflex(functions, wanted != 0);
+        calls.reflex_on = wanted != 0;
+    }
     let on = on && wanted != 0;
     let times = if on { wanted } else { 0 };
     if on != calls.framegen_on || times != calls.framegen_times {
