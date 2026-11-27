@@ -103,6 +103,8 @@ if ($Dlss -ne 'off') {
     # NVIDIA's files: where VICTORY_STREAMLINE_DIR says, else where Get-NVIDIA-DLSS.cmd puts them.
     $sl = if ($env:VICTORY_STREAMLINE_DIR) { $env:VICTORY_STREAMLINE_DIR } else { Join-Path $repo 'nvidia-sdk\Streamline\bin\x64' }
     if (Test-Path (Join-Path $sl 'sl.interposer.dll')) {
+        # Absolute: the title is started from the repository's folder, where a relative path is not found.
+        $sl = (Resolve-Path -LiteralPath $sl).ProviderPath
         $settings.VICTORY_DLSS = '1'; $settings.VICTORY_DLSS_MODE = $Dlss; $settings.VICTORY_STREAMLINE_DIR = $sl
         if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = [string]$timesWanted }
         elseif (-not $NoFrameGenReady) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = '0' }   # ready, off
@@ -119,6 +121,7 @@ if ($Dlss -ne 'off') {
 # auto: the layer uses it only where DLSS Frame Generation does not run; fsr: DLSS Frame Generation is not asked.
 if ($FgType -ne 'dlss' -and ($FrameGen -or -not $NoFrameGenReady)) {
     $fx = if ($env:VICTORY_FIDELITYFX_DIR) { $env:VICTORY_FIDELITYFX_DIR } else { Join-Path $repo 'amd-sdk\FidelityFX\bin' }
+    if (Test-Path -LiteralPath $fx) { $fx = (Resolve-Path -LiteralPath $fx).ProviderPath }
     # Asked whatever is here: the layer checks the files and the card, and the start's notice (on the picture for
     # its first 30 s, and in this window) says what runs and why not. On Series X without DLSS it stays off: the
     # title's own upscaling, which it needs, takes the Series S sizes only.
@@ -159,6 +162,9 @@ if (-not (Test-Path $victory)) {
     if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
+# Absolute before the folder changes below: the title is started from the repository's folder, where a
+# relative path would not be found (the check above looks from the folder the launcher was started in).
+$Exe = (Resolve-Path -LiteralPath $Exe).ProviderPath
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
