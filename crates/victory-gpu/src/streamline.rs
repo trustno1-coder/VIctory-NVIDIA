@@ -882,7 +882,22 @@ pub(crate) fn device_made(device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
     let sl = SL.get()?;
     // SAFETY: the native device.
     let code = unsafe { (sl.set_d3d_device)(device.as_raw()) };
-    if code != 0 {
+    // Lab: with AMDNR (a build of OptiScaler) in the process, its hook of
+    // the device's creation gives Streamline that device before we do, and
+    // Streamline answers our hand-over with "invalid integration" (its log:
+    // "plugins already initialized"). The device is the same one, so we go
+    // on: the feature functions fetched below say whether it took.
+    // `VICTORY_SL_DEVICE_STRICT=1`: such an answer ends it, as before.
+    const INVALID_INTEGRATION: i32 = 19;
+    let given_before = code == INVALID_INTEGRATION && std::env::var_os("VICTORY_SL_DEVICE_STRICT").is_none_or(|v| v != "1");
+    if given_before {
+        tracing::info!(
+            "Streamline: slSetD3DDevice says the plugins have a device already ({}, {code}): something that hooks the device's \
+             creation (AMDNR) gave it first; going on with it",
+            abi::result_name(code)
+        );
+    }
+    if code != 0 && !given_before {
         tracing::warn!(
             "Streamline: slSetD3DDevice failed: {} ({code}); DLSS and frame generation stay off",
             abi::result_name(code)
