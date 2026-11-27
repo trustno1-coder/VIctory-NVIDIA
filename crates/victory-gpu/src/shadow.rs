@@ -2378,6 +2378,11 @@ fn wc_no_back_min() -> u64 {
     })
 }
 
+/// The active cutoff for leaving a WC copy's shader writes on the card.
+fn wc_no_back_cutoff() -> Option<u64> {
+    wc_no_back().then(wc_no_back_min)
+}
+
 /// Bytes shaders were declared to write in write-combined copies and that
 /// were left on the card ([`wc_no_back`]), since the last frame-rate line.
 pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
@@ -2385,7 +2390,9 @@ pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
 /// Whether a title buffer in write-combined memory gets one copy, in card
 /// memory the CPU maps (`D3D12_HEAP_TYPE_GPU_UPLOAD`: a resizable BAR, this
 /// PC's 4070 SUPER has a 16 GiB one) instead of two sides
-/// (`VICTORY_WC_BAR=1`; off by default: an experiment).
+/// (`VICTORY_WC_BAR=1`; off by default). Honor the write-back size policy:
+/// small shader results can feed title CPU reads or refreshes of other copies.
+/// `VICTORY_WC_BAR=2` selects the original policy for comparison.
 ///
 /// Refreshes write title memory into the mapping through the bus (as they
 /// write a CPU's side now); shaders read and write the card's memory; there
@@ -2401,9 +2408,18 @@ pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
 /// fifth of the budget is free; the PC's memory of the CPU's side is saved.
 /// Copies already made, or turned down for room, keep their two sides or
 /// stay in the PC's memory.
-fn wc_bar() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_BAR").is_some_and(|v| v == "1"))
+fn wc_bar(len: u64) -> bool {
+    static MODE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let mode = MODE.get_or_init(|| std::env::var("VICTORY_WC_BAR").ok());
+    wc_bar_allowed(mode.as_deref(), wc_no_back_cutoff(), len)
+}
+
+fn wc_bar_allowed(mode: Option<&str>, cutoff: Option<u64>, len: u64) -> bool {
+    match mode {
+        Some("1") => cutoff.is_some_and(|min| len >= min),
+        Some("2") => true,
+        _ => false,
+    }
 }
 
 /// A buffer of `size` bytes in card memory the CPU maps, for [`wc_bar`],
@@ -3430,7 +3446,7 @@ impl Shadow {
         // (`VICTORY_WC_NO_BACK`, and always for `VICTORY_WC_BAR`'s copies,
         // which the CPU would read through the bus): what shaders write stays
         // on the card.
-        if (self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() || self.mapped && !self.window)
+        if (self.card.is_some() && wc_no_back_cutoff().is_some_and(|min| self.len >= min) || self.mapped && !self.window)
             && self.write_combined()
         {
             self.written.store(true, Ordering::Relaxed);
@@ -5432,7 +5448,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // Write-combined memory with `VICTORY_WC_BAR`: one buffer in the card's
         // memory that the CPU maps, no CPU's side, nothing sent, and what
         // shaders write stays there ([`wc_bar`]).
-        if wc_bar()
+        if wc_bar(len)
             && is_write_combined(key.0, len)
             && let Some((buffer, data)) = wc_mapped_for(size)
         {
@@ -5899,7 +5915,20 @@ pub(crate) fn exact_line(frames: f64) {
 
 #[cfg(test)]
 mod write_combined_tests {
-    use super::{is_write_combined, title_memory_write_combined, write_combined_freed};
+    use super::{is_write_combined, title_memory_write_combined, wc_bar_allowed, write_combined_freed};
+
+    #[test]
+    fn bar_obeys_write_back_policy_unless_legacy_mode_is_selected() {
+        let min = 1 << 20;
+        assert!(!wc_bar_allowed(None, Some(min), min));
+        assert!(!wc_bar_allowed(Some("0"), Some(min), min));
+        assert!(!wc_bar_allowed(Some("1"), None, min));
+        assert!(!wc_bar_allowed(Some("1"), Some(min), min - 1));
+        assert!(wc_bar_allowed(Some("1"), Some(min), min));
+        assert!(wc_bar_allowed(Some("1"), Some(0), 4));
+        assert!(wc_bar_allowed(Some("2"), None, 4));
+        assert!(wc_bar_allowed(Some("2"), Some(min), 4));
+    }
 
     /// A copy counts as write-combined only inside one such region, and not
     /// after the region is let go (part of it or the whole allocation).
