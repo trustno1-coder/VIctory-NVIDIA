@@ -22,7 +22,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-    GetModuleFileNameW, GetModuleHandleExW,
+    GetModuleFileNameW, GetModuleHandleA, GetModuleHandleExW, GetProcAddress,
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
@@ -594,6 +594,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         code as u32,
         locate(at)
     ));
+    if let Some(version) = wine_version() {
+        line(format!("  under Wine {version} (Windows is what this program is for)"));
+    }
     line(format!(
         "  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rsp {:#x} rbp {:#x}",
         context.Rax,
@@ -624,6 +627,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         eprint!("{said}");
         text.push_str(&said);
         append_to_log(&text);
+        if let Some(file) = LOG.get() {
+            eprintln!("  report and the title's last output are kept in {}", file.display());
+        }
     }
     #[cfg(feature = "diagnostics")]
     for (address, len, file) in SAVE.get().into_iter().flatten() {
@@ -703,6 +709,25 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
 /// `module+rva`, or the bare address.
 pub fn locate(address: usize) -> String {
     module_of(address).unwrap_or_else(|| format!("{address:#x}"))
+}
+
+/// Whether we run under Wine, and which version: its ntdll exports
+/// `wine_get_version`, Windows' does not. Windows is what this program is
+/// for, so a start and every crash report name a run of Wine.
+pub fn wine_version() -> Option<String> {
+    // SAFETY: plain lookups in ntdll, always loaded; the strings are literals.
+    let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr().cast()) };
+    if ntdll.is_null() {
+        return None;
+    }
+    // SAFETY: ntdll keeps the string for the whole life of the process.
+    let said = unsafe {
+        let get = GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast())?;
+        let get: unsafe extern "system" fn() -> *const std::ffi::c_char = std::mem::transmute(get);
+        std::ffi::CStr::from_ptr(get())
+    };
+    let said = said.to_string_lossy();
+    (!said.is_empty()).then(|| said.into_owned())
 }
 
 fn module_of(address: usize) -> Option<String> {
