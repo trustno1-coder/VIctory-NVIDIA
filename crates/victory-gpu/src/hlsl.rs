@@ -143,9 +143,51 @@ fn system_compile_for(
     if let Err(e) = compiled {
         return Err((e, messages()));
     }
-    code.as_ref()
+    let code = code
+        .as_ref()
         .map(|c| blob_bytes(c).to_vec())
-        .ok_or_else(|| (windows::core::Error::empty(), messages()))
+        .ok_or_else(|| (windows::core::Error::empty(), messages()))?;
+    // Wine's builtin compiler accepts `[RootSignature(...)]` and leaves it
+    // out of the code; the runtime then finds no root signature in it and
+    // fails with E_FAIL (vkd3d-proton: no RTS0 part is VKD3D_ERROR). Every
+    // helper that reads its root signature out of its code was off under
+    // Wine for that (the depth planes' pass, keeping the card awake, the
+    // scatter, the upload check, the tiles' look). Such code is refused, so
+    // that DXC compiles it.
+    if declares_root_signature(source, entry) && !parts(&code).any(|p| &p == b"RTS0") {
+        return Err((
+            windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL),
+            "its code holds no root signature: the compiler left out [RootSignature]".to_owned(),
+        ));
+    }
+    Ok(code)
+}
+
+/// The four-character codes of the parts of the shader container `code`
+/// (DXBC and DXIL code alike are in one); none if it is not one.
+fn parts(code: &[u8]) -> impl Iterator<Item = [u8; 4]> + '_ {
+    let word = |at: usize| -> Option<usize> { Some(u32::from_le_bytes(code.get(at..at + 4)?.try_into().ok()?) as usize) };
+    let count = if code.starts_with(b"DXBC") { word(28).unwrap_or(0) } else { 0 };
+    (0..count.min(64)).filter_map(move |i| {
+        let at = word(32 + 4 * i)?;
+        code.get(at..at + 4)?.try_into().ok()
+    })
+}
+
+/// Whether `code` is DXIL (made by DXC), not DXBC. The stages of one
+/// pipeline are best of one kind.
+pub(crate) fn is_dxil(code: &[u8]) -> bool {
+    parts(code).any(|p| &p == b"DXIL")
+}
+
+/// Whether `source` puts a root signature on function `entry`: an
+/// `[RootSignature` with `entry` named before the next `{`.
+fn declares_root_signature(source: &str, entry: &str) -> bool {
+    source.match_indices("[RootSignature").any(|(at, _)| {
+        let head = &source[at..];
+        let head = &head[..head.find('{').unwrap_or(head.len())];
+        head.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|word| word == entry)
+    })
 }
 
 fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
@@ -206,7 +248,7 @@ pub(crate) fn dxc_compile(name: &str, source: &str) -> windows::core::Result<Vec
 }
 
 /// [`dxc_compile`] of function `entry` for `target` (a 6.x target).
-fn dxc_compile_for(name: &str, source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
+pub(crate) fn dxc_compile_for(name: &str, source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Dxc::{
         CLSID_DxcCompiler, DXC_CP_UTF8, DxcBuffer, IDxcCompiler3, IDxcResult,
     };
@@ -264,6 +306,27 @@ mod tests {
         [numthreads(1, 1, 1)]
         void main() { b.Store(0, b.Load(0)); }
     "#;
+
+    /// A root signature counts as declared for the function it is put on
+    /// only.
+    #[test]
+    fn a_root_signature_is_declared_for_its_function() {
+        assert!(declares_root_signature(PROBE, "main"));
+        assert!(!declares_root_signature(PROBE, "other"));
+        let two = "float4 corner() : SV_Position { return 0; }\n[RootSignature(RS)]\nfloat plane() : SV_Depth { return 0; }";
+        assert!(declares_root_signature(two, "plane"));
+        assert!(!declares_root_signature(two, "corner"));
+    }
+
+    /// The code a helper is given holds the root signature its source
+    /// declares, whichever compiler made it (Wine's own leaves it out).
+    #[test]
+    fn compiled_code_holds_its_root_signature() {
+        if let Ok(code) = compile_compute("probe", PROBE) {
+            assert!(parts(&code).any(|p| &p == b"RTS0"));
+        }
+        assert_eq!(parts(b"not a container").count(), 0);
+    }
 
     /// A raw-buffer compute shader compiles with one of the two compilers
     /// whenever either is present, and both give shader containers.
