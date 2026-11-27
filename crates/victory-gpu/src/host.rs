@@ -5667,6 +5667,20 @@ impl Host {
         let first_heaps = (late && heaps_mark == 0 && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         let ahead = Split::begin();
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let mut batch = Batch::reused();
+        // `VICTORY_ASK_FIRST`: the submission's one asking begun now, on a
+        // thread of its own, beside the planning and the look at flights
+        // below; it is waited for where it was made before.
+        let asked_first = (late && crate::watch::first() && !upcheck::on()).then(|| {
+            batch.copy_spans(runs);
+            let ranges: Vec<(usize, usize)> = batch.spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)).collect();
+            SPLIT[8].fetch_add(ahead.so_far(), Ordering::Relaxed);
+            let first = crate::watch::ask_first(ranges);
+            ahead.part(0);
+            first
+        });
+        // Whether flights were settled for the sweep meanwhile.
+        let mut settled_for_sweep = false;
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -5746,6 +5760,7 @@ impl Host {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
+            settled_for_sweep = true;
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
@@ -5766,7 +5781,6 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::reused();
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
@@ -5781,7 +5795,24 @@ impl Host {
             ranges.extend(spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
-            crate::watch::ask_once(&batch.ranges);
+            match asked_first {
+                // Begun beside the first steps: waited for here. Made again,
+                // whole, if flights were waited for or settled since (what
+                // they landed is title memory written); else only what it
+                // does not hold is asked: the ranges of the list of steps
+                // done on the card, which was made after it.
+                Some(first) => {
+                    first.wait();
+                    ASKED_FIRST[0].fetch_add(1, Ordering::Relaxed);
+                    if waited_for_flights || settled_for_sweep {
+                        ASKED_FIRST[1].fetch_add(1, Ordering::Relaxed);
+                        crate::watch::ask_once(&batch.ranges);
+                    } else if crate::watch::ask_more(&batch.ranges) {
+                        ASKED_FIRST[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                None => crate::watch::ask_once(&batch.ranges),
+            }
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
             // Behind flights: the title wrote memory that a flight's shaders
@@ -7943,6 +7974,12 @@ fn heap_sync_first() -> bool {
 /// another after a wait for flights.
 static HEAP_SYNC_FIRST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Since the last frame line, with `VICTORY_ASK_FIRST` (`crate::watch::first`):
+/// submissions whose asking was begun beside their first steps; those that
+/// made it again after flights were waited for or settled; and those that
+/// asked for more where it was made before.
+static ASKED_FIRST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Counts into [`SPLIT`].
 struct Split(std::cell::Cell<std::time::Instant>);
 
@@ -8006,6 +8043,13 @@ fn submit_split_line(frames: f64) {
         ms[14],
         ms[15],
     );
+    let [begun, made_again, more] = [0, 1, 2].map(|i| ASKED_FIRST[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if begun > 0.0 {
+        tracing::info!(
+            "the submissions' asking begun beside their first steps, per frame (VICTORY_ASK_FIRST=1): {begun:.1}, {made_again:.1} \
+             made again after flights were waited for, {more:.1} asked for more where it was made before"
+        );
+    }
     let [first, again] = [0, 1].map(|i| HEAP_SYNC_FIRST[i].swap(0, Ordering::Relaxed) as f64 / frames);
     if first + again > 0.0 {
         tracing::info!(

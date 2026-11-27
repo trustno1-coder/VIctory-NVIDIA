@@ -549,6 +549,114 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     ask_rest(ranges);
 }
 
+/// `VICTORY_ASK_FIRST=1` (off by default; with [`once`]): a submission's one
+/// asking is begun as soon as the submission has the lock, on a thread kept
+/// for it ([`ask_first`]), beside the planning of the steps done on the card
+/// and the look at the flights in the air; the submission waits for it where
+/// it asked before, and asks for more there if it has to ([`ask_more`]).
+///
+/// Why: the asking is the kernel resetting the pages found written, 4 to 5
+/// ms a frame on the thread a frame waits for, and it reads nothing the
+/// steps before it make (session 2026-11-28 00:45: 4.3 to 5.4 ms of asking,
+/// 5.8 to 18.5 ms of planning ahead of it, a frame).
+///
+/// What changes: the asking is made a few hundred microseconds earlier in
+/// the submission. Memory the title's other threads write in that time is
+/// seen by the next submission's asking, as what they write while the
+/// refreshes run is today ([`once`]); what this submission's lists read was
+/// written before they were submitted. What does not change: after a wait
+/// for flights (what they landed is title memory written) the asking is made
+/// again, whole, where it was made before; and the ranges of the list of
+/// steps done on the card, which is made after the asking was begun, are
+/// asked there.
+pub(crate) fn first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| once() && std::env::var_os("VICTORY_ASK_FIRST").is_some_and(|v| v == "1"))
+}
+
+/// A submission's one asking, begun by [`ask_first`]: whether it is made.
+pub(crate) struct AskedFirst(std::sync::Arc<(Mutex<bool>, Condvar)>);
+
+impl AskedFirst {
+    /// Until that asking is made (or has given up: [`ask_more`] finds out).
+    pub(crate) fn wait(self) {
+        let done = &*self.0;
+        let mut made = done.0.lock().unwrap_or_else(|e| e.into_inner());
+        while !*made {
+            made = done.1.wait(made).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// [`ask_once`] of `ranges`, begun on the thread kept for it ([`first`]);
+/// here and now if there is no such thread.
+pub(crate) fn ask_first(ranges: Vec<(usize, usize)>) -> AskedFirst {
+    type Job = Box<dyn FnOnce() + Send>;
+    static THREAD: std::sync::OnceLock<Option<Mutex<std::sync::mpsc::Sender<Job>>>> = std::sync::OnceLock::new();
+    let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+    let told = done.clone();
+    let job: Job = Box::new(move || {
+        // (However it ends, the submission that waits goes on: where no
+        // asking stands it makes its own.)
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ask_once(&ranges)));
+        *told.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        told.1.notify_all();
+    });
+    let thread = THREAD.get_or_init(|| {
+        let (send, jobs) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("victory-ask".into())
+            .spawn(move || {
+                crate::cores::keep_on_fast_cores("victory-ask");
+                // (The submitting thread waits for it.)
+                let mut priority = crate::cores::Priority::new();
+                jobs.into_iter().for_each(|job| {
+                    priority.keep();
+                    job()
+                })
+            })
+            .ok()
+            .map(|_| Mutex::new(send))
+    });
+    match thread {
+        Some(send) => {
+            if let Err(job) = send.lock().unwrap_or_else(|e| e.into_inner()).send(job) {
+                (job.0)();
+            }
+        }
+        None => job(),
+    }
+    AskedFirst(done)
+}
+
+/// After [`ask_first`] was waited for: asks about what of `ranges` the
+/// asking that stands does not hold, and it stands on; all of them, as
+/// [`ask_once`] does, if none stands (the first found nothing to hold, or
+/// gave up). Whether anything was asked.
+pub(crate) fn ask_more(ranges: &[(usize, usize)]) -> bool {
+    if !once() {
+        return false;
+    }
+    let held = {
+        let j = journal();
+        j.kept.then(|| j.ahead.clone())
+    };
+    let Some(held) = held else {
+        ask_once(ranges);
+        return true;
+    };
+    // (Outside the journal's lock: `published` has locks of its own.)
+    let all_held = ranges.iter().all(|&(start, end)| {
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        start >= end || published(start, end) || held.iter().any(|&(a, b)| a <= first && last <= b)
+    });
+    if all_held {
+        return false;
+    }
+    ask_rest(ranges);
+    true
+}
+
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
@@ -3666,6 +3774,40 @@ mod tests {
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// An asking begun on the thread kept for it is made when it has been
+    /// waited for, and a range it did not hold is asked for afterwards.
+    /// (Other tests end the asking that stands at any time: what is looked at
+    /// here is what the askings noted, which stays.)
+    #[test]
+    fn an_asking_begun_first_is_made_and_more_is_asked_for() {
+        let fresh = || {
+            // SAFETY: a fresh write-watched allocation, freed at the end.
+            let p = unsafe {
+                VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+            } as usize;
+            assert_ne!(p, 0);
+            p
+        };
+        let (p, q) = (fresh(), fresh());
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
+        ask_first(vec![(p, p + 4 * PAGE)]).wait();
+        assert!(journal().written.contains_key(&(p / PAGE + 1)), "the first asking did not note the page written");
+        // SAFETY: committed pages of ours.
+        unsafe { ((q + 2 * PAGE) as *mut u8).write_volatile(1) };
+        assert!(ask_more(&[(p, p + 4 * PAGE), (q, q + 4 * PAGE)]), "a range nobody held was not asked about");
+        assert!(journal().written.contains_key(&(q / PAGE + 2)), "the asking for more did not note the page written");
+        ask_once_end();
+        // An empty asking is waited for like any other.
+        ask_first(Vec::new()).wait();
+        ask_once_end();
+        // SAFETY: our allocations.
+        unsafe {
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+            VirtualFree(q as *mut _, 0, MEM_RELEASE);
+        }
     }
 
     /// The runtime maps a view and then tells us; a copy's refresh on another
