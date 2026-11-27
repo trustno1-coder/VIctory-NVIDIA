@@ -488,7 +488,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let dxil = c
         .native_part()
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -504,7 +504,17 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let mut res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok());
+    // a program made from pieces that does not trace may have its heap's base
+    // one SGPR lower than guessed: try the code's placement, and keep the
+    // first error when that does not trace either. A program that traces is
+    // never touched.
+    if res.is_err() && crate::pieces::place_heap(&mut native, &p) {
+        if let Ok(moved) = resource::track(&p, &native.layout, native.stage, st.as_ref().ok()) {
+            res = Ok(moved);
+        }
+    }
+    let res = res?;
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)

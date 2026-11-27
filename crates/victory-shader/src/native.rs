@@ -537,7 +537,8 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 ///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
 ///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
 ///         u32 -1, u32 0
-///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
+///   0x42  a view declaration: u32 0, u8 1 (2 for a view from the heap), u8
+///         class (0 SRV, 1 UAV, 3 sampler),
 ///         u8 resource kind (DXIL's), u8 0, u32 register
 ///   0x43  the shader hash (16 B); the last record
 /// ```
@@ -606,6 +607,10 @@ pub(crate) struct Records {
     /// A 0x42 record declares a sampler (class 3): one the code takes from
     /// the sampler heap, which no 0x41 record describes.
     pub(crate) heap_sampler: bool,
+    /// A 0x42 record whose byte 8 is 2 and whose class is not a sampler, and
+    /// that no table record of its register backs: a view the code takes from
+    /// the resource heap, which no 0x41 record places either.
+    pub(crate) heap_view: bool,
 }
 
 /// What [`records`] accepts beyond what an `ACCC` part ever held.
@@ -626,6 +631,7 @@ pub(crate) fn records(data: &[u8], rules: RecordRules) -> Result<Records, Shader
     let mut layout: Vec<RootParam> = Vec::new();
     let mut used = Vec::new();
     let mut heap_sampler = false;
+    let mut heap_view = false;
     for e in data.as_chunks::<FSPX_RECORD>().0 {
         match e[0] {
             0x41 => {}
@@ -635,6 +641,23 @@ pub(crate) fn records(data: &[u8], rules: RecordRules) -> Result<Records, Shader
                 heap_sampler |= e[9] == 3
                     && !used.iter().any(|u: &UsedResource| {
                         u.kind == ResourceType::Sampler
+                            && u.root == RootType::Table
+                            && u.lower_bound == le32(e, 12)
+                    });
+                // byte 8 of 2 is a view taken from the heap (inferred: every
+                // program that reads the heap's base has one, and no other
+                // program has).
+                // no table record of its register backs.
+                let class = match e[9] {
+                    0 => Some(ResourceType::Srv),
+                    1 => Some(ResourceType::Uav),
+                    2 => Some(ResourceType::Cbv),
+                    _ => None,
+                };
+                heap_view |= e[8] == 2
+                    && e[9] != 3
+                    && !used.iter().any(|u: &UsedResource| {
+                        Some(u.kind) == class
                             && u.root == RootType::Table
                             && u.lower_bound == le32(e, 12)
                     });
@@ -685,6 +708,7 @@ pub(crate) fn records(data: &[u8], rules: RecordRules) -> Result<Records, Shader
         layout,
         used,
         heap_sampler,
+        heap_view,
     })
 }
 

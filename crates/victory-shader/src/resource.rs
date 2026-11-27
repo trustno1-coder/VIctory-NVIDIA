@@ -2453,6 +2453,14 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
         return Some(Moved::Const(((1u32 << w) - 1) << at));
     }
+    // the same mask in 64 bits, as the console's compiler makes the first two
+    // words of an immediate sampler: width and position take 6 bits, and dword
+    // k is the low (0) or high (1) half.
+    if let ("s_bfm_b64", [Operand::Const(w), Operand::Const(at)]) = (inst.name(), &src[..]) {
+        let (w, at) = (inline(*w)? & 63, inline(*at)? & 63);
+        let mask = ((1u64 << w) - 1) << at;
+        return Some(Moved::Const((mask >> (32 * (k & 1))) as u32));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -3047,6 +3055,49 @@ pub(crate) mod tests {
         assert_eq!(value(2, 1), Term::Const(0));
     }
 
+    /// The first two words of an immediate sampler are a 64-bit mask.
+    #[test]
+    fn a_64_bit_mask_gives_sampler_words_as_constants() {
+        let code: Vec<u8> = [
+            0x928C_B682, // s_bfm_b64 s[12:13], 2, 54
+            0x928C_0C0C, // s_bfm_b64 s[12:13], s12, s12
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 4, 1)];
+        let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+        let block = &p.blocks[0];
+        let value = |n: usize, k: usize| t.origin(block.insts[n].writes[k].1);
+        assert_eq!(value(0, 0), Term::Const(0));
+        assert_eq!(value(0, 1), Term::Const(0x00C0_0000));
+        // A mask of registers' bits is not folded.
+        assert!(!matches!(value(1, 0), Term::Const(_)));
+        // Through a sample: the sampler is a constant.
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0x928C_B682, // s_bfm_b64 s[12:13], 2, 54
+                0xBE8E_04FF,
+                0x1850_0000, // s_mov_b64 s[14:15], 0x18500000
+                0xF080_0F08,
+                0x0060_0002, // image_sample v[0:3], v[2:3], s[0:7], s[12:15]
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Cs,
+        );
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
+        assert_eq!(
+            sampler.source,
+            Source::Constant(vec![0, 0x00C0_0000, 0x1850_0000, 0])
+        );
+    }
 
     #[test]
     fn a_selection_that_mixes_two_descriptors_fails() {

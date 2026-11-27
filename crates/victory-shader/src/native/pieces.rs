@@ -1313,11 +1313,71 @@ pub fn program_of_stock(container: &[u8]) -> Option<ProgramHash> {
     None
 }
 
+/// Whether a program with a view from the resource heap gets the heap's base
+/// as a root parameter (`VICTORY_HEAP_VIEW` set; read once). Off, such a
+/// program keeps today's refusal. Tests run with it on.
+fn heap_views_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(test) || std::env::var_os("VICTORY_HEAP_VIEW").is_some())
+}
+
 /// The program in the data of a part of ours.
 pub(crate) fn program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let (mut program, code) = read(part)?;
     program.code = code.to_vec();
     Ok(program)
+}
+
+/// Moves the resource heap's base one SGPR down in a program made from pieces
+/// when the code shows the last user SGPR is not it. [`read`] puts the heap
+/// at the last user SGPR (or the one before a sampler heap), which is where
+/// the console's own containers have it, but a pieces program that declares a
+/// heap view and no heap sampler may keep an unused sampler heap there and
+/// the base before it. The registers the code reads on entry tell: when the
+/// last one is never read and the one before it is, the base is the one
+/// before, and the constants that [`read`] stretched over it end one dword
+/// earlier. It acts only on a heap that has no sampler heap beside it, and
+/// leaves a layout alone when a table or descriptor holds the lower SGPR or
+/// the constants would be left with none. It needs `p`, so it cannot run in
+/// [`read`], whose [`check`] runs on the title's thread at pipeline creation;
+/// the translation calls it on a worker, and only for a program whose
+/// resources do not trace with the layout as [`read`] made it. Returns
+/// whether it moved the heap.
+pub fn place_heap(native: &mut NativeProgram, p: &crate::ir::Program) -> bool {
+    use crate::ir::Reg;
+    let made = native.layout.iter().any(|q| {
+        matches!(q.root, RootType::Other(c) if c == COMPUTE_PIECES || c == PIXEL_PIECES || c == VERTEX_BUFFERS)
+    });
+    let heap = native
+        .layout
+        .iter()
+        .position(|q| q.root == RootType::ResourceHeap);
+    let (true, Some(heap)) = (made, heap) else {
+        return false;
+    };
+    if native.layout.iter().any(|q| q.root == RootType::SamplerHeap) {
+        return false;
+    }
+    let last = native.layout[heap].user_data;
+    let read = |n: u8| p.inputs.iter().any(|&(r, _)| r == Reg::S(n));
+    // (a vertex program's first three SGPRs are the system's)
+    let floor = if native.stage == HwStage::Vs { 4 } else { 1 };
+    if last < floor || read(last) || !read(last - 1) {
+        return false;
+    }
+    // what holds the lower SGPR: only constants with a dword to spare give it up
+    let lower = u32::from(last - 1);
+    match native.layout.iter().position(|q| {
+        u32::from(q.user_data) <= lower && lower < u32::from(q.user_data) + q.sgprs
+    }) {
+        Some(c) if native.layout[c].root == RootType::Constants && native.layout[c].sgprs > 1 => {
+            native.layout[c].sgprs -= 1;
+        }
+        Some(_) => return false,
+        None => {}
+    }
+    native.layout[heap].user_data = last - 1;
+    true
 }
 
 /// The program in the data of a part of ours, without its code, and the
@@ -1377,6 +1437,29 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
         strides: true,
     };
     let mut r = native::records(recs, rules)?;
+    if r.heap_view && heap_views_on() {
+        // A view from the resource heap, whose base no record places: the
+        // console's own containers put it at the last user SGPR, or the one
+        // before it when the sampler heap follows. A program that has one but
+        // no room for it keeps today's refusal at translation, as a refusal
+        // here would leave the pipeline unmade; [`place_heap`] moves it when
+        // the code shows the last SGPR is not it.
+        let at = user_sgprs
+            .checked_sub(1 + u32::from(r.heap_sampler))
+            .filter(|&at| stage != VERTEX || at >= 3);
+        if let Some(at) = at
+            && r.layout.iter().all(|p| u32::from(p.user_data) < at)
+        {
+            r.layout.push(RootParam {
+                root: RootType::ResourceHeap,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: at as u8,
+                slot: u8::MAX,
+            });
+        }
+    }
     if r.heap_sampler {
         // A sampler from the sampler heap, whose base no record places: it
         // was the last user SGPR in the eleven pixel programs seen with
@@ -1584,8 +1667,13 @@ mod tests {
 
     /// A 0x42 record of `class` for `register`.
     fn declaration(class: u8, kind: u8, register: u32) -> [u8; 32] {
+        declared(1, class, kind, register)
+    }
+
+    /// A 0x42 record with `byte8` (2 for a view taken from the heap).
+    fn declared(byte8: u8, class: u8, kind: u8, register: u32) -> [u8; 32] {
         let mut e = [0u8; 32];
-        (e[0], e[8], e[9], e[10]) = (0x42, 1, class, kind);
+        (e[0], e[8], e[9], e[10]) = (0x42, byte8, class, kind);
         put(&mut e, 12, register);
         e
     }
@@ -2741,5 +2829,171 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// The layout of a compute program with `user` user SGPRs and `records`.
+    fn compute_layout(user: u32, records: &[[u8; 32]]) -> Vec<(RootType, u8, u32)> {
+        let code = code(1);
+        let mut all = records.to_vec();
+        all.push(hash());
+        let meta = metadata(COMPUTE_METADATA, code.len(), &all);
+        let bytes = fill(
+            compute(&compute_packet(user), code.len(), meta.len()).unwrap(),
+            &code,
+            &meta,
+        );
+        let p = checked(&bytes).unwrap();
+        p.layout
+            .iter()
+            .map(|q| (q.root, q.user_data, q.sgprs))
+            .collect()
+    }
+
+    #[test]
+    fn a_heap_view_gets_the_last_user_sgpr() {
+        // Tables in s4 and s5, constants from s6 up to the heap in s7.
+        let records = [
+            resource(0, 3, 0, 7, 4, 8, 4, 0),
+            resource(0, 3, 0, 8, 4, 8, 5, 1),
+            resource(2, 0, 0, 9, 0, 4, 6, 2),
+            declared(2, 0, 2, 0),
+        ];
+        let roots = compute_layout(8, &records);
+        assert!(roots.contains(&(RootType::ResourceHeap, 7, 1)), "{roots:?}");
+        assert!(roots.contains(&(RootType::Constants, 6, 1)), "{roots:?}");
+        // Without the record the constants run to the end, as they did.
+        let without = compute_layout(8, &records[..3]);
+        assert!(without.contains(&(RootType::Constants, 6, 2)), "{without:?}");
+        assert!(without.iter().all(|r| r.0 != RootType::ResourceHeap));
+        // A parameter at the heap's place leaves no heap entry, and no refusal.
+        let taken = compute_layout(8, &[resource(0, 3, 0, 7, 4, 8, 7, 0), declared(2, 0, 2, 0)]);
+        assert!(taken.iter().all(|r| r.0 != RootType::ResourceHeap), "{taken:?}");
+    }
+
+    #[test]
+    fn a_heap_view_sits_before_a_heap_sampler_and_after_vertex_buffers() {
+        let g = Graphics::parse(
+            &graphics_packet(true, 3, &[(0, false)]),
+            &state_piece(&ELEMENTS),
+            true,
+        )
+        .unwrap();
+        let code = code(11);
+        // The pixel stage has 10 user SGPRs: the sampler heap takes s9.
+        let both = metadata(
+            GRAPHICS_METADATA,
+            code.len(),
+            &[
+                resource(0, 3, 0, 1, 4, 8, 4, 0),
+                declared(2, 0, 2, 0),
+                declaration(3, 14, 0),
+                hash(),
+            ],
+        );
+        let ps = checked(&fill(g.pixel(code.len(), both.len()).unwrap(), &code, &both)).unwrap();
+        let roots: Vec<_> = ps.layout.iter().map(|p| (p.root, p.user_data)).collect();
+        assert!(roots.contains(&(RootType::ResourceHeap, 8)), "{roots:?}");
+        assert!(roots.contains(&(RootType::SamplerHeap, 9)), "{roots:?}");
+        // The vertex buffer entry stays where it was.
+        let alone = metadata(
+            GRAPHICS_METADATA,
+            code.len(),
+            &[declared(2, 0, 2, 0), hash()],
+        );
+        let vs = checked(&fill(g.vertex(code.len(), alone.len()).unwrap(), &code, &alone)).unwrap();
+        let roots: Vec<_> = vs
+            .layout
+            .iter()
+            .map(|p| (p.root, p.user_data, p.sgprs))
+            .collect();
+        assert!(roots.contains(&(RootType::ResourceHeap, 9, 1)), "{roots:?}");
+        assert!(
+            roots.contains(&(RootType::Other(VERTEX_BUFFERS), 0, 2)),
+            "{roots:?}"
+        );
+    }
+
+    /// A compute program of 8 user SGPRs that takes a descriptor from the
+    /// heap through `s_load_dwordx4 s[20:23], s[16:17], s9`, with the heap's
+    /// base copied from s6 and the index (constants) from s5, then runs
+    /// `extra`, with `records` as its tables and constants.
+    fn heap_program(extra: &[u32], records: &[[u8; 32]]) -> (NativeProgram, crate::ir::Program) {
+        let mut words = vec![
+            0xBE90_0306, // s_mov_b32 s16, s6
+            0xBE91_0380, // s_mov_b32 s17, 0
+            0x8F09_8505, // s_lshl_b32 s9, s5, 5
+            0xF408_0508,
+            0x1200_0000, // s_load_dwordx4 s[20:23], s[16:17], s9
+        ];
+        words.extend_from_slice(extra);
+        words.push(END);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut all = records.to_vec();
+        all.push(hash());
+        let meta = metadata(COMPUTE_METADATA, code.len(), &all);
+        let bytes = fill(
+            compute(&compute_packet(8), code.len(), meta.len()).unwrap(),
+            &code,
+            &meta,
+        );
+        let native = checked(&bytes).unwrap();
+        let p = crate::ir::build(&native.code, false, 256).unwrap();
+        (native, p)
+    }
+
+    #[test]
+    fn the_heap_moves_down_when_the_last_sgpr_is_never_read() {
+        // Constants from s5 up to the heap guessed at s7.
+        let records = [
+            resource(0, 3, 0, 7, 4, 8, 4, 0),
+            resource(2, 0, 0, 9, 0, 4, 5, 1),
+            declared(2, 0, 2, 0),
+        ];
+        let (mut native, p) = heap_program(&[], &records);
+        place_heap(&mut native, &p);
+        let roots: Vec<_> = native
+            .layout
+            .iter()
+            .map(|q| (q.root, q.user_data, q.sgprs))
+            .collect();
+        assert!(roots.contains(&(RootType::ResourceHeap, 6, 1)), "{roots:?}");
+        assert!(roots.contains(&(RootType::Constants, 5, 1)), "{roots:?}");
+        // The load's base now traces to the heap, with the index computed.
+        let heap = native
+            .layout
+            .iter()
+            .position(|q| q.root == RootType::ResourceHeap)
+            .unwrap();
+        let r = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        assert_eq!(r.scalar[0].1.param, heap);
+        assert!(r.scalar[0].1.dynamic.is_some());
+        // The last SGPR read too: it is the heap, nothing moves.
+        let (mut native, p) = heap_program(&[0xBE92_0307], &records); // s_mov_b32 s18, s7
+        let before = native.layout.clone();
+        place_heap(&mut native, &p);
+        assert_eq!(native.layout, before);
+        // A table holds s6: nothing moves.
+        let held = [
+            resource(0, 3, 0, 7, 4, 8, 4, 0),
+            resource(0, 3, 0, 8, 4, 8, 6, 1),
+            resource(2, 0, 0, 9, 0, 4, 5, 2),
+            declared(2, 0, 2, 0),
+        ];
+        let (mut native, p) = heap_program(&[], &held);
+        let before = native.layout.clone();
+        place_heap(&mut native, &p);
+        assert_eq!(native.layout, before);
+    }
+
+    #[test]
+    fn the_heap_stays_when_neither_sgpr_is_read() {
+        let records = [resource(2, 0, 0, 9, 0, 4, 5, 1), declared(2, 0, 2, 0)];
+        let (mut native, _) = heap_program(&[], &records);
+        // the same layout against code that reads no user SGPR
+        let end = END.to_le_bytes();
+        let none = crate::ir::build(&end, false, 256).unwrap();
+        let before = native.layout.clone();
+        place_heap(&mut native, &none);
+        assert_eq!(native.layout, before);
     }
 }
