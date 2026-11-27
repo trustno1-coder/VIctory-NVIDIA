@@ -501,6 +501,11 @@ pub(crate) struct State {
     depth: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
+    /// Whether `targets` have already been transitioned to `RENDER_TARGET`
+    /// since the last `set_targets`, `synced`, or `reset`.
+    targets_synced: bool,
+    /// Last host state transitioned for `depth` (0 when invalidated).
+    last_depth_state: u32,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
@@ -1321,8 +1326,46 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
-        *self = State::default();
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
+        }
         self.pipeline = pipeline as usize;
+        self.heaps = [0; 2];
+        self.graphics.clear();
+        self.compute.clear();
+        self.vertex = Default::default();
+        self.index = IndexView::default();
+        self.targets.clear();
+        self.depth = 0;
+        self.depth_state = 0;
+        self.targets_synced = false;
+        self.last_depth_state = 0;
+        self.topology = 0;
+        self.topology_set = false;
+        self.target_handles.clear();
+        self.depth_handle = 0;
+        self.targets_set = false;
+        self.host_targets = None;
+        self.viewports.clear();
+        self.scissors.clear();
+        self.blend = None;
+        self.stencil = None;
+        self.depth_bounds = None;
+        self.window = None;
+        self.batch = None;
+        #[cfg(feature = "diagnostics")]
+        self.user.clear();
+        self.ambient_tables.clear();
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.host_heaps_set = false;
+        self.fresh_tables.clear();
+        self.root_srv_slots.clear();
+        self.root_uav_slots.clear();
+        self.tables_gone = false;
+        self.recording = 0;
+        self.rebinds = [0; 2];
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -1451,6 +1494,8 @@ impl State {
         self.target_handles.extend_from_slice(handles);
         self.depth_handle = depth;
         self.targets_set = true;
+        self.targets_synced = false;
+        self.last_depth_state = 0;
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
@@ -1505,17 +1550,33 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
-        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
-        // SAFETY: an open list; the views were just made.
-        unsafe {
-            list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
-                false,
-                dsv.as_ref().map(std::ptr::from_ref),
-            )
-        };
+        if views.len() <= 8 {
+            let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+            for (dst, &(texture, ref desc)) in rtvs.iter_mut().zip(views.iter()) {
+                *dst = host.rtv(texture, desc.as_ref());
+            }
+            // SAFETY: an open list; the views were just made.
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    views.len() as u32,
+                    (!views.is_empty()).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
+        } else {
+            let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+            // SAFETY: an open list; the views were just made.
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    rtvs.len() as u32,
+                    (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
+        }
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -1831,8 +1892,11 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+        if !self.targets_synced {
+            for &t in &self.targets {
+                crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            }
+            self.targets_synced = true;
         }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
@@ -1852,7 +1916,10 @@ impl State {
             } else {
                 DEPTH_WRITE
             };
-            crate::list::ensure_state(list, self.depth as This, state);
+            if state != self.last_depth_state {
+                crate::list::ensure_state(list, self.depth as This, state);
+                self.last_depth_state = state;
+            }
         }
         true
     }
@@ -5008,6 +5075,8 @@ impl State {
 
     /// The title waits for earlier work (a barrier or a pipeline sync).
     pub(crate) fn synced(&mut self) {
+        self.targets_synced = false;
+        self.last_depth_state = 0;
         if self.batch.as_ref().is_some_and(|b| b.wrote) {
             self.batch = None;
         }
