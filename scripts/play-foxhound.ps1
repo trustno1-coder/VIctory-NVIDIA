@@ -95,6 +95,16 @@ $settings = @{
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
     VICTORY_PIPELINE_BOOK = '1'
 }
+# PCs with 16 GB of RAM or less: the host copies of title memory are cut on a 1 MiB grid, and an ask without a
+# length (a root view) takes its 4 MiB cell from its own 256 KiB step on, not from the cell's start. Measured on an
+# RTX 5060 Laptop (8 GB) with 16 GB of RAM, Series S, the prison's day room (diagnostics build, memory line): the
+# windows 3,400 -> 2,598 MB, of them those asked for without a length 2,732 -> 980 MB, the card's share of the PC's
+# memory 6.0 -> 5.2 GB, and the slowest tenth of seconds 3.7 -> 11.9 fps (median 14.0 -> 14.4); release build,
+# median 16.0 -> 16.4 fps. -More @{VICTORY_WINDOW_KB='4096'} restores the 4 MiB grid.
+$ramGb = try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB } catch { 0 }
+if ($ramGb -gt 0 -and $ramGb -le 16.5) {
+    $settings.VICTORY_WINDOW_KB = '1024'; $settings.VICTORY_WINDOW_TAILS = '1'
+}
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
