@@ -66,7 +66,7 @@
 //! the console rounds, which of two boxes entered at the same distance it
 //! returns first, and what it returns for a ray exactly through an edge
 //! (here: a hit in both triangles of the edge) or for kinds 6 and 7 (here:
-//! a triangle miss; the title's programs do not read it).
+//! all ones, `[u32::MAX; 4]`, as the hardware returns).
 
 /// The result dword for a box the ray misses, or a child that is not there.
 pub const NONE: u32 = 0xffff_ffff;
@@ -127,7 +127,10 @@ pub fn intersect(words: &[u32; 28], kind: u32, ray: &Ray, sort: bool) -> [u32; 4
         4 => boxes(&children(words), &boxes16(words), ray, sort),
         5 => boxes(&children(words), &boxes32(words), ray, sort),
         k @ 0..=3 => triangle(&triangle_vertices(words, k), ray).map(f32::to_bits),
-        _ => MISS.map(f32::to_bits),
+        // An instance or a procedural node: the hardware answers -1 in all
+        // four dwords (AMD GPURT IntersectCommon.hlsl: "User defined node.
+        // HW returns -1"); the traversal handles the node itself.
+        _ => [u32::MAX; 4],
     }
 }
 
@@ -664,11 +667,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn instances_and_procedural_nodes_return_a_triangle_miss() {
+    fn instances_and_procedural_nodes_return_all_ones() {
+        // As the hardware (AMD GPURT IntersectCommon.hlsl: "User defined
+        // node. HW returns -1"): the traversal handles such a node itself.
         let node = triangles(&TRIANGLE, 9);
         let ray = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 100.0);
         for k in [6, 7] {
-            assert_eq!(intersect(&node, k, &ray, true), MISS.map(f32::to_bits));
+            assert_eq!(intersect(&node, k, &ray, true), [u32::MAX; 4]);
         }
     }
 

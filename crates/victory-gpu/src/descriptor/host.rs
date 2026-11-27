@@ -4264,16 +4264,22 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 
 /// The address a shader finds in a descriptor of title memory: where a
 /// buffer view starts, or the ray-tracing structure of a structure's view
-/// (no resource: the view's description holds the address, and the shader
-/// walks the structure from there itself).
+/// (no resource: the view's description holds the address in words 4-5, and
+/// the shader walks the structure from there itself).
 pub(crate) fn view_address(view: &View) -> Option<u64> {
     const STRUCTURE: u32 = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
-    match view {
-        View::Shader(_, Some(desc)) if desc[1] == STRUCTURE => {
-            Some(u64::from(desc[4]) | u64::from(desc[5]) << 32)
-        }
-        _ => buffer_range(view).map(|range| range.0),
+    let words = match view {
+        View::Shader(_, Some(desc)) => Some(&desc[..]),
+        View::Placed(false, _, desc) => Some(&desc[..10]),
+        _ => None,
+    };
+    if let Some(w) = words
+        && w[1] == STRUCTURE
+    {
+        let at = u64::from(w[4]) | u64::from(w[5]) << 32;
+        return (at != 0).then_some(at);
     }
+    buffer_range(view).map(|range| range.0)
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -5861,6 +5867,28 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    #[test]
+    fn structure_views_report_their_location_as_view_address() {
+        const STRUCTURE: u32 = 11;
+        let location = 0x0000_0007_8000_1200u64;
+        let mut srv = [0u32; 10];
+        srv[1] = STRUCTURE;
+        assert_eq!(view_address(&View::Shader(0, Some(srv))), None);
+        srv[4] = location as u32;
+        srv[5] = (location >> 32) as u32;
+        assert_eq!(view_address(&View::Shader(0, Some(srv))), Some(location));
+
+        let mut placed = [0u32; 16];
+        placed[1] = STRUCTURE;
+        assert_eq!(view_address(&View::Placed(false, [0; 14], placed)), None);
+        placed[4] = location as u32;
+        placed[5] = (location >> 32) as u32;
+        assert_eq!(
+            view_address(&View::Placed(false, [0; 14], placed)),
+            Some(location)
+        );
     }
 
     #[test]
