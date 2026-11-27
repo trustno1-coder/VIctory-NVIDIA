@@ -364,7 +364,7 @@ pub(crate) fn bounded_root_srvs() -> bool {
 /// where the driver puts a static sampler).
 ///
 /// Where the bytes are: a sampler description is 52 bytes of ours, written
-/// once per sampler heap into [`SAMPLER_TAIL`] slots after the title's own
+/// once per sampler heap into [`sampler_capacity`] slots after the title's own
 /// (`descriptor::host::HostHeap::new` makes sampler heaps that much longer
 /// with the switch on), by the card's descriptor write, not a copy of title
 /// memory; the shaders read them on the card; the title never sees them.
@@ -379,13 +379,32 @@ pub(crate) fn sampler_table() -> bool {
 /// tables of [`sampler_table`].
 pub(crate) const SAMPLER_TAIL: u32 = 256;
 
+/// `VICTORY_PIPELINE_SAMPLER_REUSE=1`: keep contained sampler runs and
+/// suffixes in the same slots, with room for 1024 descriptors. the 256-slot
+/// pool filled during world loading in a local run; the stages after it
+/// fell back to static samplers and missed the pipeline library.
+/// local runs on 2026-11-27, 15:05 and 16:05: library bypass calls went
+/// from 864 to 0. the later start loaded 2858 pipelines before world entry
+/// with no creations there; its sampler pool used 505 slots.
+/// read once on the pipeline workers. descriptions are host-side values;
+/// only new descriptors go to a heap, once, as before. a reused run adds no
+/// copy and never changes a descriptor the card may already be reading.
+pub(crate) fn sampler_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SAMPLER_REUSE").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn sampler_capacity() -> u32 {
+    if sampler_reuse() { 1024 } else { SAMPLER_TAIL }
+}
+
 /// How many slots a sampler heap of the host gets past the title's: none
 /// unless the sampler tables are on. Read by `HostHeap::new` when it makes
 /// a sampler heap (the change is asked for in the notes of that file; the
 /// tables have no room before it is made).
 #[allow(dead_code)]
 pub(crate) fn sampler_tail() -> u32 {
-    if sampler_table() { SAMPLER_TAIL } else { 0 }
+    if sampler_table() { sampler_capacity() } else { 0 }
 }
 
 /// A sampler description in words, to tell two apart (floats by their bits).
@@ -460,10 +479,13 @@ struct SamplerBlock {
 struct SamplerBlocks {
     list: Vec<SamplerBlock>,
     used: u32,
+    /// descriptors in physical slot order. runs may span two allocations;
+    /// no earlier slot is moved when a longer run shares its suffix.
+    keys: Vec<SamplerKey>,
 }
 
 static SAMPLER_BLOCKS: std::sync::Mutex<SamplerBlocks> =
-    std::sync::Mutex::new(SamplerBlocks { list: Vec::new(), used: 0 });
+    std::sync::Mutex::new(SamplerBlocks { list: Vec::new(), used: 0, keys: Vec::new() });
 
 /// How many blocks exist: what a list compares with before it asks for the
 /// blocks to be written.
@@ -497,18 +519,38 @@ impl SamplerBlocks {
     /// before for the same descriptions, else a new one. None for none or
     /// too many descriptions, or when the tail is full.
     fn block(&mut self, descs: &[D3D12_SAMPLER_DESC]) -> Option<u32> {
-        let n = u32::try_from(descs.len()).ok().filter(|&n| n > 0 && n <= SAMPLER_TAIL)?;
+        self.block_in(descs, sampler_capacity(), sampler_reuse())
+    }
+
+    /// allocates on a pipeline worker, under SAMPLER_BLOCKS. matching a
+    /// subrange or the tail's suffix only aliases immutable descriptors;
+    /// fill writes just the newly appended slots on the recording thread.
+    fn block_in(&mut self, descs: &[D3D12_SAMPLER_DESC], capacity: u32, reuse: bool) -> Option<u32> {
+        let n = u32::try_from(descs.len()).ok().filter(|&n| n > 0 && n <= capacity)?;
         let keys: Vec<SamplerKey> = descs.iter().map(sampler_key).collect();
-        if let Some(b) = self.list.iter().find(|b| b.keys == keys) {
-            return Some(b.offset);
-        }
-        let offset = self.used;
-        if offset + n > SAMPLER_TAIL {
+        let overlap = if reuse {
+            if let Some(at) = self.keys.windows(keys.len()).position(|run| run == keys) {
+                return Some(at as u32);
+            }
+            (1..keys.len().min(self.keys.len() + 1))
+                .rev()
+                .find(|&n| self.keys.ends_with(&keys[..n]))
+                .unwrap_or(0)
+        } else {
+            if let Some(b) = self.list.iter().find(|b| b.keys == keys) {
+                return Some(b.offset);
+            }
+            0
+        };
+        let added = n - overlap as u32;
+        if self.used.checked_add(added)? > capacity {
             return None;
         }
-        self.used += n;
-        self.list.push(SamplerBlock { offset, keys, descs: descs.to_vec() });
-        Some(offset)
+        let offset = self.used;
+        self.keys.extend_from_slice(&keys[overlap..]);
+        self.used += added;
+        self.list.push(SamplerBlock { offset, keys: keys[overlap..].to_vec(), descs: descs[overlap..].to_vec() });
+        Some(offset - overlap as u32)
     }
 }
 
@@ -528,7 +570,7 @@ pub(crate) fn sampler_blocks() -> usize {
 /// A sampler heap of our own for lists with no title sampler heap bound
 /// (the title's directly indexed samplers then read an arbitrary point
 /// sampler, as they do from `Host::fallback_sampler_heap`), long enough for
-/// the tail: [`SAMPLER_TAIL`] slots, all point samplers until a table is
+/// the tail: [`sampler_capacity`] slots, all point samplers until a table is
 /// written over them.
 pub(crate) fn table_heap() -> Option<&'static ID3D12DescriptorHeap> {
     static HEAP: std::sync::OnceLock<Option<ID3D12DescriptorHeap>> = std::sync::OnceLock::new();
@@ -538,7 +580,7 @@ pub(crate) fn table_heap() -> Option<&'static ID3D12DescriptorHeap> {
         let heap: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                NumDescriptors: SAMPLER_TAIL,
+                NumDescriptors: sampler_capacity(),
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -558,7 +600,7 @@ pub(crate) fn table_heap() -> Option<&'static ID3D12DescriptorHeap> {
         unsafe {
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart();
-            for i in 0..SAMPLER_TAIL as usize {
+            for i in 0..sampler_capacity() as usize {
                 host.device.CreateSampler(&desc, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + i * step });
             }
         }
@@ -581,7 +623,7 @@ pub(crate) struct SamplerTail {
     cpu: usize,
     gpu: u64,
     step: u32,
-    /// Slots of the heap from where the tail starts, at most [`SAMPLER_TAIL`].
+    /// Slots of the heap from where the tail starts, at most [`sampler_capacity`].
     slots: u32,
 }
 
@@ -599,7 +641,7 @@ impl SamplerTail {
                 heap.GetGPUDescriptorHandleForHeapStart().ptr,
             )
         };
-        let slots = count.checked_sub(first)?.min(SAMPLER_TAIL);
+        let slots = count.checked_sub(first)?.min(sampler_capacity());
         if slots == 0 || step == 0 {
             return None;
         }
@@ -1480,28 +1522,76 @@ mod tests {
     #[test]
     fn sampler_blocks_are_shared_and_bounded() {
         let one = |filter| table_sampler(&static_sampler(filter, 1, 0), true).unwrap();
-        let mut blocks = SamplerBlocks { list: Vec::new(), used: 0 };
-        assert_eq!(blocks.block(&[one(0), one(0x15)]), Some(0));
-        assert_eq!(blocks.block(&[one(0)]), Some(2));
-        assert_eq!(blocks.block(&[one(0), one(0x15)]), Some(0));
+        let mut blocks = SamplerBlocks { list: Vec::new(), used: 0, keys: Vec::new() };
+        let mut block = |descs: &[D3D12_SAMPLER_DESC]| blocks.block_in(descs, SAMPLER_TAIL, false);
+        assert_eq!(block(&[one(0), one(0x15)]), Some(0));
+        assert_eq!(block(&[one(0)]), Some(2));
+        assert_eq!(block(&[one(0), one(0x15)]), Some(0));
         // Same samplers in another order are another block.
-        assert_eq!(blocks.block(&[one(0x15), one(0)]), Some(3));
+        assert_eq!(block(&[one(0x15), one(0)]), Some(3));
+        drop(block);
         assert_eq!((blocks.list.len(), blocks.used), (3, 5));
-        assert_eq!(blocks.block(&[]), None);
+        assert_eq!(blocks.block_in(&[], SAMPLER_TAIL, false), None);
         let many = vec![one(0); SAMPLER_TAIL as usize + 1];
-        assert_eq!(blocks.block(&many), None);
+        assert_eq!(blocks.block_in(&many, SAMPLER_TAIL, false), None);
         let rest = vec![one(0x30); (SAMPLER_TAIL - 5) as usize];
-        assert_eq!(blocks.block(&rest), Some(5));
-        assert_eq!(blocks.block(&[one(0x31)]), None);
+        assert_eq!(blocks.block_in(&rest, SAMPLER_TAIL, false), Some(5));
+        assert_eq!(blocks.block_in(&[one(0x31)], SAMPLER_TAIL, false), None);
         // What is there is still found when the tail is full.
-        assert_eq!(blocks.block(&[one(0)]), Some(2));
+        assert_eq!(blocks.block_in(&[one(0)], SAMPLER_TAIL, false), Some(2));
+    }
+
+    /// aliased runs keep their register order, including a run spanning
+    /// allocations. only new slots are written and earlier offsets live on.
+    #[test]
+    fn sampler_runs_share_slots_without_overwriting_them() {
+        let one = |filter| table_sampler(&static_sampler(filter, 1, 0), true).unwrap();
+        let mut blocks = SamplerBlocks { list: Vec::new(), used: 0, keys: Vec::new() };
+        assert_eq!(blocks.block_in(&[one(0), one(1), one(2)], 5, true), Some(0));
+        assert_eq!(blocks.block_in(&[one(1)], 5, true), Some(1));
+        assert_eq!(blocks.block_in(&[one(1), one(2), one(3)], 5, true), Some(1));
+        assert_eq!(blocks.block_in(&[one(2), one(3), one(4)], 5, true), Some(2));
+        assert_eq!(blocks.block_in(&[one(4), one(5)], 5, true), None);
+        assert_eq!(blocks.block_in(&[one(1), one(2), one(3)], 5, true), Some(1));
+        assert_eq!(blocks.block_in(&[one(3), one(2)], 5, true), None);
+        assert_eq!((blocks.used, blocks.list.len()), (5, 3));
+        let stored: Vec<_> = blocks.list.iter().flat_map(|b| b.descs.iter().map(sampler_key)).collect();
+        assert_eq!(stored, (0..5).map(|n| sampler_key(&one(n))).collect::<Vec<_>>());
+        assert_eq!(blocks.list.iter().map(|b| b.offset).collect::<Vec<_>>(), [0, 3, 4]);
+        assert_eq!(blocks.block_in(&[], 5, true), None);
+        assert_eq!(blocks.block_in(&vec![one(0); 6], 5, true), None);
+    }
+
+    /// many different runs over a small set do not consume a fresh copy of
+    /// every descriptor. the legacy allocator runs out on this same input.
+    #[test]
+    fn sampler_run_reuse_leaves_room_for_later_stages() {
+        let one = |n: u32| {
+            let mut d = table_sampler(&static_sampler(0, 1, 0), true).unwrap();
+            d.MipLODBias = n as f32;
+            d
+        };
+        let mut compact = SamplerBlocks { list: Vec::new(), used: 0, keys: Vec::new() };
+        let mut legacy = SamplerBlocks { list: Vec::new(), used: 0, keys: Vec::new() };
+        let mut refused = 0;
+        for start in 0..32 {
+            for n in 1..=8 {
+                let descs: Vec<_> = (start..start + n).map(|i| one(i % 32)).collect();
+                let offset = compact.block_in(&descs, 256, true).unwrap() as usize;
+                let expected: Vec<_> = descs.iter().map(sampler_key).collect();
+                assert_eq!(&compact.keys[offset..offset + expected.len()], expected);
+                refused += usize::from(legacy.block_in(&descs, 256, false).is_none());
+            }
+        }
+        assert!(refused > 0);
+        assert!(compact.used < 64);
     }
 
     /// The tail is none unless the switch is on, and a heap too short for
     /// it has none either.
     #[test]
     fn the_tail_needs_the_switch_and_room() {
-        assert_eq!(sampler_tail(), if sampler_table() { SAMPLER_TAIL } else { 0 });
+        assert_eq!(sampler_tail(), if sampler_table() { sampler_capacity() } else { 0 });
         let Some(host) = host() else { return };
         // SAFETY: plain heap creation.
         let heap: ID3D12DescriptorHeap = unsafe {
@@ -1522,6 +1612,29 @@ mod tests {
         assert!(tail.handle(u32::MAX, 2).is_none());
         let (a, b) = (tail.handle(0, 1).unwrap(), tail.handle(1, 1).unwrap());
         assert!(b > a);
+    }
+
+    /// the expanded reservation fits beside 1024 title samplers on the
+    /// host device. both ends bind within the heap, never into title slots.
+    #[test]
+    fn the_sampler_reservation_fits_the_host_heap() {
+        let Some(host) = host() else { return };
+        let reserved = sampler_capacity();
+        // SAFETY: a shader-visible sampler heap within the D3D12 limit.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                NumDescriptors: 1024 + reserved,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        }.unwrap();
+        let tail = SamplerTail::new(&heap, 1024).unwrap();
+        assert_eq!(tail.slots, reserved);
+        let first = tail.handle(0, 1).unwrap();
+        let last = tail.handle(reserved - 1, 1).unwrap();
+        assert_eq!(last - first, u64::from((reserved - 1) * tail.step));
+        assert!(tail.handle(reserved, 1).is_none());
     }
 
     /// A root signature with a sampler table next to the directly indexed

@@ -2020,7 +2020,12 @@ impl HostHeap {
             // and counted by the pipeline layer.
             let tail = if sampler { crate::pipeline::host::sampler_tail() } else { 0 };
             match make(count + extra + tail) {
-                Ok(heap) => (heap, count, count + extra + tail),
+                Ok(heap) => {
+                    if tail != 0 && crate::pipeline::host::sampler_reuse() {
+                        tracing::info!(title_slots = count, tail, host_slots = count + extra + tail, "sampler heap with reusable pipeline tables");
+                    }
+                    (heap, count, count + extra + tail)
+                }
                 Err(e) if tail != 0 => {
                     tracing::warn!(error = %e, count, tail, "sampler heap with a table tail failed; made without it");
                     match make(count) {
@@ -3593,7 +3598,7 @@ impl HostHeap {
                 self.clear_twin(index);
             }
             self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -3647,6 +3652,28 @@ impl HostHeap {
         {
             null_buffer_view(self.at(self.raw + index));
             self.put(self.raw + index);
+        }
+    }
+
+    /// Copia +gerenc xbox: [`HostHeap::keep`] from a borrowed resource, cloned
+    /// only when the slot changes. The 5 recording threads made a new
+    /// reference and let it go for each draw (AddRef and Release on the same
+    /// few resources from all of them), though the slot most often showed the
+    /// same resource already.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            use windows::core::Interface;
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
+                return;
+            }
+            std::mem::replace(&mut *slot, resource.cloned())
+        };
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
         }
     }
 
@@ -3708,7 +3735,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3756,7 +3783,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3846,7 +3873,7 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:

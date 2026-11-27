@@ -7967,7 +7967,7 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        let buffer = host()?.list_uav_buffer(256)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -8049,7 +8049,7 @@ impl HostList {
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
+        let buffer = host()?.list_uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -8071,7 +8071,7 @@ impl HostList {
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
+            let made = host()?.list_uav_buffer(size)?;
             name(&made, || format!("indirect batches {size:#x}"));
             args.0.push(made);
         }
@@ -8796,6 +8796,13 @@ fn ahead_of_writes() -> bool {
 /// earlier than its step: the title's bytes are the same until a step writes
 /// title memory, and behind such a step everything is asked for again, as it
 /// was.
+/// Copia +gerenc xbox: the refreshes that go to the kept threads, the
+/// longest first (`VICTORY_REFRESH_BIG_FIRST=0`: as before).
+fn big_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_BIG_FIRST").is_none_or(|v| v != "0"))
+}
+
 fn refresh_front() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
@@ -9384,6 +9391,14 @@ impl Batch {
         // VICTORY_REFRESH_PROBE_TEXTURES): tried here first ([`lean::spread`]).
         // taken before the closure moves `due`.
         let small = !many && (due.is_empty() || lean::textures_small(&due, spans.len()));
+        // Copia +gerenc xbox: what goes straight to the threads, the longest
+        // spans first, so the join does not wait for one long span taken
+        // last (`VICTORY_REFRESH_BIG_FIRST=0`: in address order, as before).
+        // Not for the flushes tried here first: there the short ones first
+        // let this thread finish more of them within the probe.
+        if !small && big_first() {
+            spans.sort_by_key(|(_, from, to)| std::cmp::Reverse(to - from));
+        }
         lean::spread(spans.len() + due.len(), small, move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -11540,6 +11555,28 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_waited(size, true)
+    }
+
+    /// Copia +gerenc xbox (from the +proc imp copy): [`Host::uav_buffer`] for
+    /// a host list's own scratch (its indirect budget, arguments and batched
+    /// clamps' records): bound only by root views and indirect arguments of
+    /// the list being recorded, which is sent after the buffer is made, never
+    /// named by a descriptor heap that a list already sent may read. As
+    /// [`wait_resident`] says, lists sent after new memory wait for its
+    /// mapping themselves; so it is not waited for
+    /// (`VICTORY_LIST_BUFFERS_WAIT=1`: waited for, as before).
+    ///
+    /// In the other tree the title's recording threads stood 36 % of their
+    /// time in `MakeResident` for these (39,000 waits, 33 s in six minutes);
+    /// here a ten-minute run waited 45,200 times, 25 s, for new card memory.
+    pub(crate) fn list_uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        static WAIT: OnceLock<bool> = OnceLock::new();
+        let wait = *WAIT.get_or_init(|| std::env::var_os("VICTORY_LIST_BUFFERS_WAIT").is_some_and(|v| v == "1"));
+        self.uav_buffer_waited(size, wait)
+    }
+
+    fn uav_buffer_waited(&self, size: u64, wait: bool) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -11565,7 +11602,7 @@ impl Host {
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                if wait { not_resident() } else { D3D12_HEAP_FLAG_NONE },
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -11576,7 +11613,11 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = if wait {
+            made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device))
+        } else {
+            made
+        };
         match made {
             Ok(()) => buffer,
             Err(e) => {

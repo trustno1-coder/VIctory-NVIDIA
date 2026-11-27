@@ -1827,10 +1827,49 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
         Ok(g) => g,
         // (Held by this, whoever panicked with it: not to be asked for again.)
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            spin_for_guards().unwrap_or_else(|| waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())))
+        }
     };
     settle(&mut g);
     g
+}
+
+/// Copia +gerenc xbox (from the +proc imp copy): the guards' lock, tried
+/// again for a short while before the thread sleeps for it
+/// (`VICTORY_GUARDS_SPIN_US=<microseconds>`, 25 unless given; `0`: sleeps at
+/// once, as before).
+///
+/// In the other tree the lock was held some 7 to 18 µs at a time, yet
+/// threads waited some 130 µs a wait, the title's write faults most of it
+/// (Ryzen 5 5600X): a thread that sleeps for it is woken late on a CPU this
+/// busy. Most holders let go within the spin. There: each fault 59 -> 31-35
+/// µs, the waits for the lock 69 -> 22-36 ms of threads a frame.
+fn spin_for_guards() -> Option<std::sync::MutexGuard<'static, Guards>> {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // (First read in the write-fault handler, maybe: nothing logged here.)
+    let us = *US.get_or_init(|| {
+        std::env::var("VICTORY_GUARDS_SPIN_US").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(25)
+    });
+    if us == 0 {
+        return None;
+    }
+    let began = std::time::Instant::now();
+    let most = std::time::Duration::from_micros(us);
+    loop {
+        // A few pauses between tries: each try is a write of the lock's line.
+        for _ in 0..32 {
+            std::hint::spin_loop();
+        }
+        match GUARDS.try_lock() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if began.elapsed() >= most {
+            return None;
+        }
+    }
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,

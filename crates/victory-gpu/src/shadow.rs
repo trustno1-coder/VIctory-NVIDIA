@@ -1829,6 +1829,81 @@ fn wide_threads() -> usize {
     asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() * 3 / 8).clamp(2, 8))
 }
 
+/// Copia +gerenc xbox: whether a caller of [`wide`] runs only its own jobs
+/// while it waits for them (`VICTORY_WIDE_OWN=0`: any job in the kept
+/// threads' queue, as before).
+///
+/// The queue is shared: the submitting thread (and with
+/// `VICTORY_SEND_THREAD` the sending one) took the next job whoever had put
+/// it there (the landing's compares of 1 MiB, the copy-back's merges) and
+/// the title's frame waited for work that was not its own. The kept threads
+/// still take any caller's jobs. In the other tree (round4, Ryzen 5 5600X)
+/// it was kept with the others of its round: +5 to +9 % over 6-minute runs.
+fn wide_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_OWN").is_none_or(|v| v != "0"))
+}
+
+/// Copia +gerenc xbox: one [`wide`] call's jobs, with [`wide_own`].
+struct WideBatch {
+    jobs: Mutex<std::collections::VecDeque<Job>>,
+    left: Mutex<usize>,
+    done: std::sync::Condvar,
+}
+
+impl WideBatch {
+    /// Runs the next job of the batch; false if none was left to take.
+    fn run_one(&self) -> bool {
+        let Some(job) = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front() else {
+            return false;
+        };
+        job();
+        let mut n = self.left.lock().unwrap_or_else(|e| e.into_inner());
+        *n -= 1;
+        if *n == 0 {
+            self.done.notify_all();
+        }
+        true
+    }
+}
+
+/// [`wide`] with [`wide_own`]: the jobs stay in a batch of their own; the
+/// kept threads' queue gets a ticket for each helper woken (one for each job
+/// beyond the one the caller takes at once, at most all of them), and a
+/// ticket runs what is left of the batch, if anything. How long this thread
+/// ran the batch's jobs before it waited for the rest.
+fn wide_batch(workers: &'static Workers, jobs: Vec<Job>) -> std::time::Duration {
+    let began = std::time::Instant::now();
+    let n = jobs.len();
+    let tickets = (n - 1).min(wide_threads());
+    let batch = Arc::new(WideBatch {
+        jobs: Mutex::new(jobs.into()),
+        left: Mutex::new(n),
+        done: std::sync::Condvar::new(),
+    });
+    {
+        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..tickets {
+            let batch = batch.clone();
+            workers.there.fetch_add(1, Ordering::AcqRel);
+            queue.push_back(Box::new(move || while batch.run_one() {}));
+        }
+    }
+    if tickets >= wide_threads() {
+        workers.more.notify_all();
+    } else {
+        (0..tickets).for_each(|_| workers.more.notify_one());
+    }
+    while batch.run_one() {}
+    let worked = began.elapsed();
+    spin(|| batch.left.try_lock().is_ok_and(|n| *n == 0));
+    let mut left = batch.left.lock().unwrap_or_else(|e| e.into_inner());
+    while *left > 0 {
+        left = batch.done.wait(left).unwrap_or_else(|e| e.into_inner());
+    }
+    worked
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1923,6 +1998,14 @@ fn wide(jobs: Vec<Job>) {
     // Split in two for [`WIDE`]: what this thread did itself, and what it
     // stood for after that.
     let began = std::time::Instant::now();
+    if wide_own() {
+        let worked = wide_batch(workers, jobs);
+        let waited = began.elapsed().saturating_sub(worked);
+        WIDE[0].fetch_add(1, Ordering::Relaxed);
+        WIDE[1].fetch_add(worked.as_nanos() as u64, Ordering::Relaxed);
+        WIDE[2].fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+        return;
+    }
     // Helpers woken: one for each job beyond the one this thread takes
     // first, at most all of them. All were woken for every call (4 for 2
     // jobs), and those that found nothing went back to sleep; a helper busy
