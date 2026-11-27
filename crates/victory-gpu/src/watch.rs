@@ -361,6 +361,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     note_hot(&written);
     let mut j = journal_mut();
+    ahead_normalize(&mut asked);
     j.ahead_asked = next_asking();
     j.ahead = asked;
     let now = j.ahead_asked;
@@ -568,7 +569,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if !ahead_holds(&ahead, first, last)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
@@ -586,6 +587,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.note(page, parts, now);
     }
+    ahead_normalize(&mut ahead);
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
 }
@@ -671,6 +673,27 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
+/// Puts `ahead` in order and one range of those that touch: a lookup is a
+/// binary search, not a walk of every range a submission refreshes.
+fn ahead_normalize(ahead: &mut Vec<(usize, usize)>) {
+    ahead.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ahead.len());
+    for &(a, b) in ahead.iter() {
+        match out.last_mut() {
+            Some((_, e)) if a <= *e => *e = (*e).max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    *ahead = out;
+}
+
+/// Whether `ahead` (in order, one range of those that touch) holds
+/// `[first, last)` whole.
+fn ahead_holds(ahead: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let i = ahead.partition_point(|&(a, _)| a <= first);
+    i > 0 && ahead[i - 1].1 >= last
+}
+
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     // Guarding asks Windows about the pages and protects them: a lazy view
     // is none to it yet. (Not so a view in the books alone, which is
@@ -681,7 +704,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| ahead_holds(&j.ahead, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -765,7 +788,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !ahead_holds(&j.ahead, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
