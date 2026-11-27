@@ -176,6 +176,68 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
+/// Mouse look for a title that reads only the gamepad: the captured mouse's
+/// motion becomes the stand-in pad's right stick, its left and right buttons
+/// the right and left triggers. Needs `VICTORY_MOUSE_CAPTURE=1`.
+/// `VICTORY_MOUSE_STICK=0` turns it off; `VICTORY_MOUSE_SENS` is the stick
+/// per pixel moved in one poll (default 0.06), `VICTORY_MOUSE_FLOOR` the
+/// least push once the mouse moves, above the title's dead zone (default
+/// 0.25); `VICTORY_MOUSE_INVERT_Y=1` inverts up and down.
+struct LookConfig {
+    on: bool,
+    sens: f32,
+    floor: f32,
+    invert_y: bool,
+}
+
+static LOOK: LazyLock<LookConfig> = LazyLock::new(|| {
+    let num = |name: &str, default: f32| {
+        std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite()).unwrap_or(default)
+    };
+    LookConfig {
+        on: std::env::var_os("VICTORY_MOUSE_STICK").is_none_or(|v| v != "0"),
+        sens: num("VICTORY_MOUSE_SENS", 0.06).max(0.0),
+        floor: num("VICTORY_MOUSE_FLOOR", 0.25).clamp(0.0, 0.95),
+        invert_y: std::env::var_os("VICTORY_MOUSE_INVERT_Y").is_some_and(|v| v == "1"),
+    }
+});
+
+#[derive(Default)]
+struct MouseLook {
+    last: Option<(i64, i64)>,
+    x: f32,
+    y: f32,
+}
+
+impl MouseLook {
+    fn pad(&mut self, mouse: Option<MouseState>, config: &LookConfig) -> PadState {
+        let Some(m) = mouse.filter(|_| config.on) else {
+            *self = Self::default();
+            return PadState::default();
+        };
+        let (dx, dy) = self.last.map_or((0, 0), |(x, y)| (m.position_x - x, m.position_y - y));
+        self.last = Some((m.position_x, m.position_y));
+        // Polls come every 8 ms and the host's samples do not line up with
+        // them: eased, a poll without motion between two with it does not
+        // drop the stick to the middle.
+        let ease = |held: f32, wanted: f32| held * 0.6 + wanted * 0.4;
+        let up = if config.invert_y { 1.0 } else { -1.0 };
+        self.x = ease(self.x, dx as f32 * config.sens);
+        self.y = ease(self.y, dy as f32 * config.sens * up);
+        let shape = |v: f32| {
+            if v.abs() < 0.01 { 0.0 } else { v.signum() * (config.floor + (1.0 - config.floor) * v.abs().min(1.0)) }
+        };
+        let held = |bit: u32| if m.buttons & bit != 0 { 1.0 } else { 0.0 };
+        PadState {
+            right_x: shape(self.x),
+            right_y: shape(self.y),
+            right_trigger: held(0b01),
+            left_trigger: held(0b10),
+            ..Default::default()
+        }
+    }
+}
+
 /// Two pads as one: buttons of both, and of each axis and trigger the one
 /// pushed further.
 fn merged(a: PadState, b: PadState) -> PadState {
@@ -393,6 +455,7 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    look: MouseLook,
 }
 
 pub struct Hub {
@@ -440,6 +503,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                look: MouseLook::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -527,9 +591,10 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let look = self.look.pad(mouse, &LOOK);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(merged(fallback(&keys), look), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -538,7 +603,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(merged(fallback(&keys), look)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1689,6 +1754,29 @@ mod tests {
             assert_eq!(current(hub, MOUSE_KIND, MOUSE), Err(DEVICE_DISCONNECTED));
             assert_eq!(*log.lock().unwrap(), [(MOUSE, STATUS_CONNECTED, 0), (MOUSE, 0, STATUS_CONNECTED)]);
         }
+    }
+
+    #[test]
+    fn mouse_motion_turns_the_right_stick() {
+        let config = LookConfig { on: true, sens: 0.1, floor: 0.25, invert_y: false };
+        let mut look = MouseLook::default();
+        let at = |x, y, buttons| Some(MouseState { position_x: x, position_y: y, buttons, ..Default::default() });
+        // The first sample only sets the reference.
+        assert_eq!(look.pad(at(100, 100, 0), &config), PadState::default());
+        // Right and up: stick right and up, past the floor; left button: right trigger.
+        let p = look.pad(at(120, 90, 0b01), &config);
+        assert!(p.right_x > 0.25 && p.right_y > 0.25, "{p:?}");
+        assert_eq!((p.right_trigger, p.left_trigger), (1.0, 0.0));
+        // The mouse at rest: the stick eases back to the middle.
+        for _ in 0..20 { look.pad(at(120, 90, 0), &config); }
+        let p = look.pad(at(120, 90, 0b10), &config);
+        assert_eq!((p.right_x, p.right_y, p.left_trigger), (0.0, 0.0, 1.0));
+        // No mouse (window not focused): nothing, and no jump when it comes back.
+        assert_eq!(look.pad(None, &config), PadState::default());
+        assert_eq!(look.pad(at(500, 500, 0), &config), PadState::default());
+        // Switched off.
+        let off = LookConfig { on: false, ..config };
+        assert_eq!(MouseLook::default().pad(at(0, 0, 1), &off), PadState::default());
     }
 
     #[test]

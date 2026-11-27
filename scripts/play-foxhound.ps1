@@ -137,6 +137,8 @@ foreach ($k in $menu.Keys) {
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+# A held mouse that is not put back in the middle stops at the window's edge, and with it the turning.
+if ($settings.VICTORY_MOUSE_CAPTURE -eq '1' -and -not $settings.Contains('VICTORY_MOUSE_WARP')) { $settings.VICTORY_MOUSE_WARP = '1' }
 $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 # For the menu: what it shows as the current choices, where it saves, and how it starts the game again
 # (-More is not carried over a restart from the menu).
