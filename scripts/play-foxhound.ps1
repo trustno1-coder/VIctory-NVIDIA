@@ -20,7 +20,7 @@ param(
     [switch]$SeriesS,
     # 1440: output and scene 2560x1440 (Series X, the image is patched); 1080to1440: scene 1920x1080 upscaled by
     # the title; 4k: the stock Series X output (3840x2160).
-    [ValidateSet('1440', '1080to1440', '4k')][string]$Res = '1440',
+    [ValidateSet('1440', '1080to1440', '4k', '3440')][string]$Res = '1440',
     # DLSS Super Resolution in place of the title's upscaling; needs NVIDIA Streamline (README).
     [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance')][string]$Dlss = 'quality',
     # DLSS Frame Generation (RTX 40 or later, hardware-accelerated GPU scheduling on); needs DLSS.
@@ -44,6 +44,8 @@ param(
     # Every shader and the loading pipelines made first (`victory preload`), then the game; the F1 menu's
     # PRELOAD SHADERS starts this again with it.
     [switch]$Preload,
+    # A 21:9 3440x1440 output (Series X; DLSS at Performance or off), as -Res 3440. The F1 menu's ULTRAWIDE stands in for it.
+    [switch]$Ultrawide,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -61,8 +63,17 @@ if (Test-Path -LiteralPath $menuFile) {
 }
 $fpsWanted = $Fps
 if ($menu.Contains('VICTORY_MENU_CONSOLE')) { $SeriesS = $menu['VICTORY_MENU_CONSOLE'] -eq 'series-s' }
-if ($menu['VICTORY_MENU_RES'] -in '1440', '1080to1440', '4k') { $Res = $menu['VICTORY_MENU_RES'] }
+if ($menu['VICTORY_MENU_RES'] -in '1440', '1080to1440', '4k', '3440') { $Res = $menu['VICTORY_MENU_RES'] }
 if ($menu['VICTORY_MENU_DLSS'] -in 'off', 'dlaa', 'quality', 'balanced', 'performance') { $Dlss = $menu['VICTORY_MENU_DLSS'] }
+if ($menu.Contains('VICTORY_MENU_ULTRAWIDE')) { $Ultrawide = $menu['VICTORY_MENU_ULTRAWIDE'] -eq '1' }
+if ($Res -eq '3440') { $Ultrawide = $true }   # -Res 3440 and the menu's 3440X1440 picture are the same choice
+# Ultrawide: a 3440x1440 (21:9) output in place of the 2560x1440 one, so Series X at that picture; DLSS at
+# Performance or off (Quality and Balanced draw stretched triangles at that width, DLAA outgrows the title's
+# render memory). The title takes its 21:9 projection from the output size by itself.
+if ($Ultrawide) {
+    $SeriesS = $false; $Res = '1440'
+    if ($Dlss -notin 'performance', 'off') { Write-Host "Ultrawide: DLSS $Dlss -> performance"; $Dlss = 'performance' }
+}
 $timesWanted = $FrameGenX
 if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
     # 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).
@@ -103,7 +114,7 @@ $settings = @{
     VICTORY_BUDGET_PACK = '1'
 }
 if (-not $SeriesS) {
-    if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
+    if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1'; if ($Ultrawide) { $settings.VICTORY_ULTRAWIDE = '1' } }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
 }
 if ($Dlss -ne 'off') {
@@ -148,7 +159,8 @@ $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 # For the menu: what it shows as the current choices, where it saves, and how it starts the game again
 # (-More is not carried over a restart from the menu).
 $settings.VICTORY_MENU_CONSOLE = $console
-$settings.VICTORY_MENU_RES = $Res
+$settings.VICTORY_MENU_RES = if ($Ultrawide) { '3440' } else { $Res }
+$settings.VICTORY_MENU_ULTRAWIDE = if ($Ultrawide) { '1' } else { '' }
 $settings.VICTORY_MENU_DLSS = if ($settings.VICTORY_DLSS -eq '1') { $Dlss } else { 'off' }
 $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1' -or $settings.VICTORY_FSR_FRAMEGEN -eq '1') { [string]$settings.VICTORY_FRAMEGEN_X } else { '0' }
 $settings.VICTORY_MENU_FG_TYPE = $FgType

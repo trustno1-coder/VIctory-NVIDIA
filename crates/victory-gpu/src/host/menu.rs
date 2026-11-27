@@ -157,11 +157,13 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
     Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
+    // 21:9 3440x1440 output; kept in step with SERIES X PICTURE's 3440X1440 (see `Menu::ultrawide_follows`).
+    Item { var: "VICTORY_MENU_ULTRAWIDE", label: "ULTRAWIDE 21:9 (3440X1440)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_FULLSCREEN", label: "FULLSCREEN (NO BORDER)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
     Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
-    Item { var: X_RES, label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
+    Item { var: X_RES, label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160"), ("3440", "3440X1440 (21:9)")], live: false },
     // In place of SERIES X PICTURE when CONSOLE is Series S.
     Item { var: S_RES, label: "SERIES S PICTURE", values: &[("1080", "1920X1080 (DLAA)"), ("720", "1280X720 (THE GAME)"), ("626", "1113X626"), ("540", "960X540 (FASTEST)")], live: false },
     // The layer's switches.
@@ -615,6 +617,7 @@ impl Menu {
         if live(item) {
             self.apply_live(i);
         }
+        self.ultrawide_follows(item.var);
         self.note.clear();
         if item.var == FRAMEGEN && !live(item) && !matches!(self.values[i].as_str(), "" | "0") {
             "RESTART REQUIRED TO ENABLE FRAME GENERATION".clone_into(&mut self.note);
@@ -640,6 +643,54 @@ impl Menu {
             && let Some((_, mode)) = S_MODES.iter().find(|(s, _)| *s == self.values[res])
         {
             (*mode).clone_into(&mut self.values[dlss]);
+        }
+    }
+
+    /// The ultrawide output (3440x1440, 21:9) and the settings it depends on,
+    /// kept in step after `changed` changed. It needs Series X, its picture
+    /// shown as 3440X1440, and DLSS at Performance or off: at 3440 wide,
+    /// Quality and Balanced draw stretched triangles (their scene sizes are
+    /// fractional, 2293.3x960), and DLAA's buffers outgrow the title's render
+    /// memory (an `int3` at +0x2473e88 with 851 MB of 710 MB). Turning it on
+    /// (or picking the 3440X1440 picture) sets those; picking something it
+    /// cannot run with turns it off. The launcher holds to the same.
+    fn ultrawide_follows(&mut self, changed: &str) {
+        let on = self.get("VICTORY_MENU_ULTRAWIDE") == "1";
+        let wide_picture = self.get("VICTORY_MENU_RES") == "3440";
+        match changed {
+            "VICTORY_MENU_ULTRAWIDE" if on => self.ultrawide_on(),
+            "VICTORY_MENU_ULTRAWIDE" if wide_picture => self.set("VICTORY_MENU_RES", "1440"),
+            "VICTORY_MENU_RES" if wide_picture => self.ultrawide_on(),
+            "VICTORY_MENU_RES" => self.set("VICTORY_MENU_ULTRAWIDE", ""),
+            "VICTORY_MENU_CONSOLE" if on && self.get(changed) != "series-x" => self.ultrawide_off(),
+            "VICTORY_MENU_DLSS" if on && !matches!(self.get(changed).as_str(), "performance" | "off") => self.ultrawide_off(),
+            _ => {}
+        }
+    }
+
+    fn ultrawide_on(&mut self) {
+        self.set("VICTORY_MENU_ULTRAWIDE", "1");
+        self.set("VICTORY_MENU_CONSOLE", "series-x");
+        self.set("VICTORY_MENU_RES", "3440");
+        if !matches!(self.get("VICTORY_MENU_DLSS").as_str(), "performance" | "off") {
+            self.set("VICTORY_MENU_DLSS", "performance");
+        }
+    }
+
+    fn ultrawide_off(&mut self) {
+        self.set("VICTORY_MENU_ULTRAWIDE", "");
+        if self.get("VICTORY_MENU_RES") == "3440" {
+            self.set("VICTORY_MENU_RES", "1440");
+        }
+    }
+
+    fn get(&self, var: &str) -> String {
+        ITEMS.iter().position(|item| item.var == var).map(|i| self.values[i].clone()).unwrap_or_default()
+    }
+
+    fn set(&mut self, var: &str, value: &str) {
+        if let Some(i) = ITEMS.iter().position(|item| item.var == var) {
+            self.values[i] = value.to_owned();
         }
     }
 
@@ -1186,6 +1237,38 @@ mod tests {
         for line in ABOUT_S_RES {
             assert!(line.len() <= COLUMNS as usize && line.bytes().all(|b| glyph(b) != glyph(b'#') || b == b'#'), "{line}");
         }
+    }
+
+    #[test]
+    fn ultrawide_sets_what_it_needs() {
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let at = |var: &str| ITEMS.iter().position(|item| item.var == var).unwrap();
+        menu.values[at("VICTORY_MENU_RES")] = "4k".to_owned();
+        menu.values[at("VICTORY_MENU_CONSOLE")] = "series-s".to_owned();
+        let wide = at("VICTORY_MENU_ULTRAWIDE");
+        assert_eq!(at("VICTORY_FULLSCREEN"), wide + 1);
+        let full = menu.values[at("VICTORY_FULLSCREEN")].clone();
+        menu.change(wide, 1);
+        assert_eq!(menu.values[wide], "1");
+        assert_eq!(menu.values[at("VICTORY_MENU_RES")], "3440");
+        assert_eq!(menu.values[at("VICTORY_MENU_CONSOLE")], "series-x");
+        assert_eq!(menu.values[at("VICTORY_MENU_DLSS")], "performance");
+        assert_eq!(menu.values[at("VICTORY_FULLSCREEN")], full, "full screen is left alone");
+        // Off again: the picture goes back to 2560X1440.
+        menu.change(wide, 1);
+        assert_eq!(menu.values[wide], "");
+        assert_eq!(menu.values[at("VICTORY_MENU_RES")], "1440");
+        // The 3440X1440 picture turns it on; another picture, or DLSS Quality, off.
+        let res = at("VICTORY_MENU_RES");
+        menu.change(res, -1);
+        assert_eq!((menu.values[res].as_str(), menu.values[wide].as_str()), ("3440", "1"));
+        menu.change(res, 1);
+        assert_eq!((menu.values[res].as_str(), menu.values[wide].as_str()), ("1440", ""));
+        menu.change(wide, 1);
+        menu.values[at("VICTORY_MENU_DLSS")] = "off".to_owned();
+        menu.change(at("VICTORY_MENU_DLSS"), -1);
+        assert_eq!(menu.values[at("VICTORY_MENU_DLSS")], "dlaa");
+        assert_eq!((menu.values[res].as_str(), menu.values[wide].as_str()), ("1440", ""));
     }
 
     #[test]
