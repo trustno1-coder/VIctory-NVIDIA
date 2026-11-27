@@ -19,7 +19,7 @@
 | Your card | Frame generation | Limits |
 | --- | --- | --- |
 | GeForce RTX 40 and RTX 50 | **DLSS frame generation** | 2x on RTX 40; more than 2x (up to 6x) needs an RTX 50 |
-| GeForce RTX 20 and RTX 30 | **AMD FSR 3 frame generation** (DLSS frame generation needs an RTX 40 or later) | **2x at most**. DLSS upscaling still works on these cards, so the Series X profile is fine |
+| GeForce RTX 20 and RTX 30 | **Built-in DLSS-G bypass (RTX 30)** or **AMD FSR 3 frame generation** | Built-in Ampere DLSS-G/MFG bypass (`opendlssgenabler`, auto on RTX 30; disable with `VICTORY_DLSSG_BYPASS=0`), or FSR 3 (`2x` at most; DLSS upscaling still works on these cards, so the Series X profile is fine) |
 | Other cards (no DLSS) | **AMD FSR 3 frame generation** | **2x at most, Series S profile only** (F1 menu, CONSOLE): without DLSS the game's own upscaler, which FSR 3 needs, only takes the Series S sizes. Not tested here |
 
 - **At every start the game tells you** which one your card runs, and why
@@ -37,6 +37,11 @@
   script launcher. Each file is checked against the copy this fork was tested
   with, and only loaded with AMD's valid signature. A `fidelityfx` folder next
   to `victory.exe`, or `VICTORY_FIDELITYFX_DIR`, works too.
+- **Optional DLSS-G unlocker DLLs** (`MFGUnlocker.dll`, `RTX40MFGCore.dll`, or
+  `opendlssgenabler.dll`) are not part of this repository, and are picked up
+  automatically if placed beside `victory.exe`, in `%LOCALAPPDATA%\victory`, or
+  in the repository folder (or named via `VICTORY_DLSSG_UNLOCKER`; set
+  `VICTORY_DLSSG_UNLOCKER=0` to disable).
 
 ## Quick start: how to run it
 
@@ -79,21 +84,25 @@
   on. So the first start plays about 20 seconds, says so at the top of the
   picture, and starts the game again. It doesn't happen again for that version
   (a mark is kept in `%LOCALAPPDATA%\victory\warmed`).
-- RTX 20 and 30 cards can try DLSS frame generation with the
+- **RTX 30** cards automatically enable the built-in DLSS-G/MFG bypass
+  (`opendlssgenabler`, disable with `VICTORY_DLSSG_BYPASS=0`), and **RTX 20 and
+  30** cards can also try the external
   [MFG Unlocker](https://github.com/dashdogy/MFG-Unlocker) mod (not ours, and
   not tested with this fork, which was only run on an RTX 50). It is an option,
   off by default: **F1, MFG UNLOCKER, ON**, then restart. On, the next start
   downloads it by itself from the mod's own GitHub release (v1.7.2, about 5 MB,
   checked against the SHA-256 its author published) into
   `%LOCALAPPDATA%\victory\mfg-unlocker`, and every start loads it. Nothing is
-  renamed or copied. On an RTX 20 or 30 the first start also asks once (No unless
-  you type y). `victory.exe get-mfg` downloads it by hand. The mod writes its own
-  `RTXMFG-...` logs and settings beside `victory.exe`, and Backspace opens its
-  menu. The start's notice says "UNLOCKED BY A MOD" and the log says it was
-  loaded. If the game crashes or frame generation fails, turn it off in F1 (or
-  add `VICTORY_MFG_UNLOCKER=` to `%LOCALAPPDATA%\victory\victory-settings.txt`).
-  FSR 3 frame generation (2x) is the supported way on those cards. A
-  `winmm.dll` copy of the mod beside `victory.exe` still works too.
+  renamed or copied. On an RTX 20 (or an RTX 30 with `VICTORY_DLSSG_BYPASS=0`)
+  the first start also asks once (No unless you type y). `victory.exe get-mfg`
+  downloads it by hand. The mod writes its own `RTXMFG-...` logs and settings
+  beside `victory.exe`, and Backspace opens its menu. The start's notice says
+  "UNLOCKED BY A MOD" (or "BUILT-IN BYPASS" for the embedded bypass) and the log
+  says what was loaded. If the game crashes or frame generation fails, turn it
+  off in F1 (or add `VICTORY_MFG_UNLOCKER=` / `VICTORY_DLSSG_BYPASS=0` to
+  `%LOCALAPPDATA%\victory\victory-settings.txt`). FSR 3 frame generation (2x) is
+  the supported way on those cards. A `winmm.dll` copy of the mod beside
+  `victory.exe`, or `VICTORY_DLSSG_UNLOCKER`, still works too.
 
 **In the game**
 

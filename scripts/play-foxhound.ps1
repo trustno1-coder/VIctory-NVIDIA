@@ -107,8 +107,10 @@ if (-not $SeriesS) {
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
 }
 if ($Dlss -ne 'off') {
-    # NVIDIA's files: where VICTORY_STREAMLINE_DIR says, else where Get-NVIDIA-DLSS.cmd puts them.
-    $sl = if ($env:VICTORY_STREAMLINE_DIR) { $env:VICTORY_STREAMLINE_DIR } else { Join-Path $repo 'nvidia-sdk\Streamline\bin\x64' }
+    # NVIDIA's files: where VICTORY_STREAMLINE_DIR says, else where Get-NVIDIA-DLSS.cmd or `victory get-dlss` puts them.
+    $slCandidates = @($env:VICTORY_STREAMLINE_DIR, (Join-Path $repo 'nvidia-sdk\Streamline\bin\x64'), (Join-Path $env:LOCALAPPDATA 'victory\nvidia-sdk\Streamline\bin\x64')) | Where-Object { $_ }
+    $sl = ($slCandidates | Where-Object { Test-Path (Join-Path $_ 'sl.interposer.dll') } | Select-Object -First 1)
+    if (-not $sl) { $sl = Join-Path $repo 'nvidia-sdk\Streamline\bin\x64' }
     if (Test-Path (Join-Path $sl 'sl.interposer.dll')) {
         $settings.VICTORY_DLSS = '1'; $settings.VICTORY_DLSS_MODE = $Dlss; $settings.VICTORY_STREAMLINE_DIR = $sl
         if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = [string]$timesWanted }
@@ -144,6 +146,23 @@ foreach ($k in $menu.Keys) {
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+if ($settings.VICTORY_FRAMEGEN -eq '1' -and -not $settings.ContainsKey('VICTORY_DLSSG_UNLOCKER') -and $env:VICTORY_DLSSG_UNLOCKER -ne '0') {
+    if ($env:VICTORY_DLSSG_UNLOCKER) {
+        $settings.VICTORY_DLSSG_UNLOCKER = $env:VICTORY_DLSSG_UNLOCKER
+    } else {
+        $unlockerDirs = @($repo, (Join-Path $env:LOCALAPPDATA 'victory'), (Join-Path $env:LOCALAPPDATA 'victory\dlssg-unlocker'))
+        $unlockerNames = 'MFGUnlocker.dll', 'RTX40MFGCore.dll', 'opendlssgenabler.dll'
+        $foundUnlocker = $null
+        foreach ($d in $unlockerDirs) {
+            foreach ($n in $unlockerNames) {
+                $cand = Join-Path $d $n
+                if (Test-Path -LiteralPath $cand -PathType Leaf) { $foundUnlocker = $cand; break }
+            }
+            if ($foundUnlocker) { break }
+        }
+        if ($foundUnlocker) { $settings.VICTORY_DLSSG_UNLOCKER = $foundUnlocker }
+    }
+}
 $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 # For the menu: what it shows as the current choices, where it saves, and how it starts the game again
 # (-More is not carried over a restart from the menu).
@@ -171,7 +190,7 @@ if (-not (Test-Path $victory)) {
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_DLSSG_UNLOCKER', 'VICTORY_DLSSG_BYPASS', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 

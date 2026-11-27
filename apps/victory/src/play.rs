@@ -133,6 +133,8 @@ const KEPT: &[&str] = &[
     "VICTORY_CACHE_DIR",
     "VICTORY_DATA_DIR",
     "VICTORY_STREAMLINE_DIR",
+    "VICTORY_DLSSG_UNLOCKER",
+    "VICTORY_DLSSG_BYPASS",
     "VICTORY_FIDELITYFX_DIR",
     "VICTORY_LOG",
 ];
@@ -146,6 +148,7 @@ const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performanc
 /// it stays at without DLSS: the title's own FidelityFX path from 540 stopped it at the
 /// start, 0xc0000094, a division by zero in the title, 2026-11-28).
 const S_SIZES: [(&str, &str); 4] = [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance")];
+const UNLOCKER_NAMES: &[&str] = &["MFGUnlocker.dll", "RTX40MFGCore.dll", "opendlssgenabler.dll"];
 
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct Play {
@@ -271,6 +274,25 @@ fn fidelityfx_dir(here: &Path) -> Option<PathBuf> {
     let ours = amd_home().ok();
     let beside = [here.join("fidelityfx"), here.join("amd-sdk").join("FidelityFX").join("bin"), here.to_path_buf()];
     named.into_iter().chain(ours).chain(beside).find(|d| has_fsr(d))
+}
+
+fn find_unlocker_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .flat_map(|dir| UNLOCKER_NAMES.iter().map(move |name| dir.join(name)))
+        .find(|candidate| candidate.is_file())
+}
+
+fn dlssg_unlocker(here: &Path, home: &Path) -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("VICTORY_DLSSG_UNLOCKER") {
+        let trimmed = val.trim();
+        if trimmed == "0" {
+            return None;
+        }
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    find_unlocker_in(&[home.to_path_buf(), home.join("dlssg-unlocker"), here.to_path_buf()])
 }
 
 /// The lines `NAME=value` of the menu's file.
@@ -871,14 +893,27 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
             s.insert("VICTORY_FIDELITYFX_DIR".to_owned(), dir.to_string_lossy().into_owned());
         }
     }
-    // MFG Unlocker (F1, MFG UNLOCKER): DLSS frame generation on RTX 20 and 30 cards. Asked once
-    // on such a card with DLSS on, where the choice was never made and no mod DLL is beside us.
+    if s.contains_key("VICTORY_FRAMEGEN")
+        && !s.contains_key("VICTORY_DLSSG_UNLOCKER")
+        && !s.get("VICTORY_MFG_UNLOCKER").is_some_and(|v| v == "1")
+        && let Some(unlocker) = dlssg_unlocker(&here, &home)
+    {
+        s.insert("VICTORY_DLSSG_UNLOCKER".to_owned(), unlocker.to_string_lossy().into_owned());
+    }
+    // MFG Unlocker (F1, MFG UNLOCKER): DLSS frame generation on RTX 20 cards, or on RTX 30 when the
+    // built-in Ampere bypass is disabled (`VICTORY_DLSSG_BYPASS=0`). Asked once where the choice
+    // was never made and no mod DLL is beside us.
     let mods = mod_dlls(&here);
+    let bypass_disabled = s.get("VICTORY_DLSSG_BYPASS").is_some_and(|v| v.trim() == "0")
+        || (!s.contains_key("VICTORY_DLSSG_BYPASS")
+            && std::env::var("VICTORY_DLSSG_BYPASS").is_ok_and(|v| v.trim() == "0"));
     if s.contains_key("VICTORY_DLSS")
         && !menu.iter().any(|(k, _)| k == "VICTORY_MFG_UNLOCKER")
         && !s.contains_key("VICTORY_MFG_UNLOCKER")
+        && !s.contains_key("VICTORY_DLSSG_UNLOCKER")
         && mods.is_empty()
         && let Some(card) = victory_hle::streamline::adapter_name().filter(|c| older_rtx(c))
+        && (bypass_disabled || !card.to_ascii_lowercase().contains("rtx 30"))
         && offer_mfg(&card, &menu_file)
     {
         s.insert("VICTORY_MFG_UNLOCKER".to_owned(), "1".to_owned());
@@ -1201,5 +1236,33 @@ mod tests {
         assert_eq!(stamp(0), "19700101-000000");
         assert_eq!(stamp(1_795_753_200), "20261127-042000");
         assert_eq!(stamp(951_782_400), "20000229-000000");
+    }
+
+    #[test]
+    fn find_unlocker_in_checks_priority_and_dirs() {
+        let root = std::env::temp_dir().join(format!("victory-play-unlocker-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir_a = root.join("a");
+        let dir_b = root.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        assert_eq!(find_unlocker_in(&[dir_a.clone(), dir_b.clone()]), None);
+
+        let open_b = dir_b.join("opendlssgenabler.dll");
+        std::fs::write(&open_b, b"").unwrap();
+        assert_eq!(find_unlocker_in(&[dir_a.clone(), dir_b.clone()]), Some(open_b.clone()));
+
+        // Earlier directory wins over later directory.
+        let rtx_a = dir_a.join("RTX40MFGCore.dll");
+        std::fs::write(&rtx_a, b"").unwrap();
+        assert_eq!(find_unlocker_in(&[dir_a.clone(), dir_b.clone()]), Some(rtx_a));
+
+        // Within the same directory, MFGUnlocker.dll wins over RTX40MFGCore.dll.
+        let mfg_a = dir_a.join("MFGUnlocker.dll");
+        std::fs::write(&mfg_a, b"").unwrap();
+        assert_eq!(find_unlocker_in(&[dir_a.clone(), dir_b.clone()]), Some(mfg_a));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

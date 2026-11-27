@@ -659,6 +659,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-dlssg-bypass"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "victory-formats"
 version = "0.1.0"
 
@@ -678,6 +685,7 @@ dependencies = [
  "blake3",
  "tempfile",
  "tracing",
+ "victory-dlssg-bypass",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",

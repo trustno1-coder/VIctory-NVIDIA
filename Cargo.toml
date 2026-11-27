@@ -22,6 +22,7 @@ victory-shader = { path = "crates/victory-shader" }
 victory-formats = { path = "crates/victory-formats" }
 victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
+victory-dlssg-bypass = { path = "crates/victory-dlssg-bypass" }
 
 # External crates
 anyhow = "1.0.104"
