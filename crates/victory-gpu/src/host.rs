@@ -3177,6 +3177,33 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
+/// The kinds of read that make a submission wait for the card ([`READ_WAITED`]): the places
+/// a `WHY_READ` settle can come from, in the order [`late_blocked`] tries them.
+const READ_BUFFER_COPY: usize = 0;
+const READ_COPY_PLACED: usize = 1;
+const READ_FILL: usize = 2;
+const READ_TEXTURE: usize = 3;
+const READ_PLANE: usize = 4;
+const READ_KINDS: [&str; 5] = [
+    "a buffer copy's memory",
+    "a buffer copy at its place",
+    "a fill of upload memory",
+    "a texture's memory",
+    "a movie plane",
+];
+
+/// Since the last frame-rate line: microseconds of `title memory read` waits, by what was read.
+///
+/// `LATE_STATS[13..]` counts how often each kind blocks a submission 鈥?about once a frame 鈥?while the wait they cause
+/// is 226-249 ms a frame, so the count says nothing about which kind owns the time. This does.
+static READ_WAITED: [std::sync::atomic::AtomicU64; READ_KINDS.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; READ_KINDS.len()];
+
+thread_local! {
+    /// Which kind of read the next `WHY_READ` settle is for; set by [`late_blocked`].
+    static READ_KIND: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     if from >= to {
@@ -3414,6 +3441,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                                 blame("a buffer copy's destination", written, dst, len);
                             }
                         }
+                            READ_KIND.with(|k| k.set(READ_BUFFER_COPY));
                         return Some(WHY_READ);
                     }
                 }
@@ -3424,6 +3452,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             #[cfg(feature = "diagnostics")]
                             blame("a fill of upload memory", written, src, len);
                         }
+                            READ_KIND.with(|k| k.set(READ_FILL));
                         return Some(WHY_READ);
                     }
                 }
@@ -3435,6 +3464,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             #[cfg(feature = "diagnostics")]
                             blame("a texture", written, at, len);
                         }
+                            READ_KIND.with(|k| k.set(READ_TEXTURE));
                         return Some(WHY_READ);
                     }
                 }
@@ -3445,6 +3475,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             #[cfg(feature = "diagnostics")]
                             blame("a movie plane", written, at, len);
                         }
+                            READ_KIND.with(|k| k.set(READ_PLANE));
                         return Some(WHY_READ);
                     }
                 }
@@ -3458,6 +3489,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             #[cfg(feature = "diagnostics")]
                             blame("a buffer copy at its place", written, p.src, p.len);
                         }
+                            READ_KIND.with(|k| k.set(READ_COPY_PLACED));
                         return Some(WHY_READ);
                     }
                 },
@@ -3896,6 +3928,14 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
+    if why == WHY_READ {
+        let kind = READ_KIND.with(std::cell::Cell::take);
+        if kind < READ_KINDS.len() {
+            READ_WAITED[kind].fetch_add(us, Ordering::Relaxed);
+        }
+    } else {
+        READ_KIND.with(|k| k.set(usize::MAX));
+    }
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     blamed(why, us);
@@ -4121,7 +4161,9 @@ fn late_line(frames: f64) {
         tracing::info!(
             "of the waiting for the card in settles, per frame, by what settled: a synchronous submission or present {:.1} ms, \
              the card had run them {:.1}, a wait for a memory value {:.1}, title memory changed under shader writes {:.1}, \
-             title memory read {:.1}, a step of ours {:.1}, lists in the air {:.1}, bottom-of-pipe writes {:.1}, a blocking fence wait {:.1}",
+             title memory read {:.1}, a step of ours {:.1}, lists in the air {:.1}, bottom-of-pipe writes {:.1}, a blocking fence wait {:.1}, \
+             a reason with no place of its own: {:.1} and {:.1} (a wait that landed outside the WHY_ places above; \
+             they were counted in the total but never named until now)",
             w[WHY_SYNC],
             w[WHY_CARD_DONE],
             w[WHY_VALUE],
@@ -4131,6 +4173,21 @@ fn late_line(frames: f64) {
             w[WHY_MOST],
             w[WHY_WRITES],
             w[WHY_FENCE],
+            w[0],
+            w[1],
+        );
+        let reads: Vec<f64> = READ_WAITED.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
+        let named: f64 = reads.iter().sum();
+        tracing::info!(
+            "of the title memory read wait, per frame, by what was read: {} ({} in all, against {:.1} ms for why read)",
+            READ_KINDS
+                .iter()
+                .zip(&reads)
+                .map(|(name, ms)| format!("{name} {ms:.1} ms"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            format!("{named:.1} ms"),
+            w[WHY_READ],
         );
     }
     if relay() {
