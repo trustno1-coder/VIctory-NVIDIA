@@ -4445,8 +4445,11 @@ impl Host {
         };
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        // Pieces whose hash is stale and that hold what the CPU's side holds
+        // (`VICTORY_SEND_CHANGED`): hashed again with the others, nothing sent.
+        let rehash = crate::shadow::card_rehash();
         gathering.end();
-        if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
+        if declared.is_empty() && dirty.is_empty() && looked.is_empty() && rehash.is_empty() {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4472,7 +4475,7 @@ impl Host {
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
-        if !dirty.is_empty() {
+        if !dirty.is_empty() || !rehash.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
@@ -4528,7 +4531,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for (shadow, ranges) in &dirty {
+                    for (shadow, ranges) in dirty.iter().chain(&rehash) {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
                         };
@@ -4577,7 +4580,11 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: dirty
+                .into_iter()
+                .chain(rehash)
+                .map(|(shadow, _)| shadow)
+                .collect(),
             lists: used,
             sent_as,
             looks,
