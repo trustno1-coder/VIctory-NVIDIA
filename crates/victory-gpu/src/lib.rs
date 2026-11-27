@@ -21,6 +21,8 @@ mod ambient;
 mod capture;
 #[cfg(windows)]
 mod compose;
+#[cfg(windows)]
+mod dxc;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
