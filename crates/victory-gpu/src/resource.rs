@@ -1352,7 +1352,7 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
-    if first == 0
+    if (first == 0 && skip_levels().0 == 0)
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
         || desc.depth_or_array_size != 1
@@ -1369,12 +1369,100 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
         return 0;
     }
     let block = u64::from(layout.desc.block.max(1));
+    let first = first + skipped(desc, first, block);
+    if first == 0 {
+        return 0;
+    }
     let mut base = read_from(layout, first).min(u32::from(desc.mip_levels) - 1);
     let whole = |side: u64| side != 0 && side.is_multiple_of(block);
     while base > 0 && !(whole(desc.width >> base) && whole(u64::from(desc.height) >> base)) {
         base -= 1;
     }
     base
+}
+
+/// Texture quality for cards with little memory (8 GB): how many of the
+/// largest levels of the title's block-compressed textures are left out of
+/// their host copies (`VICTORY_TEXTURE_SKIP_LEVELS`, 0: none, the default,
+/// at most 4), and the smallest longer side a level left out has
+/// (`VICTORY_TEXTURE_SKIP_MIN`, 1024 texels, at least 64).
+///
+/// The host copy then begins at a later level, as with [`held_only`], and a
+/// view that starts at a level left out shows the next one
+/// (`descriptor::host` `from_base` clamps it): a quarter of the memory per
+/// level. Nothing lets go of a host copy a slot still shows, so on an 8 GB
+/// card the copies of a world's textures fill the budget and new ones wait;
+/// this makes the copies smaller instead (docs/small-config.md: with 1 level
+/// of 2048 and more, 5.7 GB in use with frame generation, against more than
+/// the 7 GB budget without).
+#[cfg(windows)]
+pub(crate) fn skip_levels() -> (u32, u64) {
+    static SKIP: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        let levels = std::env::var("VICTORY_TEXTURE_SKIP_LEVELS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(4);
+        let min = std::env::var("VICTORY_TEXTURE_SKIP_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            .max(64);
+        if levels > 0 {
+            tracing::info!(
+                levels,
+                min,
+                "texture quality: the largest levels of big block-compressed textures are left out (VICTORY_TEXTURE_SKIP_LEVELS)"
+            );
+        }
+        (levels, min)
+    })
+}
+
+/// The levels [`skip_levels`] leaves out of the texture `desc` whose views
+/// start at `first` ([`levels_left_out`]).
+#[cfg(windows)]
+fn skipped(desc: &ResourceDesc, first: u32, block: u64) -> u32 {
+    let (levels, min) = skip_levels();
+    levels_left_out(
+        desc.width,
+        u64::from(desc.height),
+        u32::from(desc.mip_levels),
+        first,
+        block,
+        levels,
+        min,
+    )
+}
+
+/// Of a texture `width` x `height` with `mip_levels` levels, viewed from
+/// `first`, how many levels from `first` on are left out: up to `levels`,
+/// only for block-compressed formats (`block` > 1), only while the level's
+/// longer side is `min` or more, and never so many that fewer than two
+/// smaller levels stay.
+#[cfg(any(windows, test))]
+fn levels_left_out(
+    width: u64,
+    height: u64,
+    mip_levels: u32,
+    first: u32,
+    block: u64,
+    levels: u32,
+    min: u64,
+) -> u32 {
+    if levels == 0 || block <= 1 {
+        return 0;
+    }
+    let mut extra = 0;
+    while extra < levels {
+        let at = first + extra;
+        if at + 2 >= mip_levels || (width >> at).max(height >> at) < min {
+            break;
+        }
+        extra += 1;
+    }
+    extra
 }
 
 /// The bytes of title memory a placed texture with the resource description
@@ -3545,6 +3633,29 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn texture_quality_leaves_out_only_big_compressed_levels() {
+        // 4096x4096 BC (block 4), 13 levels, viewed whole, min 2048: level 0
+        // (4096) and level 1 (2048) may go; with one asked for, one goes.
+        assert_eq!(levels_left_out(4096, 4096, 13, 0, 4, 1, 2048), 1);
+        assert_eq!(levels_left_out(4096, 4096, 13, 0, 4, 2, 2048), 2);
+        assert_eq!(levels_left_out(4096, 4096, 13, 0, 4, 3, 2048), 2);
+        // Viewed from level 1 (2048): only that one is big enough.
+        assert_eq!(levels_left_out(4096, 4096, 13, 1, 4, 2, 2048), 1);
+        // 1024x1024 below the 2048 floor: kept whole; at a 1024 floor, one goes.
+        assert_eq!(levels_left_out(1024, 1024, 11, 0, 4, 1, 2048), 0);
+        assert_eq!(levels_left_out(1024, 1024, 11, 0, 4, 1, 1024), 1);
+        // The longer side counts: 2048x512.
+        assert_eq!(levels_left_out(2048, 512, 12, 0, 4, 1, 2048), 1);
+        // Not block-compressed (block 1), or nothing asked: none.
+        assert_eq!(levels_left_out(4096, 4096, 13, 0, 1, 1, 2048), 0);
+        assert_eq!(levels_left_out(4096, 4096, 13, 0, 4, 0, 2048), 0);
+        // At least two smaller levels stay: 2048x2048 with only 3 levels
+        // may lose one (1024 and 512 stay), with 2 levels none.
+        assert_eq!(levels_left_out(2048, 2048, 3, 0, 4, 2, 1024), 1);
+        assert_eq!(levels_left_out(2048, 2048, 2, 0, 4, 1, 1024), 0);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

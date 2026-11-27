@@ -342,6 +342,18 @@ delete that file to go back to them. Full screen: start the game, then run
 `.\scripts\fullscreen.ps1` in another window. Logs go to
 `%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
 
+### On an 8 GB card and 16 GB of RAM
+
+Below the requirements above, the defaults run out of VRAM (textures never
+drawn, DLSS `out of VRAM`) or of the shared GPU memory (device lost after 8-13
+minutes). `PLAY_SMALL.cmd` (`scripts\play-small.ps1`) starts a lighter profile
+that stays inside both: Series S, DLSS Performance, frame generation 2x, the
+texture pool off, a smaller render target reserve, title windows in BAR memory
+and a new texture quality switch (`VICTORY_TEXTURE_SKIP_LEVELS`). Measured on an
+8 GB card with 16 GB: about 21 fps rendered (42 shown), VRAM flat near 5.7 GB of
+7, no device loss. Every change, why, and each run's numbers:
+[docs/small-config.md](docs/small-config.md).
+
 ## How it works, and the findings
 
 - [docs/README-foxhound.md](docs/README-foxhound.md): foxhound's own README
@@ -349,6 +361,8 @@ delete that file to go back to them. Full screen: start the game, then run
 - [docs/architecture.md](docs/architecture.md): the layer's parts.
 - [docs/findings.md](docs/findings.md): measurements behind the choices.
 - [docs/dlss.md](docs/dlss.md): DLSS and Frame Generation.
+- [docs/small-config.md](docs/small-config.md): a lighter profile for 8 GB
+  cards and 16 GB of RAM, and what each of its changes measured.
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): the title's ray tracing
   and the light estimate.
 - [docs/asset-policy.md](docs/asset-policy.md): what may and may not be in this
