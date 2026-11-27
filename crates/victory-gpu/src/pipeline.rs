@@ -907,6 +907,41 @@ mod tests {
         parts
     }
 
+    /// The four parts of a program that does nothing (`s_endpgm`, one thread
+    /// to a group), made by hand, go into a container that reads back as one
+    /// compute program of that code.
+    #[test]
+    fn loose_parts_make_a_container_that_reads_back() {
+        let code = 0xBF81_0000u32.to_le_bytes();
+        // Registers (0x1c bytes): thread-group size 1 x 1 x 1 at +0x0c, flags at +0x12.
+        let mut packet = vec![0u8; 0x1c];
+        for axis in 0..3 {
+            packet[0x0c + 2 * axis] = 1;
+        }
+        let hash = [0u8; 0x14];
+        // Metadata: the header (0x403, its size less 0x14, code dwords, 0, 0x40, first
+        // user data dword, no 0x41 record), then the 0x43 record that ends it.
+        let mut meta = vec![0u8; 0x18 + 32];
+        meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        let size = meta.len() as u32 - 0x14;
+        meta[4..8].copy_from_slice(&size.to_le_bytes());
+        meta[8..12].copy_from_slice(&1u32.to_le_bytes());
+        meta[20] = 0x40;
+        meta[0x18] = 0x43;
+        let container = fspx_container(&[(0, &packet), (1, &hash), (6, &code), (7, &meta)]);
+        let c = victory_shader::Container::parse(&container).expect("a container");
+        let part = c.part(victory_shader::FourCC::ACCC).expect("the ACCC part");
+        let programs = victory_shader::native_programs(part.data).expect("reads as native programs");
+        let [program] = programs.as_slice() else { panic!("{} programs", programs.len()) };
+        assert_eq!(program.stage, victory_shader::HwStage::Cs);
+        assert_eq!(program.code, code);
+        // The same parts give the same container; another code another one.
+        let again = fspx_container(&[(0, &packet), (1, &hash), (6, &code), (7, &meta)]);
+        assert_eq!(container, again);
+        let other = fspx_container(&[(0, &packet), (1, &hash), (6, &[0u8; 4]), (7, &meta)]);
+        assert_ne!(container, other);
+    }
+
     /// `VICTORY_TEST_PSO_DIR=<dir>` of `VICTORY_DUMP_PSO` files: every
     /// `0x218-*.bin` goes into a container, which has to read as a compute
     /// program and translate.
