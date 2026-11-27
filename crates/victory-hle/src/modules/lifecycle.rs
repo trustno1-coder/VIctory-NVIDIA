@@ -150,8 +150,17 @@ struct MouseCapture {
 static MOUSE_CAPTURE: std::sync::LazyLock<Mutex<MouseCapture>> =
     std::sync::LazyLock::new(|| Mutex::new(MouseCapture::default()));
 
+fn mouse_capture_enabled() -> bool {
+    use super::gameinput::{Controls, controls};
+
+    match controls() {
+        Controls::Auto | Controls::Keyboard => enabled("VICTORY_MOUSE_CAPTURE"),
+        Controls::Gamepad | Controls::DualSense => false,
+    }
+}
+
 fn capture_mouse(hwnd: HWND, active: bool) {
-    if !enabled("VICTORY_MOUSE_CAPTURE") { return; }
+    if !mouse_capture_enabled() { return; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: runs on the window thread; local geometry, balanced cursor count.
     unsafe {
@@ -184,7 +193,7 @@ fn capture_mouse(hwnd: HWND, active: bool) {
 }
 
 pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
-    if !enabled("VICTORY_MOUSE_CAPTURE") { return None; }
+    if !mouse_capture_enabled() { return None; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: sampling and warping serialize with capture/focus messages.
     unsafe {
@@ -532,7 +541,7 @@ mod tests {
 
     #[test]
     fn mouse_reference_handles_focus_reset_and_warp() {
-        if !enabled("VICTORY_MOUSE_CAPTURE") { assert_eq!(captured_mouse_delta(), None); }
+        if !mouse_capture_enabled() { assert_eq!(captured_mouse_delta(), None); }
         let mut reference = None;
         assert_eq!(mouse_motion(&mut reference, (480, 390), None), (0, 0));
         assert_eq!(mouse_motion(&mut reference, (500, 400), None), (20, 10));

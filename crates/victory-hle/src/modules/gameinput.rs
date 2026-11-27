@@ -591,6 +591,26 @@ impl State {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Controls {
+    Auto,
+    Keyboard,
+    Gamepad,
+    DualSense,
+}
+
+#[cfg(windows)]
+pub(super) fn controls() -> Controls {
+    static MODE: LazyLock<Controls> = LazyLock::new(|| match std::env::var("VICTORY_CONTROLS").as_deref() {
+        Ok("keyboard") => Controls::Keyboard,
+        Ok("gamepad") => Controls::Gamepad,
+        Ok("dualsense") => Controls::DualSense,
+        _ => Controls::Auto,
+    });
+    *MODE
+}
+
+#[cfg(windows)]
 fn host() -> Box<dyn Source> {
     Box::new(host::Host::default())
 }
@@ -1266,11 +1286,18 @@ mod host {
             Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if controls() == Controls::Keyboard {
+                return None;
+            }
             // XInput first; HID PS5 pads take the slots XInput leaves free (`VICTORY_DUALSENSE`: 0 off, 1 both).
             if slot == 0 {
-                let xinput = std::array::from_fn(|slot| self.xinput(slot));
+                let (mode, xinput) = if controls() == Controls::DualSense {
+                    (super::dualsense::Mode::Both, [None; PADS])
+                } else {
+                    (super::dualsense::mode(), std::array::from_fn(|slot| self.xinput(slot)))
+                };
                 self.pads = super::dualsense::slots(
-                    super::dualsense::mode(),
+                    mode,
                     xinput,
                     &mut self.hid_slots,
                     super::dualsense::pads,
@@ -1294,7 +1321,9 @@ mod host {
 
         fn keys(&mut self) -> Vec<KeyState> {
             // The F1 settings menu takes the keyboard while it is shown.
-            if victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
+            if matches!(controls(), Controls::Gamepad | Controls::DualSense)
+                || victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 return Vec::new();
             }
             let mut down = scripted();
@@ -1321,6 +1350,11 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            if matches!(controls(), Controls::Keyboard | Controls::DualSense)
+                || self.hid_slots[slot].is_some()
+            {
+                return;
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,

@@ -96,6 +96,8 @@
 
 **In the game**
 
+In F1, **CONTROLS** selects Auto, Keyboard, Gamepad, or DualSense (Native). Save and restart to apply it. Auto keeps the mixed input behavior. Keyboard uses keyboard gamepad emulation. Mouse capture remains a separate setting for Auto and Keyboard. Gamepad accepts XInput and uses native Sony HID when XInput is unavailable. DualSense (Native) reads the original DualSense and DualSense Edge over USB or Bluetooth, even if a virtual XInput pad is present.
+
 - **F1** brings up the settings menu (arrow keys pick and change, Enter does
   it): DLSS, frame generation, frame rate cap and more.
 - **F3** shows the stats panel (frame rate, frame generation, draws, GPU and

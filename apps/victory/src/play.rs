@@ -828,10 +828,20 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     let quoted = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "''"));
     s.insert("VICTORY_MENU_FILE".to_owned(), menu_file.to_string_lossy().into_owned());
     s.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
-    s.insert(
-        "VICTORY_MENU_ARGS".to_owned(),
-        format!("play {}{}", quoted(&exe), if o.no_framegen_ready { " --no-framegen-ready" } else { "" }),
+    let mut restart_args = format!(
+        "play {} --res {} --dlss {} --fg-type {} --fps {}",
+        quoted(&exe), o.res, o.dlss, o.fg_type, o.fps,
     );
+    if o.series_s {
+        restart_args.push_str(" --series-s");
+    }
+    if o.no_framegen_ready {
+        restart_args.push_str(" --no-framegen-ready");
+    }
+    if let Some(times) = o.framegen {
+        restart_args.push_str(&format!(" --framegen {times}"));
+    }
+    s.insert("VICTORY_MENU_ARGS".to_owned(), restart_args);
     let log = log_file(&home.join("logs"))?;
     let console = if series_s { "series-s" } else { "series-x" };
     let line: Vec<String> = s.iter().map(|(k, v)| format!("{k}={v}")).collect();
