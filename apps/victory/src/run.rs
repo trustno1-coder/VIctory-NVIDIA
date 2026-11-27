@@ -81,10 +81,15 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
+    let build = victory_game::identify(&hash);
+    match build {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    // (Not with the title's FidelityFX path asked for: DLSS, frame
+    // generation and `VICTORY_FSR_PATH` take the title's FidelityFX
+    // upscaler, which the known build's patches turn off.)
+    apply_title_patches(&mut prepared, build, upscaler.is_none())?;
 
     // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
     // patched image goes to a folder of its own, beside the stock one.
@@ -678,4 +683,69 @@ mod cpu_check_tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// Bytes as lower-case hex.
+#[cfg(windows)]
+fn hex_str(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The known build's code patches (`VICTORY_TITLE_PATCHES=0`: none; none
+/// either unless `own_upscaler`: they make the title keep its own upscaler,
+/// and the FidelityFX path of DLSS and frame generation needs the title's
+/// choice left alone), then
+/// any from `VICTORY_TITLE_PATCH=<rva>:<old hex>:<new hex>,...`. The old
+/// bytes must be there (another build of the title is refused), and the
+/// patched copy has a file name of its own.
+#[cfg(windows)]
+fn apply_title_patches(
+    prepared: &mut victory_loader::PreparedImage,
+    build: Option<&victory_game::KnownBuild>,
+    own_upscaler: bool,
+) -> Result<()> {
+    let mut patches = Vec::new();
+    let mut names = Vec::new();
+    if !own_upscaler && build.is_some_and(|b| !b.patches.is_empty()) {
+        println!("title patch    none: the title's FidelityFX path is asked for, its choice of upscaler is left to it");
+    } else if std::env::var("VICTORY_TITLE_PATCHES").as_deref() != Ok("0") {
+        for p in build.map_or(&[][..], |b| b.patches) {
+            patches.push((p.rva, p.expect.to_vec(), p.write.to_vec()));
+            names.push(p.name.to_owned());
+        }
+    }
+    let spec = std::env::var("VICTORY_TITLE_PATCH").unwrap_or_default();
+    for one in spec.split(',').filter(|p| !p.trim().is_empty()) {
+        let parts: Vec<&str> = one.split(':').collect();
+        anyhow::ensure!(
+            parts.len() == 3,
+            "VICTORY_TITLE_PATCH entry is not <rva>:<old>:<new>: {one}"
+        );
+        let rva = u32::from_str_radix(parts[0].trim().trim_start_matches("0x"), 16)?;
+        patches.push((rva, from_hex(parts[1])?, from_hex(parts[2])?));
+        names.push("VICTORY_TITLE_PATCH".to_owned());
+    }
+    if patches.is_empty() {
+        return Ok(());
+    }
+    prepared.patch(&patches)?;
+    for ((rva, old, new), name) in patches.iter().zip(names) {
+        println!(
+            "title patch    +{rva:#x} {name}: {} -> {}",
+            hex_str(old),
+            hex_str(new)
+        );
+    }
+    Ok(())
+}
+
+/// Bytes from hex digits.
+#[cfg(windows)]
+fn from_hex(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim();
+    anyhow::ensure!(s.len().is_multiple_of(2), "odd hex length: {s}");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(anyhow::Error::from))
+        .collect()
 }
