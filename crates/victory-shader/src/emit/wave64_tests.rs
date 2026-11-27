@@ -933,3 +933,80 @@ fn lds_accesses_after_the_last_plain_write_need_no_meeting() {
     assert_eq!(unstable.iter().map(|x| x.0).collect::<Vec<_>>(), ["ds_read_b32"]);
     assert!(unordered[0].1 > 0x10, "the read after the barrier");
 }
+
+/// Tile compute shader LDS pattern: thread 0 alone stores the tile's starting maximum (0,
+/// dword 0) and minimum (-1, dword 1), then every thread `ds_max_u32`s and `ds_min_u32`s its
+/// key in and reads both back. `max_start` replaces the 0; `stray` adds a dynamic-address
+/// write; `atomics: false` omits the atomics.
+fn tile_min_max(max_start: u32, stray: bool, atomics: bool) -> NativeProgram {
+    let mut body = vec![
+        0xBE8C_047E,           // s_mov_b64 s[12:13], exec
+        0x7D92_0080,           // v_cmpx_eq_u32 exec, 0, v0
+        0x7E06_02FF,
+        max_start,             // v_mov_b32 v3, max_start
+        0x7E08_02C1,           // v_mov_b32 v4, -1
+        0x7E0A_0280,           // v_mov_b32 v5, 0
+        0xD838_0100,
+        0x0004_0305,           // ds_write2_b32 v5, v3, v4 offset1:1
+        0xBEFE_040C,           // s_mov_b64 exec, s[12:13]
+        0x7E0A_0280,           // v_mov_b32 v5, 0
+    ];
+    if stray {
+        body.extend([0xD834_0000, 0x0000_0000]); // ds_write_b32 v0, v0
+    }
+    if atomics {
+        body.extend([
+            0xD81C_0004,
+            0x0000_0005, // ds_min_u32 v5, v0 offset:4
+            0xD820_0000,
+            0x0000_0005, // ds_max_u32 v5, v0
+        ]);
+    }
+    body.extend([0xD8DC_0100, 0x0600_0005]); // ds_read2_b32 v[6:7], v5 offset1:1
+    body.extend([
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 6 << 8, // buffer_store_dword v6, off, s[8:11], 0
+    ]);
+    let mut program = native(&body);
+    if let StageIo::Cs(cs) = &mut program.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    program
+}
+
+#[test]
+fn accumulator_inits_are_hoisted_to_the_start() {
+    let hoists = |program: NativeProgram| {
+        let p = crate::spill::build(&program).unwrap();
+        lower::lds_init_hoists(&p, 128)
+    };
+    assert_eq!(hoists(tile_min_max(0, false, true)), [(0, 0), (1, u32::MAX)]);
+    // A start value that is not the maximum's identity stays unhoisted.
+    assert_eq!(hoists(tile_min_max(5, false, true)), [(1, u32::MAX)]);
+    // Plain stores without atomics are not accumulators.
+    assert_eq!(hoists(tile_min_max(0, false, false)), []);
+    // Any dynamic-address write prevents hoisting.
+    assert_eq!(hoists(tile_min_max(0, true, true)), []);
+    // The shader still lowers and passes DXIL validation.
+    let program = tile_min_max(0, false, true);
+    let p = crate::spill::build(&program).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &program.layout, program.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &program).unwrap();
+    let shader = lower::lower(&lower::Parts {
+        native: &program,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .unwrap();
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut dxil = shader.dxil.clone();
+        v.validate(&mut dxil).unwrap();
+    }
+}

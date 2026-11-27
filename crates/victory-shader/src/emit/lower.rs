@@ -1193,6 +1193,132 @@ fn lane_constant_masks(st: &Structured) -> bool {
     false
 }
 
+/// Whether accumulator initialisations are also stored at the start of the program
+/// ([`lds_init_hoists`]); `VICTORY_LDS_INIT_HOIST=0` turns it off.
+fn lds_init_hoist_on() -> bool {
+    std::env::var_os("VICTORY_LDS_INIT_HOIST").is_none_or(|v| v != "0")
+}
+
+/// The value an LDS dword must start with for the atomic `name` to accumulate into it (`min`
+/// of everything with `u32::MAX`, `max` with `0`, ...): `None` for an operation that is not
+/// such an accumulation.
+fn accumulator_identity(name: &str) -> Option<u32> {
+    Some(match name.replace("_rtn", "").as_str() {
+        "ds_min_u32" | "ds_and_b32" => u32::MAX,
+        "ds_max_u32" | "ds_add_u32" | "ds_or_b32" | "ds_xor_b32" => 0,
+        "ds_min_i32" => 0x7FFF_FFFF,
+        "ds_max_i32" => 0x8000_0000,
+        _ => return None,
+    })
+}
+
+/// The LDS dwords (below `dwords`, the program's own) that the program initialises for
+/// accumulation, with their starting value: a dword every write to which is a `ds_write_b32`
+/// or `ds_write2_b32` of one constant at a constant address, and every atomic on which
+/// accumulates with that constant as identity (at least one).
+///
+/// Ported from `fxceless/victory-fork` commit `a918163` (GPL-3.0): tile compute programs have
+/// thread 0 store starting min/max after per-pixel early returns before every thread runs
+/// `ds_min_u32`/`ds_max_u32`. When thread 0 returns early, atomics combine with uninitialised
+/// LDS (causing flickering dark patches in water tiles). Hoisting those constant stores to
+/// program entry behind a group barrier ensures every lane sees the identity value.
+pub(super) fn lds_init_hoists(p: &Program, dwords: u32) -> Vec<(u32, u32)> {
+    let constant = |insts: &[Inst], i: usize, x: Value| -> Option<u32> {
+        let d = insts[..i]
+            .iter()
+            .rposition(|j| j.writes.iter().any(|w| w.1 == x))?;
+        let Fields::Valu(f) = &insts[d].fields else {
+            return None;
+        };
+        let plain = insts[d].name() == "v_mov_b32"
+            && f.abs == 0
+            && f.neg == 0
+            && !f.clamp
+            && f.omod == 0
+            && f.opsel == 0
+            && f.sdwa.is_none()
+            && f.dpp.is_none()
+            && insts[d + 1..i]
+                .iter()
+                .all(|j| j.write(Reg::S(EXEC)).is_none() && j.write(Reg::S(EXEC + 1)).is_none());
+        if !plain {
+            return None;
+        }
+        match f.src.first()? {
+            Operand::Const(c) => crate::resource::inline(*c),
+            Operand::Literal(k) => Some(*k),
+            _ => None,
+        }
+    };
+    let operand = |insts: &[Inst], i: usize, o: Option<&Operand>| -> Option<u32> {
+        let &Operand::Vector { reg, .. } = o? else {
+            return None;
+        };
+        constant(insts, i, insts[i].read(Reg::V(reg))?)
+    };
+    let mut stores: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+    let mut atomics: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+    for block in &p.blocks {
+        let insts = &block.insts;
+        for (i, inst) in insts.iter().enumerate() {
+            let Fields::Ds {
+                addr,
+                data,
+                offset0,
+                offset1,
+                gds,
+                ..
+            } = &inst.fields
+            else {
+                continue;
+            };
+            let name = inst.name();
+            if *gds
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute")
+                || name.starts_with("ds_read")
+            {
+                continue;
+            }
+            let Some(base) = operand(insts, i, addr.as_ref()) else {
+                return Vec::new();
+            };
+            let single = u32::from(*offset0) | u32::from(*offset1) << 8;
+            let dword = |bytes: u32| base.wrapping_add(bytes) / 4;
+            match name {
+                "ds_write_b32" | "ds_write2_b32" => {
+                    let at: &[u32] = if name == "ds_write_b32" {
+                        &[single]
+                    } else {
+                        &[u32::from(*offset0) * 4, u32::from(*offset1) * 4]
+                    };
+                    for (n, &bytes) in at.iter().enumerate() {
+                        let Some(k) = operand(insts, i, data.get(n)) else {
+                            return Vec::new();
+                        };
+                        stores.entry(dword(bytes)).or_default().push(k);
+                    }
+                }
+                _ => {
+                    let Some(identity) = accumulator_identity(name) else {
+                        return Vec::new();
+                    };
+                    atomics.entry(dword(single)).or_default().push(identity);
+                }
+            }
+        }
+    }
+    stores
+        .into_iter()
+        .filter_map(|(dword, values)| {
+            let k = values[0];
+            let ids = atomics.get(&dword)?;
+            (dword < dwords && values.iter().all(|&v| v == k) && ids.iter().all(|&v| v == k))
+                .then_some((dword, k))
+        })
+        .collect()
+}
+
 /// The widest wave the host GPU runs (0: not known – no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2634,6 +2760,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        self.hoist_lds_inits();
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -4598,6 +4725,30 @@ impl<'a> Lower<'a> {
                 (self.s.m.load(c, p0), self.s.m.load(c, p1))
             })
             .collect()
+    }
+
+    /// The LDS dwords a compute program initialises for accumulation ([`lds_init_hoists`]),
+    /// stored with their starting values by every thread first thing, then a group barrier:
+    /// every thread of the group is still here, before any other LDS access.
+    fn hoist_lds_inits(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        if self.s.mesh.is_some() || !lds_init_hoist_on() {
+            return;
+        }
+        let inits = lds_init_hoists(self.x.p, cs.lds_bytes() / 4);
+        if inits.is_empty() {
+            return;
+        }
+        let e = self.s.entry;
+        let lds = self.s.lds();
+        for (dword, value) in inits {
+            let (at, k) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(e, lds, at);
+            self.s.m.store(e, ptr, k);
+        }
+        self.group_sync(e);
     }
 
     /// A group barrier with an LDS fence in `block`.
