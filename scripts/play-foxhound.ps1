@@ -149,16 +149,16 @@ $settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
     # Not built yet: built here, once.
-    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { Write-Host "No $victory, and no cargo to build it with: install Rust (README), then start this again."; return }
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { Write-Host "No $victory, and no cargo to build it with: install Rust (README), then start this again."; exit 1 }
     Write-Host 'Building the layer (a few minutes the first time) ...'
     Push-Location $repo
     try {
         if ($Build -eq 'diag') { cargo build --locked --profile diag -p victory --features diagnostics }
         else { cargo build --release --locked -p victory }
     } finally { Pop-Location }
-    if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
+    if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; exit 1 }
 }
-if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
+if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; exit 1 }
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
@@ -186,3 +186,5 @@ finally { Pop-Location }
 Push-Location $repo
 try { & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line } }
 finally { Pop-Location; $writer.Dispose() }
+# What `victory run` returned: a title that failed is a failed start for whoever called this script.
+exit $LASTEXITCODE
