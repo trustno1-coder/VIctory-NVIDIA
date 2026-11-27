@@ -71,6 +71,11 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# The hot paths cross crates (the list calls into the translator, the formats
+# and the host side) and the frame is bound by the processor: the program is
+# optimised as one unit. Slower to build; the code does the same.
+lto = "fat"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
