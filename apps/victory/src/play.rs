@@ -259,6 +259,21 @@ fn parse_menu(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Applies worker-pool and placed-order defaults tuned for `cpus` logical
+/// processors (before menu and `--set` overrides).
+fn apply_cpu_tuning(s: &mut BTreeMap<String, String>, cpus: usize) {
+    s.insert("VICTORY_PLACED_ORDER".to_owned(), "1".to_owned());
+    if cpus >= 24 {
+        s.insert("VICTORY_THIN_THREADS".to_owned(), "12".to_owned());
+        s.insert("VICTORY_UNDER_THREADS".to_owned(), "8".to_owned());
+        s.insert("VICTORY_LAND_THREADS".to_owned(), "8".to_owned());
+    } else if cpus >= 16 {
+        s.insert("VICTORY_THIN_THREADS".to_owned(), "12".to_owned());
+        s.insert("VICTORY_UNDER_THREADS".to_owned(), "8".to_owned());
+        s.insert("VICTORY_LAND_THREADS".to_owned(), "6".to_owned());
+    }
+}
+
 /// The settings of a start and whether it is the Series S profile: the
 /// options, what the menu saved over them (`menu`), `--set` over both.
 /// `streamline`: the folder with NVIDIA's files, if there is one.
@@ -283,6 +298,11 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         .unwrap_or(o.fps);
 
     let mut s: BTreeMap<String, String> = SETTINGS.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+    // Match scripts/play-gta6-framegen.ps1 worker-pool tuning on 16/24+ logical
+    // CPUs (+22-29% in heavy scenes on RTX 4070 SUPER) unless GTA6_NO_TUNE=1.
+    if std::env::var_os("GTA6_NO_TUNE").is_none_or(|v| v != "1") {
+        apply_cpu_tuning(&mut s, std::thread::available_parallelism().map(usize::from).unwrap_or(0));
+    }
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     if !series_s {
         match res {
@@ -1022,5 +1042,23 @@ mod tests {
         assert_eq!(stamp(0), "19700101-000000");
         assert_eq!(stamp(1_795_753_200), "20261127-042000");
         assert_eq!(stamp(951_782_400), "20000229-000000");
+    }
+
+    #[test]
+    fn cpu_tuning_scales_worker_pools_by_logical_cores() {
+        let mut s8 = BTreeMap::new();
+        apply_cpu_tuning(&mut s8, 8);
+        assert_eq!(s8.get("VICTORY_PLACED_ORDER").map(String::as_str), Some("1"));
+        assert!(!s8.contains_key("VICTORY_THIN_THREADS"));
+
+        let mut s16 = BTreeMap::new();
+        apply_cpu_tuning(&mut s16, 16);
+        assert_eq!(s16.get("VICTORY_THIN_THREADS").map(String::as_str), Some("12"));
+        assert_eq!(s16.get("VICTORY_UNDER_THREADS").map(String::as_str), Some("8"));
+        assert_eq!(s16.get("VICTORY_LAND_THREADS").map(String::as_str), Some("6"));
+
+        let mut s24 = BTreeMap::new();
+        apply_cpu_tuning(&mut s24, 24);
+        assert_eq!(s24.get("VICTORY_LAND_THREADS").map(String::as_str), Some("8"));
     }
 }
