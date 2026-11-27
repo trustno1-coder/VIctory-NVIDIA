@@ -66,6 +66,104 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    /// The stream's hash so far (FNV-1a over its words).
+    hash: u64,
+    /// Words recorded since the beginning, the bytes of some things included.
+    total: usize,
+    /// [`Front::hash`] at each stream handed over (or held back).
+    marks: Vec<u64>,
+    /// Streams held back while they still match the previous recording of
+    /// this list ([`list_cache`]), or all of them ([`full_cache`]).
+    deferred: Vec<Vec<u64>>,
+    /// The words of [`Front::deferred`].
+    held_words: usize,
+    /// The previous recording of this list: its hash, its marks, its words.
+    prev: Option<Prev>,
+    /// The stream stopped matching [`Front::prev`].
+    diverged: bool,
+}
+
+/// A recording of a list, as the next one is compared with it
+/// ([`list_cache`]).
+struct Prev {
+    hash: u64,
+    marks: Vec<u64>,
+    total: usize,
+}
+
+/// [`Front::hash`] of nothing recorded.
+const HASH_START: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Whether a list recorded with the same stream as before is run again
+/// (`VICTORY_LIST_CACHE=1`; off by default): its host list was recorded once,
+/// and the title's re-recording of it is not translated again.
+fn list_cache() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// Whether every stream is held back to its close, so that any list whose
+/// stream was recorded before is run again, not only the one that recorded it
+/// (`VICTORY_LIST_CACHE_FULL=1`; with [`list_cache`]).
+fn full_cache() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CACHE_FULL").is_some_and(|v| v == "1"))
+}
+
+fn any_cache() -> bool {
+    list_cache() || full_cache()
+}
+
+/// Words held back for one list at most: past it the stream is handed over to
+/// translate (the memory of the words is a list's whole stream otherwise).
+const DEFER_MOST: usize = 64 << 10;
+
+/// Host lists recorded for a stream, by its hash: taken to run again, given
+/// back when that run is done with (`Recording`'s drop).
+static HASHED: Mutex<Option<Cached>> = Mutex::new(None);
+
+#[derive(Default)]
+struct Cached {
+    by_hash: std::collections::HashMap<u64, Vec<usize>>,
+    order: VecDeque<u64>,
+}
+
+/// Kept host lists at most: past it the oldest go back to the pool.
+const CACHE_MOST: usize = 128;
+
+/// A host list recorded for `hash`, if one is free.
+fn take_cached(hash: u64) -> Option<usize> {
+    let mut all = held(&HASHED);
+    let all = all.get_or_insert_with(Cached::default);
+    let list = all.by_hash.get_mut(&hash)?.pop()?;
+    if all.by_hash.get(&hash).is_some_and(Vec::is_empty) {
+        all.by_hash.remove(&hash);
+        all.order.retain(|&h| h != hash);
+    }
+    Some(list)
+}
+
+/// Gives `back` to the cache as the host list of `hash` (or back to the pool
+/// past [`CACHE_MOST`]).
+fn keep_cached(hash: u64, back: usize) {
+    let mut old = Vec::new();
+    {
+        let mut all = held(&HASHED);
+        let all = all.get_or_insert_with(Cached::default);
+        if !all.by_hash.contains_key(&hash) {
+            all.order.push_back(hash);
+        }
+        all.by_hash.entry(hash).or_default().push(back);
+        while all.order.len() > CACHE_MOST {
+            let Some(front) = all.order.pop_front() else { break };
+            if let Some(lists) = all.by_hash.remove(&front) {
+                old.extend(lists);
+            }
+        }
+    }
+    for list in old {
+        held(&BACKS).push(list);
+    }
 }
 
 impl Drop for Front {
@@ -84,6 +182,14 @@ impl Front {
             recording.abandoned.store(true, Release);
         }
         self.words.clear();
+        for words in self.deferred.drain(..) {
+            give_back(vec![words]);
+        }
+        self.hash = HASH_START;
+        self.total = 0;
+        self.marks.clear();
+        self.held_words = 0;
+        self.diverged = false;
     }
 
     /// Begins a recording, with `pipeline` bound.
@@ -92,7 +198,23 @@ impl Front {
         self.recording = Some(Arc::new(Recording::new(kind)));
         self.closed = false;
         self.submitted = false;
+        self.hash = HASH_START;
+        // The kind of list is part of the stream: a host list of another kind
+        // cannot be run for this one.
+        self.mix(u64::from(kind));
         self.put(RESET, &[pipeline as u64]);
+    }
+
+    #[inline]
+    fn append(&mut self, op: u64, args: &[u64]) {
+        let word = op | (args.len() as u64) << 16;
+        self.mix(word);
+        self.words.push(word);
+        for &a in args {
+            self.mix(a);
+        }
+        self.words.extend_from_slice(args);
+        self.total += 1 + args.len();
     }
 
     #[inline]
@@ -100,8 +222,7 @@ impl Front {
         if self.closed || self.recording.is_none() {
             return;
         }
-        self.words.push(op | (args.len() as u64) << 16);
-        self.words.extend_from_slice(args);
+        self.append(op, args);
         if self.words.len() >= CHUNK {
             self.hand_over();
         }
@@ -125,38 +246,126 @@ impl Front {
         }
         let len = (self.words.len() - at - 1) as u64;
         self.words[at] = op | len << 16;
+        self.total += self.words.len() - at;
+        for i in at..self.words.len() {
+            let w = self.words[i];
+            self.mix(w);
+        }
         if self.words.len() >= CHUNK {
             self.hand_over();
         }
     }
 
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.hash = (self.hash ^ word).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    /// Whether the stream so far is still one of the previous recording's.
+    fn matches_prev(&self) -> bool {
+        let Some(prev) = &self.prev else { return false };
+        let n = self.marks.len();
+        self.marks.get(n.wrapping_sub(1)) == prev.marks.get(n.wrapping_sub(1))
+    }
+
     fn hand_over(&mut self) {
-        let Some(recording) = &self.recording else { return };
+        let Some(recording) = self.recording.clone() else { return };
         if self.words.is_empty() {
             return;
         }
-        let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
-        let words = std::mem::replace(&mut self.words, fresh);
-        CHUNKS.fetch_add(1, Relaxed);
-        let schedule = {
-            let mut inner = held(&recording.inner);
-            inner.chunks.push_back(words);
-            !std::mem::replace(&mut inner.scheduled, true)
-        };
-        if schedule {
-            held(&READY).push_back(recording.clone());
-            WORK.notify_one();
+        self.marks.push(self.hash);
+        let hold = full_cache() && self.held_words + self.words.len() <= DEFER_MOST
+            || list_cache() && !self.diverged && self.matches_prev();
+        if hold {
+            // Held back: the previous recording of this stream may be run
+            // again.
+            let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
+            let words = std::mem::replace(&mut self.words, fresh);
+            self.held_words += words.len();
+            self.deferred.push(words);
+            return;
         }
+        self.diverged = true;
+        self.hand_over_now(&recording);
+    }
+
+    /// Gives the recording the streams held back and the one being written.
+    fn hand_over_now(&mut self, recording: &Arc<Recording>) {
+        self.held_words = 0;
+        for words in self.deferred.drain(..) {
+            push_chunk(recording, words);
+        }
+        if !self.words.is_empty() {
+            let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
+            let words = std::mem::replace(&mut self.words, fresh);
+            push_chunk(recording, words);
+        }
+    }
+
+    /// After the last stream: runs the previous recording again if this one
+    /// is the same (`VICTORY_LIST_CACHE=1`), else hands it over to translate.
+    fn finish(&mut self) {
+        let recording = self.recording.clone();
+        let same = self.prev.as_ref().is_some_and(|prev| {
+            prev.hash == self.hash && prev.total == self.total && prev.marks == self.marks
+        });
+        let mut reused = false;
+        if any_cache()
+            && (full_cache() || !self.diverged && same)
+            && !self.deferred.is_empty()
+            && let Some(back) = take_cached(self.hash)
+            && let Some(recording) = &recording
+        {
+            self.deferred.clear();
+            reuse(recording, back, self.hash);
+            reused = true;
+        }
+        if !reused && let Some(recording) = &recording {
+            recording.hash.store(self.hash, Release);
+            self.diverged = true;
+            self.hand_over_now(recording);
+        }
+        self.prev = Some(Prev { hash: self.hash, marks: std::mem::take(&mut self.marks), total: self.total });
     }
 
     fn close(&mut self) {
         if self.closed {
             return;
         }
-        self.put(CLOSE, &[]);
+        if self.recording.is_none() {
+            self.closed = true;
+            return;
+        }
+        self.append(CLOSE, &[]);
         self.closed = true;
         self.hand_over();
+        self.finish();
     }
+}
+
+/// Gives `words` to `recording`, starting its translation if it was not.
+fn push_chunk(recording: &Arc<Recording>, words: Vec<u64>) {
+    CHUNKS.fetch_add(1, Relaxed);
+    let schedule = {
+        let mut inner = held(&recording.inner);
+        inner.chunks.push_back(words);
+        !std::mem::replace(&mut inner.scheduled, true)
+    };
+    if schedule {
+        held(&READY).push_back(recording.clone());
+        WORK.notify_one();
+    }
+}
+
+/// Makes `recording` the run of the host list `back`, recorded before for the
+/// same stream: nothing is translated.
+fn reuse(recording: &Arc<Recording>, back: usize, hash: u64) {
+    let mut inner = held(&recording.inner);
+    inner.back = back;
+    inner.closed = true;
+    recording.hash.store(hash, Release);
+    recording.done.store(true, Release);
+    recording.moved.notify_all();
 }
 
 /// Streams' memory to use again.
@@ -181,6 +390,8 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub(crate) struct Recording {
     kind: u32,
     inner: Mutex<Inner>,
+    /// The stream's hash, once it is complete ([`Front::finish`]).
+    hash: AtomicU64,
     /// Translated to its end.
     done: AtomicBool,
     moved: Condvar,
@@ -205,6 +416,7 @@ impl Recording {
         Recording {
             kind,
             inner: Mutex::default(),
+            hash: AtomicU64::new(0),
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
@@ -272,7 +484,14 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let back = inner.back;
+            let hash = self.hash.load(Acquire);
+            if any_cache() && inner.closed && hash != 0 {
+                drop(inner);
+                keep_cached(hash, back);
+            } else {
+                held(&BACKS).push(back);
+            }
         }
     }
 }
