@@ -99,6 +99,9 @@ mod permlane_tests;
 mod rect;
 mod sampler;
 mod shader;
+mod split;
+#[cfg(test)]
+mod split_tests;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -511,8 +514,149 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// What a console wave64 program that only 64-lane waves run stops with on a host of 32-lane
+/// waves.
+const NO_WAVE32: &str = "no wave32 lowering for this wave64 program";
+
 /// Emits a program whose earlier stages already ran.
+///
+/// A console wave64 compute program that every form here leaves needing 64-lane waves on a
+/// host of 32-lane waves gets one more try, NVIctory's split-wave fallback ([`split_waves`]).
+/// It never changes a program the forms before it translate.
+/// (`VICTORY_WAVE_SPLIT=0` turns it off.)
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let r = emit_forms(c, native, p, st, io, res);
+    let refused = matches!(&r, Err(ShaderError::Unsupported { what, .. }) if *what == NO_WAVE32);
+    if !refused
+        || native.stage != HwStage::Cs
+        || !native.wave64
+        || lower::host_max_wave() != 32
+        || std::env::var_os("VICTORY_WAVE_SPLIT").is_some_and(|v| v == "0")
+    {
+        return r;
+    }
+    split_waves(c, native, p).map_or(r, Ok)
+}
+
+/// NVIctory's split-wave fallback (`split`): `p` lowered with LDS read and written in one
+/// lane-branch region where its proofs admit the accesses ([`split::with_fallback`]). Where
+/// they refuse a region, as NVIctory's `emit_with` does: an `s_cbranch_execz` that only skips
+/// code EXEC already masks falls through (`s_nop`; its arm becomes guarded code the whole group
+/// runs together, where accesses meet), the refused region's first; with no such skip left,
+/// in a group of one console wave, the branches that close or leave the loop around the access
+/// are taken by the whole wave ([`structure::structure_wide`]): every lane runs every
+/// iteration, those done guarded off, as the console runs them. At most 24 rounds.
+fn split_waves(c: &Container, native: &NativeProgram, p: &ir::Program) -> Option<HostShader> {
+    let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    let one_wave = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() <= 64);
+    let mut code = native.patched_code();
+    // byte offsets of the branches the whole wave takes
+    let mut waves = std::collections::HashSet::new();
+    let mut current: Option<ir::Program> = None;
+    for round in 0..24 {
+        let q = current.as_ref().unwrap_or(p);
+        let mut wide: std::collections::HashSet<usize> = q
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.insts.last().is_some_and(|i| waves.contains(&i.machine.offset)))
+            .map(|(b, _)| b)
+            .collect();
+        let mut st = structure::structure_wide(q, &wide).ok()?;
+        // (a branch on a plain scalar is the wave's already: NVIctory's mark is a no-op there)
+        if wide.iter().any(|&b| st.wave_any.get(b).copied().flatten().is_none()) {
+            wide.retain(|&b| st.wave_any.get(b).copied().flatten().is_some());
+            st = structure::structure_wide(q, &wide).ok()?;
+        }
+        let io = io::raise(q, native).ok()?;
+        let res = resource::track(q, &native.layout, native.stage, Some(&st)).ok()?;
+        split::REFUSED.take();
+        split::REFUSED_AT.set(None);
+        split::SPLITTING.take();
+        lower::take_needs();
+        let r = split::with_fallback(|| emit_program(c, native, q, &st, &io, &res));
+        lower::take_needs();
+        if why {
+            match &r {
+                Ok((_, wave)) => eprintln!("WAVE64-SPLIT round {round}: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-SPLIT round {round}: {e}"),
+            }
+        }
+        match r {
+            Ok((shader, wave)) if wave != Some(64) => return Some(shader),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+        let offset = split::REFUSED_AT.take()?;
+        if why {
+            eprintln!("WAVE64-SPLIT round {round}: LDS access at {offset:#x} unfenced");
+        }
+        let mut changed = false;
+        for at in split::REFUSED.take() {
+            let Some(name) = q.blocks.iter().filter_map(|b| b.insts.last()).find(|i| i.machine.offset == at).map(|i| i.name()) else {
+                continue;
+            };
+            if name == "s_cbranch_execz" && split::skips_forward(q, at) {
+                code[at..at + 4].copy_from_slice(&0xBF80_0000u32.to_le_bytes()); // s_nop 0
+                changed = true;
+                if why {
+                    eprintln!("WAVE64-SPLIT round {round}: skip at {at:#x} falls through");
+                }
+            } else if one_wave
+                && ["s_cbranch_scc", "s_cbranch_vcc", "s_cbranch_exec"].iter().any(|k| name.starts_with(k))
+                && waves.insert(at)
+            {
+                changed = true;
+                if why {
+                    eprintln!("WAVE64-SPLIT round {round}: {name} at {at:#x} wave-wide");
+                }
+            }
+        }
+        if changed {
+        } else if let Some(at) = split::execz_skip_over(q, offset) {
+            code[at..at + 4].copy_from_slice(&0xBF80_0000u32.to_le_bytes()); // s_nop 0
+            if why {
+                eprintln!("WAVE64-SPLIT round {round}: skip at {at:#x} over it falls through");
+            }
+        } else if let exits = split::loop_exits_over(q, offset, &waves)
+            && one_wave
+            && !exits.is_empty()
+        {
+            if why {
+                eprintln!("WAVE64-SPLIT round {round}: loop exits {exits:x?} wave-wide");
+            }
+            waves.extend(exits);
+        } else if let splitting = split::SPLITTING.take().into_iter().filter(|at| !waves.contains(at)).collect::<Vec<_>>()
+            && one_wave
+            && !splitting.is_empty()
+        {
+            // (beyond NVIctory: the lane branches that split the group where it runs together,
+            // taken by the whole wave as the console takes them, so what they join is the same
+            // in both halves; NVIctory takes the scalar test after such a join on both halves'
+            // SCC instead, which this lowering has no form for)
+            if why {
+                eprintln!("WAVE64-SPLIT round {round}: splitting branches {splitting:x?} wave-wide");
+            }
+            waves.extend(splitting);
+        } else {
+            return None;
+        }
+        let mut patched = native.clone();
+        patched.code = code.clone();
+        current = Some(crate::spill::build(&patched).ok()?);
+    }
+    None
+}
+
+/// [`emit`] without the split-wave fallback.
+fn emit_forms(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -758,7 +902,7 @@ pub fn emit(
         if wave == Some(64) && lower::host_max_wave() == 32 {
             Err(ShaderError::Unsupported {
                 offset: 0,
-                what: "no wave32 lowering for this wave64 program",
+                what: NO_WAVE32,
             })
         } else {
             Ok(shader)

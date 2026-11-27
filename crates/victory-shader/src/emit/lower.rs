@@ -1101,6 +1101,7 @@ fn lds_meetings(
     st: &Structured,
     all: &[bool],
     unordered: &HashSet<(usize, usize)>,
+    mixed: bool,
 ) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
@@ -1150,7 +1151,7 @@ fn lds_meetings(
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    if !mixed && (0..n).any(|r| reads[r] && writes[r]) {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -1714,16 +1715,35 @@ impl<'a> Lower<'a> {
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                             && !lds_order.unordered.contains(&(b, k))
                     };
-                    if let Some(all) = all_lane_blocks(x.st) {
+                    if let Some(mut all) = all_lane_blocks(x.st) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().enumerate().all(|(k, inst)| {
                                 !lds(b, k, inst) || all.get(b).copied().unwrap_or(false)
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, &lds_order.unordered) {
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, &lds_order.unordered, false) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
+                        }
+                        // The last resort ([`super::split::with_fallback`]): a region that reads
+                        // and writes LDS, where NVIctory's proofs find its accesses need no fence
+                        // between them; the halves meet around it as above, and exchange only
+                        // where the group also runs together by [`super::split::convergent`].
+                        // (as NVIctory: not without room for the exchange dwords and the counter
+                        // in the host group's 32 KiB)
+                        let room = s.lds_dwords + 2 * group.div_ceil(64) + 1 <= HOST_LDS_DWORDS;
+                        if !lds_ok && super::split::fallback() && !PAIR_MEETINGS.get() && room {
+                            match super::split::admit(p, x.st, &all, cs.threads, s.lds_dwords * 4) {
+                                Ok(together) => {
+                                    if let Some(meet) = lds_meetings(p, x.st, &together, &lds_order.unordered, true) {
+                                        all = together;
+                                        lds_meet = Some((all.clone(), meet));
+                                        lds_ok = true;
+                                    }
+                                }
+                                Err(offset) => super::split::REFUSED_AT.set(Some(offset)),
+                            }
                         }
                         if !lds_ok {
                             // (the blocks whose LDS accesses not every lane runs: with the
@@ -1777,7 +1797,7 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all, &lds_order.unordered).is_none() => {
+                            Some(all) if lds_meetings(p, x.st, &all, &lds_order.unordered, false).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
                             }
                             Some(_) => {}
@@ -2363,6 +2383,10 @@ impl<'a> Lower<'a> {
             // each thread walks the bits of this value and works only at its own, which the
             // host wave's OR holds: the same run as with the console wave's OR
             r
+        } else if self.exchange.is_some() && super::split::fallback() && !self.all_lanes(self.cur_ir) {
+            // NVIctory's split waves, where the group is not together: this half's own result
+            // and prefix, the other half giving the operation's identity
+            r
         } else if self.exchange.is_some() {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
@@ -2463,7 +2487,9 @@ impl<'a> Lower<'a> {
             .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
         let mut r_lo = self.s.m.extract(c, split, 0);
         let mut r_hi = self.s.m.extract(c, split, 1);
-        if self.exchange.is_some() {
+        // (NVIctory's split waves, where the group is not together: this half's own sum)
+        let own = super::split::fallback() && !self.all_lanes(self.cur_ir);
+        if self.exchange.is_some() && !own {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
@@ -3821,12 +3847,19 @@ impl<'a> Lower<'a> {
                         if !self.local_ok && !self.local_any {
                             return Err("a lane mask read as data in a half-wave");
                         }
+                        xy = self.exchange_halves(at, xy.0)?;
                     } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.all_lanes(b)) {
                         // (a group of 32 or fewer has no other half to exchange with)
-                        need(b.unwrap_or(0));
-                        return Err(DIVERGENT_MASK_EXCHANGE);
+                        if !super::split::fallback() {
+                            need(b.unwrap_or(0));
+                            return Err(DIVERGENT_MASK_EXCHANGE);
+                        }
+                        // NVIctory's split waves, where the group is not together: the ballot
+                        // of this half's lanes, none of the other's
+                        xy = self.own_half(at, xy.0);
+                    } else {
+                        xy = self.exchange_halves(at, xy.0)?;
                     }
-                    xy = self.exchange_halves(at, xy.0)?;
                 }
                 self.ballots.insert(lo, xy);
                 xy
@@ -4645,6 +4678,17 @@ impl<'a> Lower<'a> {
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// (lower half's, upper half's) with this host wave's half holding `mine`, the other
+    /// nothing: no exchange.
+    fn own_half(&mut self, at: usize, mine: V) -> (V, V) {
+        let cl = self.console_lane();
+        let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
+        let upper = self.s.m.cmp(at, pred::IUGE, cl, k32);
+        let lo = self.s.m.select(at, upper, z, mine);
+        let hi = self.s.m.select(at, upper, mine, z);
+        (lo, hi)
+    }
+
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it. The halves
     /// meet ([`Self::meet`]): the results are in [`Self::cur`], which may be a new block;
@@ -4661,12 +4705,7 @@ impl<'a> Lower<'a> {
         }
         if self.local {
             // each host wave on its own: its half holds `mine`, the other nothing
-            let cl = self.console_lane();
-            let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
-            let upper = self.s.m.cmp(at, pred::IUGE, cl, k32);
-            let lo = self.s.m.select(at, upper, z, mine);
-            let hi = self.s.m.select(at, upper, mine, z);
-            return Ok((lo, hi));
+            return Ok(self.own_half(at, mine));
         }
         if self.pairs.is_some() {
             if at != self.cur {
@@ -4745,6 +4784,11 @@ impl<'a> Lower<'a> {
             return Ok(some);
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
+            if super::split::fallback() {
+                // (NVIctory's split waves: this half's lanes alone where the group is not
+                // together)
+                return Ok(some);
+            }
             need(made.unwrap_or(0));
             return Err(DIVERGENT_MASK_EXCHANGE);
         }
@@ -9244,7 +9288,10 @@ impl<'a> Lower<'a> {
                     self.cross_lane(false)?;
                 }
                 if let Some(slot) = self.exchange.as_ref().map(|e| e.0) {
-                    if self.local && self.local_any {
+                    // (NVIctory's split waves, where the group is not together: the half
+                    // reads within itself)
+                    let own = super::split::fallback() && !self.all_lanes(self.cur_ir);
+                    if self.local && self.local_any || own && !self.exchange.as_ref().is_some_and(|e| e.1) {
                         // this host wave's lane of that number (lanes 32..63 are 0..31 here)
                         let k31 = self.s.m.i32(31);
                         let here = self.s.m.bin(self.cur, Bin::And, lane, k31);
@@ -9342,8 +9389,12 @@ impl<'a> Lower<'a> {
                         // first lane, exact when the value is the same in every lane of
                         // the console wave (the ray-tracing builder's scans read a sum of
                         // scalars this way, inside a loop whose exit is per console wave).
+                        // NVIctory's split waves always do so where the group is not together
+                        // (its `Exchange::own`), and so does their fallback here.
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
+                        if super::split::fallback()
+                            || *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1"))
+                        {
                             return int(self, mine);
                         }
                         need(self.cur_ir);
