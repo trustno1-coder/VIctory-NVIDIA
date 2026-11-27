@@ -1545,9 +1545,23 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`, 1..=16).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        wide_threads_for(
+            std::env::var("VICTORY_WIDE_THREADS").ok().as_deref(),
+            std::thread::available_parallelism().ok().map(|n| n.get()),
+        )
+    })
+}
+
+fn wide_threads_for(asked: Option<&str>, cpus: Option<usize>) -> usize {
+    asked
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| cpus.map_or(4, |n| n / 4).clamp(2, 6))
+        .clamp(1, 16)
 }
 
 fn workers() -> &'static Workers {
@@ -5914,4 +5928,20 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod wide_threads_tests {
+    use super::wide_threads_for;
+
+    #[test]
+    fn wide_threads_defaults_and_honors_override_within_bounds() {
+        assert_eq!(wide_threads_for(None, Some(8)), 2);
+        assert_eq!(wide_threads_for(None, Some(16)), 4);
+        assert_eq!(wide_threads_for(None, Some(24)), 6);
+        assert_eq!(wide_threads_for(Some("10"), Some(24)), 10);
+        assert_eq!(wide_threads_for(Some("32"), Some(24)), 16);
+        assert_eq!(wide_threads_for(Some("0"), Some(24)), 6);
+        assert_eq!(wide_threads_for(Some("bad"), Some(16)), 4);
+    }
 }

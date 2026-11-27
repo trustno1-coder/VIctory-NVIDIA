@@ -75,7 +75,17 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+const RETIRED_SHARDS: usize = 16;
+static RETIRED: [Mutex<std::collections::VecDeque<(u64, Retired)>>; RETIRED_SHARDS] =
+    [const { Mutex::new(std::collections::VecDeque::new()) }; RETIRED_SHARDS];
+
+fn retired_shard() -> &'static Mutex<std::collections::VecDeque<(u64, Retired)>> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static INDEX: usize = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & (RETIRED_SHARDS - 1);
+    }
+    &RETIRED[INDEX.with(|&i| i)]
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -480,7 +490,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
+    retired_shard()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push_back((started, Retired::Any(Box::new(object))));
@@ -496,7 +506,10 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    retired_shard()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back((started, Retired::Resource(object)));
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -514,18 +527,17 @@ fn bury_lag() -> u64 {
 }
 
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
-/// numbers come in order, but for threads that overtake each other: one of
-/// those is dropped a little later than it could be.
+/// numbers come in order within each thread's shard.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut done: Vec<(u64, Retired)> = Vec::new();
+    for shard in &RETIRED {
+        let mut retired = shard.lock().unwrap_or_else(|e| e.into_inner());
         let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
+        if n > 0 {
+            done.extend(retired.drain(..n));
         }
-        retired.drain(..n).collect()
-    };
+    }
     drop(done);
 }
 
