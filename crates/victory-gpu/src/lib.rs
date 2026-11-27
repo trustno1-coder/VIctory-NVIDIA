@@ -29,6 +29,8 @@ mod copystat;
 mod faultbook;
 #[cfg(windows)]
 mod cores;
+#[cfg(windows)]
+pub use cores::title_group_affinity;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]

@@ -29,6 +29,7 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//! `VICTORY_AMBIENT_LEAST=<level>`: the least light the estimate gives ([`least`]).
 //! `VICTORY_AMBIENT_ONCE=1`: one bounce of the title's own light, without the
 //! stand-in's light coming back to it ([`once`]).
 //!
@@ -127,6 +128,22 @@ fn parse(set: &str) -> Set {
     }
 }
 
+/// `VICTORY_AMBIENT_LEAST=<level>`: with the estimate (`VICTORY_AMBIENT=<share>`),
+/// the least indirect light a point gets, as the constant of `constant:<level>`
+/// gives it (0, the default: no floor). The estimate is made from what is on
+/// screen, so at night outdoors and in unlit rooms it is about nothing and
+/// what no lamp reaches is black; VI-BR-PORT keeps such a floor
+/// (`estimate:<share>:<least>`, 0.16 outdoors since the opening was too dark at
+/// 0.08; edsuuu/VI-BR-PORT 849a20b3, GPL-3.0-or-later).
+fn least() -> f32 {
+    static LEAST: OnceLock<f32> = OnceLock::new();
+    *LEAST.get_or_init(|| parse_least(&std::env::var("VICTORY_AMBIENT_LEAST").unwrap_or_default()))
+}
+
+fn parse_least(set: &str) -> f32 {
+    set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).map_or(0.0, |v| v.min(4.0))
+}
+
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
@@ -207,7 +224,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -217,6 +234,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float once;
+    float least;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -475,6 +493,13 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
+    // Never under the least light asked for (`VICTORY_AMBIENT_LEAST`): at
+    // night what is on screen is dark, the estimate made from it too. After
+    // the bound above, which stays the estimate's: raised by the floor it let
+    // the probes' violet memory through outdoors (sky and trees in violet
+    // tones, 2026-11-27).
+    float3 floor_light = float3(1.0, 0.98, 0.94) * least * open;
+    if (least > 0.0 && dot(found, LUMA) < dot(floor_light, LUMA)) found = floor_light;
     float3 now = max(was, found);
     light[p] = pack(now);
     if (once > 0.0) {
@@ -715,7 +740,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 13];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -724,6 +749,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[12] = least().to_bits();
     words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -732,7 +758,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -780,6 +806,16 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+    }
+
+    #[test]
+    fn least_settings() {
+        assert_eq!(parse_least(""), 0.0);
+        assert_eq!(parse_least("0"), 0.0);
+        assert_eq!(parse_least("x"), 0.0);
+        assert_eq!(parse_least("-1"), 0.0);
+        assert_eq!(parse_least(" 0.16 "), 0.16);
+        assert_eq!(parse_least("99"), 4.0);
     }
 
     #[test]

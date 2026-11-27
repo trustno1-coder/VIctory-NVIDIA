@@ -99,6 +99,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
     Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
     Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_AMBIENT_LEAST", label: "LIGHT FLOOR (DARK ROOMS)", values: &[("", "OFF"), ("0.1", "0.1"), ("0.05", "0.05"), ("0.16", "0.16")], live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },
     Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
     // On unless "0": a file saved by an earlier version holds an empty value (its OFF) or "1",

@@ -1,6 +1,9 @@
 //! Which processors our own threads run on, where a processor has two kinds
 //! of cores. `cpu_sets` and `keep_on_fast_cores` are fxceless/victory-fork's
-//! (`framelog.rs`, commit 0b0074e0, GPL-3.0-or-later, as this).
+//! (`framelog.rs`, commit 0b0074e0, GPL-3.0-or-later, as this). The title's
+//! own threads, where it places them itself: [`title_group_affinity`].
+
+use std::ffi::c_void;
 
 /// The system's processor sets of group 0: each one's id and its efficiency
 /// class (higher is faster).
@@ -159,6 +162,207 @@ impl Priority {
     }
 }
 
+/// A logical processor of group 0: its number in the group's masks, the
+/// core it is on and that core's efficiency class (higher is faster).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Logical {
+    index: u8,
+    core: u8,
+    class: u8,
+}
+
+/// Group 0's logical processors ([`cpu_sets`], with where each one is).
+fn logical_processors() -> Vec<Logical> {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut bytes = 0u32;
+    // SAFETY: a size query, then the call into a buffer of that size.
+    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
+    let ok = unsafe { GetSystemCpuSetInformation(buffer.as_mut_ptr().cast(), bytes, &mut bytes, GetCurrentProcess(), 0) };
+    let mut all = Vec::new();
+    let mut at = 0usize;
+    while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
+        // SAFETY: a record inside the buffer; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_CPU_SET_INFORMATION>()) };
+        if info.Size == 0 {
+            break;
+        }
+        // SAFETY: the record's type is CpuSet (the only one there is).
+        let set = unsafe { &info.Anonymous.CpuSet };
+        if set.Group == 0 && set.LogicalProcessorIndex < 64 {
+            all.push(Logical { index: set.LogicalProcessorIndex, core: set.CoreIndex, class: set.EfficiencyClass });
+        }
+        at += info.Size as usize;
+    }
+    all
+}
+
+/// The mask of group 0's logical processors on the fastest cores, if some
+/// are slower (0: all alike, or nothing known).
+fn fast_mask(all: &[Logical]) -> u64 {
+    let best = all.iter().map(|l| l.class).max().unwrap_or(0);
+    if all.iter().all(|l| l.class == best) {
+        return 0;
+    }
+    all.iter().filter(|l| l.class == best).fold(0, |m, l| m | 1u64 << l.index)
+}
+
+/// What a group 0 mask holds, for the log: how many logical processors, on
+/// how many cores, how many of them on fast cores, and how many cores hold
+/// two of them.
+fn describe(mask: u64, all: &[Logical]) -> String {
+    let best = all.iter().map(|l| l.class).max().unwrap_or(0);
+    let held: Vec<&Logical> = all.iter().filter(|l| mask >> l.index & 1 != 0).collect();
+    let mut cores: Vec<u8> = held.iter().map(|l| l.core).collect();
+    cores.sort_unstable();
+    let shared = cores.windows(2).filter(|w| w[0] == w[1]).count();
+    cores.dedup();
+    let fast = held.iter().filter(|l| l.class == best).count();
+    format!(
+        "{} logical on {} cores ({} on fast cores, {} on slow; {} cores with two of them)",
+        held.len(),
+        cores.len(),
+        fast,
+        held.len() - fast,
+        shared
+    )
+}
+
+/// A thread the title placed itself ([`title_group_affinity`]): its id, our
+/// own handle of it, and the group and mask it asked for.
+struct Placed {
+    thread: u32,
+    handle: usize,
+    group: u16,
+    mask: usize,
+}
+
+static PLACED: std::sync::Mutex<Vec<Placed>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether the title's placed threads go on every fast core instead
+/// (0: not read yet, 1: no, 2: yes): `VICTORY_TITLE_FAST_CORES=1`, which
+/// `VICTORY_AB` can flip while the title runs ([`title_reapply`]).
+static TITLE_FAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn title_fast() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match TITLE_FAST.load(Relaxed) {
+        0 => {
+            let on = crate::asked_for!("VICTORY_TITLE_FAST_CORES");
+            // (A flip by `title_reapply` meanwhile wins.)
+            let _ = TITLE_FAST.compare_exchange(0, if on { 2 } else { 1 }, Relaxed, Relaxed);
+            TITLE_FAST.load(Relaxed) == 2
+        }
+        v => v == 2,
+    }
+}
+
+/// [`fast_mask`] of this processor, found once.
+fn fast_now() -> u64 {
+    static FAST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FAST.get_or_init(|| fast_mask(&logical_processors()))
+}
+
+/// The group and mask a thread that asked for `(group, mask)` is given:
+/// with `fast`, group 0's fast cores in place of any group 0 mask.
+fn chosen(group: u16, mask: usize, fast: bool, fast_mask: u64) -> (u16, usize) {
+    if fast && group == 0 && fast_mask != 0 { (0, fast_mask as usize) } else { (group, mask) }
+}
+
+/// The title's `SetThreadGroupAffinity`. The title places its threads on
+/// processors it picks from what `GetLogicalProcessorInformation` tells it,
+/// with a console's like cores in mind; on a processor with fast and slow
+/// cores (i9-13900KF: 8 fast ones with two logical processors each, 16 slow
+/// ones) a thread a frame waits for can be kept on a slow core, or two of
+/// them on one core. The first 128 placements are logged; with
+/// `VICTORY_TITLE_FAST_CORES=1` a thread is given all of group 0's fast cores
+/// in place of the mask it asked for, and the scheduler spreads them there.
+///
+/// What the log showed on an i9-13900KF (2026-11-27): every thread the title
+/// places stays inside logical processors 0 to 13, seven fast cores with
+/// their two logical processors each, as on the console (masks 0x3fff; 0xff,
+/// eight threads on four cores; 0x1f00, some eleven threads on five logical
+/// processors; 0x3f00; 0x2000); some calls ask for mask 0, which Windows
+/// refuses. The eighth fast core and the sixteen slow ones are never asked
+/// for. All fast cores in place of those masks measured no gain with
+/// `VICTORY_AB` on the traffic road (+3.4 % time per draw, better in 14 of 34
+/// paired phases): our own submitting thread and its helpers are kept on the
+/// same cores. Off by default; the log of the masks is what it is for.
+///
+/// # Safety
+///
+/// As the host's `SetThreadGroupAffinity`: `thread` a thread handle with
+/// `THREAD_SET_INFORMATION` and `THREAD_QUERY_INFORMATION`, `asked` null or a
+/// readable `GROUP_AFFINITY`, `previous` null or a writable one.
+pub unsafe fn title_group_affinity(thread: *mut c_void, asked: *const c_void, previous: *mut c_void) -> i32 {
+    use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetThreadId, SetThreadGroupAffinity};
+    let asked = asked.cast::<GROUP_AFFINITY>();
+    if asked.is_null() {
+        // SAFETY: the title's own arguments, passed on (the host refuses them).
+        return unsafe { SetThreadGroupAffinity(thread, asked, previous.cast()) };
+    }
+    // SAFETY: the title passes a GROUP_AFFINITY to read.
+    let a = unsafe { *asked };
+    // SAFETY: the title's thread handle.
+    let id = unsafe { GetThreadId(thread) };
+    let fast = title_fast();
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 128 {
+        let held = if a.Group == 0 { describe(a.Mask as u64, &logical_processors()) } else { String::new() };
+        tracing::info!(
+            thread = id,
+            group = a.Group,
+            mask = format_args!("{:#x}", a.Mask),
+            held = %held,
+            on_fast_cores = fast,
+            "the title places a thread (SetThreadGroupAffinity; VICTORY_TITLE_FAST_CORES=1: on all fast cores instead)"
+        );
+    }
+    let mut own: *mut c_void = std::ptr::null_mut();
+    // SAFETY: the title's thread handle, duplicated into our own process
+    // with its access (which let the title place it).
+    let copied = unsafe {
+        DuplicateHandle(GetCurrentProcess(), thread, GetCurrentProcess(), &mut own, 0, 0, DUPLICATE_SAME_ACCESS)
+    } != 0;
+    if copied {
+        let mut placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = placed.iter_mut().find(|p| p.thread == id) {
+            // SAFETY: our own handle, replaced.
+            unsafe { CloseHandle(p.handle as *mut c_void) };
+            (p.handle, p.group, p.mask) = (own as usize, a.Group, a.Mask);
+        } else {
+            placed.push(Placed { thread: id, handle: own as usize, group: a.Group, mask: a.Mask });
+        }
+    }
+    let (group, mask) = chosen(a.Group, a.Mask, fast, fast_now());
+    let given = GROUP_AFFINITY { Mask: mask, Group: group, Reserved: [0; 3] };
+    // SAFETY: the title's thread handle and out pointer; our own mask.
+    unsafe { SetThreadGroupAffinity(thread, &given, previous.cast()) }
+}
+
+/// `VICTORY_TITLE_FAST_CORES` switched to `fast` while the title runs
+/// (`VICTORY_AB`): every thread the title placed is placed again.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn title_reapply(fast: bool) {
+    use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
+    use windows_sys::Win32::System::Threading::SetThreadGroupAffinity;
+    let placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    TITLE_FAST.store(if fast { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    let fast_mask = fast_now();
+    let mut moved = 0u32;
+    for p in placed.iter() {
+        let (group, mask) = chosen(p.group, p.mask, fast, fast_mask);
+        let given = GROUP_AFFINITY { Mask: mask, Group: group, Reserved: [0; 3] };
+        // SAFETY: our own handle of the thread (one that has ended refuses).
+        moved += u32::from(unsafe { SetThreadGroupAffinity(p.handle as *mut c_void, &given, std::ptr::null_mut()) } != 0);
+    }
+    tracing::debug!(fast, moved, of = placed.len(), "the title's placed threads placed again (VICTORY_TITLE_FAST_CORES)");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +374,44 @@ mod tests {
         assert!(fast_of(&[]).is_empty());
         assert!(!cpu_sets().is_empty());
         std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
+    }
+
+    fn l(index: u8, core: u8, class: u8) -> Logical {
+        Logical { index, core, class }
+    }
+
+    #[test]
+    fn a_mask_is_told_by_its_cores_and_the_fast_ones_replace_it_when_asked() {
+        // Two fast cores with two logical processors each, two slow ones.
+        let all = [l(0, 0, 1), l(1, 0, 1), l(2, 1, 1), l(3, 1, 1), l(4, 2, 0), l(5, 3, 0)];
+        assert_eq!(fast_mask(&all), 0b1111);
+        assert_eq!(fast_mask(&all[..4]), 0, "all alike: nothing to prefer");
+        assert_eq!(describe(0b11, &all), "2 logical on 1 cores (2 on fast cores, 0 on slow; 1 cores with two of them)");
+        assert_eq!(describe(0b110100, &all), "3 logical on 3 cores (1 on fast cores, 2 on slow; 0 cores with two of them)");
+        assert_eq!(chosen(0, 0b10000, true, 0b1111), (0, 0b1111));
+        assert_eq!(chosen(0, 0b10000, false, 0b1111), (0, 0b10000));
+        assert_eq!(chosen(1, 0b1, true, 0b1111), (1, 0b1), "another group stays as asked");
+        assert_eq!(chosen(0, 0b10000, true, 0), (0, 0b10000), "no fast cores known");
+        assert!(!logical_processors().is_empty());
+    }
+
+    #[test]
+    fn the_titles_placement_is_passed_on() {
+        use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadGroupAffinity};
+        std::thread::spawn(|| {
+            // SAFETY: this thread's own affinity, read and set again as it was.
+            unsafe {
+                let mut was: GROUP_AFFINITY = std::mem::zeroed();
+                assert_ne!(GetThreadGroupAffinity(GetCurrentThread(), &mut was), 0);
+                let mut before: GROUP_AFFINITY = std::mem::zeroed();
+                let ok = title_group_affinity(GetCurrentThread(), (&raw const was).cast(), (&raw mut before).cast());
+                assert_ne!(ok, 0);
+                assert_eq!(before.Mask, was.Mask);
+            }
+        })
+        .join()
+        .unwrap();
+        assert!(!PLACED.lock().unwrap().is_empty());
     }
 }
