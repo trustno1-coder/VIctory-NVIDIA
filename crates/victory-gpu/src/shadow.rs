@@ -548,7 +548,9 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        // Unset: 4096 when the shared budget is small.
+        let unset = if crate::residency::shared_is_small() { 4096 } else { 0 };
+        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(unset) << 20
     })
 }
 

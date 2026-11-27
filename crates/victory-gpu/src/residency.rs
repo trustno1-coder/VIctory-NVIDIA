@@ -55,6 +55,25 @@ fn sample_commit(now: u64) -> u64 {
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
 }
 
+/// Whether the shared GPU memory budget is under 10 GiB (7.2 GB on a
+/// 16 GB PC) and card memory can be mapped by the CPU. Then windows and sends
+/// default to card memory (`VICTORY_WINDOWS_BAR_MB=4096`, `VICTORY_SEND_BAR=1`).
+pub(crate) fn shared_is_small() -> bool {
+    static SMALL: OnceLock<bool> = OnceLock::new();
+    *SMALL.get_or_init(|| {
+        let Some(host) = crate::host::host() else { return false };
+        let small = host.video_memory().is_some_and(|[_, _, budget, _]| small_budget(budget)) && host.mapped_card_memory();
+        if small {
+            tracing::info!("small shared GPU memory budget: windows and sends go to card memory (VICTORY_WINDOWS_BAR_MB=0, VICTORY_SEND_BAR=0 to opt out)");
+        }
+        small
+    })
+}
+
+fn small_budget(budget: u64) -> bool {
+    budget != 0 && budget < 10 * GIB
+}
+
 fn has_upload_reserve(commit: u64, bake: bool) -> bool {
     // Keep a protective floor against Rust/game OOM aborts without starving
     // bindless world textures or one-shot ped decoration bakes when steady-state
@@ -175,6 +194,13 @@ mod tests {
             assert_eq!(has_upload_reserve(commit, false), lookahead);
             assert_eq!(has_growth_reserve(commit, false), growth);
         }
+    }
+
+    #[test]
+    fn a_budget_of_a_16_gb_pc_is_small_and_one_of_32_is_not() {
+        assert!(small_budget(7224 * MIB));
+        assert!(!small_budget(16 * GIB));
+        assert!(!small_budget(0), "no answer is not a small budget");
     }
 
     #[test]

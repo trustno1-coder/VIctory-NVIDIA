@@ -132,7 +132,11 @@ fn kept() -> u64 {
 /// default.
 fn on_card() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BAR").is_some_and(|v| v == "1"))
+    // Unset: on when the shared budget is small.
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_SEND_BAR") {
+        Some(v) => v == "1",
+        None => crate::residency::shared_is_small(),
+    })
 }
 
 fn memory(host: &Host, size: u64) -> Option<Memory> {
