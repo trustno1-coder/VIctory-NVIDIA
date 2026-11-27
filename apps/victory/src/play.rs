@@ -104,8 +104,9 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_AMBIENT_SPECULAR", "1"),
     // Pixel programs keep the console's early depth test
     ("VICTORY_EARLY_DEPTH", "1"),
-    // Left out: the decal heap's defragmentation and the heat-haze pass
-    ("VICTORY_LEAVE_OUT", "02384a60fda6f2d0,731a39171b568298"),
+    // Left out: the heat-haze pass. The decal heap's defragmentation runs: without
+    // it the faces' meshes are missing (#100).
+    ("VICTORY_LEAVE_OUT", "731a39171b568298"),
     // Pipelines the title makes are written down, for `victory warm`
     ("VICTORY_PIPELINE_BOOK", "1"),
 ];
