@@ -120,6 +120,9 @@ first start builds the layer, which takes a few minutes.
 Options, requirements in full and the details are under
 [How to run it](#how-to-run-it).
 
+Building on Linux is experimental and documented in
+[docs/linux-proton.md](docs/linux-proton.md).
+
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files **you** supply,
 tuned for **NVIDIA RTX** cards.
