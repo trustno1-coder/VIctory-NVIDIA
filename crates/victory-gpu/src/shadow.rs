@@ -1751,6 +1751,8 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    // (Lab, on the submitting thread: the call by the clock and on a processor.)
+    let _piece = crate::lab::piece(17);
     // Helpers woken: one for each job beyond the one this thread takes
     // first, at most all of them. All were woken for every call (4 for 2
     // jobs), and those that found nothing went back to sleep; a helper busy
@@ -1788,11 +1790,15 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
+    // (Lab: this thread's share is done; from here on it waits for the helpers'.)
+    let waiting = std::time::Instant::now();
     spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
     let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
     while *n > 0 {
         n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
     }
+    drop(n);
+    crate::lab::waited_for(4, waiting);
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's

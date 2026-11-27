@@ -177,12 +177,18 @@ fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
     let got = f();
     WAITS[what][0].fetch_add(1, Relaxed);
     WAITS[what][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    crate::lab::waited_for(what, began);
     got
 }
 
+/// (Lab: the submitting thread's waits are counted in every build; a wait
+/// only, never a lock that was free.)
 #[cfg(not(feature = "diagnostics"))]
-fn waited<T>(_: usize, f: impl FnOnce() -> T) -> T {
-    f()
+fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
+    let began = std::time::Instant::now();
+    let got = f();
+    crate::lab::waited_for(what, began);
+    got
 }
 
 /// [`WAITS`], taken, for the log: per frame.
@@ -271,6 +277,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let began = std::time::Instant::now();
+        let piece = crate::lab::piece(18);
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
@@ -282,6 +289,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
                 &mut granularity,
             )
         } != 0;
+        drop(piece);
         // (Lab: what the askings are and cost, in every build.)
         crate::lab::asked((last - first) * (PAGE >> 10), if failed { 0 } else { count }, began);
         #[cfg(feature = "diagnostics")]
@@ -2146,6 +2154,8 @@ fn is_view(start: usize, end: usize) -> bool {
 fn protect(g: &mut Guards, from: usize, to: usize) {
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
+    // (Lab, on the submitting thread: by the clock and on a processor.)
+    let _piece = crate::lab::piece(19);
     protect_here(g, from, to);
     cover(g, from, to);
 }

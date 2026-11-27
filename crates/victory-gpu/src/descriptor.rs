@@ -34,6 +34,8 @@ pub(crate) fn waited(which: usize, started: std::time::Instant) -> u64 {
     let other = usize::from(!IN_TEXTURE_PASS.get());
     let ns = started.elapsed().as_nanos() as u64;
     LOCK_WAITS[2 * which + other].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    // (Lab: the submitting thread's among them, by name.)
+    crate::lab::waited_for(5 + which, started);
     ns
 }
 

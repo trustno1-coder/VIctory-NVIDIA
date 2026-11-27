@@ -58,9 +58,13 @@ pub(crate) const WIDE: usize = 16;
 /// How many of the threads that translate lists take work
 /// (`crate::list::thin`; 0: as `VICTORY_THIN_THREADS` says, eight without it).
 pub(crate) const LISTS: usize = 17;
+/// The submitting thread's time on a processor is counted beside the clock's
+/// time for each part of its work (1), for the line [`on_line`] writes: some
+/// 1,200 questions to the system a frame ([`cycles`]).
+pub(crate) const CYC: usize = 18;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 18] = [
+const KNOBS: [(&str, i64); 19] = [
     ("reuse", 1),
     ("zero", 1),
     ("a", 0),
@@ -79,8 +83,9 @@ const KNOBS: [(&str, i64); 18] = [
     ("own", 0),
     ("wide", 0),
     ("lists", 0),
+    ("cyc", 0),
 ];
-static VALUES: [AtomicI64; 18] = [const { AtomicI64::new(0) }; 18];
+static VALUES: [AtomicI64; 19] = [const { AtomicI64::new(0) }; 19];
 
 /// Switch `own`, asked by the submitting thread (`role` 0) before each
 /// submission and by the thread that lands flights (`role` 1) before each
@@ -546,6 +551,202 @@ pub(crate) fn asked(kb: usize, found: usize, began: Instant) {
     ASKS[at + 1].fetch_add(kb as u64, Relaxed);
     ASKS[at + 2].fetch_add(found as u64, Relaxed);
     ASKS[at + 3].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn QueryThreadCycleTime(thread: *mut std::ffi::c_void, cycles: *mut u64) -> i32;
+}
+
+/// The submitting thread, for its time on a processor ([`on_line`]): a handle
+/// kept for the process's life, 0 until that thread has started.
+static SUBMITTER: AtomicUsize = AtomicUsize::new(0);
+
+/// The calling thread is the one that prepares and sends submissions.
+pub(crate) fn submits() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
+    SUBMITS.set(true);
+    // SAFETY: a handle to this thread, never closed.
+    let handle = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, GetCurrentThreadId()) };
+    SUBMITTER.store(handle as usize, Relaxed);
+}
+
+/// The processor cycles the submitting thread has had so far, asked by
+/// itself: 0 on any other thread and with switch `cyc` off. (The system
+/// counts them at every change of thread on a processor, by the processor's
+/// own clock: time waiting, for a lock or for a processor, is not in them.)
+pub(crate) fn cycles() -> u64 {
+    if !SUBMITS.get() || peek(CYC) == 0 {
+        return 0;
+    }
+    let mut n = 0;
+    // SAFETY: this thread's own count.
+    unsafe { QueryThreadCycleTime(windows_sys::Win32::System::Threading::GetCurrentThread(), &mut n) };
+    n
+}
+
+/// Since the last frame-rate line, the submitting thread's processor cycles
+/// by part of its work: the parts of `crate::host`'s split under their numbers
+/// there (0 to 15), after a sending (16), and the pieces of [`PIECES`] (17 on).
+static ON: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
+
+/// The submitting thread's cycles since `since` ([`cycles`] then) are part
+/// `part`'s. Its cycles now (0: not counted).
+pub(crate) fn on(part: usize, since: u64) -> u64 {
+    if since == 0 {
+        return 0;
+    }
+    let now = cycles();
+    if now != 0 {
+        ON[part].fetch_add(now.saturating_sub(since), Relaxed);
+    }
+    now
+}
+
+/// Since the last frame-rate line, pieces of the submitting thread's work
+/// inside the parts above, each how many and their nanoseconds by the clock:
+/// work spread over threads (`crate::shadow::wide`), the kernel's write watch
+/// asked, blocks of title memory made read-only (`crate::watch`). Their
+/// cycles are in [`ON`] from 17 on.
+static PIECES: [[AtomicU64; 2]; 3] = [const { [const { AtomicU64::new(0) }; 2] }; 3];
+
+/// One of [`PIECES`], counted when dropped.
+pub(crate) struct Piece(usize, Instant, u64);
+
+/// Piece `which` (17 on) of the submitting thread's work begins; nothing on
+/// another thread.
+pub(crate) fn piece(which: usize) -> Option<Piece> {
+    SUBMITS.get().then(|| Piece(which, Instant::now(), cycles()))
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        PIECES[self.0 - 17][0].fetch_add(1, Relaxed);
+        PIECES[self.0 - 17][1].fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
+        on(self.0, self.2);
+    }
+}
+
+/// Since the last frame-rate line, waits of the submitting thread inside its
+/// work, each how many and their nanoseconds: for ranges another thread asks
+/// the kernel about (0), for the journal to read it (1) and to note in it
+/// (2), for the guards' lock (3) (`crate::watch`; only when the lock was not
+/// free); for the helpers at the end of work spread over threads (4); for the
+/// lock of the queue of textures picked by index (5) and of the views' table
+/// (6) (`crate::descriptor`).
+static WAITS: [[AtomicU64; 2]; 7] = [const { [const { AtomicU64::new(0) }; 2] }; 7];
+
+/// A wait of kind `what` ([`WAITS`]) that began at `began` is over.
+pub(crate) fn waited_for(what: usize, began: Instant) {
+    if SUBMITS.get() {
+        WAITS[what][0].fetch_add(1, Relaxed);
+        WAITS[what][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
+/// For the frame-rate line, from `crate::host`'s split of the submitting
+/// thread's work: `wall` is its parts' milliseconds a frame by the clock (0
+/// to 15 as there, 16 after a sending). Two lines: what that thread waited for
+/// inside its work, with its time on a processor (in every run), and, with
+/// switch `cyc`, each part's time on a processor beside its time by the clock.
+pub(crate) fn on_line(frames: f64, wall: &[f64; 17]) {
+    // When the last line was, the processor's clock then, and the thread's cycles.
+    static BEFORE: Mutex<Option<(Instant, u64, u64)>> = Mutex::new(None);
+    let mut whole = 0;
+    let handle = SUBMITTER.load(Relaxed);
+    if handle != 0 {
+        // SAFETY: the handle made in `submits`.
+        unsafe { QueryThreadCycleTime(handle as *mut std::ffi::c_void, &mut whole) };
+    }
+    // SAFETY: reads the processor's clock.
+    let now = (Instant::now(), unsafe { std::arch::x86_64::_rdtsc() }, whole);
+    let before = lock(&BEFORE).replace(now);
+    let on: Vec<u64> = ON.iter().map(|n| n.swap(0, Relaxed)).collect();
+    let pieces: Vec<[f64; 2]> = PIECES.iter().map(|p| [p[0].swap(0, Relaxed) as f64 / frames, p[1].swap(0, Relaxed) as f64 / 1e6 / frames]).collect();
+    let waits: Vec<[f64; 2]> = WAITS.iter().map(|w| [w[0].swap(0, Relaxed) as f64 / frames, w[1].swap(0, Relaxed) as f64 / 1e6 / frames]).collect();
+    let Some(before) = before else {
+        return;
+    };
+    let ms = now.0.saturating_duration_since(before.0).as_secs_f64() * 1000.0;
+    // Cycles of the processor's clock in a millisecond.
+    let rate = now.1.wrapping_sub(before.1) as f64 / ms.max(1.0);
+    if handle == 0 || rate <= 0.0 || wall.iter().sum::<f64>() <= 0.0 {
+        return;
+    }
+    let whole = now.2.saturating_sub(before.2) as f64 / rate / frames;
+    tracing::info!(
+        "the submitting thread's waits inside its work per frame (lab): it was on a processor {whole:.1} ms of the frame's {:.1}; \
+         it waited {:.1} times {:.2} ms for the helpers at the end of work spread over threads, {:.1} times {:.2} ms for the guards' \
+         lock, {:.1} times {:.2} ms for the journal to read it, {:.1} times {:.2} ms to note in it, {:.1} times {:.2} ms for ranges \
+         another thread asked the kernel about, {:.1} times {:.2} ms for the lock of the queue of textures picked by index, {:.1} \
+         times {:.2} ms for the views table's; by the clock: work spread over threads {:.1} times {:.2} ms, the kernel's write \
+         watch {:.1} calls {:.2} ms, blocks made read-only {:.1} times {:.2} ms",
+        ms / frames,
+        waits[4][0],
+        waits[4][1],
+        waits[3][0],
+        waits[3][1],
+        waits[1][0],
+        waits[1][1],
+        waits[2][0],
+        waits[2][1],
+        waits[0][0],
+        waits[0][1],
+        waits[5][0],
+        waits[5][1],
+        waits[6][0],
+        waits[6][1],
+        pieces[0][0],
+        pieces[0][1],
+        pieces[1][0],
+        pieces[1][1],
+        pieces[2][0],
+        pieces[2][1],
+    );
+    if on.iter().sum::<u64>() == 0 {
+        return;
+    }
+    let on: Vec<f64> = on.iter().map(|&n| n as f64 / rate / frames).collect();
+    tracing::info!(
+        "the submitting thread on a processor per frame (lab, switch cyc): {whole:.1} ms of the frame's {:.1}; the parts of its \
+         submissions, ms by the clock / ms on a processor: asking the write watch {:.2} / {:.2}, the title's bytes under flights' \
+         writes {:.2} / {:.2}, the lists' steps {:.2} / {:.2} (their flushes of refreshes {:.2} / {:.2}), snapshots {:.2} / {:.2}, \
+         copies in the card's memory {:.2} / {:.2}, sending {:.2} / {:.2}, planning steps done on the card {:.2} / {:.2}, waiting \
+         for flights {:.2} / {:.2}, the heaps' records and what is swept {:.2} / {:.2}, waiting for the heaps' records {:.2} / \
+         {:.2}, after a sending {:.2} / {:.2}; inside them: work spread over threads {:.2} / {:.2}, the kernel's write watch \
+         {:.2} / {:.2}, blocks made read-only {:.2} / {:.2}",
+        ms / frames,
+        wall[0],
+        on[0],
+        wall[1],
+        on[1],
+        wall[2],
+        on[2],
+        wall[6] - wall[9],
+        on[6],
+        wall[3],
+        on[3],
+        wall[4],
+        on[4],
+        wall[5],
+        on[5],
+        wall[12],
+        on[12],
+        wall[13],
+        on[13],
+        wall[14],
+        on[14],
+        wall[15],
+        on[15],
+        wall[16],
+        on[16],
+        pieces[0][1],
+        on[17],
+        pieces[1][1],
+        on[18],
+        pieces[2][1],
+        on[19],
+    );
 }
 
 /// Since the last frame-rate line, the microseconds the submitting thread's

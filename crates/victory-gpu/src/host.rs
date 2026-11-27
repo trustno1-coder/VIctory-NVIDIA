@@ -5951,6 +5951,7 @@ impl Host {
             return;
         };
         let after = std::time::Instant::now();
+        let after_cycles = crate::lab::cycles();
         crate::lab::note("a flight is sent to the card (its number, its fence value)", sent.number, *submitted);
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
@@ -5997,6 +5998,7 @@ impl Host {
         let _landing = crate::timeline::span("landed lists reset and given back");
         land();
         AFTER_SEND.fetch_add(after.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::lab::on(16, after_cycles);
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -8592,12 +8594,14 @@ fn heap_sync_first() -> bool {
 /// another after a wait for flights.
 static HEAP_SYNC_FIRST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// Counts into [`SPLIT`].
-struct Split(std::cell::Cell<std::time::Instant>);
+/// Counts into [`SPLIT`]; and, on the submitting thread with lab switch
+/// `cyc`, that thread's processor cycles into the lab's count of them
+/// (`crate::lab::on`).
+struct Split(std::cell::Cell<std::time::Instant>, std::cell::Cell<u64>);
 
 impl Split {
     fn begin() -> Split {
-        Split(std::cell::Cell::new(std::time::Instant::now()))
+        Split(std::cell::Cell::new(std::time::Instant::now()), std::cell::Cell::new(crate::lab::cycles()))
     }
 
     /// Nanoseconds since the last part.
@@ -8609,6 +8613,7 @@ impl Split {
     fn part(&self, i: usize) {
         let now = std::time::Instant::now();
         SPLIT[i].fetch_add((now - self.0.replace(now)).as_nanos() as u64, Ordering::Relaxed);
+        self.1.set(crate::lab::on(i, self.1.get()));
     }
 }
 
@@ -8621,6 +8626,8 @@ fn submit_split_line(frames: f64) {
     let f: [f64; 4] = std::array::from_fn(|i| FLUSHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
     let after = AFTER_SEND.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
     let all: f64 = [0, 1, 2, 3, 4, 5, 11, 12, 13, 14, 15].iter().map(|&i| ms[i]).sum();
+    // (Lab: the same parts by that thread's time on a processor, and its waits.)
+    crate::lab::on_line(frames, &std::array::from_fn(|i| if i < 16 { ms[i] } else { after }));
     if all + after <= 0.0 {
         return;
     }
@@ -9208,6 +9215,7 @@ impl Batch {
         FLUSHES[1].fetch_add(spans.len() as u64, Ordering::Relaxed);
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
+        let cycles = crate::lab::cycles();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
@@ -9248,6 +9256,7 @@ impl Batch {
         PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
         PREPARING[0].fetch_add(took, Ordering::Relaxed);
         SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::lab::on(6, cycles);
     }
 
     /// Before the steps of `runs` ([`ahead_of_writes`]); copies and fills
@@ -9342,9 +9351,11 @@ impl Batch {
             return;
         }
         let (began, all) = (std::time::Instant::now(), self.refreshes.len());
+        let cycles = crate::lab::cycles();
         let _flush = crate::timeline::span("refreshes of copies");
         self.flush_all();
         SPLIT[6].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::lab::on(6, cycles);
         FLUSHES[0].fetch_add(1, Ordering::Relaxed);
         FLUSHES[1].fetch_add(all as u64, Ordering::Relaxed);
     }

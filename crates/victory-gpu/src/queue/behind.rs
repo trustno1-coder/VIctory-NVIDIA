@@ -846,7 +846,7 @@ fn started() -> bool {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
             crate::cores::keep_on_fast_cores("victory-submit");
             OURS.set(true);
-            crate::lab::SUBMITS.set(true);
+            crate::lab::submits();
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LANE.serve()));
             if ended.is_err() {
                 // Nothing would ever be sent again, and the title's thread
