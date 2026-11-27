@@ -19,17 +19,14 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::font::{colours, glyph};
+use super::font::{CELL, Script, colours, painted, text_width};
 use super::{Host, HostList, transition};
 
 /// How often the numbers change.
 const EVERY: Duration = Duration::from_millis(500);
 
-/// A character's dots, and with the space beside and below it.
-const GLYPH: (u32, u32) = (5, 7);
-const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
-const COLUMNS: u32 = 40;
+const COLUMNS: u32 = 48;
 const LINES: u32 = 10;
 const RIM: u32 = 3;
 
@@ -81,41 +78,6 @@ const fn size(shape: Shape, scale: u32) -> (u32, u32) {
 /// shows one and a third.
 fn scale(height: u32) -> u32 {
     (height / 540).max(1)
-}
-
-/// Whether a dot of the picture of `lines` is white.
-fn lit(lines: &[String], shape: Shape, x: u32, y: u32) -> bool {
-    let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
-        return false;
-    };
-    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= shape.columns {
-        return false;
-    }
-    let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
-        return false;
-    };
-    (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
-}
-
-/// The box as rows of `pitch` bytes.
-fn painted(lines: &[String], shape: Shape, scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
-    let (width, height) = size(shape, scale);
-    let bytes = colours[0].len();
-    let mut out = vec![0; pitch * height as usize];
-    for y in 0..height / scale {
-        let top = pitch * (y * scale) as usize;
-        for x in 0..width / scale {
-            let colour = colours[usize::from(lit(lines, shape, x, y))];
-            for i in 0..scale {
-                let at = top + (x * scale + i) as usize * bytes;
-                out[at..at + bytes].copy_from_slice(colour);
-            }
-        }
-        for i in 1..scale as usize {
-            out.copy_within(top..top + pitch, top + i * pitch);
-        }
-    }
-    out
 }
 
 /// The counters read for it. They grow, and go back to 0 with the frame-rate
@@ -256,7 +218,7 @@ impl Buffers {
 
     fn write(&mut self, lines: &[String]) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.shape, self.scale, colours, self.pitch as usize);
+        let picture = painted(lines, size(self.shape, self.scale), self.scale, RIM, Script::Simplified, colours, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -427,7 +389,7 @@ impl Notice {
         let warmup = super::menu::warmup_seconds().map(super::menu::warmup_notice).unwrap_or_default();
         let lines: Vec<String> =
             warmup.into_iter().chain(crate::streamline::notice()).map(|l| l.to_ascii_uppercase()).collect();
-        let columns = lines.iter().map(|l| l.len() as u32).max().unwrap_or(0).min(NOTICE_COLUMNS);
+        let columns = lines.iter().map(|l| text_width(l)).max().unwrap_or(0).min(NOTICE_COLUMNS);
         let shape = Shape { columns, lines: lines.len() as u32 };
         Notice { done: lines.is_empty(), lines, shape, since: None, buffers: None, written: false }
     }
@@ -462,7 +424,7 @@ impl Notice {
             buffers.write(&self.lines);
         }
         let (w, _) = size(self.shape, scale);
-        let at = (width.saturating_sub(w) / 2, 24 * scale);
+        let at = (width.saturating_sub(w) / 2, (CELL.1 + 8) * scale);
         buffers.copy(&list.list, back, at, (width, height));
     }
 }
@@ -471,48 +433,12 @@ impl Notice {
 mod tests {
     use super::*;
 
-    /// Every character the lines use has its own picture, and no two look
-    /// alike.
-    #[test]
-    fn characters_differ() {
-        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- ").collect();
-        for (i, a) in used.iter().enumerate() {
-            assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
-            assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));
-            for b in &used[i + 1..] {
-                assert_ne!(glyph(*a), glyph(*b), "{} {}", *a as char, *b as char);
-            }
-        }
-    }
-
     /// The frame generation line fits the box and says what is shown.
     #[test]
     fn generated_frames_are_told() {
         assert_eq!(generated(27.5, 1), "FRAME GEN OFF");
         assert_eq!(generated(27.5, 6), "FRAME GEN 6X  SHOWN 165.0 FPS");
-        assert!(generated(999.9, 6).len() <= COLUMNS as usize);
-    }
-
-    #[test]
-    fn a_box_is_painted() {
-        let lines = vec!["I".to_owned(), " i".to_owned()];
-        for scale in [1, 2, 4] {
-            let (width, height) = size(PANEL, scale);
-            let pitch = (width * 4).next_multiple_of(256) as usize;
-            let colours = colours(DXGI_FORMAT_R10G10B10A2_UNORM).unwrap();
-            let picture = painted(&lines, PANEL, scale, colours, pitch);
-            assert_eq!(picture.len(), pitch * height as usize);
-            let at = |x: u32, y: u32| &picture[y as usize * pitch + x as usize * 4..][..4];
-            // The rim is black, the first letter's top row lit in its middle.
-            assert_eq!(at(0, 0), colours[0]);
-            assert_eq!(at((RIM + 2) * scale, RIM * scale), colours[1]);
-            assert_eq!(at((RIM + 2) * scale + scale - 1, RIM * scale + scale - 1), colours[1]);
-            assert_eq!(at(RIM * scale, RIM * scale), colours[0]);
-            // Small letters are shown as capitals, a line and a cell on.
-            assert_eq!(at((RIM + CELL.0 + 2) * scale, (RIM + CELL.1) * scale), colours[1]);
-            // Nothing past a line's end.
-            assert_eq!(at((RIM + CELL.0 * 2 + 2) * scale, (RIM + CELL.1) * scale), colours[0]);
-        }
+        assert!(text_width(&generated(999.9, 6)) <= COLUMNS);
     }
 
     #[test]

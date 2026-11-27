@@ -32,12 +32,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::font::{colours, glyph};
+use super::font::{CELL, Script, colours, painted, text_width};
 use super::{Host, HostList, transition};
 
-const GLYPH: (u32, u32) = (5, 7);
-const CELL: (u32, u32) = (6, 9);
-const COLUMNS: u32 = 60;
+const COLUMNS: u32 = 62;
+const LABEL_CELLS: u32 = 27;
 /// Lines of the box: a title, a help line, a blank, the settings shown, a
 /// blank, what the line picked does (`ABOUT`, else blank), a note and the
 /// repository's link.
@@ -282,39 +281,6 @@ const fn size(scale: u32) -> (u32, u32) {
     ((COLUMNS * CELL.0 + 2 * RIM) * scale, (LINES * CELL.1 + 2 * RIM) * scale)
 }
 
-fn lit(lines: &[String], x: u32, y: u32) -> bool {
-    let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
-        return false;
-    };
-    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= COLUMNS {
-        return false;
-    }
-    let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
-        return false;
-    };
-    (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
-}
-
-fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
-    let (width, height) = size(scale);
-    let bytes = colours[0].len();
-    let mut out = vec![0; pitch * height as usize];
-    for y in 0..height / scale {
-        let top = pitch * (y * scale) as usize;
-        for x in 0..width / scale {
-            let colour = colours[usize::from(lit(lines, x, y))];
-            for i in 0..scale {
-                let at = top + (x * scale + i) as usize * bytes;
-                out[at..at + bytes].copy_from_slice(colour);
-            }
-        }
-        for i in 1..scale as usize {
-            out.copy_within(top..top + pitch, top + i * pitch);
-        }
-    }
-    out
-}
-
 struct Buffers {
     format: DXGI_FORMAT,
     scale: u32,
@@ -322,7 +288,7 @@ struct Buffers {
     uploads: Vec<(ID3D12Resource, *mut u8)>,
     card: ID3D12Resource,
     turn: usize,
-    fresh: bool,
+    fresh: u64,
     /// The card's buffer was copied into before (it is in the copy-source state;
     /// at first it is in the common state, promoted by the first copy).
     used: bool,
@@ -355,16 +321,18 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, used: false })
+        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: 0, used: false })
     }
 
     fn write(&mut self, lines: &[String]) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.scale, colours, self.pitch as usize);
+        let (width, _) = size(self.scale);
+        let height = (lines.len() as u32 * CELL.1 + 2 * RIM) * self.scale;
+        let picture = painted(lines, (width, height), self.scale, RIM, Script::Simplified, colours, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read frames ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
-        self.fresh = true;
+        self.fresh = picture.len() as u64;
     }
 }
 
@@ -414,11 +382,12 @@ impl Menu {
                 let value = &self.values[row];
                 let shown = shown_value(item, value);
                 let mark = if *value != self.started[row] { if live(item) { " *LIVE" } else { " *" } } else if live(item) { " LIVE" } else { "" };
-                format!("{cursor} {:<27} < {shown} >{mark}", item.label)
+                let pad = LABEL_CELLS.saturating_sub(text_width(item.label)) as usize;
+                format!("{cursor} {}{:pad$} < {shown} >{mark}", item.label, "")
             } else {
                 format!("{cursor} {}", ACTIONS[row - ITEMS.len()])
             };
-            out.push(line.chars().take(COLUMNS as usize).collect());
+            out.push(line);
         }
         while out.len() < 3 + ROWS {
             out.push(String::new());
@@ -695,7 +664,7 @@ impl Menu {
         }
         // The whole box in the middle, or of it the first line's part in the corner.
         let (w, h) = match &line {
-            Some(l) => ((l.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
+            Some(l) => ((text_width(l) * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
             None => size(scale),
         };
         let (w, h) = (w.min(width), h.min(height));
@@ -703,11 +672,12 @@ impl Menu {
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
-            if std::mem::take(&mut buffers.fresh) {
+            let fresh = std::mem::take(&mut buffers.fresh);
+            if fresh != 0 {
                 if std::mem::replace(&mut buffers.used, true) {
                     list.ResourceBarrier(&[transition(&buffers.card, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
                 }
-                list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
+                list.CopyBufferRegion(&buffers.card, 0, &buffers.uploads[buffers.turn].0, 0, fresh);
                 list.ResourceBarrier(&[transition(&buffers.card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             }
             let from = D3D12_TEXTURE_COPY_LOCATION {
@@ -754,22 +724,18 @@ mod tests {
         // Every note fits the box and has its letters.
         for note in [menu.note.as_str(), "SAVED. ON NOW", "SAVED. APPLIES AT THE NEXT START", "NO FOLDER FOR THE SETTINGS FILE"] {
             assert!(note.len() <= COLUMNS as usize, "{note}");
-            assert!(note.bytes().all(|c| glyph(c) != glyph(b'#')), "{note}");
         }
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn every_line_fits_and_every_character_has_a_picture() {
+    fn every_line_fits() {
         let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;
             for line in menu.lines() {
-                assert!(line.len() <= COLUMNS as usize, "{line}");
-                for c in line.bytes() {
-                    assert_ne!(glyph(c.to_ascii_uppercase()), glyph(b'#'), "{line}: {}", c as char);
-                }
+                assert!(text_width(&line) <= COLUMNS, "{line}");
             }
         }
     }
