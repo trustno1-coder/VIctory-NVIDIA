@@ -1114,7 +1114,7 @@ type TargetKey = (usize, (usize, [u32; 7]));
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+fn root_view(list: &HostList, address: u64, srv: bool) -> Option<(u64, Option<std::sync::Arc<crate::shadow::Shadow>>)> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
@@ -1131,9 +1131,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         #[cfg(feature = "diagnostics")]
         crate::book::root(gpu, len);
-        return Some(gpu);
+        return Some((gpu, Some(shadow)));
     }
-    list.fill_scratch(address as *const u8, len)
+    list.fill_scratch(address as *const u8, len).map(|gpu| (gpu, None))
 }
 
 macro_rules! once {
@@ -1791,6 +1791,7 @@ impl State {
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
+        let mut vertex_shadows = Vec::new();
         let mut count = 0;
         for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
             if p.slots & 1 << slot == 0 {
@@ -1809,6 +1810,7 @@ impl State {
                 SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
                 StrideInBytes: v.stride,
             };
+            vertex_shadows.push(shadow);
         }
         // SAFETY: an open list; the views name live host buffers.
         unsafe {
@@ -1816,6 +1818,7 @@ impl State {
                 l.IASetVertexBuffers(0, Some(&views[..count]));
             }
         }
+        let mut index_shadow = None;
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
@@ -1829,6 +1832,13 @@ impl State {
             };
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
+            index_shadow = Some(shadow);
+        }
+        for shadow in &vertex_shadows {
+            list.buffer_read(&shadow.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        }
+        if let Some(shadow) = &index_shadow {
+            list.buffer_read(&shadow.buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -1950,6 +1960,7 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        let mut bound_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, D3D12_RESOURCE_STATES, bool)> = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -2100,7 +2111,7 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
+                    let Some((mut gpu, shadow)) = root_view(list, address, srv) else {
                         continue;
                     };
                     if biased {
@@ -2111,6 +2122,20 @@ impl State {
                             0,
                             None,
                         ));
+                    }
+                    if let Some(shadow) = shadow {
+                        let state = match (compute, srv) {
+                            (_, false) => D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                            (true, true) => D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            (false, true) => {
+                                if stage.shader.stage == "pixel" {
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                } else {
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                }
+                            }
+                        };
+                        bound_buffers.push((shadow, state, false));
                     }
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
@@ -2146,9 +2171,16 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                if !self.root_uav(list, address, param, compute, writes, &mut bound_buffers) {
                     return false;
                 }
+            }
+        }
+        for (shadow, state, write) in bound_buffers {
+            if write {
+                list.buffer_write(&shadow.buffer, state);
+            } else {
+                list.buffer_read(&shadow.buffer, state);
             }
         }
         // Depth textures it writes through unordered access: their colour
@@ -2175,6 +2207,7 @@ impl State {
         param: u32,
         compute: bool,
         writes: bool,
+        bound_buffers: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, D3D12_RESOURCE_STATES, bool)>,
     ) -> bool {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -2221,6 +2254,7 @@ impl State {
                     list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
                 }
             }
+            bound_buffers.push((s, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true));
             return true;
         }
         let heap = match self.heaps[0] {

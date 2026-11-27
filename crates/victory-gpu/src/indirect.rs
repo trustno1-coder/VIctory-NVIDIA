@@ -440,6 +440,20 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
+    // SAFETY: live D3D12 buffer addresses; only note reads when the clamp will
+    // actually dispatch (`records > 0` and alignment passes).
+    if spec.2 > 0
+        && validate_layout(spec, src.1, count.map(|(_, off)| off)).is_some()
+        && unsafe { src.0.GetGPUVirtualAddress() }.is_multiple_of(4)
+        && unsafe { dst.GetGPUVirtualAddress() }.is_multiple_of(4)
+        && budget.is_multiple_of(4)
+        && count.is_none_or(|(b, _)| unsafe { b.GetGPUVirtualAddress() }.is_multiple_of(4))
+    {
+        list.buffer_read(src.0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if let Some((c_buf, _)) = count {
+            list.buffer_read(c_buf, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+    }
     let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
     if recorded {
         list.indirect_readable(dst);
@@ -592,12 +606,14 @@ pub(crate) fn open_batch(
     let mut ids = [0u64; batch::SOURCES];
     let mut sources = [gpu(source.1)?; batch::SOURCES];
     ids[0] = source.0;
+    list.buffer_read(source.1, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
     for (i, (id, buffer)) in others.enumerate() {
         if let Some(at) = gpu(buffer) {
             // Bound, and read only if a job names it: kept alive like the
             // copies draws read (`Shadow::refresh`).
             list.keep(buffer);
+            list.buffer_read(buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             (ids[i + 1], sources[i + 1]) = (*id, at);
         }
     }
