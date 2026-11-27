@@ -246,6 +246,7 @@ impl Recording {
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+            crate::lab::burn(crate::lab::C);
             let mut inner = held(&self.inner);
             inner.kept.push(chunk);
             if closed {

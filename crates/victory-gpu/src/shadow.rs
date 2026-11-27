@@ -1648,6 +1648,11 @@ fn stay_awake(workers: &Workers) -> bool {
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    // (Lab: switch `a` of the lab file gives the microseconds while the title runs.)
+    let most = match crate::lab::knob(crate::lab::A) {
+        a if a > 0 => a as u64,
+        _ => most,
+    };
     if most == 0 {
         return;
     }

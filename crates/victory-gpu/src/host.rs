@@ -483,10 +483,26 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back((started, Retired::Any(Box::new(object))));
+    retire_later(started, Retired::Any(Box::new(object)));
+}
+
+/// `what` waits for the submissions up to `started` to finish: with the
+/// burying thread ([`bury_aside`]) in its line, which no thread waits for
+/// (run 33: the eight translating threads stood a quarter of one thread's
+/// time waiting for the lock of `RETIRED`, 67,000 times a frame); without
+/// it in `RETIRED`.
+fn retire_later(started: u64, what: Retired) {
+    match bury_aside() {
+        Some(aside) => {
+            BURY_WAITING.fetch_add(1, Ordering::Relaxed);
+            // (The thread is gone only as the process ends.)
+            if let Err(back) = aside.items.send((started, what)) {
+                BURY_WAITING.fetch_sub(1, Ordering::Relaxed);
+                drop(back.0);
+            }
+        }
+        None => RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, what)),
+    }
 }
 
 /// [`retire`] for a resource.
@@ -499,7 +515,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    retire_later(started, Retired::Resource(object));
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -520,6 +536,11 @@ fn bury_lag() -> u64 {
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
+    // (With the burying thread: it is told, and looks at what waits itself.)
+    if let Some(aside) = bury_aside() {
+        aside.thread.unpark();
+        return;
+    }
     let handing = std::time::Instant::now();
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
@@ -530,19 +551,8 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    let n = done.len() as u64;
-    BURIED[0].fetch_add(n, Ordering::Relaxed);
-    match bury_aside() {
-        Some(aside) => {
-            BURY_WAITING.fetch_add(n, Ordering::Relaxed);
-            // (The thread is gone only as the process ends.)
-            if let Err(back) = aside.send(done) {
-                BURY_WAITING.fetch_sub(n, Ordering::Relaxed);
-                bury_drop(back.0);
-            }
-        }
-        None => bury_drop(done),
-    }
+    BURIED[0].fetch_add(done.len() as u64, Ordering::Relaxed);
+    bury_drop(done);
     BURIED[1].fetch_add(handing.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
@@ -563,27 +573,45 @@ static BURY_WAITING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// 44-47 ms landing in all: every fence signal and bottom-of-pipe write of
 /// the next flights waited behind it. Dropping later than could be is what
 /// [`bury_lag`] does already; no drop is earlier.
-fn bury_aside() -> Option<&'static std::sync::mpsc::Sender<Vec<(u64, Retired)>>> {
-    static ASIDE: OnceLock<Option<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>> = OnceLock::new();
+fn bury_aside() -> Option<&'static BuryAside> {
+    static ASIDE: OnceLock<Option<BuryAside>> = OnceLock::new();
     ASIDE
         .get_or_init(|| {
             if std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "0") {
                 return None;
             }
-            let (send, receive) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
-            std::thread::Builder::new()
+            let (items, receive) = std::sync::mpsc::channel::<(u64, Retired)>();
+            let thread = std::thread::Builder::new()
                 .name("victory-bury".into())
                 .spawn(move || {
-                    for done in receive {
-                        let n = done.len() as u64;
+                    // What waits, in the order it came (nearly the order of
+                    // its numbers: one behind a greater number waits with it).
+                    let mut waiting: std::collections::VecDeque<(u64, Retired)> = std::collections::VecDeque::new();
+                    loop {
+                        std::thread::park_timeout(std::time::Duration::from_millis(50));
+                        waiting.extend(receive.try_iter());
+                        let finished = FINISHED.load(Ordering::Acquire).saturating_sub(bury_lag());
+                        let n = waiting.iter().take_while(|(at, _)| *at <= finished).count();
+                        if n == 0 {
+                            crate::lab::trim();
+                            continue;
+                        }
+                        let done: Vec<(u64, Retired)> = waiting.drain(..n).collect();
+                        BURIED[0].fetch_add(n as u64, Ordering::Relaxed);
                         bury_drop(done);
-                        BURY_WAITING.fetch_sub(n, Ordering::Relaxed);
+                        BURY_WAITING.fetch_sub(n as u64, Ordering::Relaxed);
                     }
                 })
-                .ok()
-                .map(|_| send)
+                .ok()?;
+            Some(BuryAside { items, thread: thread.thread().clone() })
         })
         .as_ref()
+}
+
+/// The burying thread and the line to it.
+struct BuryAside {
+    items: std::sync::mpsc::Sender<(u64, Retired)>,
+    thread: std::thread::Thread,
 }
 
 /// Drops `done`, oldest first, each drop timed (the line of [`bury_log`]).
@@ -2779,11 +2807,20 @@ struct CardPlan {
 /// the fill's bytes or the copy's source (a buffer copy, another copy at its
 /// place, a shader write, work that may write title memory).
 /// `VICTORY_FILL_THROUGH_PLACED=0`: as before.
-fn fill_through_placed(copies: &[Step], src: usize, len: usize) -> usize {
+///
+/// `first` is where in `copies` the list's first copy at its place lies
+/// (`Deferred::placed_first`): most lists have none, and no fill of theirs
+/// looks at a step (run 33: 20 % of one translating thread went into walking
+/// back through the steps for each of 5,000 to 8,000 fills a frame).
+fn fill_through_placed(copies: &[Step], first: Option<usize>, src: usize, len: usize) -> usize {
     static ON: OnceLock<bool> = OnceLock::new();
+    let Some(first) = first else {
+        return src;
+    };
     if len == 0 || !*ON.get_or_init(|| std::env::var_os("VICTORY_FILL_THROUGH_PLACED").is_none_or(|v| v != "0")) {
         return src;
     }
+    let copies = &copies[first.min(copies.len())..];
     let meets = |a: usize, b: usize, from: usize, to: usize| a < to && from < b;
     let end = src + len;
     // Ranges written between the copy and the fill, seen walking back.
@@ -2859,6 +2896,9 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Lab: where in `copies` the first copy at its place is
+    /// ([`fill_through_placed`] looks no further back).
+    placed_first: Option<usize>,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -5553,6 +5593,7 @@ impl Host {
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+        crate::lab::burn(crate::lab::D);
         let landing = std::time::Instant::now();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
@@ -6180,6 +6221,7 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        crate::lab::burn(crate::lab::B);
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
@@ -7788,7 +7830,7 @@ impl HostList {
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
-        let src = fill_through_placed(&deferred.copies, src as usize, len);
+        let src = fill_through_placed(&deferred.copies, deferred.placed_first, src as usize, len);
         deferred.copies.push(Step::Fill(dst as usize, src, len, None));
     }
 
@@ -7811,7 +7853,7 @@ impl HostList {
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
         let mut deferred = self.deferred();
-        let src = fill_through_placed(&deferred.copies, src as usize, len);
+        let src = fill_through_placed(&deferred.copies, deferred.placed_first, src as usize, len);
         deferred.copies.push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
     }
 
@@ -7820,7 +7862,7 @@ impl HostList {
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
         let mut deferred = self.deferred();
-        let src = fill_through_placed(&deferred.copies, src as usize, len);
+        let src = fill_through_placed(&deferred.copies, deferred.placed_first, src as usize, len);
         deferred.copies.push(Step::Fill(dst as usize, src, len, to));
     }
 

@@ -249,6 +249,9 @@ impl HostList {
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
         let mut deferred = self.deferred();
+        if deferred.placed_first.is_none() {
+            deferred.placed_first = Some(deferred.copies.len());
+        }
         deferred.copies.push(Step::Placed(Placed {
             dst,
             src,

@@ -932,6 +932,7 @@ pub(super) fn present(
     overlay: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
     shown: super::Shown,
 ) {
+    crate::lab::burn(crate::lab::E);
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
     LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);

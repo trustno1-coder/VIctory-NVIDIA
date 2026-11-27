@@ -25,10 +25,12 @@ pub(crate) const A: usize = 2;
 pub(crate) const B: usize = 3;
 pub(crate) const C: usize = 4;
 pub(crate) const D: usize = 5;
+pub(crate) const E: usize = 6;
+pub(crate) const F: usize = 7;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 6] = [("reuse", 1), ("zero", 1), ("a", 0), ("b", 0), ("c", 0), ("d", 0)];
-static VALUES: [AtomicI64; 6] = [const { AtomicI64::new(0) }; 6];
+const KNOBS: [(&str, i64); 8] = [("reuse", 1), ("zero", 1), ("a", 0), ("b", 0), ("c", 0), ("d", 0), ("e", 0), ("f", 0)];
+static VALUES: [AtomicI64; 8] = [const { AtomicI64::new(0) }; 8];
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -57,6 +59,22 @@ pub(crate) fn knob(which: usize) -> i64 {
         });
     });
     VALUES[which].load(Relaxed)
+}
+
+/// Keeps this thread busy for as many microseconds as switch `which` says
+/// (0: none). A stage of the frame's work made slower by a known amount
+/// shows, by how much the frame grows, whether the frame waits for it: `b`
+/// each submission prepared, `c` each piece of a list translated, `d` each
+/// landing, `e` each present of the title's.
+pub(crate) fn burn(which: usize) {
+    let us = knob(which);
+    if us <= 0 {
+        return;
+    }
+    let began = Instant::now();
+    while (began.elapsed().as_micros() as i64) < us {
+        std::hint::spin_loop();
+    }
 }
 
 fn read(path: &std::ffi::OsString, last: &mut String) {
