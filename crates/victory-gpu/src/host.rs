@@ -9315,7 +9315,7 @@ impl Meter {
         let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^30), the largest cost of one {biggest} (0: under 2^22)"
         );
         crate::indirect::merge::line(frames);
         crate::shadow::exact_line(frames);

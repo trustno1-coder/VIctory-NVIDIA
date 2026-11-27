@@ -23,10 +23,13 @@
 //!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
-//! tail slots. Each list has a budget (2^27 vertex instances or threads,
+//! tail slots. Each list has a budget (2^30 vertex instances or threads,
 //! groups counted as 64 threads, mesh groups as 128): active records past it
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
-//! garbage records cannot run for seconds either.
+//! garbage records cannot run for seconds either (a list that spends all of
+//! 2^30 on garbage is a few tenths of a second of card time, under the 2 s
+//! after which Windows removes the device). At 2^27 the title's own lists
+//! ran out in normal play, and the records cut changed from frame to frame.
 //!
 //! shortcut: the bounds (below 2^23 vertices an instance, 2^26 vertex instances, 65,535
 //! groups per dimension, in x 2^20 ([`widest`]), and 2^20 per dispatch, one-dimensional mesh
@@ -62,7 +65,7 @@ RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+static const uint BUDGET = 1u << 30;
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
@@ -637,6 +640,19 @@ pub(crate) mod tests {
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
+
+    /// The list budget the clamps are compiled with (`BUDGET` in [`SOURCE`]
+    /// and [`batch::SOURCE`]).
+    const BUDGET: u32 = 1 << 30;
+    /// The most one draw record is let cost (`1u << 26` in the clamps).
+    const MOST_RECORD: u32 = 1 << 26;
+
+    #[test]
+    fn the_clamps_are_compiled_with_the_tests_budget() {
+        let line = format!("static const uint BUDGET = 1u << {};", BUDGET.trailing_zeros());
+        assert!(SOURCE.contains(&line), "the clamp's budget is not the tests'");
+        assert!(batch::SOURCE.contains(&line), "the batched clamp's budget is not the tests'");
+    }
 
     const WORKER_CS: &str = r#"
 #define RS "UAV(u0)"
@@ -2118,7 +2134,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
 
         // Fill the entire source buffer with non-zero sentinel bytes, then
         // populate 3 valid records at `ARGS_OFFSET` and 4,093 huge garbage
-        // records in `3..MAX` that would exhaust `BUDGET` ~2,000x over if read.
+        // records in `3..MAX` that would exhaust `BUDGET` ~250x over if read.
         let mut initial_src = vec![0xA5u8; src_bytes];
         let write_record = |buf: &mut [u8], idx: usize, words: [u32; 6]| {
             let base = ARGS_OFFSET + idx * (STRIDE as usize);
@@ -2144,7 +2160,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         );
         for slot in 3..MAX as usize {
             // Each garbage slot would clamp to 65535 * 16 * 1 = 1,048,560 groups
-            // (`cost = 67,107,840 ~= BUDGET / 2`), exhausting `BUDGET` immediately!
+            // (`cost = 67,107,840 ~= BUDGET / 16`), exhausting `BUDGET` within one group!
             write_record(
                 &mut initial_src,
                 slot,
@@ -2387,7 +2403,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         const KIND_INDEXED: u32 = 1;
         const STRIDE: u32 = 24; // 5 indexed-draw words + 1 trailing custom word
         const RECORDS: u32 = 128; // 2 waves of 64: old InterlockedAdd wrapped 2^32 at 64!
-        const BUDGET_CAP: u32 = 1 << 27;
+        const BUDGET_CAP: u32 = BUDGET;
+        // Records of `MOST_RECORD` each: this many fill the budget exactly.
+        const FIT: usize = (BUDGET / MOST_RECORD) as usize;
 
         let total_bytes = (STRIDE * RECORDS) as usize;
         let (src_buf, src_ptr, _) = warp.shared_buffer(total_bytes as u64);
@@ -2476,7 +2494,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        assert_eq!((kept, zeroed), (FIT, (RECORDS as usize) - FIT));
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's
@@ -2610,7 +2628,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
-        const BUDGET_CAP: u32 = 1 << 27;
+        const BUDGET_CAP: u32 = BUDGET;
         let counts = [100u32, 250, 50, 100];
         let total = counts.len() * STRIDE as usize;
         let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
@@ -2697,8 +2715,12 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
-        let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
+        // Records of 1,024 x 1,024 groups (2^26 threads, the most one
+        // dispatch runs) that fill the budget exactly, so the small record
+        // after them runs empty whether or not a record that does not fit
+        // takes the rest (`VICTORY_INDIRECT_REST`).
+        const BIG: u32 = BUDGET / (1 << 26);
+        let Some((big, big_ptr)) = host.shared_buffer(u64::from(BIG * STRIDE)) else {
             return;
         };
         let Some((small, small_ptr)) = host.shared_buffer(u64::from(STRIDE)) else {
@@ -2709,8 +2731,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
-            for i in 0..3 {
-                let words = [65535u32, 16, 1];
+            for i in 0..BIG as usize {
+                let words = [1024u32, 1024, 1];
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -2724,7 +2746,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, BIG)).unwrap();
             let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
@@ -3154,9 +3176,17 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             return;
         };
         let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
-        const BUDGET: u32 = 1 << 27;
-        // 2^26 vertices each, as much as a draw is let run: two fill it.
-        for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
+        // 2^26 vertices each, as much as a draw is let run: `FIT` fill it.
+        const FIT: u32 = BUDGET / MOST_RECORD;
+        // One record read by more executions than fit does not fit whole:
+        // it takes the rest only with `VICTORY_INDIRECT_REST=1`.
+        let over = if rest() == 1 { BUDGET } else { 0 };
+        for (times, records, filled, charged) in [
+            (1u32, u64::from(FIT) + 1, FIT as usize, BUDGET),
+            (2, 1, 1, 2 * MOST_RECORD),
+            (1, 1, 1, MOST_RECORD),
+            (FIT + 1, 1, 0, over),
+        ] {
             let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
             let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (back, back_ptr, _) = warp.shared_buffer(1024);
@@ -3181,7 +3211,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             // SAFETY: an open list; the records are readable as arguments.
             unsafe {
                 warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                warp.list.CopyBufferRegion(&back, 0, &dst, 0, 256);
+                warp.list.CopyBufferRegion(&back, 0, &dst, 0, 1024);
             }
             warp.submit_and_wait();
             // SAFETY: the list has run; mapped words.
@@ -3193,7 +3223,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            assert_eq!(spent, charged, "{times} times {records}");
         }
     }
 

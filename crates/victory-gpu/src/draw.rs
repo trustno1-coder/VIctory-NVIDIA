@@ -418,7 +418,7 @@ const WINDOW_MOST: u64 = 64;
 /// budgets on them and emptied the draws after), so in a window a record
 /// that asks for more than can run is left empty and charges nothing
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
-/// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
+/// charged what it asks, a few thousand of 2^30. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
