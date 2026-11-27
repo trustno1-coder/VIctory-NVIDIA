@@ -2888,11 +2888,34 @@ mod barycentric_tests {
     }
 
     fn pixel_with_inputs(words: &[u32], input_addr: u32, inputs: &[container::SigElement]) -> Result<HostShader, ShaderError> {
+        pixel_in(words, input_addr, inputs, false, vec![])
+    }
+
+    /// The marker a program made from pieces carries in its layout.
+    fn pieces_mark() -> crate::native::RootParam {
+        crate::native::RootParam {
+            root: crate::native::RootType::Other(crate::native::PIXEL_PIECES),
+            table_offset_dwords: 0,
+            sgprs: 0,
+            base_register: 0,
+            user_data: 0,
+            slot: u8::MAX,
+        }
+    }
+
+    /// [`pixel_with_inputs`] in waves of `wave64` lanes, with `layout`.
+    fn pixel_in(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[container::SigElement],
+        wave64: bool,
+        layout: Vec<crate::native::RootParam>,
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
-            wave64: false,
+            wave64,
             vgprs: 8,
-            layout: vec![],
+            layout,
             used: vec![],
             io: StageIo::Ps {
                 inputs: vec![PsInput {
@@ -2941,6 +2964,64 @@ mod barycentric_tests {
         let inputs = c.part(FourCC::ISG1).unwrap().data;
         assert_eq!((inputs[8 + 25], inputs[8 + 32 + 25]), (0, 4));
         validate(&shader);
+    }
+
+    /// The fixed-point position (bit 15) is the pixel's x and y as two 16-bit halves, made
+    /// from the position's floats; only a program made from pieces gets it.
+    #[test]
+    fn a_fixed_point_position_is_made_from_the_position() {
+        let [e0, e1] = exp_mrt0(1);
+        // line stipple in v0, the fixed-point position in v1
+        let words = [e0, e1, 0xBF81_0000];
+        let position = element("SV_Position", 3, 1);
+        let shader = pixel_in(&words, 0x8080, &[position.clone()], false, vec![pieces_mark()]).unwrap();
+        // x and y are read: the read-write mask of the position's row in the signature
+        let c = Container::parse(&shader.dxil).unwrap();
+        let isg1 = c.part(FourCC::ISG1).unwrap().data;
+        assert_eq!(isg1[8 + 25], 0b11, "{isg1:?}");
+        validate(&shader);
+        let refused = pixel_in(&words, 0x8080, &[position], false, vec![]).unwrap_err();
+        assert!(
+            matches!(refused, ShaderError::Unsupported { what: "a pixel system input", .. }),
+            "{refused:?}"
+        );
+    }
+
+    /// A select by a mask of all lanes or none, set from a scalar test, is that test in
+    /// every lane, in waves of either size; a title's program is decided as before.
+    #[test]
+    fn a_select_by_an_all_or_no_lanes_mask_is_the_scalar_test() {
+        let [e0, e1] = exp_mrt0(1);
+        for (wave64, cselect) in [(false, 0x856A_80C1u32), (true, 0x85EA_80C1)] {
+            let words = [
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                cselect,     // s_cselect_b32 vcc_lo, -1, 0 (b64: vcc)
+                0x7E04_02F2, // v_mov_b32 v2, 1.0
+                0x7E06_02F4, // v_mov_b32 v3, 2.0
+                0x0202_0702, // v_cndmask_b32 v1, v2, v3, vcc
+                e0,
+                e1,
+                0xBF81_0000,
+            ];
+            let inputs = [element("TEXCOORD", 0, 0)];
+            // a root constant in s0 for the test to read
+            let constant = crate::native::RootParam {
+                root: crate::native::RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            };
+            let shader =
+                pixel_in(&words, 0, &inputs, wave64, vec![constant, pieces_mark()]).unwrap();
+            validate(&shader);
+            let refused = pixel_in(&words, 0, &inputs, wave64, vec![constant]).unwrap_err();
+            assert!(
+                matches!(refused, ShaderError::Unsupported { what: "a select on an untracked mask", .. }),
+                "{refused:?}"
+            );
+        }
     }
 
     /// A pixel program's first-lane loop (no table entry in it, so not a waterfall the tracker

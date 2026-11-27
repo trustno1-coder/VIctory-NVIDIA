@@ -2801,6 +2801,15 @@ impl<'a> Lower<'a> {
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
                     // No wave overlaps this one (see `ordered_section`).
                     None if self.pops_collision(v) => Val::I32(self.s.m.i32(0)),
+                    // VCC is undefined at wave launch; any read of it on entry
+                    // is one no correct program depends on, so it reads as
+                    // zero, as the SGPRs above. Only for a program made from
+                    // pieces.
+                    None if self.made_from_pieces()
+                        && (n == crate::ir::VCC || n == crate::ir::VCC + 1) =>
+                    {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -2881,6 +2890,7 @@ impl<'a> Lower<'a> {
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
             }
+            Input::FixedPosition if self.made_from_pieces() => return self.fixed_position(),
             _ => return Val::Missing("a pixel system input"),
         };
         let free = self
@@ -2926,6 +2936,33 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// The fixed-point position (SPI_PS_INPUT_ADDR bit 15): the pixel's integer x in bits
+    /// 0-15 and y in bits 16-31. The floor of SV_Position's x and y is that pixel, at the
+    /// centre, a sample or the centroid alike; coordinates are never negative, so the
+    /// conversion to unsigned is the floor.
+    fn fixed_position(&mut self) -> Val {
+        let Some(id) = self.s.inputs.iter().position(|e| e.kind == 3) else {
+            return Val::Missing("a pixel system input the signature lacks");
+        };
+        let entry = self.s.entry;
+        let mut half = [None; 2];
+        for c in 0..2u8 {
+            let Val::I32(bits) = self.load_input(id, c) else {
+                return Val::Missing("a 16-bit input");
+            };
+            let f = self.s.m.cast(entry, Cast::Bitcast, bits, self.s.t.f32);
+            let n = self.s.m.cast(entry, Cast::FpToUi, f, self.s.t.i32);
+            let k = self.s.m.i32(0xFFFF);
+            half[usize::from(c)] = Some(self.s.m.bin(entry, Bin::And, n, k));
+        }
+        let (Some(x), Some(y)) = (half[0], half[1]) else {
+            return Val::Missing("a 16-bit input");
+        };
+        let k16 = self.s.m.i32(16);
+        let y = self.s.m.bin(entry, Bin::Shl, y, k16);
+        Val::I32(self.s.m.bin(entry, Bin::Or, x, y))
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -9162,6 +9199,22 @@ impl<'a> Lower<'a> {
                         };
                         self.cross_lane(false)?;
                         self.lane_bit(c, lo, hi)
+                    }
+                    // A mask of all lanes or none (`s_cselect_b64 vcc, -1, 0`
+                    // on a scalar test): each lane's bit is the scalar
+                    // condition, on a wave of any size and lane order.
+                    // Only for a program made from pieces: a title's
+                    // programs are decided as before.
+                    None if self.made_from_pieces() => {
+                        let lo = mask.ok_or(UNTRACKED)?;
+                        let hi = match v.src.get(2) {
+                            Some(&Operand::Scalar { code, .. }) if self.x.native.wave64 => {
+                                inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?
+                            }
+                            _ => lo,
+                        };
+                        let m = self.x.st.uniform_bits(lo, hi).ok_or(UNTRACKED)?;
+                        self.boolean(m, c)?
                     }
                     None => return Err(UNTRACKED),
                 };

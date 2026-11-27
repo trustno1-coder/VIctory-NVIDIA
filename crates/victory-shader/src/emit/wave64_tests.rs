@@ -181,6 +181,44 @@ fn a_select_by_a_number_in_a_program_made_from_pieces_has_console_lanes() {
     }
 }
 
+/// A lane-mask merge that starts from VCC as it was on entry: the edge that skips the write
+/// of VCC is taken only with no lanes left, so the merge ANDs it with an empty EXEC and VCC is
+/// never read for its value. VCC is not set at wave launch, so a program made from pieces
+/// reads it as zero there; a title's program is decided as it was.
+#[test]
+fn vcc_read_on_entry_past_an_empty_exec_reads_as_zero_in_a_program_made_from_pieces() {
+    let mut native = native(&[
+        0x7DAA_0080, // v_cmpx_ne_u32 exec, 0, v0
+        0xBF88_0001, // s_cbranch_execz to the merge
+        0xBEEA_047E, // s_mov_b64 vcc, exec
+        0x878C_7E6A, // s_and_b64 s[12:13], vcc, exec
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xBF88_0002, // s_cbranch_execz past the store
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let refused = lowered(&native, &p, &HashSet::new()).unwrap_err();
+    assert!(
+        matches!(refused, ShaderError::Unsupported { what: "a hardware SGPR input", .. }),
+        "{refused:?}"
+    );
+    native.layout.push(RootParam {
+        root: RootType::Other(crate::native::COMPUTE_PIECES),
+        table_offset_dwords: 0,
+        sgprs: 0,
+        base_register: 0,
+        user_data: 0,
+        slot: u8::MAX,
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+}
+
 #[test]
 fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     // thread t holds the 16-bit float with bits 0x3C00 + 37 t (1.0 and up, with odd

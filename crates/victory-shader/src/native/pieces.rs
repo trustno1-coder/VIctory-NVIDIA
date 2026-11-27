@@ -1142,7 +1142,9 @@ impl Graphics {
         read.sort_unstable();
         read.dedup();
         let mut inputs: Vec<Row> = read.into_iter().map(|p| self.param(p)).collect();
-        if pixel.input_addr & 0xf00 != 0 {
+        // (bit 15, the fixed-point position, is made from the position's x
+        // and y, so it brings the row as well)
+        if pixel.input_addr & 0x8f00 != 0 {
             inputs.push(self.position());
         }
         if pixel.input_addr & 0x1000 != 0 {
@@ -2319,6 +2321,24 @@ mod tests {
         assert_eq!(marked(&ps), 1);
         assert_eq!(marked(&vs), 0);
         assert!(ps.layout.iter().all(|e| e.root != RootType::Other(PIXEL_PIECES) || e.sgprs == 0));
+    }
+
+    #[test]
+    fn a_fixed_point_position_brings_the_position_row() {
+        // The pixel signature names the parameter, and the position beside it when
+        // the fixed-point position (bit 15) is enabled: it is made from the position.
+        let rows = |input_addr: u32| {
+            let mut packet = graphics_packet(true, 1, &[(0, false)]);
+            put(&mut packet, G_PS_INPUT_ADDR, input_addr);
+            let g = Graphics::parse(&packet, &state_piece(&ELEMENTS), true).unwrap();
+            let code = code(11);
+            let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+            let bytes = fill(g.pixel(code.len(), meta.len()).unwrap(), &code, &meta);
+            let c = crate::Container::parse(&bytes).unwrap();
+            u32_at(c.part(FourCC::ISG1).unwrap().data, 0).unwrap()
+        };
+        assert_eq!(rows(0x0080), 1);
+        assert_eq!(rows(0x8080), 2);
     }
 
     #[test]
