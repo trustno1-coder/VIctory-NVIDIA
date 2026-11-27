@@ -77,3 +77,11 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# The lab's play build: release with whole-program optimisation (one unit, fat
+# LTO), built with RUSTFLAGS="-C target-cpu=native" on the PC that runs it.
+# The shader cache key does not include this file, so translations are kept.
+[profile.lab]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
