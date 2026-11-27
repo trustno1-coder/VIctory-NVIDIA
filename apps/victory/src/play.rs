@@ -812,17 +812,17 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     {
         s.insert("VICTORY_MFG_UNLOCKER_DLL".to_owned(), dll.to_string_lossy().into_owned());
     }
-    // The first start of this victory.exe (no mark for its bytes yet): the game plays a little
-    // and starts again by itself (crates\victory-gpu\src\host\menu.rs, `warmup`), since a new
-    // exe's first run stays at about 14 fps. `--set VICTORY_WARMUP_RESTART=0`: not done.
-    if !s.contains_key("VICTORY_WARMUP_RESTART")
-        && let Some(mark) = warmup_mark(&home, &program)
-        && !mark.exists()
-    {
-        println!("First start of this version of victory.exe: the game restarts by itself after {WARMUP_SECONDS} seconds,");
-        println!("once (a new version's first run otherwise stays at about 14 fps).");
-        s.insert("VICTORY_WARMUP_RESTART".to_owned(), WARMUP_SECONDS.to_string());
-        s.insert("VICTORY_WARMUP_MARK".to_owned(), mark.to_string_lossy().into_owned());
+    // The first start of this victory.exe (no mark for its bytes yet): run preload to
+    // precompile shaders and pipelines, so the driver has them before the game needs them.
+    // `--set VICTORY_WARMUP_RESTART=0`: not done.
+    if !s.contains_key("VICTORY_WARMUP_RESTART") {
+        if let Some(mark) = warmup_mark(&home, &program) {
+            if !mark.exists() {
+                s.insert("VICTORY_WARMUP_RESTART".to_owned(), "0".to_string());
+                s.insert("VICTORY_WARMUP_MARK".to_owned(), mark.to_string_lossy().into_owned());
+                s.insert("VICTORY_PRELOAD".to_owned(), "1".to_owned());
+            }
+        }
     }
     // Where the menu saves, and how it starts the title again (`--set` is not carried over).
     let quoted = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "''"));
