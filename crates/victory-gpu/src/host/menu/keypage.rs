@@ -176,7 +176,7 @@ impl KeyPage {
                     put(&mut line, ACTION, "MOUSE SENSITIVITY");
                     let scale = keymap::mouse_scale();
                     let bar = ((scale / MAX_SENSITIVITY * 12.0).round() as usize).min(12);
-                    value(&mut line, &mut marks, &format!("< {:.2} > {}{}", scale, "#".repeat(bar), "-".repeat(12 - bar)));
+                    value(&mut line, &mut marks, &format!("< {:.2} > {}{}", scale, "=".repeat(bar), "-".repeat(12 - bar)));
                 }
                 Row::Invert => {
                     put(&mut line, ACTION, "INVERT MOUSE Y");
@@ -337,7 +337,7 @@ mod tests {
                     assert_eq!(lines.len(), LINES as usize);
                     for line in &lines {
                         assert!(line.len() <= COLUMNS as usize, "{line}");
-                        assert!(line.bytes().all(|c| glyph(c.to_ascii_uppercase()) != glyph(b'#') || c == b'#'), "{line}");
+                        assert!(line.bytes().all(|c| glyph(c.to_ascii_uppercase()) != glyph(b'#')), "{line}");
                     }
                     assert!(marks.iter().all(|&(r, a, b)| r < lines.len() && a < b && b <= COLUMNS as usize), "{marks:?}");
                 }
