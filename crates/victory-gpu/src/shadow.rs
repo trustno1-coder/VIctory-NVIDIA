@@ -114,6 +114,9 @@ struct Card {
     /// is copied into it as into any copy, and what changed in it goes to
     /// the card's side before the next submission.
     staging: ID3D12Resource,
+    /// Pooled storage needs alias activation and a complete first upload.
+    /// None for committed resources; false until that upload is queued.
+    pool_activated: Option<std::sync::atomic::AtomicBool>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -3084,6 +3087,21 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    pub(crate) fn card_pooled(&self) -> bool {
+        self.card.as_ref().is_some_and(|card| card.pool_activated.is_some())
+    }
+
+    pub(crate) fn card_needs_alias(&self) -> bool {
+        self.card.as_ref().and_then(|card| card.pool_activated.as_ref())
+            .is_some_and(|activated| !activated.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn card_alias_queued(&self) {
+        if let Some(activated) = self.card.as_ref().and_then(|card| card.pool_activated.as_ref()) {
+            activated.store(true, Ordering::Release);
+        }
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -4664,6 +4682,7 @@ impl Shadow {
         if card {
             shadow.card = Some(Card {
                 staging: none(),
+                pool_activated: None,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -4821,6 +4840,7 @@ mod land_tests {
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
             staging: buffer,
+            pool_activated: None,
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -5266,6 +5286,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 );
                 let card = Card {
                     staging: buffer,
+                    pool_activated: None,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -5495,6 +5516,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,
+        pool_activated: None,
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -5580,13 +5602,23 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    // Borrow existing local backing before the committed-allocation gate.
+    // A miss retains the normal placement policy and L0 fallback.
+    let pooled = cards().then(|| crate::pool::window_buffer(host()?, len)).flatten();
+    let is_pooled = pooled.is_some();
+    let (buffer, card) = match pooled.or_else(|| window_card_for(len)) {
         Some(on_card) => {
+            if is_pooled {
+                WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+            }
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
                 staging: buffer,
+                pool_activated: is_pooled.then(|| std::sync::atomic::AtomicBool::new(false)),
                 before: Mutex::default(),
-                dirty: Mutex::default(),
+                // Already dirty when carded publishes the Weak reference;
+                // an at-rest checker must never inspect old heap bytes.
+                dirty: Mutex::new(if is_pooled { vec![(0, len as usize)] } else { Vec::new() }),
                 sent: Mutex::default(),
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
@@ -5609,6 +5641,12 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         carded(&shadow);
+        if is_pooled {
+            // Include unrequested bytes, whose zero staging contents must
+            // replace the previous resource's contents. Enqueue after
+            // carded has installed the Weak reference used by TOUCHED.
+            shadow.card_changed(0, len as usize);
+        }
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());

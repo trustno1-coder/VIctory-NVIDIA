@@ -101,6 +101,9 @@ pub(crate) struct Taken {
 /// Refreshes since the last send, per copy (by its number).
 static NOTED: Mutex<BTreeMap<u64, Vec<Taken>>> = Mutex::new(BTreeMap::new());
 
+#[cfg(test)]
+mod pool_tests;
+
 /// At most this much is looked at per submission.
 const MOST: usize = 128 << 20;
 
@@ -161,7 +164,13 @@ pub(super) fn record(
     let mut all: Vec<(std::sync::Arc<Shadow>, Taken)> = Vec::new();
     let mut total = 0;
     for (shadow, _) in dirty {
-        for taken in noted.remove(&shadow.id()).unwrap_or_default() {
+        let taken = noted.remove(&shadow.id()).unwrap_or_default();
+        // Drain first-refresh notes without inspecting bytes left by the
+        // previous heap occupant. Keep activation pending through enqueue.
+        if shadow.card_needs_alias() {
+            continue;
+        }
+        for taken in taken {
             total += 2 * taken.was.len();
             if total <= MOST {
                 all.push((shadow.clone(), taken));

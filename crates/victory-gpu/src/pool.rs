@@ -10,16 +10,19 @@
 //! forty seconds of a world without its textures.
 //! `VICTORY_TEXTURE_POOL=0` makes every one an allocation of its own again.
 //!
-//! A piece given back is used again only two seconds later (nothing the card
+//! Without mixed heaps a piece given back is used again only two seconds later (nothing the card
 //! was told before that is still running: Windows resets a card that takes
 //! that long over one submission), and by then no list names it (the owners' rule, as for allocations of their own): a
 //! texture's piece comes back when the last reference to the host texture
 //! goes (an object of ours the texture holds says so), a staging buffer's
 //! when the last list that recorded its copy is reset.
+//! With `VICTORY_POOL_WINDOWS_MB` above zero, Tier2 heaps also admit window
+//! buffers. Every piece of those heaps additionally waits for the actual
+//! queue fence captured at final COM release; the CPU never waits here.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -46,6 +49,19 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
+    if window_limit() != 0 {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let last = LAST.load(Ordering::Relaxed);
+        if tick.saturating_sub(last) >= 5000 && LAST.compare_exchange(last, tick, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            let [held, made, missed, capped, failed] = window_counts();
+            tracing::info!(
+                "pooled windows: {} KiB held of a {} MiB cap; since start {} offers, {} placements, \
+                 {} hole misses, {} cap refusals, {} unsupported, {} native or owner failures; existing heap backing only",
+                held >> 10, window_limit() >> 20, WINDOW_OFFERS.load(Ordering::Relaxed), made, missed, capped,
+                WINDOW_UNSUPPORTED.load(Ordering::Relaxed), failed
+            );
+        }
+    }
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
     if let Ok(mut pool) = TEXTURES.try_lock() {
@@ -82,6 +98,80 @@ fn now() -> u64 {
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
+}
+
+fn parse_window_limit(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).and_then(|mb| mb.checked_mul(1 << 20)).unwrap_or(0)
+}
+
+/// An opt-in cap on occupied placement bytes, not additional heap backing.
+pub(crate) fn window_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| parse_window_limit(std::env::var("VICTORY_POOL_WINDOWS_MB").ok().as_deref()))
+}
+
+fn mixed_heaps(device: &ID3D12Device) -> bool {
+    if window_limit() == 0 {
+        return false;
+    }
+    let Some(host) = crate::host::made_host().filter(|host| host.device.as_raw() == device.as_raw()) else {
+        return false;
+    };
+    if !host.pool_retirement_supported() {
+        return false;
+    }
+    static MIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // The pool, like the production Host, belongs to one device.
+    *MIXED.get_or_init(|| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: a plain feature query with its exact output size.
+        let checked = unsafe {
+            device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(), size_of_val(&options) as u32)
+        };
+        checked.is_ok() && options.ResourceHeapTier == D3D12_RESOURCE_HEAP_TIER_2
+    })
+}
+
+/// Tier2 mixed heaps require every category-denial flag unset. Keep the
+/// allocator's narrower non-RT/DS, single-sample policy in software.
+fn mixed_texture_supported(desc: &D3D12_RESOURCE_DESC) -> bool {
+    desc.SampleDesc.Count == 1
+        && desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == D3D12_RESOURCE_FLAG_NONE
+}
+
+type FenceSource = (ID3D12Fence, Arc<AtomicU64>);
+
+/// Snapshot only at final release; prepared and recorded users retain the
+/// resource, so all work which could name a released piece is before it.
+fn snapshot(source: &FenceSource) -> (ID3D12Fence, u64) {
+    (source.0.clone(), source.1.load(Ordering::Acquire))
+}
+
+fn fenced_ready(now: u64, until: u64, completed: u64, target: u64) -> bool {
+    now >= until && completed != u64::MAX && target != u64::MAX && completed >= target
+}
+
+struct Resting {
+    until: u64,
+    piece: Piece,
+    /// None is the unchanged texture-only/staging path, or a creation
+    /// failure whose piece was never exposed to any GPU work.
+    fence: Option<(ID3D12Fence, u64)>,
+    /// Mixed-heap accounting/cap stays charged until this extent is free.
+    _charge: Option<Occupied<'static>>,
+}
+
+impl Resting {
+    fn ready(&self, now: u64) -> bool {
+        if now < self.until {
+            return false;
+        }
+        match &self.fence {
+            None => true,
+            // SAFETY: the captured queue fence is kept alive by this entry.
+            Some((fence, target)) => fenced_ready(now, self.until, unsafe { fence.GetCompletedValue() }, *target),
+        }
+    }
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
@@ -194,7 +284,7 @@ struct Pool<B> {
     /// `None`: a block let go, its place to be used again.
     blocks: Vec<Option<Block<B>>>,
     /// Pieces given back, and when each may be used again.
-    resting: VecDeque<(u64, Piece)>,
+    resting: VecDeque<Resting>,
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
@@ -210,6 +300,33 @@ impl<B: Clone> Pool<B> {
     /// part was ever used before; `make` makes a block when none has room.
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
         self.take_ripe(len, align, now, Ripe::ALL, make)
+    }
+
+    /// No growth and no unripe fallback: window buffers borrow only free
+    /// ranges of existing compatible blocks. Resting pieces are excluded.
+    fn take_existing(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        ripe: Ripe,
+        mut compatible: impl FnMut(&B) -> bool,
+    ) -> Option<(Piece, B)> {
+        if len == 0 || len > BLOCK || !align.is_power_of_two() || align > BLOCK {
+            return None;
+        }
+        self.rested(now);
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            let Some(block) = block else { continue };
+            if !ripe.is(block) || !compatible(&block.memory) {
+                continue;
+            }
+            if let Some(start) = block.free.take(len, align) {
+                block.used_to = block.used_to.max(start + len);
+                return Some((Piece { block: i, start, len }, block.memory.clone()));
+            }
+        }
+        None
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
@@ -299,7 +416,15 @@ impl<B: Clone> Pool<B> {
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        self.give_fenced(piece, now, None);
+    }
+
+    fn give_fenced(&mut self, piece: Piece, now: u64, fence: Option<(ID3D12Fence, u64)>) {
+        self.give_charged(piece, now, fence, None);
+    }
+
+    fn give_charged(&mut self, piece: Piece, now: u64, fence: Option<(ID3D12Fence, u64)>, charge: Option<Occupied<'static>>) {
+        self.resting.push_back(Resting { until: now.saturating_add(REST), piece, fence, _charge: charge });
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -310,14 +435,17 @@ impl<B: Clone> Pool<B> {
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
         let mut any = false;
-        while let Some(&(ready, piece)) = self.resting.front()
-            && ready <= now
+        while self.resting.front().is_some_and(|r| r.ready(now))
         {
-            self.resting.pop_front();
+            let retired = self.resting.pop_front().unwrap();
+            let piece = retired.piece;
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
                 any |= block.free.whole(BLOCK);
             }
+            // Release accounting only after returning the range, with the
+            // pool lock still excluding another allocation of that range.
+            drop(retired);
         }
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
@@ -353,11 +481,71 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bytes of the pieces textures hold now.
+/// Charged placement bytes. Mixed heaps include retired, unreusable pieces;
+/// legacy texture-only heaps keep their original live-resource accounting.
 static HELD: AtomicU64 = AtomicU64::new(0);
 
-/// Bytes of the texture blocks no texture holds: the card's memory in use
-/// by us that new textures take first.
+static WINDOW_BYTES: AtomicU64 = AtomicU64::new(0);
+static WINDOW_OFFERS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_MADE: AtomicU64 = AtomicU64::new(0);
+static WINDOW_MISSED: AtomicU64 = AtomicU64::new(0);
+static WINDOW_CAPPED: AtomicU64 = AtomicU64::new(0);
+static WINDOW_FAILED: AtomicU64 = AtomicU64::new(0);
+static WINDOW_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// Cap reservation rolls back before an extent is taken. Thereafter it
+/// follows that extent through COM lifetime and fence/REST quarantine.
+struct WindowBytes<'a> {
+    counter: &'a AtomicU64,
+    bytes: u64,
+}
+
+impl<'a> WindowBytes<'a> {
+    fn reserve(counter: &'a AtomicU64, bytes: u64, limit: u64) -> Option<Self> {
+        if bytes == 0 {
+            return None;
+        }
+        counter.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |held| {
+            held.checked_add(bytes).filter(|sum| *sum <= limit)
+        }).ok()?;
+        Some(Self { counter, bytes })
+    }
+}
+
+impl Drop for WindowBytes<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// Only atomics/cap ownership: no resource or pool lock, and no COM cycle.
+struct Occupied<'a> {
+    held: &'a AtomicU64,
+    bytes: u64,
+    _window: Option<WindowBytes<'a>>,
+}
+
+impl<'a> Occupied<'a> {
+    fn new(held: &'a AtomicU64, bytes: u64, window: Option<WindowBytes<'a>>) -> Self {
+        held.fetch_add(bytes, Ordering::Relaxed);
+        Self { held, bytes, _window: window }
+    }
+}
+
+impl Drop for Occupied<'_> {
+    fn drop(&mut self) {
+        self.held.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// Current occupied buffer bytes and cumulative successful placements,
+/// hole misses, cap refusals and native/attachment failures (not residency).
+pub(crate) fn window_counts() -> [u64; 5] {
+    [&WINDOW_BYTES, &WINDOW_MADE, &WINDOW_MISSED, &WINDOW_CAPPED, &WINDOW_FAILED].map(|n| n.load(Ordering::Relaxed))
+}
+
+/// Uncharged pool backing. Mixed-heap fence/REST quarantine is excluded;
+/// legacy texture-only heaps retain their original accounting.
 pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
@@ -409,13 +597,15 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     Some((owned, memory.0, piece.start, data))
 }
 
-/// An object the host texture holds and releases when it goes: its piece
-/// is free then.
+/// An object the resource holds until its last COM reference goes. Mixed
+/// pieces transfer their charge to retirement rather than releasing it.
 #[repr(C)]
 struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    fence: Option<FenceSource>,
+    charge: Option<Occupied<'static>>,
 }
 
 struct Methods([*const (); 3]);
@@ -451,9 +641,16 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     unsafe {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
-            let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            lock(&TEXTURES).give(gone.piece, now());
+            let mut gone = Box::from_raw(this.cast::<Reclaim>());
+            let fence = gone.fence.as_ref().map(snapshot);
+            let charge = gone.charge.take();
+            if fence.is_some() {
+                lock(&TEXTURES).give_charged(gone.piece, now(), fence, charge);
+            } else {
+                // Preserve off-path accounting at final resource release.
+                drop(charge);
+                lock(&TEXTURES).give(gone.piece, now());
+            }
         }
         left
     }
@@ -622,19 +819,104 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
-    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+const RECLAIM_KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, fence: Option<FenceSource>, charge: Occupied<'static>) {
+    let made = Box::into_raw(Box::new(Reclaim {
+        methods: &RECLAIM.0, references: AtomicU32::new(1), piece, fence, charge: Some(charge),
+    }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
-        if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
+        if texture.SetPrivateDataInterface(&RECLAIM_KEY, &object).is_err() {
             // Never given back: the piece stays taken, nothing is reused
             // under a texture that may be alive.
             std::mem::forget(object);
         }
     }
+}
+
+/// Borrows a free range from a mixed texture heap; never grows that pool or
+/// creates a committed fallback. The caller MUST order an aliasing barrier
+/// and a complete first upload before any GPU use (including zero bytes).
+/// That is the existing window Card path's responsibility, not this allocator.
+pub(crate) fn window_buffer(host: &crate::host::Host, size: u64) -> Option<ID3D12Resource> {
+    if !on() || window_limit() == 0 {
+        return None;
+    }
+    WINDOW_OFFERS.fetch_add(1, Ordering::Relaxed);
+    if size == 0 || size > BLOCK || !mixed_heaps(&host.device) || !host.card_ready() {
+        WINDOW_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    // SAFETY: the exact buffer description which will be placed.
+    let info = unsafe { host.device.GetResourceAllocationInfo(0, &[desc]) };
+    if info.SizeInBytes == 0 || info.SizeInBytes > BLOCK || !info.Alignment.is_power_of_two() || info.Alignment > BLOCK {
+        WINDOW_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let Some(reserved) = WindowBytes::reserve(&WINDOW_BYTES, info.SizeInBytes, window_limit()) else {
+        WINDOW_CAPPED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let found = lock(&TEXTURES).take_existing(info.SizeInBytes, info.Alignment, now(), Ripe::now(), |heap| {
+        // SAFETY: a live pool heap. Texture-only heaps never admit a buffer.
+        let flags = unsafe { heap.GetDesc() }.Flags;
+        flags & (D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES) == D3D12_HEAP_FLAG_NONE
+    });
+    let Some((piece, heap)) = found else {
+        WINDOW_MISSED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let charge = Occupied::new(&HELD, piece.len, Some(reserved));
+    let source = host.pool_retirement_fence();
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: the validated range belongs to this resource alone. Its
+    // resource-owned COM lease keeps it occupied through every bare clone.
+    let placed = unsafe {
+        host.device.CreatePlacedResource(&heap, piece.start, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+    };
+    let made = match (placed, made) {
+        (Ok(()), Some(made)) => made,
+        _ => {
+            lock(&TEXTURES).give_charged(piece, now(), Some(snapshot(&source)), Some(charge));
+            WINDOW_FAILED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    let owner = Box::into_raw(Box::new(Reclaim {
+        methods: &RECLAIM.0, references: AtomicU32::new(1), piece, fence: Some(source), charge: Some(charge),
+    }));
+    // SAFETY: the local reference owns our COM object; successful attachment
+    // retains its own. On failure neither resource nor owner escapes, so
+    // dropping them quarantines the charged extent instead of leaking it.
+    let attached = unsafe {
+        let object = IUnknown::from_raw(owner.cast());
+        made.SetPrivateDataInterface(&RECLAIM_KEY, &object)
+    };
+    if attached.is_err() {
+        WINDOW_FAILED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    WINDOW_MADE.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::book::made(&made, || "a window buffer in a texture block".into());
+        crate::book::block(&heap, &made, piece.start, BLOCK);
+    }
+    Some(made)
 }
 
 /// A texture of `desc` (no target, depth or unordered access) in a block;
@@ -655,6 +937,10 @@ pub(crate) unsafe fn texture(
     // each otherwise.
     // SAFETY: the caller's description.
     let mut d = unsafe { *desc };
+    let mixed = mixed_heaps(device);
+    if mixed && !mixed_texture_supported(&d) {
+        return None;
+    }
     d.Alignment = if small_placement() { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
     // SAFETY: plain queries.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
@@ -663,38 +949,77 @@ pub(crate) unsafe fn texture(
         info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     }
     if info.SizeInBytes == u64::MAX {
+        #[cfg(test)]
+        eprintln!("pool texture: invalid allocation info size={} alignment={} desc={d:?}", info.SizeInBytes, info.Alignment);
         return None;
     }
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let fence = if mixed {
+        // A device-only caller must use this pool's production Host. Unknown
+        // devices fall back rather than retiring behind the wrong fence.
+        let host = crate::host::made_host().filter(|host| host.device.as_raw() == device.as_raw())?;
+        Some(host.pool_retirement_fence())
+    } else {
+        None
+    };
+    let taken = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+            Flags: (if fence.is_some() { D3D12_HEAP_FLAG_NONE } else { D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES })
+                | crate::host::not_resident(),
         };
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
         if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+            #[cfg(test)]
+            eprintln!("pool texture: CreateHeap failed code={:?} error={e} desc={desc:?}", e.code());
+            #[cfg(test)]
+            if let Some(host) = crate::host::made_host() {
+                eprintln!("pool texture: native validation {:?}", host.log_messages());
+            }
             crate::residency::allocation_error(&e);
             tracing::warn!(error = %e, "no block of texture memory");
         }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
+        if let Some(h) = &heap {
+            if let Err(e) = crate::host::resident(device, h) {
+                #[cfg(test)]
+                eprintln!("pool texture: resident failed code={:?} error={e} desc={desc:?}", e.code());
+                tracing::warn!(error = %e, "a block of texture memory is not resident");
+                return None;
+            }
+            if let Err(e) = crate::host::mapped(device) {
+                #[cfg(test)]
+                eprintln!("pool texture: mapped failed code={:?} error={e} desc={desc:?}", e.code());
+                tracing::warn!(error = %e, "a block of texture memory is not mapped");
+                return None;
+            }
+        } else {
+            #[cfg(test)]
+            eprintln!("pool texture: CreateHeap supplied no heap desc={desc:?}");
         }
         heap
-    })?;
+    });
+    #[cfg(test)]
+    if taken.is_none() {
+        eprintln!("pool texture: no pool range for size={} alignment={} desc={d:?}", info.SizeInBytes, info.Alignment);
+    }
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let (piece, heap, again) = taken?;
+    let mut charge = fence.as_ref().map(|_| Occupied::new(&HELD, piece.len, None));
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
     let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
+    #[cfg(test)]
+    if result.is_err() || made.is_none() {
+        eprintln!("pool texture: CreatePlacedResource result={result:?} returned_resource={} offset={} size={} alignment={} state={state:?} desc={d:?}",
+                  made.is_some(), piece.start, piece.len, info.Alignment);
+    }
     match (result, made) {
         (Ok(()), Some(made)) => {
-            HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece);
+            let charge = charge.take().unwrap_or_else(|| Occupied::new(&HELD, piece.len, None));
+            give_back_with(&made, piece, fence, charge);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -718,15 +1043,136 @@ pub(crate) unsafe fn texture(
             Some(made)
         }
         _ => {
-            lock(&TEXTURES).give(piece, now());
+            lock(&TEXTURES).give_charged(piece, now(), fence.as_ref().map(snapshot), charge);
             None
         }
     }
 }
 
 #[cfg(test)]
+mod window_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_texture_policy_rejects_targets_depth_and_multisampling() {
+        let mut desc = D3D12_RESOURCE_DESC::default();
+        desc.SampleDesc.Count = 1;
+        assert!(mixed_texture_supported(&desc));
+        for flags in [D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL] {
+            desc.Flags = flags;
+            assert!(!mixed_texture_supported(&desc));
+        }
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        for count in [0, 2, 4, 8] {
+            desc.SampleDesc.Count = count;
+            assert!(!mixed_texture_supported(&desc));
+        }
+    }
+
+    #[test]
+    fn window_cap_is_opt_in_and_rejects_overflow() {
+        assert_eq!(parse_window_limit(None), 0);
+        assert_eq!(parse_window_limit(Some("0")), 0);
+        assert_eq!(parse_window_limit(Some(" 128 ")), 128 << 20);
+        assert_eq!(parse_window_limit(Some("-1")), 0);
+        assert_eq!(parse_window_limit(Some("not a number")), 0);
+        assert_eq!(parse_window_limit(Some("18446744073709551615")), 0);
+    }
+
+    #[test]
+    fn window_cap_reservations_rollback_and_do_not_overbook_concurrently() {
+        let held = AtomicU64::new(0);
+        {
+            let reservation = WindowBytes::reserve(&held, 4096, 4096).unwrap();
+            assert!(WindowBytes::reserve(&held, 1, 4096).is_none());
+            assert_eq!(held.load(Ordering::Relaxed), 4096);
+            drop(reservation);
+        }
+        assert_eq!(held.load(Ordering::Relaxed), 0);
+        held.store(u64::MAX, Ordering::Relaxed);
+        assert!(WindowBytes::reserve(&held, 1, u64::MAX).is_none());
+        held.store(0, Ordering::Relaxed);
+        let begin = std::sync::Barrier::new(9);
+        let reserved = std::sync::Barrier::new(9);
+        let accepted = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (held, begin, reserved, accepted) = (&held, &begin, &reserved, &accepted);
+                scope.spawn(move || {
+                    begin.wait();
+                    let reservation = WindowBytes::reserve(held, 65536, 2 * 65536);
+                    if reservation.is_some() {
+                        accepted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    reserved.wait();
+                    drop(reservation);
+                });
+            }
+            begin.wait();
+            reserved.wait();
+        });
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+        assert_eq!(held.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn window_holes_never_grow_or_take_incompatible_or_resting_memory() {
+        let mut pool = Pool::<u32>::new(2);
+        assert!(pool.take_existing(BLOCK, 65536, 0, Ripe::ALL, |_| true).is_none());
+        assert_eq!(pool.blocks(), 0);
+        pool.add(1, 0);
+        pool.add(2, 0);
+        let (piece, heap) = pool.take_existing(BLOCK, 65536, 0, Ripe::ALL, |heap| *heap == 2).unwrap();
+        assert_eq!(heap, 2);
+        assert_eq!(piece, Piece { block: 1, start: 0, len: BLOCK });
+        assert!(pool.take_existing(65536, 65536, 0, Ripe::ALL, |heap| *heap == 2).is_none());
+        assert_eq!(pool.blocks(), 2);
+        pool.give(piece, 0);
+        assert!(pool.take_existing(BLOCK, 65536, REST - 1, Ripe::ALL, |heap| *heap == 2).is_none());
+        assert_eq!(pool.take_existing(BLOCK, 65536, REST, Ripe::ALL, |heap| *heap == 2).unwrap().0, piece);
+        assert_eq!(pool.blocks(), 2);
+    }
+
+    #[test]
+    fn mixed_piece_retirement_needs_the_native_fence_and_the_rest() {
+        assert!(!fenced_ready(REST - 1, REST, 99, 10));
+        assert!(!fenced_ready(REST, REST, 9, 10));
+        assert!(fenced_ready(REST, REST, 10, 10));
+        assert!(fenced_ready(REST + 1, REST, 11, 10));
+        assert!(!fenced_ready(u64::MAX, REST, u64::MAX, 10));
+        assert!(!fenced_ready(u64::MAX, REST, u64::MAX, u64::MAX));
+        assert!(!fenced_ready(u64::MAX, REST, 10, u64::MAX));
+        assert!(fenced_ready(REST, REST, 0, 0));
+    }
+
+    #[test]
+    fn retired_extent_keeps_its_cap_and_accounting_until_reclaimed() {
+        static CAP: AtomicU64 = AtomicU64::new(0);
+        static ACCOUNTED: AtomicU64 = AtomicU64::new(0);
+        let mut pool = Pool::<u32>::new(2);
+        pool.add(1, 0);
+        let (piece, _) = pool.take_existing(65536, 65536, 0, Ripe::ALL, |_| true).unwrap();
+        let window = WindowBytes::reserve(&CAP, piece.len, piece.len).unwrap();
+        let charge = Occupied::new(&ACCOUNTED, piece.len, Some(window));
+        // The same transfer is used on COM release and on failed native
+        // placement after an extent was taken. Native-fence refusal is
+        // covered separately and by the explicit native extent fixture.
+        pool.give_charged(piece, 0, None, Some(charge));
+        for tick in [0, REST - 1] {
+            pool.reclaim(tick, 2, true);
+            assert_eq!(CAP.load(Ordering::Relaxed), piece.len);
+            assert_eq!(ACCOUNTED.load(Ordering::Relaxed), piece.len);
+            assert!(WindowBytes::reserve(&CAP, 1, piece.len).is_none());
+        }
+        pool.reclaim(REST, 2, true);
+        assert_eq!(CAP.load(Ordering::Relaxed), 0);
+        assert_eq!(ACCOUNTED.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.take_existing(piece.len, 65536, REST, Ripe::ALL, |_| true).unwrap().0, piece);
+        assert!(WindowBytes::reserve(&CAP, piece.len, piece.len).is_some());
+    }
 
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {

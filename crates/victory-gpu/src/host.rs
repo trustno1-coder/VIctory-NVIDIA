@@ -42,6 +42,9 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// Published before Execute, so final COM release can retire a pool
+    /// piece behind our queue without recursively taking `submitted`.
+    pool_reserved: std::sync::Arc<std::sync::atomic::AtomicU64>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -835,7 +838,6 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it is made already.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
 }
@@ -1003,6 +1005,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            pool_reserved: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             event,
             rtvs,
             rtv_size,
@@ -1020,6 +1023,20 @@ fn create() -> windows::core::Result<Host> {
 }
 
 impl Host {
+    /// The pool owns these clones, never this Host or a resource. Its COM
+    /// owner snapshots the watermark at final release, not at allocation.
+    pub(crate) fn pool_retirement_fence(&self) -> (ID3D12Fence, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        (self.fence.clone(), self.pool_reserved.clone())
+    }
+
+    /// One queue must dominate every use of a mixed-heap piece. Keep the
+    /// optional two-queue experiment outside this allocation class, even
+    /// while that experiment only plans work for a second queue.
+    pub(crate) fn pool_retirement_supported(&self) -> bool {
+        // SAFETY: a plain query of our live queue.
+        !two_queues::on() && unsafe { self.queue.GetDesc() }.Type == D3D12_COMMAND_LIST_TYPE_DIRECT
+    }
+
     /// The driver's version, as the system counts it (0: not known).
     pub(crate) fn driver(&self) -> i64 {
         let adapter = self.adapter.as_ref();
@@ -4468,9 +4485,26 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
+        let mut initializing = Vec::new();
+        for (shadow, ranges) in &mut dirty {
+            if shadow.card_needs_alias() {
+                // Placed buffers can hold a preceding texture's bytes. Do
+                // not compare that invalid representation or leave unread
+                // parts of the new window uninitialized.
+                ranges.clear();
+                ranges.push((0, shadow.span().1 as usize));
+                initializing.push(shadow.clone());
+            }
+        }
+        let pooled_sends = dirty.iter().any(|(shadow, ranges)| shadow.card_pooled() && !ranges.is_empty());
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
-        let own = if send::own() { send::take(self, &dirty) } else { None };
+        let own = if send::own() || pooled_sends { send::take(self, &dirty) } else { None };
+        if pooled_sends && own.is_none() {
+            // Never expose mutable COPY sources or incomplete pooled bytes
+            // when allocation/compilation of the protected send failed.
+            fail(format_args!("no immutable upload for a pooled card window"));
+        }
         taking.end();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
@@ -4485,6 +4519,20 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    for shadow in &initializing {
+                        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                                    pResourceBefore: std::mem::ManuallyDrop::new(None),
+                                    // Borrowed for this call; initializing
+                                    // and CardPlan pin the resource itself.
+                                    pResourceAfter: std::mem::transmute_copy(&shadow.buffer),
+                                }),
+                            },
+                        }]);
+                    }
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4565,6 +4613,11 @@ impl Host {
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    // This DIRECT-queue prefix precedes the title's lists
+                    // and every later check. Keep pending on record failure.
+                    for shadow in &initializing {
+                        shadow.card_alias_queued();
+                    }
                     Ok(())
                 })()
             };
@@ -5224,9 +5277,10 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
+                    *submitted += 1;
+                    self.pool_reserved.store(*submitted, Ordering::Release);
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
-                    *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
@@ -5912,6 +5966,7 @@ impl Host {
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
+            self.pool_reserved.store(*submitted, Ordering::Release);
             #[cfg(feature = "diagnostics")]
             if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
@@ -5975,6 +6030,7 @@ impl Host {
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            self.pool_reserved.store(*submitted, Ordering::Release);
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
