@@ -13,6 +13,9 @@
 >    in `%LOCALAPPDATA%\VIctory\data\7952987A\temp\`.
 >
 > Also say which GPU, Windows version (10 or 11) and release you used.
+>
+> Many errors already have an answer in
+> [docs/troubleshooting.md](docs/troubleshooting.md): look there first.
 
 ## Frame generation: what your card supports
 
@@ -346,6 +349,8 @@ delete that file to go back to them. Full screen: start the game, then run
 
 - [docs/README-foxhound.md](docs/README-foxhound.md): foxhound's own README
   (set-up by hand, warming up, its switches).
+- [docs/troubleshooting.md](docs/troubleshooting.md): common errors and what
+  to do about them.
 - [docs/architecture.md](docs/architecture.md): the layer's parts.
 - [docs/findings.md](docs/findings.md): measurements behind the choices.
 - [docs/dlss.md](docs/dlss.md): DLSS and Frame Generation.
