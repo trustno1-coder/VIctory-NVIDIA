@@ -12,11 +12,12 @@ if not exist "%PS1%" (
   pause
   exit /b 1
 )
-if /i "%~1"=="check" (
-  %PSH% -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Check
-  pause
-  exit /b 0
-)
+if /i not "%~1"=="check" goto :menu
+%PSH% -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Check
+pause
+rem The check's answer is what callers read: a failed check says so.
+exit /b %errorlevel%
+:menu
 set "PICK=%~1"
 if not "%PICK%"=="" goto :run
 
