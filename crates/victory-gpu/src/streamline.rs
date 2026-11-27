@@ -1288,6 +1288,10 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
             && (i != REACTIVE || plan.asked.reactive)
             && (i != EXPOSURE || camera.flags & plan::FFX_AUTO_EXPOSURE == 0)
     };
+    // For the timing run: the upscaling's inputs made ready, the upscaling
+    // itself and what the list records after it, each under a name.
+    #[cfg(feature = "diagnostics")]
+    host.note_op(|| "upscale inputs (Streamline)".to_owned());
     let mut textures: Textures = Default::default();
     for i in [COLOUR, DEPTH, MOTION, EXPOSURE, REACTIVE, OUTPUT] {
         if !used(i) {
@@ -1306,10 +1310,14 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
         }
         textures[i] = Some((texture, legal));
     }
+    #[cfg(feature = "diagnostics")]
+    host.note_op(|| format!("upscale (Streamline) {:?} to {:?}", camera.render, camera.output));
     let recorded = match record(host.list.as_raw(), &textures, &camera, up.pre_exposure, id) {
         Ok(recorded) => recorded,
         Err(why) => return fail(&why),
     };
+    #[cfg(feature = "diagnostics")]
+    host.note_op(|| "upscale's end (Streamline)".to_owned());
     crate::external::output_written(up.resources[OUTPUT].0);
     EVALUATED.fetch_add(1, Relaxed);
     let all = EVALUATED_ALL.fetch_add(1, Relaxed) + 1;

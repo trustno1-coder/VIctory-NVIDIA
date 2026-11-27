@@ -5368,7 +5368,14 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
-                self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+                // A dispatch's group counts as the title's memory has them
+                // (the card reads the host copy, which an earlier dispatch
+                // may have written: then these are not what runs).
+                let groups = (kind == DISPATCH && crate::texture::committed(arguments as *const u8, 12))
+                    // SAFETY: 12 committed bytes of title memory.
+                    .then(|| unsafe { (arguments as *const [u32; 3]).read_unaligned() })
+                    .map_or(String::new(), |g| format!(" groups in title memory ({} {} {})", g[0], g[1], g[2]));
+                self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}{groups}"), kind == DISPATCH)
             });
             let epoch = list.epoch();
             if joining && call.single && !call.alone {
