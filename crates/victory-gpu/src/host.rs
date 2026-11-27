@@ -9904,7 +9904,7 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
                 // What the queue's room test (`crate::resource::room`) weighs.
-                if let Some([budget, used, blocks, buffers, targets, line]) =
+                if let Some([budget, used, blocks, buffers, targets, line, by_gate, to_come, block_room]) =
                     crate::resource::room_terms(host().and_then(|h| h.video_memory()))
                 {
                     let weighed = used.saturating_sub(blocks) + buffers + targets;
@@ -9913,7 +9913,37 @@ impl Meter {
                          card copies of title buffers + {targets} MB kept for render targets = {weighed} MB against a line of \
                          {line} MB ({:.1} % of a budget of {budget} MB): {}",
                         line as f64 * 100.0 / budget.max(1) as f64,
-                        if weighed < line { "room" } else { "no room, new textures wait" }
+                        if by_gate < line {
+                            "room"
+                        } else if weighed < line {
+                            "no room in the texture blocks and none for a new block, new textures wait"
+                        } else {
+                            "no room, new textures wait"
+                        }
+                    );
+                    // The gate on new blocks (`crate::pool::gate`) and how
+                    // full the blocks are.
+                    let [n, free, q0, h0, q1, h1, q2, h2, q3, h3, given] = crate::pool::fill();
+                    let [made, not_made, past] = crate::pool::BLOCKS.each_ref().map(|b| b.load(Ordering::Relaxed));
+                    let no_place = crate::draw::HEAP_TEXTURES_NO_PLACE[0].load(Ordering::Relaxed);
+                    let no_place_now = crate::draw::HEAP_TEXTURES_NO_PLACE[1].swap(0, Ordering::Relaxed);
+                    tracing::info!(
+                        "texture blocks{}: {n} blocks ({} MB), {} MB of them free; by how full: {q0} under a quarter (they hold {} \
+                         MB), {q1} up to a half ({} MB), {q2} up to three quarters ({} MB), {q3} fuller ({} MB); a new block: {used} \
+                         MB in use + 64 MB + {buffers} MB kept for card copies of title buffers + {to_come} MB of render targets \
+                         still to come = {} MB against the line of {line} MB: {}; since the start {made} blocks made, {not_made} \
+                         blocks not made for want of room, {past} made without room for textures that could not wait, {given} \
+                         given back; textures waiting for a place: {no_place_now} looks since the last line, {no_place} since the \
+                         start",
+                        if crate::pool::gate() { "" } else { " (VICTORY_POOL_GATE=0: a block is made whenever none has room)" },
+                        n * 64,
+                        free >> 20,
+                        h0 >> 20,
+                        h1 >> 20,
+                        h2 >> 20,
+                        h3 >> 20,
+                        used + 64 + buffers + to_come,
+                        if block_room != 0 { "one may be made" } else { "none is made, textures take the free pieces" },
                     );
                 }
                 let [looks, mapped, same, staged, all, made, views] =
