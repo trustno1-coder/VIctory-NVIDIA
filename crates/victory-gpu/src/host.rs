@@ -440,6 +440,13 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// Pressure-only retirement of idle host lists and oversized fetch buffers.
+/// A process-wide opt-out for matched measurements and compatibility diagnosis.
+fn idle_reclaim() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_IDLE_RECLAIM").is_none_or(|v| v != "0"))
+}
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
@@ -465,6 +472,9 @@ fn sweep() {
     crate::book::check();
     crate::residency::refresh();
     if crate::residency::pressured() {
+        if idle_reclaim() {
+            crate::list::trim_idle(now);
+        }
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
@@ -2167,6 +2177,8 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    /// Last time this capacity was needed, not merely read from.
+    fetched_large_at: u64,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -3609,6 +3621,8 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// Last time this capacity was needed, not merely read from.
+    buffer_large_at: u64,
     /// Pieces caught while a later flight was writing them.
     suspects: torn::Suspects,
     /// What earlier fetches brought of flights not landed yet.
@@ -4454,6 +4468,7 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                fetched_large_at: 0,
                 taken: 0,
                 out: 0,
             })
@@ -4806,9 +4821,43 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                buffer_large_at: 0,
                 suspects: torn::Suspects::default(),
                 had: crate::land::Had::default(),
             })
+        }
+    }
+
+    /// Reuse ordinary fetch capacity; release a peak only after two seconds
+    /// below that size and under memory pressure. Called between completed
+    /// fetch/merge operations, never while GPU or CPU users hold the mapping.
+    fn resize_fetch(
+        &self,
+        buffer: &mut Option<(ID3D12Resource, usize, u64)>,
+        large_at: &mut u64,
+        needed: u64,
+    ) {
+        let now = now_ms();
+        let capacity = buffer.as_ref().map_or(0, |b| b.2);
+        let wanted = needed.next_multiple_of(16 << 20);
+        let grow = needed > capacity;
+        if wanted >= capacity {
+            *large_at = now;
+        }
+        let shrink = idle_reclaim() && crate::residency::pressured()
+            && wanted < capacity && now.saturating_sub(*large_at) >= 2_000;
+        if grow || shrink {
+            if wanted == 0 {
+                *buffer = None;
+            } else {
+                let replacement = self.shared_buffer(wanted).map(|(b, p)| (b, p as usize, wanted));
+                // Failed shrinking leaves a usable old allocation. Failed growth
+                // keeps the existing caller's allocation-failure path.
+                if grow || replacement.is_some() {
+                    *buffer = replacement;
+                }
+            }
+            *large_at = now;
         }
     }
 
@@ -4924,6 +4973,13 @@ impl Host {
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.
         let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
+        if let Some(f) = fetch.as_mut() {
+            // The preceding fetch and its CPU readers finished on this same
+            // relay thread before this call; none refers to the old mapping now.
+            self.resize_fetch(&mut f.buffer, &mut f.buffer_large_at, total);
+            #[cfg(test)]
+            membench::RELAY_FETCH.store(f.buffer.as_ref().map_or(0, |b| b.2), Ordering::Relaxed);
+        }
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next
             // fetch, if that goes to the queue the sends went to.
@@ -4937,13 +4993,6 @@ impl Host {
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
         };
-        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
-            // (A local of this thread: the memory bench reads its size here.)
-            #[cfg(test)]
-            membench::RELAY_FETCH.store(size, Ordering::Relaxed);
-        }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
@@ -5258,11 +5307,10 @@ impl Host {
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
         let mut written = vec![0usize; plan.ranges.len()];
+        // Serialized by CARD_WORK and the submission lock; the previous copy
+        // fence and CPU merge were waited for before returning.
+        self.resize_fetch(&mut work.fetched, &mut work.fetched_large_at, total);
         if !pieces.is_empty() {
-            if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
-                let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
-            }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
             };

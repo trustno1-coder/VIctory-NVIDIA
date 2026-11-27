@@ -837,3 +837,59 @@ fn memory_bench_pressure_lets_idle_go() {
         );
     }
 }
+
+/// Retirement must allow a second burst to allocate/reuse storage and return
+/// the same bytes, in both relay and synchronous processes.
+#[test]
+#[ignore = "on the card; a process of its own; exercise reclamation and regrowth"]
+fn memory_bench_reclaims_and_regrows_with_correct_bytes() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(mut rig) = Rig::new() else {
+        eprintln!("no host GPU: nothing measured");
+        return;
+    };
+    struct Pressure;
+    impl Drop for Pressure {
+        fn drop(&mut self) { FREE_RAM_SAID.store(0, Relaxed); }
+    }
+    let _pressure = Pressure;
+    let pace = std::time::Duration::from_millis(16);
+    frames(&mut rig, 40, WINDOWS, pace);
+    for round in 0..2 {
+        FREE_RAM_SAID.store(0, Relaxed);
+        quiesce();
+        // Make every piece differ in both bursts so the second one must
+        // grow the fetch buffer again, rather than reuse a small matching tail.
+        // SAFETY: the owned source allocation is idle and has SRC bytes.
+        unsafe { std::slice::from_raw_parts_mut(rig.src.1 as *mut u8, SRC).fill(0x35 + round); }
+        rig.spike();
+        // SAFETY: the rig owns both mapped allocations and spike waited for
+        // every submitted copy and merge; no CPU or GPU writer is outstanding.
+        unsafe {
+            let want = std::slice::from_raw_parts(rig.src.1 as *const u8, SPIKE_BIG);
+            let got = std::slice::from_raw_parts(rig.big.1 as *const u8, BIG);
+            for (chunk, bytes) in got.chunks_exact(SPIKE_BIG).enumerate() {
+                assert!(bytes == want, "round {round}, fetched chunk {chunk} differs");
+            }
+        }
+        frames(&mut rig, 32, WINDOWS, pace);
+        quiesce();
+        let peak = census();
+        let active_fetch = if relay() { "fetch buffer (relay)" } else { "fetch buffer (no relay)" };
+        assert!(value(&peak, "card copies", active_fetch) >= BIG as u64,
+            "round {round}: the burst did not grow the fetch buffer" );
+        FREE_RAM_SAID.store((1u64 << 30) + 1, Relaxed);
+        frames_for(&mut rig, 3_500, 1);
+        quiesce();
+        let short = census();
+        assert!(value(&short, "host lists", "idle in the pool") < value(&peak, "host lists", "idle in the pool"),
+            "round {round}: old idle lists were retained");
+        for what in ["fetch buffer (no relay)", "fetch buffer (relay)"] {
+            let before = value(&peak, "card copies", what);
+            if before > 16 << 20 {
+                assert!(value(&short, "card copies", what) < before, "round {round}: {what} retained its peak");
+            }
+        }
+        println!("reclaim/regrow round {round}: copied bytes match; idle lists and peak fetch capacity reclaimed");
+    }
+}
