@@ -43,7 +43,8 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let host_low = crate::residency::host_room_low();
+    let limit = if host_low { SPARE } else { spares(memory, crate::host::keep_freed() && !pressure) };
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
@@ -54,7 +55,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
             0
-        } else if pressure {
+        } else if pressure || host_low {
             1
         } else {
             limit
@@ -69,6 +70,15 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
         _ => SPARE,
     }
 }
+
+/// Empty blocks let go to Windows, and their bytes, since the start (both
+/// pools: a texture block and a staging block are the PC's memory alike).
+static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub(crate) fn let_go() -> [u64; 2] {
+    [LET_GO[0].load(Ordering::Relaxed), LET_GO[1].load(Ordering::Relaxed)]
+}
+
 
 /// Milliseconds until a piece given back is used again. (It was three
 /// frames, a tenth of a second while the title shows a loading screen at 30
@@ -329,6 +339,8 @@ impl<B: Clone> Pool<B> {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+                        LET_GO[1].fetch_add(BLOCK, Ordering::Relaxed);
                     }
                 }
             }

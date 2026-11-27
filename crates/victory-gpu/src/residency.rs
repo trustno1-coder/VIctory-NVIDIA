@@ -139,6 +139,47 @@ pub(crate) fn pressured() -> bool {
     PRESSURED.load(Ordering::Relaxed)
 }
 
+/// How long host copies of placed textures whose title memory is no longer
+/// mapped may stay cached, when the PC's own memory is tight: 5 s below a
+/// quarter of RAM (at most 16 GiB left), 1 s below 8 GiB. `None`: enough
+/// host memory, keep the card's 10-minute rule.
+///
+/// The card's rule ([`crate::host::vram_keep_below`]) only looks at VRAM;
+/// on a 64 GB host with 14 GB left it kept 12.8 GB of host textures, 5.2 GB
+/// of them for title memory that was unmapped. Only unmapped copies are
+/// taken, so mapped, hot textures keep the full cache.
+/// `VICTORY_HOST_TEXTURE_SWEEP=0` restores the card-only rule.
+pub(crate) fn host_texture_idle_ms() -> Option<u64> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HOST_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    host_texture_idle_for(headroom()?, total_physical())
+}
+
+pub(crate) fn host_room_low() -> bool {
+    host_texture_idle_ms().is_some()
+}
+
+fn total_physical() -> u64 {
+    static TOTAL: OnceLock<u64> = OnceLock::new();
+    *TOTAL.get_or_init(|| memory_status().map_or(0, |s| s.ullTotalPhys))
+}
+
+fn host_texture_idle_for(head: u64, total: u64) -> Option<u64> {
+    if total == 0 {
+        return None;
+    }
+    let line = (total / 4).min(16 * GIB);
+    if head < 8 * GIB {
+        Some(1_000)
+    } else if head < line {
+        Some(5_000)
+    } else {
+        None
+    }
+}
+
 /// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation
 /// just failed with `E_OUTOFMEMORY`, requiring emergency throttling.
 pub(crate) fn critical_commit() -> bool {
@@ -197,5 +238,17 @@ mod tests {
         assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
         assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
         assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+    }
+
+    #[test]
+    fn host_texture_idle_follows_host_commit_not_only_the_card() {
+        assert_eq!(host_texture_idle_for(20 * GIB, 64 * GIB), None);
+        assert_eq!(host_texture_idle_for(16 * GIB, 64 * GIB), None);
+        assert_eq!(host_texture_idle_for(15 * GIB, 64 * GIB), Some(5_000));
+        assert_eq!(host_texture_idle_for(8 * GIB, 64 * GIB), Some(5_000));
+        assert_eq!(host_texture_idle_for(7 * GIB, 64 * GIB), Some(1_000));
+        assert_eq!(host_texture_idle_for(9 * GIB, 32 * GIB), None);
+        assert_eq!(host_texture_idle_for(7 * GIB, 32 * GIB), Some(1_000));
+        assert_eq!(host_texture_idle_for(1 * GIB, 0), None);
     }
 }

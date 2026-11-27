@@ -2269,14 +2269,22 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
-            crate::host::vram_keep_below(budget, used, room_line(budget))
-        }
-        _ => (crate::host::vram_idle_ms(memory), u64::MAX),
+    // The card's rule keeps idle copies for ten minutes while the card has
+    // room. When the PC's own commit is the limit, only copies for title
+    // memory that is no longer mapped are taken, after 5 s (1 s under
+    // 8 GiB): a mapped, hot texture keeps the full cache.
+    let host_idle = crate::residency::host_texture_idle_ms();
+    let (idle_ms, most) = match host_idle {
+        Some(ms) => (ms, u64::MAX),
+        None => match memory {
+            Some([budget, used, ..]) if keep => {
+                let used = used.saturating_sub(crate::pool::texture_room())
+                    + crate::shadow::card_room_kept()
+                    + targets_room_kept();
+                crate::host::vram_keep_below(budget, used, room_line(budget))
+            }
+            _ => (crate::host::vram_idle_ms(memory), u64::MAX),
+        },
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
@@ -2304,7 +2312,7 @@ pub(crate) fn let_go_idle() {
     let whole = *WHOLE.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_some_and(|v| v == "whole"));
     let part = if most != u64::MAX {
         0
-    } else if whole || idle_ms < 60_000 {
+    } else if whole || (idle_ms < 60_000 && host_idle.is_none()) {
         usize::MAX
     } else {
         PART
@@ -2327,6 +2335,21 @@ pub(crate) fn let_go_idle() {
         let used = r.host.used.load(Relaxed);
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
             continue;
+        }
+        if host_idle.is_some() {
+            // All of the placed texture's range, not just its first page:
+            // a smaller-but-mapped part would be lost with the copy. With
+            // neither end committed this is two queries and no walk
+            // (`texture::mapped_bytes`); a mapped first page answers at
+            // once. Portions mapped between the ends make it skip.
+            let unmapped = r.host.placed.load(Relaxed)
+                && footprint(&r.desc).is_some_and(|f| {
+                    f.size > 0 && crate::texture::mapped_bytes(r.data().cast_const(), f.size as usize) == 0
+                });
+            if !unmapped {
+                // Mapped, hot: the card's rule still decides when it may go.
+                continue;
+            }
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -2354,6 +2377,10 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
+            if host_idle.is_some() {
+                HOST_PRESSURE[0].fetch_add(1, Relaxed);
+                HOST_PRESSURE[1].fetch_add(host.bytes, Relaxed);
+            }
             crate::host::retire(host);
         }
     }
@@ -2375,6 +2402,19 @@ pub(crate) fn let_go_idle() {
 /// longest one's.
 #[cfg(windows)]
 pub(crate) static SWEPT_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Host copies the sweep let go because the PC's memory was tight, and their
+/// bytes, since the start.
+#[cfg(windows)]
+static HOST_PRESSURE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(windows)]
+pub(crate) fn host_pressure_reclaimed() -> [u64; 2] {
+    [
+        HOST_PRESSURE[0].load(std::sync::atomic::Ordering::Relaxed),
+        HOST_PRESSURE[1].load(std::sync::atomic::Ordering::Relaxed),
+    ]
+}
+
 
 /// For the memory line: the host copies the sweep never lets go
 /// ([`let_go_idle`] takes only copies of textures the title fills that the

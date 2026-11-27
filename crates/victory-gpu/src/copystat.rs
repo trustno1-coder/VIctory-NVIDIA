@@ -791,6 +791,15 @@ fn log_memory() {
     {
         let [textures, staging] = crate::pool::memory();
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+    {
+        let [copies, bytes] = crate::resource::host_pressure_reclaimed();
+        let [blocks, block_bytes] = crate::pool::let_go();
+        tracing::info!(
+            "host memory reclamation since the start: {copies} unmapped texture copies let go under host pressure ({:.0} MB); {blocks} empty pool blocks let go to Windows ({:.0} MB)",
+            mb(bytes),
+            mb(block_bytes)
+        );
+    }
     }
     let targets = crate::resource::targets_census();
     tracing::info!(
