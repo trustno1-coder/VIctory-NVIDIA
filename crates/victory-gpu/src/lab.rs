@@ -51,9 +51,16 @@ pub(crate) const HOT: usize = 14;
 /// with the thread that lands flights and nothing else (2); every other
 /// thread of the process runs on the other cores ([`own_core`]).
 pub(crate) const OWN: usize = 15;
+/// How many of the threads kept for refreshes on several threads are in use
+/// (`crate::shadow::wide_threads`; 0: as `VICTORY_WIDE_THREADS` or the number
+/// of processors says).
+pub(crate) const WIDE: usize = 16;
+/// How many of the threads that translate lists take work
+/// (`crate::list::thin`; 0: as `VICTORY_THIN_THREADS` says, eight without it).
+pub(crate) const LISTS: usize = 17;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 16] = [
+const KNOBS: [(&str, i64); 18] = [
     ("reuse", 1),
     ("zero", 1),
     ("a", 0),
@@ -70,8 +77,10 @@ const KNOBS: [(&str, i64); 16] = [
     ("u", 0),
     ("hot", 0),
     ("own", 0),
+    ("wide", 0),
+    ("lists", 0),
 ];
-static VALUES: [AtomicI64; 16] = [const { AtomicI64::new(0) }; 16];
+static VALUES: [AtomicI64; 18] = [const { AtomicI64::new(0) }; 18];
 
 /// Switch `own`, asked by the submitting thread (`role` 0) before each
 /// submission and by the thread that lands flights (`role` 1) before each
