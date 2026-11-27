@@ -750,29 +750,49 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     Some(answer)
 }
 
+/// Shared read handle to the write-watch [`Journal`], allowing callers to
+/// amortize the `RwLock::read` acquire/release across a batch of
+/// [`JournalRead::nothing_new`] checks. Must be dropped before calling
+/// [`writes`] or any other function that acquires the journal for writing.
+pub(crate) struct JournalRead(std::sync::RwLockReadGuard<'static, Journal>);
+
+/// Acquires a shared read handle to the write-watch journal for batched
+/// [`JournalRead::nothing_new`] checks.
+pub(crate) fn read_journal() -> JournalRead {
+    JournalRead(journal())
+}
+
+impl JournalRead {
+    /// As [`nothing_new`], reusing this shared journal guard.
+    pub(crate) fn nothing_new(&self, start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        // The bits first, then the journal, as in `writes`.
+        let known = published(start, end);
+        #[cfg(feature = "diagnostics")]
+        if known {
+            crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+        }
+        let j = &self.0;
+        if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            return false;
+        }
+        let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+            return false;
+        };
+        (ranged != 0 || taken.iter().all(|&at| at != 0))
+            && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    }
+}
+
 /// Whether nothing of `[start, end)` was written that a copy with the notes
 /// `copied` (the asking after which each page from page `base` on was taken)
 /// and `ranged` (the asking after which a range that holds this one was
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
+#[cfg(test)]
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    // The bits first, then the journal, as in `writes`.
-    let known = published(start, end);
-    #[cfg(feature = "diagnostics")]
-    if known {
-        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
-    }
-    let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return false;
-    }
-    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
-        return false;
-    };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    read_journal().nothing_new(start, end, base, copied, ranged)
 }
 
 impl Tracked {

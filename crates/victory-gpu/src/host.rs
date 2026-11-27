@@ -8580,7 +8580,8 @@ impl Batch {
         let many = spans.len() > FEW;
         if !many {
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let journal = crate::watch::read_journal();
+            spans.retain(|(shadow, from, to)| !shadow.nothing_new_with(&journal, *from, *to - *from));
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
@@ -8723,7 +8724,10 @@ impl Batch {
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            {
+                let journal = crate::watch::read_journal();
+                self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new_with(&journal, *from, *to - *from));
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
@@ -8749,15 +8753,43 @@ impl Batch {
             let before = PREPARING[0].load(Ordering::Relaxed);
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
-                // A number to a free thread, not a job to each copy.
+                // Claim chunks of copies per atomic increment, hold one shared
+                // journal read guard across each chunk's `nothing_new` checks,
+                // drop the guard before any `update` (which may write the
+                // journal), and flush the skipped count once per chunk.
+                const CHUNK: usize = 32;
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                let check_noop = refreshes.len() > FEW;
+                crate::shadow::wide_chunks(refreshes.len(), CHUNK, move |range| {
+                    if !check_noop {
+                        for i in range {
+                            let (shadow, from, to) = &refreshes[i];
+                            Self::update(shadow, *from, *to);
+                        }
                         return;
                     }
-                    Self::update(shadow, *from, *to);
+                    let mut dirty = [0usize; CHUNK];
+                    let mut dirty_n = 0usize;
+                    let mut skipped = 0u64;
+                    {
+                        let journal = crate::watch::read_journal();
+                        for i in range {
+                            let (shadow, from, to) = &refreshes[i];
+                            if shadow.nothing_new_with(&journal, *from, *to - *from) {
+                                skipped += 1;
+                            } else {
+                                dirty[dirty_n] = i;
+                                dirty_n += 1;
+                            }
+                        }
+                    }
+                    if skipped > 0 {
+                        FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
+                    }
+                    for &i in &dirty[..dirty_n] {
+                        let (shadow, from, to) = &refreshes[i];
+                        Self::update(shadow, *from, *to);
+                    }
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
