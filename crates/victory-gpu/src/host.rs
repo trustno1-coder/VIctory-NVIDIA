@@ -2279,6 +2279,15 @@ fn rehash_runs() -> bool {
 /// hashed, and compare passes after the lists.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Native maintenance dispatches (rehash, compare), and phases which retained
+/// the legacy path. Logical ranges and their readback fanout remain unchanged.
+static CARD_LAUNCHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn maintenance_batches() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAINTENANCE_BATCHES").is_some_and(|v| v == "1"))
+}
+
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
 /// default). The pieces the card's compare found differing come down in
@@ -2339,6 +2348,21 @@ struct CardPlan {
     looks: Option<upcheck::Looks>,
     /// With [`send`]: the memory its sends come from.
     sends: Option<send::Memory>,
+    /// Immutable job tables, descriptor heaps and resource pins. Their pool
+    /// separately proves native fence completion before allowing reuse.
+    maintenance: Vec<maintenance::Batch>,
+}
+
+impl CardPlan {
+    /// # Safety
+    /// `target` is a future native signal after the prefix, title producers and
+    /// checker. The submission lock prevents reserving the same value twice.
+    unsafe fn maintenance_submitted(&mut self, fence: &ID3D12Fence, target: u64) {
+        for batch in &mut self.maintenance {
+            // SAFETY: all batches are on the same native queue before target.
+            unsafe { batch.submitted(fence, target) };
+        }
+    }
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3852,6 +3876,9 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod maintenance;
+#[cfg(all(test, feature = "diagnostics"))]
+mod maintenance_tests;
 pub(crate) mod indirects;
 mod font;
 mod menu;
@@ -4119,6 +4146,64 @@ fn hand_back(back: &[Declared]) {
             crate::copystat::compared(from, to - from, written);
         }
         shadow.copy_back_done(declared);
+    }
+}
+
+/// The nonempty Execute ranges inside one existing submission part. Opening
+/// timestamp lists must finish before producer work can start; the checker must
+/// likewise follow every producer. Neither split needs another fence or wait.
+fn submission_ranges(
+    from: usize,
+    to: usize,
+    opening: usize,
+    checker: Option<usize>,
+) -> impl Iterator<Item = (usize, usize)> {
+    let opening = opening.clamp(from, to);
+    let checker = checker.unwrap_or(to).clamp(opening, to);
+    [(from, opening), (opening, checker), (checker, to)]
+        .into_iter()
+        .filter(|&(a, b)| a < b)
+}
+
+#[cfg(test)]
+mod submission_range_tests {
+    use super::submission_ranges;
+
+    #[test]
+    fn no_opening_stamp_preserves_producer_and_checker() {
+        assert_eq!(submission_ranges(0, 5, 0, None).collect::<Vec<_>>(), [(0, 5)]);
+        assert_eq!(submission_ranges(0, 5, 0, Some(3)).collect::<Vec<_>>(), [(0, 3), (3, 5)]);
+        assert!(submission_ranges(0, 0, 0, None).next().is_none());
+    }
+
+    #[test]
+    fn one_or_two_opening_stamps_finish_before_producers() {
+        for opening in 1..=2 {
+            assert_eq!(
+                submission_ranges(0, 8, opening, Some(6)).collect::<Vec<_>>(),
+                [(0, opening), (opening, 6), (6, 8)],
+            );
+            assert_eq!(
+                submission_ranges(0, 8, opening, None).collect::<Vec<_>>(),
+                [(0, opening), (opening, 8)],
+            );
+        }
+    }
+
+    #[test]
+    fn existing_parts_and_checker_boundaries_are_kept() {
+        let parts = [(0, 0), (0, 4), (4, 7), (7, 11), (11, 12)];
+        let calls: Vec<_> = parts.into_iter().flat_map(|(a, b)| submission_ranges(a, b, 2, Some(9))).collect();
+        assert_eq!(calls, [(0, 2), (2, 4), (4, 7), (7, 9), (9, 11), (11, 12)]);
+        assert_eq!(calls.into_iter().flat_map(|(a, b)| a..b).collect::<Vec<_>>(), (0..12).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn serial_timing_groups_keep_prefix_once_and_never_resubmit_it() {
+        let groups = [(0, 5), (5, 10)];
+        let calls: Vec<_> = groups.into_iter().flat_map(|(a, b)| submission_ranges(a, b, 2, Some(8))).collect();
+        assert_eq!(calls, [(0, 2), (2, 5), (5, 8), (8, 10)]);
+        assert_eq!(submission_ranges(2, 8, 2, Some(8)).collect::<Vec<_>>(), [(2, 8)]);
     }
 }
 
@@ -4468,6 +4553,7 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut maintenance = Vec::new();
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
@@ -4529,6 +4615,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    let mut jobs = Vec::new();
                     for (shadow, ranges) in &dirty {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
@@ -4539,8 +4626,6 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         let joins = rehash_runs() || own.is_some();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
@@ -4561,9 +4646,17 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            card_pass(list, &run, size as u32, 0, 0);
+                            jobs.push(maintenance::Job {
+                                source: shadow.buffer.clone(),
+                                hashes: before.clone(),
+                                span: run,
+                                size: size as u32,
+                                out_at: 0,
+                                mode: 0,
+                            });
                         }
                     }
+                    self.record_maintenance(list, &jobs, &work.differs.0, &mut maintenance, 0);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -4583,6 +4676,7 @@ impl Host {
             sent_as,
             looks,
             sends: own.map(send::Own::memory),
+            maintenance,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -4659,17 +4753,24 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    let mut jobs = Vec::new();
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                        jobs.push(maintenance::Job {
+                            source: r.shadow.buffer.clone(),
+                            hashes: before.clone(),
+                            span: r.span,
+                            size: size as u32,
+                            out_at: r.at,
+                            mode: if flown && !r.picked { 2 } else { 1 },
+                        });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    self.record_maintenance(list, &jobs, &work.differs.0, &mut plan.maintenance, 1);
                     list.Close()?;
                     list.cast()
                 })()
@@ -4682,6 +4783,48 @@ impl Host {
         }
         work.out += 1;
         Some(plan)
+    }
+
+    /// Prepare the entire phase before binding any batched resources. A
+    /// rejected plan preserves the original job order and all result slots.
+    ///
+    /// # Safety
+    /// The list is open, with the legacy hash root signature/pipeline bound,
+    /// and producers transitioned/ordered as required by `card_pass`.
+    unsafe fn record_maintenance(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        jobs: &[maintenance::Job],
+        differs: &ID3D12Resource,
+        leases: &mut Vec<maintenance::Batch>,
+        phase: usize,
+    ) {
+        if jobs.is_empty() {
+            return;
+        }
+        if maintenance_batches() {
+            if let Some(mut batch) = maintenance::prepare(self, jobs, differs) {
+                CARD_LAUNCHES[phase].fetch_add(batch.dispatches() as u64, Ordering::Relaxed);
+                // SAFETY: the caller established producer ordering and states;
+                // preparation validated every complete shader footprint.
+                unsafe { batch.record(list) };
+                leases.push(batch);
+                return;
+            }
+            CARD_LAUNCHES[phase + 2].fetch_add(1, Ordering::Relaxed);
+        }
+        for job in jobs {
+            // SAFETY: caller's legacy bindings/states; original jobs retained.
+            unsafe {
+                list.SetComputeRootShaderResourceView(1, job.source.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(2, job.hashes.GetGPUVirtualAddress());
+                card_pass(list, &job.span, job.size, job.out_at, job.mode);
+            }
+            CARD_LAUNCHES[phase].fetch_add(
+                u64::from(job.span.pieces.div_ceil(D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION)),
+                Ordering::Relaxed,
+            );
+        }
     }
 
     /// With [`relay`]: whether the compare's result area is half taken by
@@ -5874,7 +6017,7 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let mut card = self.card_before(&declared, &picked, flown);
         if let Some(probe) = probe {
             let finished = FINISHED.load(Ordering::Acquire);
             two_queues::place(probe, this_submission, card.is_some(), own.is_some(), runs.len(), finished);
@@ -5884,7 +6027,9 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
+        let mut checker_at = None;
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+            checker_at = Some(lists.len());
             lists.push(Some(check));
         }
         split.part(4);
@@ -5902,12 +6047,18 @@ impl Host {
         stage.next("submit: sending");
         // When it runs on the card, for the timeline.
         #[cfg(feature = "diagnostics")]
+        let mut opening_stamps = 0;
+        #[cfg(not(feature = "diagnostics"))]
+        let opening_stamps = 0;
+        #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
         #[cfg(feature = "diagnostics")]
         if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
             lists.insert(0, Some(ahead));
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
+            checker_at.iter_mut().for_each(|at| *at += 1);
+            opening_stamps += 1;
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
@@ -5918,13 +6069,23 @@ impl Host {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
+                checker_at.iter_mut().for_each(|at| *at += 1);
+                opening_stamps += 1;
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
+                if let Some(card) = &mut card {
+                    card.maintenance_submitted(&self.fence, *submitted);
+                }
                 let mut from = 0;
+                // A checker appended to the producer Execute call can overlap
+                // it. A separate call orders COPY and UAV writers and permits
+                // buffer decay/promotion before the checker reads their bytes.
                 for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
+                    for (a, b) in submission_ranges(from, to, opening_stamps, checker_at) {
+                        self.queue.ExecuteCommandLists(&lists[a..b]);
+                    }
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
@@ -5962,24 +6123,34 @@ impl Host {
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<(usize, usize)> = if timing() {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
+                .enumerate()
+                // Opening diagnostic lists precede the first run. Keep them
+                // in its group, then split their Execute call below.
+                .map(|(i, (&a, &b))| (if i == 0 { 0 } else { a }, b))
                 .collect()
         } else {
-            vec![&lists[..]]
+            vec![(0, lists.len())]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = [(0, lists.len())];
+        if let Some(card) = &mut card {
+            // SAFETY: the final native signal covers all prefix work and all
+            // groups, including the checker. An absent signal quarantines it.
+            unsafe { card.maintenance_submitted(&self.fence, *submitted + groups.len() as u64) };
+        }
         submitting(2, runs.len());
-        for (i, group) in groups.iter().enumerate() {
+        for (i, &(from, to)) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                for (a, b) in submission_ranges(from, to, opening_stamps, checker_at) {
+                    self.queue.ExecuteCommandLists(&lists[a..b]);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -9359,6 +9530,16 @@ impl Meter {
                      ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \
                      {wc_left:.1} MB declared written in write-combined memory left on the card (VICTORY_WC_NO_BACK)",
                     if rehash_runs() { "on" } else { "off" }
+                );
+            }
+            let [hash, compare, hash_fallback, compare_fallback] =
+                [0, 1, 2, 3].map(|i| CARD_LAUNCHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if hash + compare > 0.0 {
+                tracing::info!(
+                    "native card maintenance dispatches per frame: {hash:.0} rehash, {compare:.0} compare; \
+                     {hash_fallback:.1} rehash and {compare_fallback:.1} compare phases retained legacy work \
+                     (VICTORY_MAINTENANCE_BATCHES={})",
+                    u8::from(maintenance_batches())
                 );
             }
         }
