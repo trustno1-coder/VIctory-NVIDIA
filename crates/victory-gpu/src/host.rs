@@ -127,8 +127,20 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
+/// For tests (the memory bench, `membench`): the free physical RAM that
+/// [`available_physical_ram`] and the pressure of [`crate::residency`] tell,
+/// plus one; 0 (the default): the system's. What is kept by free RAM
+/// (`ram_idle_ms`) is looked at with it.
+#[cfg(test)]
+pub(crate) static FREE_RAM_SAID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
 pub(crate) fn available_physical_ram() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(said) = FREE_RAM_SAID.load(Ordering::Relaxed).checked_sub(1) {
+        return Some(said);
+    }
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
@@ -3839,6 +3851,8 @@ pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
 mod font;
+#[cfg(test)]
+mod membench;
 mod menu;
 mod panel;
 mod place;
@@ -4876,6 +4890,9 @@ impl Host {
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
             f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            // (A local of this thread: the memory bench reads its size here.)
+            #[cfg(test)]
+            membench::RELAY_FETCH.store(size, Ordering::Relaxed);
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));

@@ -507,7 +507,7 @@ impl Drop for Staging {
 
 /// For the memory line: staging buffers alive, their bytes, and how many
 /// of them their texture still has (the others wait for a list's reset).
-#[cfg(feature = "diagnostics")]
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn memory() -> [u64; 3] {
     use std::sync::atomic::Ordering::Relaxed;
     let kept = STAGING
@@ -522,7 +522,7 @@ pub(crate) fn memory() -> [u64; 3] {
 static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// For the memory line: staging buffers let go as idle, and their bytes.
-#[cfg(feature = "diagnostics")]
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn let_go() -> [u64; 2] {
     use std::sync::atomic::Ordering::Relaxed;
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
