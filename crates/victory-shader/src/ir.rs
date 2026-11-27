@@ -178,7 +178,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             offset: machine.offset,
             what: "unknown opcode",
         })?;
-        let mut fields = machine.fields(wave64);
+        let mut fields = lane_wrapped_fields(&machine, name, wave64);
         // A move to or from a scalar parked in a VGPR lane (`unspill`): its register
         // codes may be ones the machine word cannot hold.
         if let Ok(k) = parked.binary_search_by_key(&n, |m| m.0)
@@ -266,6 +266,29 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 /// a scalar later, say. Where that keeps a pair from being one, each life of a
 /// lane (the saves that reach a restore in common, and those restores) is a
 /// store of its own.
+/// The fields of `inst`, a constant lane of `v_readlane_b32` / `v_writelane_b32` taken
+/// modulo the wave as the console takes it (S1[4:0] in wave32, S1[5:0] in wave64), before any
+/// pass matches a write to a read: in wave32 lanes 36 and 4 are one slot (`unspill`). As
+/// UwUCammie found and did in jtrudeau1530/VIctory-7900XTX#38.
+fn lane_wrapped_fields(inst: &gfx10::Instruction, name: &str, wave64: bool) -> Fields {
+    let mut fields = inst.fields(wave64);
+    if matches!(name, "v_readlane_b32" | "v_writelane_b32")
+        && let Fields::Valu(v) = &mut fields
+        && let Some(lane) = v.src.get_mut(1)
+    {
+        let constant = match *lane {
+            Operand::Const(code) => crate::resource::inline(code),
+            Operand::Literal(value) => Some(value),
+            _ => None,
+        };
+        if let Some(value) = constant {
+            let mask = if wave64 { 63 } else { 31 };
+            *lane = Operand::Const(128 + (value & mask) as u8);
+        }
+    }
+    fields
+}
+
 fn unspill(
     list: &mut [gfx10::Instruction],
     flows: &[Flow],
@@ -304,7 +327,7 @@ fn unspill(
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     for inst in list.iter() {
         let Some(name) = inst.name() else { return Vec::new() };
-        let fields = inst.fields(wave64);
+        let fields = lane_wrapped_fields(inst, name, wave64);
         let park = parked(inst, &fields);
         let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
             return Vec::new();
@@ -1708,6 +1731,30 @@ mod tests {
     fn build_words(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         build(&code, wave64, 256).unwrap()
+    }
+
+    /// A scalar parked in lane 36 and read back from it: in wave32 that is lane 4, which a
+    /// later write takes over, so the read is that write's scalar; in wave64 the two lanes stay
+    /// apart (`lane_wrapped_fields`).
+    #[test]
+    fn a_constant_lane_past_the_wave_is_its_lane_modulo_the_wave() {
+        let words = [
+            0xD761_0005,
+            (164 << 9) | 2, // v_writelane_b32 v5, s2, 36
+            0xD761_0005,
+            (132 << 9) | 3, // v_writelane_b32 v5, s3, 4
+            0xD760_000C,
+            (164 << 9) | 261, // v_readlane_b32 s12, v5, 36
+            S_ENDPGM,
+        ];
+        for wave64 in [false, true] {
+            let p = build_words(&words, wave64);
+            let insts = &p.blocks[0].insts;
+            let latest = if wave64 { 0 } else { 1 };
+            let (slot, saved) = insts[latest].writes[0];
+            assert_eq!(insts[2].name(), "s_mov_b32", "wave64 {wave64}: the read back is a move");
+            assert_eq!(insts[2].read(slot), Some(saved), "wave64 {wave64}: it reads write {latest}'s scalar");
+        }
     }
 
     fn input(p: &Program, reg: Reg) -> Value {

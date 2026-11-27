@@ -6432,7 +6432,8 @@ impl<'a> Lower<'a> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                // SCC is whether S0 was chosen (S0 < S1, S0 > S1), not D != 0.
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -9238,7 +9239,16 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let host_lane = self.mask_data == MaskData::Host && !matches!(lane, V::Const(_));
+                // The console reads lane S1[4:0] (wave32) or S1[5:0] (wave64): a select
+                // past the wave wraps.
+                let lane = if host_lane {
+                    lane
+                } else {
+                    let wm = self.s.m.i32(self.wave() - 1);
+                    self.s.m.bin(self.cur, Bin::And, lane, wm)
+                };
+                if host_lane {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
@@ -9301,6 +9311,9 @@ impl<'a> Lower<'a> {
                     return Err("a lane write in a half-wave");
                 }
                 let me = self.console_lane();
+                // The lane is S1[4:0] (wave32) or S1[5:0] (wave64), as for `v_readlane_b32`.
+                let wm = self.s.m.i32(self.wave() - 1);
+                let lane = self.s.m.bin(c, Bin::And, lane, wm);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
