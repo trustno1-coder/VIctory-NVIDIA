@@ -160,11 +160,32 @@ thread_local! {
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether [`State::bring_bake_sources`] synchronously uploads the exact
+/// textures referenced by a decoration bake draw (`VICTORY_BAKE_SOURCES=0`: off).
+fn bake_sources_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_SOURCES").is_none_or(|v| v != "0"))
+}
+
+/// Resolves the synchronous full-heap texture pass budget before decoration
+/// bakes: when `VICTORY_BAKE_SOURCES` is enabled (the default) and
+/// `VICTORY_BAKE_TEXTURES_MS` is not explicitly set, return `0` so decoration
+/// bakes upload only their own referenced sources instead of stalling for up
+/// to 1,500 ms uploading thousands of unrelated world textures synchronously.
+fn resolve_bake_ms(explicit: Option<u64>, sources_on: bool) -> u64 {
+    match explicit {
+        Some(ms) => ms,
+        None if sources_on => 0,
+        None => 1500,
+    }
+}
+
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
 /// (`VICTORY_EARLY_TEXTURES_MS`, 12; 0: never, as before), and the
-/// milliseconds it may take just before a draw of the title's decoration
-/// bake (`VICTORY_BAKE_TEXTURES_MS`, 1500; 0: nothing special).
+/// milliseconds the full-heap pass may take just before a draw of the title's
+/// decoration bake (`VICTORY_BAKE_TEXTURES_MS`, default 0 when
+/// `VICTORY_BAKE_SOURCES=1`, else 1500).
 ///
 /// The pass ran only from the first world frame on, where it met some
 /// 24,000 slots at once and needed 60-80 frames for them. The title bakes
@@ -176,10 +197,11 @@ thread_local! {
 fn early_budgets() -> (u64, u64) {
     static MS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
-        let ms = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
-        };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        let parse = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (
+            parse("VICTORY_EARLY_TEXTURES_MS").unwrap_or(12),
+            resolve_bake_ms(parse("VICTORY_BAKE_TEXTURES_MS"), bake_sources_on()),
+        )
     })
 }
 
@@ -2696,8 +2718,7 @@ impl State {
         host: &crate::descriptor::host::HostHeap,
         sync: &mut BakeSync,
     ) -> Option<[u64; BAKE_SOURCE_COUNTS]> {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_SOURCES").is_none_or(|v| v != "0")) {
+        if !bake_sources_on() {
             return None;
         }
         let mut n = [0u64; BAKE_SOURCE_COUNTS];
@@ -2809,10 +2830,11 @@ impl State {
     /// never submit a bake draw ahead of its texture uploads.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
-        if compute || (early_ms == 0 && bake_ms == 0) {
+        let bake_active = bake_ms > 0 || bake_sources_on();
+        if compute || (early_ms == 0 && !bake_active) {
             return;
         }
-        let is_bake = bake_ms > 0 && self.is_bake_draw(p);
+        let is_bake = bake_active && self.is_bake_draw(p);
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
@@ -5956,5 +5978,13 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+
+    #[test]
+    fn bake_pass_budget_skips_full_heap_when_sources_on() {
+        assert_eq!(super::resolve_bake_ms(None, true), 0);
+        assert_eq!(super::resolve_bake_ms(None, false), 1500);
+        assert_eq!(super::resolve_bake_ms(Some(250), true), 250);
+        assert_eq!(super::resolve_bake_ms(Some(0), false), 0);
     }
 }
