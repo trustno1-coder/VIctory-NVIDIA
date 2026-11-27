@@ -1293,6 +1293,35 @@ pub(crate) fn nothing_put(block: usize) -> bool {
     count.load(Relaxed) < crate::titlewrite::MOST && count.fetch_add(1, Relaxed) < crate::titlewrite::MOST
 }
 
+/// Descriptor heap hooks (`crate::heap_hooks`): the 64 KiB block of title
+/// memory at `at` was written through our own view of its page, with no
+/// fault. It is told as written at every address the title shows the page
+/// at, as [`put_beside`] tells it: the guard stays, the block is no longer
+/// known by its bit, and the next asking takes it.
+pub(crate) fn written_beside(at: usize) {
+    let page = at / BLOCK * BLOCK;
+    let mut views = crate::inplace::pages_of(page);
+    if views.is_empty() {
+        views.push(page);
+    }
+    for &view in &views {
+        BESIDE.set(view / BLOCK);
+    }
+    for view in views {
+        PUBLISHED.clear(view / BLOCK);
+    }
+}
+
+/// Descriptor heap hooks: the blocks of `[first, last)` that are neither
+/// guarded nor known to be unmapped (memory that is to stay guarded, and was
+/// opened by a change of mapping or by a write of ours).
+pub(crate) fn unguarded(first: usize, last: usize) -> Vec<usize> {
+    let g = guards();
+    (first..last)
+        .filter(|&block| !g.protected.contains(block) && !g.absent.contains(block))
+        .collect()
+}
+
 /// The title is about to write block by block around `at`: as by a fault.
 pub(crate) fn opened_for_writing(at: usize) {
     let mut g = guards();
@@ -1437,6 +1466,8 @@ pub(crate) fn guarded(start: usize, end: usize) -> bool {
 /// Whether nothing of `[start, end)` can have been written since an asking
 /// noted it in the journal ([`PUBLISHED`]).
 fn published(start: usize, end: usize) -> bool {
+    // (Blocks written through our view by the heap hooks are told first.)
+    crate::heap_hooks::tell_watch();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // (In this order: who puts something in beside a guard sets the one bit,
     // then clears the other, which an asking that is publishing the block may
@@ -1967,6 +1998,8 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    // (Blocks written through our view by the heap hooks are told first.)
+    crate::heap_hooks::tell_watch();
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -3102,6 +3135,12 @@ pub(crate) fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
+        // Descriptor heap hooks: the hooked view heap is written through its hooks
+        // only; a write that faults on its guard is one they miss, and is traced
+        // (`crate::heap_hooks`; its STRICT switch stops the process there).
+        if PROTECTED.any(block, block + 1) {
+            crate::heap_hooks::guard_fault(at, r.ExceptionAddress as usize, context);
+        }
         if ours.is_none()
             && PROTECTED.any(block, block + 1)
             // SAFETY: the context the system passes, to go on from.

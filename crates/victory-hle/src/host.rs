@@ -83,6 +83,8 @@ impl HostPolicy {
         #[cfg(windows)]
         if let ImportSymbol::Name { name, .. } = symbol {
             let ours = victory_gpu::titlewrite::import(name, address);
+            // Descriptor heap hooks: copies into the hooked view heap go through our view.
+            let ours = victory_gpu::heap_hooks::import(name, ours);
             if ours != address {
                 return Some(ours);
             }

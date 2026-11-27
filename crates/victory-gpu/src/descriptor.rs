@@ -472,24 +472,46 @@ pub(crate) fn sync_heaps() {
         kinds[4] += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
-        let began = std::time::Instant::now();
-        let taken = written.take(start as usize, end as usize);
-        spent[0] += since(began);
+        // Ranges of the heap to look at.
         let mut parts: Vec<(usize, usize)> = Vec::new();
-        for (range_from, range_end) in taken {
-            let mut page = range_from & !(crate::watch::PAGE - 1);
-            while page < range_end {
-                parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
-                page += crate::watch::PAGE;
+        // Descriptor heap hooks: the slots the title's hooked writers and our own
+        // calls wrote records into, in place of the changed pages.
+        let hooked = crate::heap_hooks::adopted(start);
+        if hooked {
+            // First, a block that is not guarded any more (a change of mapping
+            // opened it) is guarded again, and what was written there meanwhile is
+            // noted: every write into the heap is a hooked one, or faults.
+            let began = std::time::Instant::now();
+            crate::heap_hooks::reguard(start, |from, to| written.take(from, to));
+            spent[0] += since(began);
+            for (first, n) in crate::heap_hooks::take(start).unwrap_or_default() {
+                let from = start as usize + first as usize * step as usize;
+                parts.push((from, from + n as usize * step as usize));
+            }
+        } else {
+            let began = std::time::Instant::now();
+            let taken = written.take(start as usize, end as usize);
+            spent[0] += since(began);
+            for (range_from, range_end) in taken {
+                let mut page = range_from & !(crate::watch::PAGE - 1);
+                while page < range_end {
+                    parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
+                    page += crate::watch::PAGE;
+                }
             }
         }
+        // The hooks' runs are short: more of them a job.
+        let pages_a_job = if hooked { pages_a_job.max(parts.len() / 48) } else { pages_a_job };
         // A few pages a thread at a time: read, compared with what was last
         // seen there and sorted out, beside one another (14 ms a frame of one
         // thread at 160 pages, run faults-6).
         let began = std::time::Instant::now();
         let copied = host.copied_begin(step as usize);
         let samplers = heap.samplers();
-        let in_place = sync_in_place() && step == 32 && crate::safecopy::on();
+        // (A hooked round is read through the kernel, as the donor's: a run of
+        // marked slots is no page, and the heap's memory is read-only at the
+        // title's addresses by design.)
+        let in_place = sync_in_place() && step == 32 && crate::safecopy::on() && !hooked;
         let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(pages_a_job).map(|_| Default::default()).collect();
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
@@ -529,8 +551,12 @@ pub(crate) fn sync_heaps() {
                     if !crate::host::read_into(from as *const u8, &mut page_bytes) {
                         continue;
                     }
-                    out.pages += 1;
-                    out.views += u64::from(crate::watch::guarded(from, to));
+                    // (A hooked run of marked slots is no page; nor does it ask
+                    // the guards.)
+                    if !hooked {
+                        out.pages += 1;
+                        out.views += u64::from(crate::watch::guarded(from, to));
+                    }
                     out.bytes += (to - from) as u64;
                     let Some(records) = page_bytes.get(lead.wrapping_sub(from)..) else {
                         continue;
@@ -740,6 +766,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    crate::heap_hooks::line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -900,6 +927,7 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        crate::heap_hooks::let_go(self.start);
     }
 }
 
@@ -1644,8 +1672,23 @@ fn record(handle: u64, view: View) {
         return;
     }
     let [i, generation] = words_for(view);
-    // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-    unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    let words = [VIEW_TAG, i, generation];
+    // Descriptor heap hooks: into the hooked view heap through our view of
+    // it (its pages are read-only at the title's address), and noted.
+    #[cfg(windows)]
+    let hooked = {
+        let mut bytes = [0u8; 12];
+        for (k, word) in words.iter().enumerate() {
+            bytes[4 * k..4 * k + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        crate::heap_hooks::write(handle, &bytes)
+    };
+    #[cfg(not(windows))]
+    let hooked = false;
+    if !hooked {
+        // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+        unsafe { (handle as *mut [u32; 3]).write_unaligned(words) };
+    }
     #[cfg(windows)]
     mirror(handle);
 }
@@ -1891,9 +1934,12 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
+        // (Into the hooked view heap: through our view, and noted.)
         #[cfg(windows)]
         unsafe {
-            crate::titlewrite::put(dst as *mut u8, src as *const u8, len as usize)
+            if !crate::heap_hooks::copy(dst, src, len as usize) {
+                crate::titlewrite::put(dst as *mut u8, src as *const u8, len as usize)
+            }
         };
         // SAFETY: as above.
         #[cfg(not(windows))]
@@ -2027,6 +2073,11 @@ pub(crate) extern "system" fn create_heap(
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
     });
+    // Descriptor heap hooks: the title's hooked writers tell this heap's slots.
+    #[cfg(windows)]
+    if placed && visible && desc.kind == VIEWS_KIND {
+        crate::heap_hooks::adopt(start, desc.count);
+    }
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;

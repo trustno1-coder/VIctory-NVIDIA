@@ -358,6 +358,8 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    // The hooked view heap's way to our view there goes too.
+    crate::heap_hooks::views_gone(at, len);
     let mut v = views_mut();
     if v.views.is_empty() {
         return;

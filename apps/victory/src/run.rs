@@ -330,6 +330,31 @@ pub fn run(
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
     }
+    // Descriptor heap hooks (VICTORY_HEAP_HOOKS=1): every store of the title's
+    // into its view heap goes through our view of its pages and notes its
+    // slots, so a round of the heaps' records reads those slots and no others
+    // (`victory-gpu`'s `heap_hooks`). All of them or none: a site whose bytes
+    // differ leaves the title as it is, and says which.
+    #[cfg(windows)]
+    if execute && victory_hle::heap_hooks::on() {
+        use victory_loader::heap_sites::{apply, sites};
+        let size = image.info().size_of_image as usize;
+        let sites = sites();
+        // SAFETY: the image stays mapped, nothing of it has run yet, and the
+        // cells and the call are statics of `victory-gpu`.
+        match unsafe { apply(image.base(), size, victory_hle::heap_hooks::cells_address(), victory_hle::heap_hooks::resolve_address(), &sites) } {
+            Ok((hooked, mirror)) => {
+                println!("heap hooks: {} places of the title's stores into its view heap hooked", hooked.len());
+                victory_hle::heap_hooks::hooked(image.base(), size, hooked.iter().map(|h| (h.span, h.stub, h.len)).collect(), mirror);
+                // The trace of the writers no hook took, beside the crash log.
+                victory_hle::heap_hooks::trace_to(temp.with_file_name("heap-writers.tsv"));
+            }
+            Err(why) => {
+                println!("heap hooks: off for this executable: {why}");
+                victory_hle::heap_hooks::refused(&why);
+            }
+        }
+    }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
     // clock ticks at that interval (victory-gpu), and the title is given
     // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS
@@ -379,6 +404,8 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
+    #[cfg(windows)]
+    victory_hle::heap_hooks::write_trace();
     Ok(())
 }
 

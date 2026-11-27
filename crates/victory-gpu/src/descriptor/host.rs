@@ -879,6 +879,8 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ([`HostHeap::texture_slots_page_written`]), as [`remapped`] keeps its
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
+    // The hooked view heap's slots there changed with no hooked write.
+    crate::heap_hooks::changed(at, len);
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
@@ -941,6 +943,9 @@ fn stale_rule() -> Rule {
 /// ([`HostHeap::texture_slots_remapped`]). Called with the runtime's own
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
+    // The hooked view heap's slots there changed with no hooked write, and
+    // what shows them may have.
+    crate::heap_hooks::changed(at, len);
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
