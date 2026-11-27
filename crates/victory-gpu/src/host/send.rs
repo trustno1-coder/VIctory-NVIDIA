@@ -200,11 +200,16 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let mut copies = Vec::with_capacity(dirty.len());
     for (_, ranges) in dirty {
         let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
+        let mut words = 0usize;
+        for &(a, b) in ranges {
+            let len = b - a;
+            if short(&(a, b)) {
+                words += len / 4;
+            } else {
+                runs.push((a, at, len));
+                at += (len as u64).next_multiple_of(16);
+            }
         }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
         copies.push(Copy { runs, pairs: (at, words as u32) });
         at += (words as u64 * 8).next_multiple_of(16);
     }

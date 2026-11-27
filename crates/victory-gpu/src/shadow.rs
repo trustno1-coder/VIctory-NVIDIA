@@ -3727,11 +3727,18 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return 0;
         }
-        let was = title.clone();
-        if !merge_piece(now, held, title) {
-            return 0;
+        thread_local! {
+            static MERGE_WAS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        put_changed(start + at, &was, title)
+        MERGE_WAS.with(|cell| {
+            let mut was = cell.borrow_mut();
+            was.clear();
+            was.extend_from_slice(title);
+            if !merge_piece(now, held, title) {
+                return 0;
+            }
+            put_changed(start + at, &was, title)
+        })
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
