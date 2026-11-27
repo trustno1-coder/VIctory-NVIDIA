@@ -30,6 +30,8 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# The A/B switches (`VICTORY_AB`) in a build without the rest of diagnostics.
+ab = ["victory-hle/ab"]
 
 [lints]
 workspace = true

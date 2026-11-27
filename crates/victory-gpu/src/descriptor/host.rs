@@ -253,7 +253,7 @@ pub(crate) static SPANS_QUICK: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// 113). What is done is the same: forgetting a slot that is not there does
 /// nothing.
 fn spans_quick() -> bool {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_SPANS_QUICK") {
         return on;
     }
@@ -355,7 +355,7 @@ pub(crate) fn show_after() -> bool {
 /// it showed (or the neutral texture) and flips it when every submission
 /// begun before the texture was made has finished.
 pub(crate) fn show_new_later() -> bool {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_SHOW_NEW_LATER") {
         return on;
     }
@@ -5182,7 +5182,7 @@ fn kin(old: &View, new: &View) -> Kin {
 /// texture; 1: one of the same kind in another place or size; 2: any of the
 /// same dimension.
 fn keep_shown() -> u8 {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
         return if on { 2 } else { 0 };
     }

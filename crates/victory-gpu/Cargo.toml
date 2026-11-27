@@ -25,6 +25,8 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# The A/B switches (`VICTORY_AB`, crate::ab) without the rest of diagnostics.
+ab = []
 
 [lints]
 workspace = true

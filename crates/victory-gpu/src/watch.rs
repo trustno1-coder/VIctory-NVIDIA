@@ -1646,14 +1646,14 @@ fn hot() -> Option<std::time::Duration> {
         static HOT: std::sync::OnceLock<(std::time::Duration, Option<u32>)> = std::sync::OnceLock::new();
         let &(keep, _bit) = HOT.get_or_init(|| {
             let ms = std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|ms| *ms > 0.0);
-            #[cfg(feature = "diagnostics")]
+            #[cfg(any(feature = "diagnostics", feature = "ab"))]
             let bit = crate::ab::bit("VICTORY_GUARD_HOT");
-            #[cfg(not(feature = "diagnostics"))]
+            #[cfg(not(any(feature = "diagnostics", feature = "ab")))]
             let bit = None;
             let ms = ms.or(bit.map(|_| 50.0)).unwrap_or(0.0);
             (std::time::Duration::from_secs_f64(ms.min(1e6) / 1000.0), bit)
         });
-        #[cfg(feature = "diagnostics")]
+        #[cfg(any(feature = "diagnostics", feature = "ab"))]
         if _bit.is_some_and(|bit| !crate::ab::on(bit)) {
             return None;
         }

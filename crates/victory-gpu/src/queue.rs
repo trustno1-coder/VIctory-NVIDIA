@@ -1038,6 +1038,8 @@ extern "system" fn present(
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
+        #[cfg(all(feature = "ab", not(feature = "diagnostics")))]
+        ab_frame_ends();
         return S_OK;
     }
     #[cfg(windows)]
@@ -1082,7 +1084,20 @@ extern "system" fn present(
     called.end();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
+    #[cfg(all(windows, feature = "ab", not(feature = "diagnostics")))]
+    ab_frame_ends();
     S_OK
+}
+
+/// In a build with `ab` and without diagnostics, the A/B
+/// phases move on at the title's presents as [`frame_ends`] does.
+#[cfg(all(windows, feature = "ab", not(feature = "diagnostics")))]
+fn ab_frame_ends() {
+    crate::ab::presented(|switch, was, will| {
+        if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
+            behind::leave();
+        }
+    });
 }
 
 /// Diagnostics: the title's present is over.

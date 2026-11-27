@@ -89,7 +89,8 @@ pub mod signature;
 #[cfg(windows)]
 pub mod streamline;
 mod switch;
-#[cfg(all(windows, feature = "diagnostics"))]
+// Also in builds with the `ab` feature alone (A/B in a release build).
+#[cfg(all(windows, any(feature = "diagnostics", feature = "ab")))]
 mod ab;
 #[cfg(windows)]
 mod tdr;
@@ -114,7 +115,7 @@ pub use upload::reserve_space as reserve_upload_space;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(windows, any(feature = "diagnostics", feature = "ab")))]
 pub fn switched(switch: &str) -> Option<bool> {
     ab::pick(switch)
 }

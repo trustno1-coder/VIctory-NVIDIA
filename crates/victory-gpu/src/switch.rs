@@ -23,7 +23,7 @@ pub(crate) fn on(name: &str) -> bool {
 #[doc(hidden)]
 macro_rules! toggled {
     ($name:literal) => {{
-        #[cfg(feature = "diagnostics")]
+        #[cfg(any(feature = "diagnostics", feature = "ab"))]
         {
             static BIT: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
             match BIT.get_or_init(|| match $crate::ab::bit($name) {
@@ -34,7 +34,7 @@ macro_rules! toggled {
                 Err(bit) => $crate::ab::on(*bit),
             }
         }
-        #[cfg(not(feature = "diagnostics"))]
+        #[cfg(not(any(feature = "diagnostics", feature = "ab")))]
         {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ON.get_or_init(|| std::env::var_os($name).is_none_or(|v| v != "0"))
@@ -52,7 +52,7 @@ macro_rules! asked_for {
     ($name:literal) => {{
         static ASKED: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
         let asked = ASKED.get_or_init(|| {
-            #[cfg(feature = "diagnostics")]
+            #[cfg(any(feature = "diagnostics", feature = "ab"))]
             if let Some(bit) = $crate::ab::bit($name) {
                 return Err(bit);
             }
@@ -60,9 +60,9 @@ macro_rules! asked_for {
         });
         match *asked {
             Ok(on) => on,
-            #[cfg(feature = "diagnostics")]
+            #[cfg(any(feature = "diagnostics", feature = "ab"))]
             Err(bit) => $crate::ab::on(bit),
-            #[cfg(not(feature = "diagnostics"))]
+            #[cfg(not(any(feature = "diagnostics", feature = "ab")))]
             Err(_) => false,
         }
     }};

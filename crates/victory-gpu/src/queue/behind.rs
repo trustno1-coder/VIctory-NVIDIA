@@ -752,7 +752,7 @@ thread_local! {
 /// the relay has them, and lists cut at their waits).
 pub(super) fn on() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`).
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_ASYNC_SUBMIT") {
         return on && started();
     }
@@ -764,7 +764,7 @@ pub(super) fn on() -> bool {
 
 /// The line is about to be left for the way without it: everything in it is
 /// done first. (At a present, by the title's thread that submits.)
-#[cfg(feature = "diagnostics")]
+#[cfg(any(feature = "diagnostics", feature = "ab"))]
 pub(super) fn leave() {
     LANE.wait_presents(0);
     LANE.drain();

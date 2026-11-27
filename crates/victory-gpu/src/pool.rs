@@ -475,7 +475,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
 /// 64 KiB multiples have none of that, for some memory (at most 60 KiB a
 /// small texture).
 fn small_placement() -> bool {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_POOL_SMALL") {
         return on;
     }
