@@ -50,8 +50,7 @@ fn paint_text(
     rim: u32,
     script: Script,
     colours: [&[u8]; 2],
-    pitch: usize,
-    out: &mut [u8],
+    (out, pitch): (&mut [u8], usize),
 ) -> Option<()> {
     // SAFETY: a private DC, a top-down 32-bit DIB of the requested size, and
     // counted UTF-16 strings with one advance per code unit. The bits are read
@@ -157,7 +156,7 @@ pub(super) fn painted(
     pitch: usize,
 ) -> Vec<u8> {
     let mut out = vec![0; pitch * size.1 as usize];
-    if paint_text(lines, size, scale, rim, script, colours, pitch, &mut out).is_none() {
+    if paint_text(lines, size, scale, rim, script, colours, (&mut out, pitch)).is_none() {
         static WARN: std::sync::Once = std::sync::Once::new();
         WARN.call_once(|| tracing::warn!("could not draw overlay text with Windows GDI"));
         for pixel in out.chunks_exact_mut(colours[0].len()) {
