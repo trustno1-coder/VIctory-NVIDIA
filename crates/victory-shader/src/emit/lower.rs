@@ -558,6 +558,104 @@ pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<us
     Some(out)
 }
 
+/// Joins of a compare's mask past a per-lane branch ([`Self::skipped`]): the per-lane branches'
+/// regions by branch block ([`lane_regions`]), and where each value is written.
+struct CompareJoins {
+    regions: HashMap<usize, Vec<bool>>,
+    defs: HashMap<Value, (usize, Def)>,
+}
+
+/// How a value is written: by the join of that index in its block, by a compare (`v_cmp_*`;
+/// not `v_cmpx_*`, which writes EXEC) or otherwise.
+#[derive(Clone, Copy)]
+enum Def {
+    Join(usize),
+    Compare,
+    Other,
+}
+
+impl CompareJoins {
+    /// None with an indirect exit.
+    fn new(p: &Program, st: &Structured) -> Option<Self> {
+        let regions = lane_regions(st)?.into_iter().collect();
+        let mut defs = HashMap::new();
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, phi) in block.phis.iter().enumerate() {
+                defs.insert(phi.value, (b, Def::Join(i)));
+            }
+            for inst in &block.insts {
+                let name = inst.name();
+                let def = if name.starts_with("v_cmp_") && !name.starts_with("v_cmpx_") {
+                    Def::Compare
+                } else {
+                    Def::Other
+                };
+                for &(_, v) in &inst.writes {
+                    defs.insert(v, (b, def));
+                }
+            }
+        }
+        Some(CompareJoins { regions, defs })
+    }
+
+    /// A compare inside a per-lane branch whose mask a join after the branch's region reads:
+    /// the blocks of that region through which the compare's mask reaches the phi at `(b, i)`,
+    /// while the branch's other lanes bring their old mask past the region. On the console the
+    /// wave runs the region when any lane does, and a compare (`v_cmp_*` writing VCC or an SGPR
+    /// pair) writes the whole mask with 0 for the lanes EXEC leaves out (RDNA2 ISA, VOPC), so
+    /// after the join every lane has the region's mask: its own bit 0 where it skipped, the
+    /// region's number as data. Per lane, a lane that skipped keeps the old mask. Taking those
+    /// branches wave-wide ([`branches_around`], `emit`'s retry) is what the console does.
+    /// `skip_bits`, for a join read as lane bits: each edge's incoming bit
+    /// ([`Structured::phi_masks`]); an edge whose lanes all bring 0 is right per lane. Empty
+    /// where per lane is right. Found by the RDNA2 oracle (`oracle_tests`).
+    fn skipped(&self, p: &Program, b: usize, i: usize, skip_bits: Option<&[Bool]>) -> Vec<usize> {
+        let block = &p.blocks[b];
+        let phi = &block.phis[i];
+        let mut out = Vec::new();
+        for (n, &q) in block.preds.iter().enumerate() {
+            if skip_bits.is_some_and(|bits| bits.get(n) == Some(&Bool::FALSE)) {
+                continue;
+            }
+            // (an edge from a per-lane branch past its region, not into it)
+            let Some(region) = self.regions.get(&q).filter(|region| !region[b]) else {
+                continue;
+            };
+            for (m, &r) in block.preds.iter().enumerate() {
+                if region[r]
+                    && phi.args[m] != phi.args[n]
+                    && self.compare_in(p, region, phi.args[m], &mut HashSet::new())
+                    && !out.contains(&r)
+                {
+                    out.push(r);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `v` is a compare's mask written in `region`, or a join in `region` of one.
+    fn compare_in(
+        &self,
+        p: &Program,
+        region: &[bool],
+        v: Value,
+        seen: &mut HashSet<Value>,
+    ) -> bool {
+        if !seen.insert(v) {
+            return false;
+        }
+        match self.defs.get(&v) {
+            Some(&(b, Def::Compare)) => region[b],
+            Some(&(b, Def::Join(i))) if region[b] => p.blocks[b].phis[i]
+                .args
+                .iter()
+                .any(|&a| self.compare_in(p, region, a, seen)),
+            _ => false,
+        }
+    }
+}
+
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
 /// waves meeting there), which the other forms of the program may give it.
 pub(super) fn needs_every_lane(what: &str) -> bool {
@@ -1413,6 +1511,33 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_WAVE_WIDE=1`: a console wave run as two host waves may take branches wave-wide,
+/// with group barriers inside them. [`THREAD_WAVE_WIDE`] turns it on for one thread: tests,
+/// which must not change the environment that other tests read while they translate.
+pub(super) fn wave_wide_on() -> bool {
+    THREAD_WAVE_WIDE.get() || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+}
+
+thread_local! {
+    pub(super) static THREAD_WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// See [`with_per_lane_compare_joins`].
+    static PER_LANE_COMPARE_JOINS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with the joins [`CompareJoins::skipped`] finds lowered per lane, as before
+/// the console's zeros were followed there: the lanes that skipped a compare keep their old
+/// mask. For a program whose branches around such joins cannot be taken wave-wide, which
+/// otherwise would no longer translate.
+pub(super) fn with_per_lane_compare_joins<R>(translate: impl FnOnce() -> R) -> R {
+    let before = PER_LANE_COMPARE_JOINS.replace(true);
+    let result = translate();
+    PER_LANE_COMPARE_JOINS.set(before);
+    result
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -13175,12 +13300,33 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// Whether a join that reads a compare's mask past a per-lane branch
+    /// ([`CompareJoins::skipped`]) stops this lowering with [`LANE_MASK`], naming the region for
+    /// `emit`'s retry, which takes the branch wave-wide. Compute programs (console lanes), not
+    /// with each host wave on its own, not with `VICTORY_WAVE_WIDE=0` (no such retry) nor in
+    /// [`with_per_lane_compare_joins`]; a console wave run as two host waves only with
+    /// `VICTORY_WAVE_WIDE=1`, as its wave-wide branches need group barriers.
+    fn compare_zeros(&self) -> bool {
+        self.mask_data == MaskData::Console
+            && !LOCAL_WAVES.get()
+            && !LOCAL_ANY.get()
+            && !PER_LANE_COMPARE_JOINS.get()
+            && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0")
+            && (!(self.x.native.wave64 && host_max_wave() == 32) || wave_wide_on())
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // Lane-mask joins first (what an edge brings may ask for more joins,
         // of masks and of numbers): each edge's mask as the structure
         // tracked it, a constant or a scalar-built one included.
         let st = self.x.st;
+        // (where joins of a compare's mask follow the console)
+        let joins = if self.compare_zeros() {
+            CompareJoins::new(p, st)
+        } else {
+            None
+        };
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
@@ -13188,6 +13334,13 @@ impl<'a> Lower<'a> {
                 .phi_masks
                 .get(&phi.value)
                 .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
+            if let Some(joins) = &joins {
+                let around = joins.skipped(p, b, i, Some(args));
+                if !around.is_empty() {
+                    around.into_iter().for_each(need);
+                    return Err(unsupported(offset, LANE_MASK));
+                }
+            }
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -13213,6 +13366,18 @@ impl<'a> Lower<'a> {
         } else {
             Vec::new()
         };
+        // With branches taken wave-wide (`widen`, which a join of a compare's mask asks for):
+        // the joins of an SGPR that a read join of it is made of are read too, so that a mask
+        // joined twice (a compare in a nested branch, read as data after the outer join) is
+        // not that zero. Not in the per-lane form, which stays as it was; a wave-wide form this
+        // stops leaves `emit` with its other forms.
+        if joins.is_some() && !st.wide.is_empty() {
+            let sgpr = |v: &Value| {
+                let at = self.phi_at.get(v);
+                at.is_some_and(|&(b, i)| matches!(p.blocks[b].phis[i].reg, Reg::S(_)))
+            };
+            work.extend(self.read_phis.iter().copied().filter(sgpr));
+        }
         while let Some(v) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
@@ -13223,9 +13388,35 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // (joins of SGPRs looked at for a compare's mask: none of them had one)
+        let mut checked = HashSet::new();
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            // A compare's mask read as data after a per-lane branch: through this join or
+            // through a join it is made of (which may be read only through this one).
+            if let Some(joins) = &joins
+                && matches!(phi.reg, Reg::S(_))
+                && self.read_phis.contains(&phi.value)
+            {
+                let (mut around, mut work) = (Vec::new(), vec![(b, i)]);
+                while let Some((jb, ji)) = work.pop() {
+                    if !checked.insert((jb, ji)) {
+                        continue;
+                    }
+                    for r in joins.skipped(p, jb, ji, None) {
+                        if !around.contains(&r) {
+                            around.push(r);
+                        }
+                    }
+                    let args = p.blocks[jb].phis[ji].args.iter();
+                    work.extend(args.filter_map(|a| self.phi_at.get(a).copied()));
+                }
+                if !around.is_empty() {
+                    around.into_iter().for_each(need);
+                    return Err(unsupported(p.blocks[b].offset, LANE_MASK));
+                }
+            }
             // A join of numbers with dead registers (`dead`): the paths that bring those
             // never read the result, so they bring zero. Not for a join that is itself a
             // lane mask (a ballot gives that one as data).
