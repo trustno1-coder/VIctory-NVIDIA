@@ -88,20 +88,38 @@ pub struct SpaceInfo {
 }
 
 fn used_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => used_bytes(&e.path()),
-            Ok(m) => m.len(),
-            Err(_) => 0,
-        })
-        .sum()
+    let mut pending = vec![dir.to_owned()];
+    let mut bytes = 0u64;
+    while let Some(dir) = pending.pop() {
+        let Ok(metadata) = std::fs::symlink_metadata(&dir) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            // Links can escape this quota tree or point back to an ancestor.
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            } else {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    bytes
 }
 
-/// What the host disk under `dir` has free (unlimited if unknown).
+/// What the host disk under `dir` has free (treated as unlimited if unknown).
 pub(crate) fn disk_free(dir: &Path) -> u64 {
     #[cfg(windows)]
     {
@@ -121,6 +139,15 @@ pub(crate) fn disk_free(dir: &Path) -> u64 {
         if ok != 0 {
             return free;
         }
+        let error = std::io::Error::last_os_error();
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                path = %dir.display(),
+                %error,
+                "could not query free storage space; treating it as unlimited"
+            );
+        });
     }
     let _ = dir;
     u64::MAX
@@ -146,13 +173,17 @@ extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
 /// Tells our prompts apart from other calls on the same block.
 static PROMPT: u8 = 0;
 
-/// There is nobody to ask: granted when the quota has room, else declined.
-extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
-    let hr = if bytes <= space().total_free {
+/// There is nobody to ask: granted only when the quota and host disk have room.
+fn prompt_status(bytes: u64, space: SpaceInfo) -> HRESULT {
+    if bytes <= space.available_free {
         S_OK
     } else {
         E_ABORT
-    };
+    }
+}
+
+extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
+    let hr = prompt_status(bytes, space());
     xasync::finished(block, (&raw const PROMPT).cast(), hr)
 }
 
@@ -225,7 +256,10 @@ mod tests {
 
         let prompt = method::<Prompt>(&OBJECT, 0x30);
         let result = method::<Result>(&OBJECT, 0x38);
-        for (bytes, expect) in [(900, S_OK), (901, E_ABORT)] {
+        for (bytes, expect) in [
+            (info.available_free, S_OK),
+            (info.available_free + 1, E_ABORT),
+        ] {
             let mut block = AsyncBlock {
                 queue: std::ptr::null(),
                 context: std::ptr::null_mut(),
@@ -236,5 +270,39 @@ mod tests {
             assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
             assert_eq!(result(this, &mut block), expect, "{bytes} bytes");
         }
+    }
+
+    #[test]
+    fn prompt_declines_when_the_host_disk_has_less_space_than_the_quota() {
+        let space = SpaceInfo {
+            available_free: 100,
+            total_free: 900,
+            used: 100,
+            total: 1000,
+        };
+        assert_eq!(prompt_status(100, space), S_OK);
+        assert_eq!(prompt_status(101, space), E_ABORT);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_usage_does_not_follow_directory_symlinks() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("save.dat"), [0u8; 100]).unwrap();
+        if let Err(error) = symlink_dir(root.path(), nested.join("loop")) {
+            let no_symlink_privilege = error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314);
+            if no_symlink_privilege {
+                eprintln!("skipping symlink traversal test: {error}");
+                return;
+            }
+            panic!("creating directory symlink failed: {error}");
+        }
+
+        assert_eq!(used_bytes(root.path()), 100);
     }
 }
