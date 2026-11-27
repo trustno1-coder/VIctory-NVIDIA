@@ -6453,7 +6453,10 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
-        let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
+        let wide = name.ends_with("_b64")
+            || name.ends_with("_u64")
+            || name.ends_with("_i64")
+            || name == "s_bitreplicate_b64_b32";
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
             let nonzero = |l: &mut Self, a: V, b: V| {
@@ -6474,6 +6477,52 @@ impl<'a> Lower<'a> {
                     self.set(hi, Val::I32(zero));
                     let nonzero = self.s.m.cmp(c, pred::NE, mask, zero);
                     self.set(scc, Val::Bit(nonzero));
+                    Ok(())
+                }
+                "s_bitreplicate_b64_b32" => {
+                    // Every bit of the source twice: bit i of it is bits 2i and
+                    // 2i+1 of the result. Each 16-bit half is spread to the
+                    // even bits of a dword, then doubled.
+                    let a = src32(self, 0)?;
+                    let mut halves = Vec::new();
+                    for shift in [0, 16] {
+                        let (k, m) = (self.s.m.i32(shift), self.s.m.i32(0xFFFF));
+                        let x = self.s.m.bin(c, Bin::LShr, a, k);
+                        let mut x = self.s.m.bin(c, Bin::And, x, m);
+                        for (by, keep) in [(8, 0x00FF_00FF), (4, 0x0F0F_0F0F), (2, 0x3333_3333), (1, 0x5555_5555)] {
+                            let (k, m) = (self.s.m.i32(by), self.s.m.i32(keep));
+                            let up = self.s.m.bin(c, Bin::Shl, x, k);
+                            let both = self.s.m.bin(c, Bin::Or, x, up);
+                            x = self.s.m.bin(c, Bin::And, both, m);
+                        }
+                        let k1 = self.s.m.i32(1);
+                        let up = self.s.m.bin(c, Bin::Shl, x, k1);
+                        halves.push(self.s.m.bin(c, Bin::Or, x, up));
+                    }
+                    self.set(lo, Val::I32(halves[0]));
+                    self.set(hi, Val::I32(halves[1]));
+                    Ok(())
+                }
+                "s_bfm_b64" => {
+                    // ((1 << src0[5:0]) - 1) << src1[5:0].
+                    let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let k63 = self.s.m.i32(63);
+                    let a = self.s.m.bin(c, Bin::And, a, k63);
+                    let b = self.s.m.bin(c, Bin::And, b, k63);
+                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let m = self.s.m.bin(c, Bin::Shl, one, a);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    let r = self.s.m.bin(c, Bin::Shl, m, b);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
                     Ok(())
                 }
                 "s_bcnt1_i32_b64" => {
@@ -6757,6 +6806,26 @@ impl<'a> Lower<'a> {
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
             }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // Two 16-bit halves in one dword, the first operand's in the
+                // low half: both low halves (ll), the first's low and the
+                // second's high (lh), or both high halves (hh).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low_half, high_half) =
+                    (self.s.m.i32(16), self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_0000));
+                let low = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, low_half)
+                };
+                let high = if name == "s_pack_ll_b32_b16" {
+                    let b = self.s.m.bin(c, Bin::And, b, low_half);
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, b, high_half)
+                };
+                (self.s.m.bin(c, Bin::Or, low, high), None)
+            }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k31 = self.s.m.i32(31);
@@ -6781,6 +6850,9 @@ impl<'a> Lower<'a> {
                         | "s_brev_b32"
                         | "s_mul_i32"
                         | "s_mulk_i32"
+                        | "s_pack_ll_b32_b16"
+                        | "s_pack_lh_b32_b16"
+                        | "s_pack_hh_b32_b16"
                 ) =>
                 {
                     return Ok(());
