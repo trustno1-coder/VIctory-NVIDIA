@@ -1776,10 +1776,41 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
         Ok(g) => g,
         // (Held by this, whoever panicked with it: not to be asked for again.)
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())),
+        Err(std::sync::TryLockError::WouldBlock) => waited(3, guards_taken),
     };
     settle(&mut g);
     g
+}
+
+/// The guards' lock, which was not free. Lab switch `spin`: it is asked for
+/// again and again for so many microseconds before the thread sleeps for it.
+///
+/// Who holds it changes one protection, some 13 microseconds by the
+/// submitting thread's clock. The submitting thread found it taken 13 times a
+/// frame, and each time it was 170 microseconds until it ran again: 80 asleep
+/// and 90 with no processor after the wake; its four helpers 45 times a
+/// frame, 100 microseconds each (run 53, the system's record of the threads'
+/// changes: 59 waits and 4.7 ms a frame at this lock among the five).
+fn guards_taken() -> std::sync::MutexGuard<'static, Guards> {
+    let spin = crate::lab::peek(crate::lab::SPIN).clamp(0, 5_000) as u64;
+    if spin > 0 {
+        let most = std::time::Duration::from_micros(spin);
+        let began = std::time::Instant::now();
+        loop {
+            for _ in 0..16 {
+                std::hint::spin_loop();
+            }
+            match GUARDS.try_lock() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if began.elapsed() >= most {
+                break;
+            }
+        }
+    }
+    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -2006,6 +2037,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // runtime's. Windows is asked with the lock not held (the range is, no
     // other thread asks about it: `ASKING`); what the runtime tells meanwhile
     // takes the block out of the set, and it is looked at as any other.
+    // (Lab switch `once`: with no hole to ask Windows about, the lock taken
+    // for this look is kept for what follows, not let go and taken again:
+    // the threads that wait for it wait here, run 53.)
+    let once = crate::lab::peek(crate::lab::ONCE) == 1;
+    let mut kept = None;
     let unsure: Vec<usize> = {
         let g = guards_timed();
         if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) && !unsettled(first, last) {
@@ -2014,7 +2050,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             tally(3, 1);
             return Some(Vec::new());
         }
-        g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect()
+        let unsure: Vec<usize> = g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect();
+        if once && unsure.is_empty() {
+            kept = Some(g);
+        }
+        unsure
     };
     let mut came: Vec<(usize, bool)> = Vec::new();
     let mut uncommitted_until = first;
@@ -2032,7 +2072,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     let rest = rest();
-    let mut g = guards_timed();
+    let mut g = kept.unwrap_or_else(guards_timed);
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     for &(block, view) in &came {

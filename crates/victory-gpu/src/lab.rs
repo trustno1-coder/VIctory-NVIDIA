@@ -67,9 +67,17 @@ pub(crate) const CYC: usize = 18;
 /// (2: `crate::cores::Priority`); 0: as made, above normal
 /// ([`submitter_priority`]).
 pub(crate) const P: usize = 19;
+/// Microseconds a thread that finds the guards' lock taken asks for it again
+/// and again before it sleeps (`crate::watch::guards`; 0: as the lock is
+/// made, which sleeps after a few microseconds).
+pub(crate) const SPIN: usize = 20;
+/// An asking that guards view memory keeps the guards' lock from its look at
+/// the range to what it makes read-only (1), where it has nothing to ask
+/// Windows between them; 0: it takes the lock for each (`crate::watch::guard`).
+pub(crate) const ONCE: usize = 21;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 20] = [
+const KNOBS: [(&str, i64); 22] = [
     ("reuse", 1),
     ("zero", 1),
     ("a", 0),
@@ -90,8 +98,10 @@ const KNOBS: [(&str, i64); 20] = [
     ("lists", 0),
     ("cyc", 0),
     ("p", 0),
+    ("spin", 0),
+    ("once", 0),
 ];
-static VALUES: [AtomicI64; 20] = [const { AtomicI64::new(0) }; 20];
+static VALUES: [AtomicI64; 22] = [const { AtomicI64::new(0) }; 22];
 
 /// Switch `p`, asked by the submitting thread before each submission: its
 /// priority is "highest" with 1 or 2, "above normal" (as made) with 0. (The
@@ -666,11 +676,20 @@ impl Drop for Piece {
 /// (6) (`crate::descriptor`).
 static WAITS: [[AtomicU64; 2]; 7] = [const { [const { AtomicU64::new(0) }; 2] }; 7];
 
+/// Since the last frame-rate line, every thread's waits for the guards' lock
+/// (the title's in a write fault among them): how many and their nanoseconds.
+static GUARD_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// A wait of kind `what` ([`WAITS`]) that began at `began` is over.
 pub(crate) fn waited_for(what: usize, began: Instant) {
+    let ns = began.elapsed().as_nanos() as u64;
+    if what == 3 {
+        GUARD_WAITS[0].fetch_add(1, Relaxed);
+        GUARD_WAITS[1].fetch_add(ns, Relaxed);
+    }
     if SUBMITS.get() {
         WAITS[what][0].fetch_add(1, Relaxed);
-        WAITS[what][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+        WAITS[what][1].fetch_add(ns, Relaxed);
     }
 }
 
@@ -694,6 +713,7 @@ pub(crate) fn on_line(frames: f64, wall: &[f64; 17]) {
     let on: Vec<u64> = ON.iter().map(|n| n.swap(0, Relaxed)).collect();
     let pieces: Vec<[f64; 2]> = PIECES.iter().map(|p| [p[0].swap(0, Relaxed) as f64 / frames, p[1].swap(0, Relaxed) as f64 / 1e6 / frames]).collect();
     let waits: Vec<[f64; 2]> = WAITS.iter().map(|w| [w[0].swap(0, Relaxed) as f64 / frames, w[1].swap(0, Relaxed) as f64 / 1e6 / frames]).collect();
+    let guards = [GUARD_WAITS[0].swap(0, Relaxed) as f64 / frames, GUARD_WAITS[1].swap(0, Relaxed) as f64 / 1e6 / frames];
     let Some(before) = before else {
         return;
     };
@@ -710,7 +730,8 @@ pub(crate) fn on_line(frames: f64, wall: &[f64; 17]) {
          lock, {:.1} times {:.2} ms for the journal to read it, {:.1} times {:.2} ms to note in it, {:.1} times {:.2} ms for ranges \
          another thread asked the kernel about, {:.1} times {:.2} ms for the lock of the queue of textures picked by index, {:.1} \
          times {:.2} ms for the views table's; by the clock: work spread over threads {:.1} times {:.2} ms, the kernel's write \
-         watch {:.1} calls {:.2} ms, blocks made read-only {:.1} times {:.2} ms",
+         watch {:.1} calls {:.2} ms, blocks made read-only {:.1} times {:.2} ms; every thread's waits for the guards' lock \
+         {:.1} times {:.2} ms",
         ms / frames,
         waits[4][0],
         waits[4][1],
@@ -732,6 +753,8 @@ pub(crate) fn on_line(frames: f64, wall: &[f64; 17]) {
         pieces[1][1],
         pieces[2][0],
         pieces[2][1],
+        guards[0],
+        guards[1],
     );
     if on.iter().sum::<u64>() == 0 {
         return;
