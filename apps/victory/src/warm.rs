@@ -20,6 +20,9 @@ const LONGEST: Duration = Duration::from_secs(180);
 
 /// As the runs count one that takes long.
 const SLOW_MS: f64 = 1000.0;
+/// A book error requires both this exit code and an explicit worker report:
+/// the MSVC runtime can also return 3 from a native compiler abort.
+const BOOK_ERROR: i32 = 3;
 
 fn folder() -> Result<PathBuf> {
     let cfg = victory_core::Config::load()?;
@@ -32,11 +35,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         return make(&dir, &these);
     }
     let began = Instant::now();
+    let keys = known::keys(&dir);
+    if !keys.is_empty() {
+        known::check_shader_book(&dir).with_context(|| format!("cannot open known-shaders.bin in {}", dir.display()))?;
+    }
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
-    let keys = known::keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
     for line in listed.lines() {
@@ -70,7 +76,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     );
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
     let next = AtomicUsize::new(0);
-    let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
+    let book_failed = AtomicBool::new(false);
+    let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize, 0usize));
     let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
     let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
@@ -78,9 +85,11 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     std::thread::scope(|s| {
         for _ in 0..jobs.min(chunks.len()) {
             s.spawn(|| {
-                while let Some(&chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                while !book_failed.load(Ordering::Relaxed)
+                    && let Some(&chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed))
+                {
                     let mut rest = chunk;
-                    while !rest.is_empty() {
+                    while !rest.is_empty() && !book_failed.load(Ordering::Relaxed) {
                         let (made, ended) = child(rest, |n, ms, there| {
                             if ms >= SLOW_MS {
                                 let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
@@ -97,11 +106,22 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                         });
                         rest = &rest[made.min(rest.len())..];
                         match (ended, rest.split_first()) {
-                            (Some(why), Some((&n, after))) => {
-                                // The one it was at.
-                                println!("pipeline {n} {}: {why}", keys[n]);
-                                let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
-                                lock(&state).2 += 1;
+                            (Some(stop), Some((&n, after))) => {
+                                match stop {
+                                    WorkerStop::BookUnavailable => {
+                                        book_failed.store(true, Ordering::Relaxed);
+                                        return;
+                                    }
+                                    WorkerStop::UnreadableRecipe => {
+                                        println!("pipeline {n} {}: missing or unreadable recipe", keys[n]);
+                                        lock(&state).3 += 1;
+                                    }
+                                    WorkerStop::Failed(why) => {
+                                        println!("pipeline {n} {}: {why}", keys[n]);
+                                        let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+                                        lock(&state).2 += 1;
+                                    }
+                                }
                                 rest = after;
                             }
                             _ => break,
@@ -111,11 +131,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             });
         }
     });
-    let (mut times, refused, crashed) = state.into_inner().unwrap_or_else(|e| e.into_inner());
+    if book_failed.load(Ordering::Relaxed) {
+        anyhow::bail!("cannot open known-shaders.bin in {}", dir.display());
+    }
+    let (mut times, refused, crashed, unreadable) = state.into_inner().unwrap_or_else(|e| e.into_inner());
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
     println!(
-        "{} made in {:.0} s ({refused} have no host pipeline, {crashed} ended their process); ms each: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
+        "{} made in {:.0} s ({refused} have no host pipeline, {crashed} ended their process, {unreadable} unreadable recipes); ms each: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
         times.len(),
         began.elapsed().as_secs_f64(),
         at(0.5),
@@ -131,8 +154,14 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+enum WorkerStop {
+    BookUnavailable,
+    UnreadableRecipe,
+    Failed(String),
+}
+
 /// Has a process make `these`; how many it made, and how it ended if not well.
-fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Option<String>) {
+fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Option<WorkerStop>) {
     let list: Vec<String> = these.iter().map(usize::to_string).collect();
     let spawned = std::env::current_exe().and_then(|exe| {
         use std::os::windows::process::CommandExt;
@@ -151,6 +180,7 @@ fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Opt
     let (heard, over) = (Mutex::new(Instant::now()), AtomicBool::new(false));
     let hung = AtomicBool::new(false);
     let mut made = 0;
+    let mut book_error = None;
     std::thread::scope(|s| {
         s.spawn(|| {
             while !over.load(Ordering::Relaxed) {
@@ -165,27 +195,46 @@ fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Opt
         for line in BufReader::new(out).lines().map_while(Result::ok) {
             *lock(&heard) = Instant::now();
             let mut words = line.split(' ');
-            if words.next() == Some("made")
-                && let (Some(n), Some(ms), Some(there)) = (words.next(), words.next(), words.next())
-                && let (Ok(n), Ok(ms)) = (n.parse(), ms.parse())
-            {
-                made += 1;
-                each(n, ms, there == "1");
+            match words.next() {
+                Some("made")
+                    if let (Some(n), Some(ms), Some(there)) = (words.next(), words.next(), words.next())
+                        && let (Ok(n), Ok(ms)) = (n.parse(), ms.parse())
+                        && these.get(made) == Some(&n) =>
+                {
+                    made += 1;
+                    each(n, ms, there == "1");
+                }
+                Some("unreadable-recipe")
+                    if let Some(n) = words.next().and_then(|n| n.parse::<usize>().ok())
+                        && these.get(made) == Some(&n) =>
+                {
+                    book_error = Some(WorkerStop::UnreadableRecipe);
+                }
+                Some("book-unavailable") if made == 0 => book_error = Some(WorkerStop::BookUnavailable),
+                _ => {}
             }
         }
         over.store(true, Ordering::Relaxed);
     });
     let status = lock(&process).wait();
+    if status.as_ref().is_ok_and(|s| s.code() == Some(BOOK_ERROR))
+        && let Some(error) = book_error
+    {
+        return (made, Some(error));
+    }
     let well = status.as_ref().is_ok_and(|s| s.success());
+    if well && made == these.len() {
+        return (made, None);
+    }
     if well {
-        return (these.len(), None);
+        return (made, Some(WorkerStop::Failed("worker exited without reporting all requested pipelines".into())));
     }
     let why = if hung.load(Ordering::Relaxed) {
         format!("hung for {} s", LONGEST.as_secs())
     } else {
         status.map_or_else(|e| e.to_string(), |s| format!("{s}"))
     };
-    (made, Some(why))
+    (made, Some(WorkerStop::Failed(why)))
 }
 
 /// What such a process does.
@@ -194,17 +243,35 @@ fn make(dir: &Path, these: &str) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
     let mut out = std::io::stdout();
-    known::make(dir, &these, |n, came| {
+    let mut completed = 0;
+    let results = known::make(dir, &these, |n, came| {
         let told = match came {
             None => writeln!(out, "at {n}"),
-            Some((ms, there)) => writeln!(out, "made {n} {ms:.2} {}", u8::from(there)),
+            Some((ms, there)) => {
+                completed += 1;
+                writeln!(out, "made {n} {ms:.2} {}", u8::from(there))
+            }
         };
         if told.and_then(|()| out.flush()).is_err() {
             // Whoever asked is gone.
             std::process::exit(1);
         }
     });
-    // Without what a run's end does (nothing to save, the host's threads).
-    let _ = out.flush();
+    // Skip normal run teardown: the title is not running, and worker
+    // children can own driver threads even after the last recipe.
+    if let Some(n) = these.get(completed) {
+        let report = match results {
+            Ok(()) => {
+                eprintln!("warm: missing or unreadable pipeline recipe {n} in {}", dir.display());
+                writeln!(out, "unreadable-recipe {n}")
+            }
+            Err(error) => {
+                eprintln!("warm: cannot open known-shaders.bin for pipeline recipe {n} in {}: {error}", dir.display());
+                writeln!(out, "book-unavailable")
+            }
+        };
+        let published = report.and_then(|()| out.flush()).is_ok();
+        std::process::exit(if published { BOOK_ERROR } else { 1 });
+    }
     std::process::exit(0)
 }

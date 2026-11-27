@@ -214,14 +214,25 @@ pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
+/// Check the shader book once before starting a worker pool.
+pub fn check_shader_book(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir.join(SHADERS)).map(drop)
+}
+
 /// Makes the host pipelines of those of `which` (numbers in the file) and
 /// lets each go again: the driver's cache on disk keeps them. `each` is told
 /// the number before, and what came of it after: milliseconds and whether
-/// there is one.
-pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
+/// there is one. A missing or unreadable recipe ends the batch at that index
+/// without a completion, rather than being counted as a host refusal. An
+/// unavailable shader book is an I/O error for the whole batch.
+pub fn make(
+    dir: &Path,
+    which: &[usize],
+    mut each: impl FnMut(usize, Option<(f64, bool)>),
+) -> std::io::Result<()> {
+    let mut file = std::fs::File::open(dir.join(SHADERS))?;
     let mut places = HashMap::new();
     walk_shaders(dir, |stage, hash, at, len| drop(places.insert(hash, (stage, at, len))));
-    let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();
     walk_pipelines(dir, |n, bytes| {
@@ -237,14 +248,14 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         Some(bytes)
     };
     for n in which {
-        let Some(entry) = entries.get(n) else { continue };
+        let Some(entry) = entries.get(n) else { break };
         each(*n, None);
         let began = std::time::Instant::now();
-        let made = parse(entry, &mut read)
-            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
-            .is_some();
+        let Some((shaders, g)) = parse(entry, &mut read) else { break };
+        let made = HostPipeline::new(&shaders, g.as_deref()).is_some();
         each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
     }
+    Ok(())
 }
 
 #[allow(clippy::type_complexity)]

@@ -21,6 +21,9 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
