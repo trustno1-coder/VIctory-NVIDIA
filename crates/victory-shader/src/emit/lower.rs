@@ -1415,6 +1415,31 @@ thread_local! {
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether `native` was made from loose pieces ([`Lower::made_from_pieces`]),
+/// asked before a [`Lower`] exists.
+fn from_pieces(native: &NativeProgram) -> bool {
+    let range = crate::native::VERTEX_BUFFERS >> 8;
+    native
+        .layout
+        .iter()
+        .any(|p| matches!(p.root, RootType::Other(code) if code >> 8 == range))
+}
+
+/// A `v_cndmask_b32` whose mask is no lane mask the structuring tracks: a
+/// number the code holds (`s_cselect` of all lanes or none, a bit pattern).
+/// The select takes this lane's own bit of it ([`Lower::valu_op`]), which
+/// needs the console's lane numbers. [`reads_mask_as_data`] leaves selects
+/// out on purpose (their masks are mostly tracked ones), so a program whose
+/// only such use is this one would be lowered with host lanes.
+fn selects_by_number(st: &Structured, i: &Inst) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    i.name() == "v_cndmask_b32"
+        && matches!(v.src.get(2), Some(&Operand::Scalar { code, .. })
+            if i.read(Reg::S(code)).is_some_and(|m| !st.masks.contains_key(&m)))
+}
+
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     // A scalar select uses the condition of the whole guest wave, even
     // when the preceding mask operation has no scalar-dword consumers.
@@ -1665,6 +1690,7 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
+            let pieces = from_pieces(x.native);
             console_lanes = insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
@@ -1674,6 +1700,9 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
+                    // (only for a program made from pieces: the console
+                    // compiler's programs are decided as they were before)
+                    || pieces && selects_by_number(x.st, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
@@ -2772,6 +2801,15 @@ impl<'a> Lower<'a> {
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
                     // No wave overlaps this one (see `ordered_section`).
                     None if self.pops_collision(v) => Val::I32(self.s.m.i32(0)),
+                    // VCC is undefined at wave launch; any read of it on entry
+                    // is one no correct program depends on, so it reads as
+                    // zero, as the SGPRs above. Only for a program made from
+                    // pieces.
+                    None if self.made_from_pieces()
+                        && (n == crate::ir::VCC || n == crate::ir::VCC + 1) =>
+                    {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -2852,6 +2890,7 @@ impl<'a> Lower<'a> {
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
             }
+            Input::FixedPosition if self.made_from_pieces() => return self.fixed_position(),
             _ => return Val::Missing("a pixel system input"),
         };
         let free = self
@@ -2897,6 +2936,33 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// The fixed-point position (SPI_PS_INPUT_ADDR bit 15): the pixel's integer x in bits
+    /// 0-15 and y in bits 16-31. The floor of SV_Position's x and y is that pixel, at the
+    /// centre, a sample or the centroid alike; coordinates are never negative, so the
+    /// conversion to unsigned is the floor.
+    fn fixed_position(&mut self) -> Val {
+        let Some(id) = self.s.inputs.iter().position(|e| e.kind == 3) else {
+            return Val::Missing("a pixel system input the signature lacks");
+        };
+        let entry = self.s.entry;
+        let mut half = [None; 2];
+        for c in 0..2u8 {
+            let Val::I32(bits) = self.load_input(id, c) else {
+                return Val::Missing("a 16-bit input");
+            };
+            let f = self.s.m.cast(entry, Cast::Bitcast, bits, self.s.t.f32);
+            let n = self.s.m.cast(entry, Cast::FpToUi, f, self.s.t.i32);
+            let k = self.s.m.i32(0xFFFF);
+            half[usize::from(c)] = Some(self.s.m.bin(entry, Bin::And, n, k));
+        }
+        let (Some(x), Some(y)) = (half[0], half[1]) else {
+            return Val::Missing("a 16-bit input");
+        };
+        let k16 = self.s.m.i32(16);
+        let y = self.s.m.bin(entry, Bin::Shl, y, k16);
+        Val::I32(self.s.m.bin(entry, Bin::Or, x, y))
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -6456,6 +6522,15 @@ impl<'a> Lower<'a> {
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
             }
+            "s_pack_ll_b32_b16" => {
+                // low half of the first source, then the low half of the second
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let low = self.s.m.i32(0xFFFF);
+                let k16 = self.s.m.i32(16);
+                let a = self.s.m.bin(c, Bin::And, a, low);
+                let b = self.s.m.bin(c, Bin::Shl, b, k16);
+                (self.s.m.bin(c, Bin::Or, a, b), None)
+            }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k31 = self.s.m.i32(31);
@@ -6636,6 +6711,16 @@ impl<'a> Lower<'a> {
         }
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
             return self.memory_smem(inst);
+        }
+        if self.scalar.get(&site).is_some_and(|a| self.vertex_table(a.param)) {
+            // A vertex buffer's descriptor: the fetches through it read the
+            // host's input layout (`vertex_fetch`), and its dwords (an
+            // address, a stride, a size) have no value here.
+            for &(_, v) in &inst.writes {
+                self.vals.insert(v, Val::Missing("a vertex buffer's descriptor read as data"));
+                self.stale.insert(v);
+            }
+            return Ok(());
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
@@ -9115,6 +9200,22 @@ impl<'a> Lower<'a> {
                         self.cross_lane(false)?;
                         self.lane_bit(c, lo, hi)
                     }
+                    // A mask of all lanes or none (`s_cselect_b64 vcc, -1, 0`
+                    // on a scalar test): each lane's bit is the scalar
+                    // condition, on a wave of any size and lane order.
+                    // Only for a program made from pieces: a title's
+                    // programs are decided as before.
+                    None if self.made_from_pieces() => {
+                        let lo = mask.ok_or(UNTRACKED)?;
+                        let hi = match v.src.get(2) {
+                            Some(&Operand::Scalar { code, .. }) if self.x.native.wave64 => {
+                                inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?
+                            }
+                            _ => lo,
+                        };
+                        let m = self.x.st.uniform_bits(lo, hi).ok_or(UNTRACKED)?;
+                        self.boolean(m, c)?
+                    }
                     None => return Err(UNTRACKED),
                 };
                 if v.abs != 0 || v.neg != 0 {
@@ -10944,6 +11045,38 @@ impl<'a> Lower<'a> {
             let x = l.operand(inst, &op.ok_or("an interpolation operand")?)?;
             Ok(l.as_float(x))
         };
+        // An input that is a constant (SPI_PS_INPUT_CNTL OFFSET 0x20, made
+        // from loose pieces) is held by no signature element: whatever the
+        // vertex program exports, the input is DEFAULT_VAL's value. It is
+        // the vertex values P0, and what an interpolation weighs P10 and
+        // P20 by is the difference of equal values, zero, so a first half
+        // gives the constant, a second half leaves what it was given, and
+        // a read of P10 or P20 gives zero.
+        let held = match *interp {
+            Interp::Interpolated { attribute, .. }
+            | Interp::Vertex { attribute, .. }
+            | Interp::Weighted { attribute } => attribute,
+        };
+        if let Some(value) = crate::native::PsInput::default_value(held.row) {
+            if name.ends_with("_f16") || held.high {
+                return Err("a 16-bit read of a constant input");
+            }
+            let constant = crate::native::PsInput::default_channel(value, held.channel);
+            let x = match *interp {
+                Interp::Weighted { .. } if !name.starts_with("v_interp_p1") => {
+                    let old = match &inst.fields {
+                        Fields::Valu(v) => v.src.get(2).copied(),
+                        _ => Some(dst),
+                    };
+                    float(self, old)?
+                }
+                Interp::Vertex { vertex, .. } if vertex != 2 => self.s.m.f32(0f32.to_bits()),
+                _ => self.s.m.f32(constant.to_bits()),
+            };
+            let x = self.as_int(x);
+            self.write(inst, Reg::V(reg), x, None);
+            return Ok(());
+        }
         // What the result adds to the evaluated channel (a second half's
         // first half, when the halves evaluate on their own).
         let mut add = None;
@@ -11422,12 +11555,15 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            // One channel goes into a view the program also counts in.
+            // shortcut: stores are taken to write a float format (the console
+            // converts by the view's format). One channel goes into a view
+            // the program also counts in.
             let counter = *dmask == 1 && self.is_counter(src);
-            if *dmask != 0xF && !counter {
-                return Err("an image store of some channels");
+            if !counter && *dmask == 0 {
+                return Err("an image store of no channels");
+            }
+            if !counter && *dmask != 0xF && self.is_counter(src) {
+                return Err("an image store of some channels into a view the program counts in");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -11465,14 +11601,24 @@ impl<'a> Lower<'a> {
                 self.end_guarded(at, &[]);
                 return Ok(());
             }
+            // the console writes the channels the mask leaves out as zero, not
+            // their old values, so no read of the texel is needed and no other
+            // lane's write is lost. The enabled channels sit in consecutive
+            // registers (d16: two to a register, low half first), `n` counts
+            // them.
             let mut vals = Vec::new();
+            let mut n = 0u8;
             for k in 0..4u8 {
-                // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                if (*dmask >> k) & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
+                let r = if *d16 { n / 2 } else { n };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
+                n += 1;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if (n - 1) % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -11622,7 +11768,10 @@ impl<'a> Lower<'a> {
             if kind == 5 && (*unorm || op == 81) {
                 return Err("a cube sample with texel coordinates or a level query");
             }
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // CalculateLOD takes spatial coordinates only. Array samples
+            // still need the slice, but the query leaves that operand undef.
+            let coord_count = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(coord_count) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
@@ -12182,6 +12331,14 @@ impl<'a> Lower<'a> {
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
+        // Through a vertex buffer's descriptor: one of the program's own
+        // vertex fetches.
+        if let Some(&src) = self.descriptors.get(&(site, false))
+            && let Some((param, byte)) = self.entry(src)
+            && self.vertex_table(param)
+        {
+            return self.vertex_fetch(inst, byte, guard);
+        }
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
         // min and max, exchange; compare-exchange apart.
@@ -12520,15 +12677,19 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                // shortcut: typed stores are taken to write a float format.
+                if *offen || *offset != 0 {
+                    return Err("a typed buffer store at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
                     args.push(self.as_float(x));
+                }
+                // the console writes the channels past the instruction's last
+                // as zero; the view drops those it lacks.
+                for _ in count..4 {
+                    args.push(self.s.m.f32(0));
                 }
                 (69, "bufferStore.f32")
             } else {
@@ -12687,14 +12848,163 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether the program was made from loose pieces ([`crate::pieces`])
+    /// and not passed by a title in a container. Those programs carry a
+    /// layout entry whose `RootType::Other` code is in the 0x200 range (the
+    /// vertex buffer table, [`crate::native::VERTEX_BUFFERS`], is the
+    /// first); a title's programs never do, the codes the host computes
+    /// for them lie in the 0x100 range. What the pieces added to the
+    /// translation is taken only where this holds, so a title's shaders
+    /// translate as they did before the pieces existed.
+    fn made_from_pieces(&self) -> bool {
+        from_pieces(self.x.native)
+    }
+
+    /// Whether layout entry `param` is the table of vertex buffer
+    /// descriptors of a program that fetches its own attributes.
+    fn vertex_table(&self, param: usize) -> bool {
+        let entry = self.x.native.layout.get(param);
+        entry.is_some_and(|p| p.root == RootType::Other(crate::native::VERTEX_BUFFERS))
+    }
+
+    /// A vertex program's own fetch of an attribute: a buffer load through
+    /// the descriptor at byte `entry` of the vertex buffer table (16 bytes
+    /// a slot), at the vertex index and a constant byte of the vertex. It
+    /// becomes a read of the input signature, so the host's input assembler
+    /// fetches (and adds the base vertex, as the code does with s2).
+    ///
+    /// Only the forms seen are taken: whole dwords of a 32-bit float
+    /// element, and an `R8G8B8A8_UNORM` element through a typed load of
+    /// that format or of one of its bytes. Anything else is refused: a
+    /// fetch that reads what the element does not hold would draw wrong.
+    fn vertex_fetch(&mut self, inst: &Inst, entry: u32, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Buffer {
+            data,
+            addr,
+            soffset,
+            offset,
+            offen,
+            idxen,
+            format,
+            lds,
+            tfe,
+            ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let name = inst.name();
+        let plain = matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128));
+        if !*idxen || *offen || !plain || *lds || *tfe || !entry.is_multiple_of(16) {
+            return Err("a vertex fetch that is not by vertex index at a constant byte");
+        }
+        // The index must be the vertex's own: v0 as it arrives plus s2 as
+        // it arrives (the base vertex), which is what the host adds too.
+        let Operand::Vector { reg: areg, .. } = *addr else {
+            return Err("a buffer address");
+        };
+        let index = inst.read(Reg::V(areg)).ok_or("a buffer address")?;
+        let p = self.x.p;
+        let arrives = |reg: Reg| p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1);
+        let own = p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            i.name() == "v_add_nc_u32"
+                && i.writes.iter().any(|w| w.1 == index)
+                && i.read(Reg::S(2)).is_some_and(|v| Some(v) == arrives(Reg::S(2)))
+                && i.read(Reg::V(0)).is_some_and(|v| Some(v) == arrives(Reg::V(0)))
+                && matches!(&i.fields, Fields::Valu(f) if f.src.len() == 2
+                    && f.sdwa.is_none()
+                    && f.dpp.is_none()
+                    && f.src.iter().any(|s| matches!(s, Operand::Scalar { code: 2, .. }))
+                    && f.src.iter().any(|s| matches!(s, Operand::Vector { reg: 0, .. })))
+        });
+        if !own {
+            return Err("a vertex fetch at an index that is not the vertex's own");
+        }
+        // The element of the input layout that holds the byte.
+        let StageIo::Vs { fetch, .. } = &self.x.native.io else {
+            return Err("a vertex fetch outside a vertex program");
+        };
+        let (slot, byte) = (entry / 16, u32::from(*offset));
+        let e = fetch
+            .iter()
+            .find(|e| e.slot == slot && byte >= e.offset && byte - e.offset < e.bytes)
+            .ok_or("a vertex fetch outside the elements whose format is handled")?;
+        let within = byte - e.offset;
+        let channels = crate::pieces::element_shape(e.format).map_or(0, |s| u32::from(s.1));
+        // The first channel read and how many, by the load and the format.
+        let dwords = match name {
+            "buffer_load_dword" => Some(1),
+            "buffer_load_dwordx2" => Some(2),
+            "buffer_load_dwordx3" => Some(3),
+            "buffer_load_dwordx4" => Some(4),
+            _ => None,
+        };
+        let typed = match name.strip_prefix("tbuffer_load_format_") {
+            Some("x") => Some(1),
+            Some("xy") => Some(2),
+            Some("xyz") => Some(3),
+            Some("xyzw") => Some(4),
+            _ => None,
+        };
+        let bytes = e.format == crate::pieces::R8G8B8A8_UNORM;
+        let (first, count) = match (dwords, typed, format.and_then(|f| buffer_format(f))) {
+            // Whole dwords of a float element.
+            (Some(n), None, None) if !bytes && within.is_multiple_of(4) => (within / 4, n),
+            // All four bytes as normalized values, or some of the first.
+            (None, Some(n), Some((&[8, 8, 8, 8], Numeric::Unorm))) if bytes && within == 0 => (0, n),
+            // One byte as a normalized value.
+            (None, Some(1), Some((&[8], Numeric::Unorm))) if bytes => (within, 1),
+            _ => return Err("a vertex fetch of a form or format that is not handled"),
+        };
+        if first + count > channels {
+            return Err("a vertex fetch past its element");
+        }
+        let Some(Operand::Vector { reg, .. }) = *data else {
+            return Err("a buffer result");
+        };
+        for k in 0..count {
+            let (id, col) = self
+                .find_input(e.row, (first + k) as u8)
+                .ok_or("a vertex input the signature lacks")?;
+            // (float elements arrive as their bits, normalized ones as the
+            // float the typed load gives)
+            let x = match self.load_input(id, col) {
+                Val::I32(x) => x,
+                Val::Bit(x) => self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32),
+                Val::Missing(w) => return Err(w),
+            };
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        if e.compressed {
-            return Err("a compressed export");
-        }
+        // A compressed export holds two 16-bit values in each of its two
+        // dwords: channel c in half c % 2 of dword c / 2. It is taken apart
+        // for a render target the signature declares as 16-bit floats (a
+        // program whose exports are final, made from loose pieces, with the
+        // `FP16_ABGR` export format) or as 16-bit integers (`UINT16_ABGR`,
+        // `SINT16_ABGR`); what the halves are under any other format is not
+        // known here.
+        let packed = match e.target {
+            // (only for a program made from pieces: a title's container
+            // keeps the refusal)
+            Target::Color(n) if e.compressed && self.made_from_pieces() => {
+                let declared = self.s.outputs.iter().any(|o| {
+                    o.kind == 16 && o.row == Some(u32::from(n)) && o.half && matches!(o.comp, 4 | 5 | 9)
+                });
+                if !declared {
+                    return Err("a compressed export");
+                }
+                true
+            }
+            _ if e.compressed => return Err("a compressed export"),
+            _ => false,
+        };
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
         let c = self.cur;
@@ -12773,6 +13083,17 @@ impl<'a> Lower<'a> {
             if halves.is_some() {
                 break;
             }
+            if packed {
+                // (the element is all four channels of its register)
+                if let Target::Color(n) = e.target
+                    && let Some(id) = outputs.iter().position(|o| {
+                        o.kind == 16 && o.row == Some(u32::from(n)) && ch >= o.col && ch < o.col + o.cols
+                    })
+                {
+                    stores.push((id, ch - outputs[id].col, value, Some(ch % 2 == 1)));
+                }
+                continue;
+            }
             let found = match e.target {
                 Target::Color(n) => outputs
                     .iter()
@@ -12819,6 +13140,14 @@ impl<'a> Lower<'a> {
                     // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
                     let k = usize::from(n - 1) * 4 + usize::from(ch);
                     flat.get(k).copied()
+                }
+                // (pos3 exists only behind a misc vector in pos1, whose point
+                // size, layer and viewport D3D12 does not take from a
+                // vertex program the way the hardware does)
+                Target::Position(_) if self.made_from_pieces() => {
+                    return Err(
+                        "pos3 (PA_CL_VS_OUT_CNTL USE_VTX_POINT_SIZE / VS_OUT_MISC_VEC_ENA: a misc vector in pos1)",
+                    );
                 }
                 Target::Position(_) => return Err("clip, cull or point-size exports"),
                 Target::Primitive => return Err("a primitive export"),
@@ -12874,7 +13203,29 @@ impl<'a> Lower<'a> {
         };
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
-            if let Some(high) = half {
+            let comp = elements(self, primitive)[id].comp;
+            if let Some(high) = half
+                && packed
+                && matches!(comp, 4 | 5)
+            {
+                // A half of a compressed export under a 16-bit integer
+                // format, declared a 32-bit integer on the host: zero extended where unsigned (comp 5), sign extended
+                // where signed (comp 4).
+                let c = self.cur;
+                let k16 = self.s.m.i32(16);
+                x = match (comp, high) {
+                    (5, true) => self.s.m.bin(c, Bin::LShr, x, k16),
+                    (5, false) => {
+                        let mask = self.s.m.i32(0xffff);
+                        self.s.m.bin(c, Bin::And, x, mask)
+                    }
+                    (_, true) => self.s.m.bin(c, Bin::AShr, x, k16),
+                    (_, false) => {
+                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
+                        self.s.m.bin(c, Bin::AShr, up, k16)
+                    }
+                };
+            } else if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
                 if high {
@@ -13998,5 +14349,94 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// Lowers a pixel program that exports `v0..v3` to render target 0 in
+    /// compressed form, with `layout` as its root parameters and a
+    /// 16-bit render target declared as `comp` (9 floats, 5 unsigned
+    /// integers, 4 signed ones). Gives the refusal's reason, if any.
+    fn compressed_export(layout: Vec<RootParam>, comp: u8) -> Option<&'static str> {
+        use super::super::container::SigElement;
+        use crate::native::PsInput;
+        // exp mrt0 v0, v1, off, off compr done vm; s_endpgm
+        let words = [0xF800_1C0F, 0x0000_0201, S_ENDPGM];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout,
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: Vec::<PsInput>::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: true,
+        };
+        let p = ir::build(&native.code, false, 4).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        match lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        }) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(_) => Some("another error"),
+            Ok(_) => None,
+        }
+    }
+
+    /// A compressed export is taken apart only for a program made from
+    /// loose pieces: a title's container keeps the refusal, whatever its
+    /// signature declares.
+    #[test]
+    fn a_compressed_export_is_unpacked_only_for_pieces() {
+        let ours = |code| RootParam {
+            root: RootType::Other(code),
+            table_offset_dwords: 0,
+            sgprs: 0,
+            base_register: 0,
+            user_data: 0,
+            slot: u8::MAX,
+        };
+        for comp in [9, 5, 4] {
+            assert_eq!(
+                compressed_export(vec![], comp),
+                Some("a compressed export"),
+                "a title's program, comp {comp}"
+            );
+            // the host's own codes (0x100 range) are not pieces either
+            assert_eq!(
+                compressed_export(vec![ours(0x101)], comp),
+                Some("a compressed export"),
+                "a host-computed code, comp {comp}"
+            );
+            assert_eq!(
+                compressed_export(vec![ours(crate::native::VERTEX_BUFFERS + 1)], comp),
+                None,
+                "a program made from pieces, comp {comp}"
+            );
+        }
     }
 }

@@ -540,6 +540,11 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
+    /// The tail of the bound sampler heap that holds the tables of the
+    /// pipelines' samplers (`VICTORY_PIPELINE_SAMPLER_TABLE`), and how many
+    /// of the blocks this list has seen written into it.
+    sampler_tail: Option<crate::pipeline::host::SamplerTail>,
+    sampler_seen: usize,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1581,6 +1586,8 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        self.sampler_tail = None;
+        self.sampler_seen = 0;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1866,6 +1873,8 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // the pass the next views belong to, for the diagnostics that name the title's render targets (VICTORY_RR_TARGETS)
+        crate::streamline::targets::pass(list, p, compute, self.depth, &self.targets);
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1885,6 +1894,9 @@ impl State {
         if !self.host_heaps_set || self.host_heaps != self.heaps {
             let mut view_heap: Option<ID3D12DescriptorHeap> = None;
             let mut sampler_heap: Option<ID3D12DescriptorHeap> = None;
+            // Where the title's slots end in the sampler heap bound, for the
+            // tables of the pipelines' samplers.
+            let mut tail_from = 0;
             for &h in &self.heaps {
                 if h == 0 {
                     continue;
@@ -1893,6 +1905,7 @@ impl State {
                 if let Some(host_heap) = title_heap.host() {
                     if title_heap.samplers() {
                         sampler_heap = Some(host_heap.heap.clone());
+                        tail_from = host_heap.count();
                     } else {
                         view_heap = Some(host_heap.heap.clone());
                     }
@@ -1901,9 +1914,18 @@ impl State {
             if view_heap.is_none() {
                 view_heap = crate::host::host().and_then(|h| h.fallback_view_heap().cloned());
             }
+            if sampler_heap.is_none() && crate::pipeline::host::sampler_table() {
+                // Our own long heap, so that the tables have a place.
+                sampler_heap = crate::pipeline::host::table_heap().cloned();
+            }
             if sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
+            self.sampler_tail = sampler_heap
+                .as_ref()
+                .filter(|_| crate::pipeline::host::sampler_table())
+                .and_then(|h| crate::pipeline::host::SamplerTail::new(h, tail_from));
+            self.sampler_seen = 0;
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
             if let Some(h) = view_heap {
                 list.keep(&h);
@@ -1960,6 +1982,9 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                return false;
+            }
+            if !self.sampler_table(list, stage, compute) {
                 return false;
             }
             if stage.shader.ambient.is_some() {
@@ -2154,6 +2179,38 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        true
+    }
+
+    /// Binds the table of a stage's immediate samplers
+    /// (`VICTORY_PIPELINE_SAMPLER_TABLE`): the blocks not yet written into
+    /// the bound sampler heap are written, once per heap, and the table
+    /// parameter points at the stage's block in its tail. True if the stage
+    /// has none. False, counted, if the heap has no room for the block (a
+    /// sampler heap made without the tail): the draw is dropped, never
+    /// drawn through other samplers.
+    fn sampler_table(&mut self, list: &HostList, stage: &crate::pipeline::host::Stage, compute: bool) -> bool {
+        let Some((param, offset, n)) = stage.samplers else { return true };
+        let handle = self.sampler_tail.as_ref().and_then(|tail| {
+            if self.sampler_seen < crate::pipeline::host::sampler_blocks() {
+                self.sampler_seen = tail.fill();
+            }
+            tail.handle(offset, n)
+        });
+        let Some(handle) = handle else {
+            crate::pipeline::host::sampler_refused();
+            once!("a draw whose sampler table has no room in the sampler heap bound is dropped");
+            return false;
+        };
+        // SAFETY: an open list; the block is in the tail of the bound sampler
+        // heap, written above.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: handle });
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: handle });
+            }
+        }
         true
     }
 
@@ -2574,10 +2631,11 @@ impl State {
     /// and structurally detects depth-less 4+ MRT square atlas bakes
     /// (`>= 512x512`) so unseen NPC/head/clothing shader permutations never
     /// bake `neutral()` or `null` stand-ins into permanent ped textures.
+    /// The lists name the title's own containers; a pipeline made from pieces
+    /// is taken for its program (`Shader::is`).
     fn is_bake_draw(&self, p: &HostPipeline) -> bool {
         if p.stages.iter().any(|s| {
-            let h = s.shader.hash.as_str();
-            BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+            BAKE_PIXEL_SHADERS.iter().chain(&BAKE_GEOMETRY_SHADERS).any(|h| s.shader.is(h))
         }) {
             return true;
         }
@@ -3619,7 +3677,20 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::staged_memory(resource) } else { None };
                 memory.map(|(at, len)| (at, len, crate::texture::fingerprint(at, len)))
             });
-            rest(6, || crate::texture::unstage(resource));
+            let staged = rest(6, || crate::texture::unstage(resource));
+            // Read by threads of ours from here, after the fingerprint for
+            // the later look ([`crate::texture::ahead::read_ahead`]): not a
+            // bake's, not one taken ahead, not one looked at again by
+            // mapped bytes alone.
+            if let Some(staging) = staged
+                && crate::texture::ahead::read_ahead()
+                && ahead.is_none()
+                && sync.is_none()
+                && !baking
+                && memory.is_some()
+            {
+                crate::texture::ahead::read_soon(staging);
+            }
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
@@ -3691,6 +3762,10 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        // (A builder dispatch's recording is timed in three parts for the
+        // by-address memory's line: the all-or-none check, the binding with
+        // its memory made ready, and the dispatch with what it writes.)
+        let timed = crate::pipeline::is_builder(self.pipeline as This).then(std::time::Instant::now);
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3707,6 +3782,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.note_unbuilt("dispatch", [x, y, z]);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3718,6 +3794,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        let timed = timed.map(|began| crate::memory::builder_time(0, began));
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3727,6 +3804,7 @@ impl State {
             }
             return;
         }
+        let timed = timed.map(|began| crate::memory::builder_time(1, began));
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -3754,6 +3832,9 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
+        if let Some(began) = timed {
+            crate::memory::builder_time(2, began);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
@@ -4369,7 +4450,7 @@ impl State {
         }
         if compute {
             for (i, c) in CULL.iter().enumerate() {
-                if p.stages.iter().any(|s| s.shader.hash.as_str() == c.0) {
+                if p.stages.iter().any(|s| s.shader.is(c.0)) {
                     census.2[i] += 1;
                 }
             }
@@ -4776,23 +4857,31 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
-            let frontend = if count == 3 && instances == 1 { self.native_frontend_viewport() } else { None };
-            if let Some(viewport) = frontend {
-                viewports(list, &[viewport]);
+            let frontend = if count == 3 && instances == 1 { self.frontend_place() } else { None };
+            if let Some((viewport, scissor)) = &frontend {
+                viewports(list, &[*viewport]);
+                if let Some(rect) = scissor {
+                    scissors(list, &[*rect]);
+                }
             }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            if frontend.is_some() {
+            if let Some((_, scissor)) = &frontend {
                 viewports(list, &self.viewports);
+                // interface_band only answers with a scissor when the title set one
+                if scissor.is_some() {
+                    scissors(list, &self.scissors);
+                }
             }
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.note_unbuilt("draw", [vertices, instances, 1]);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4821,18 +4910,109 @@ impl State {
         crate::streamline::before_target_draw(list, target as This, p, triangle);
     }
 
+    /// With `VICTORY_PIPELINE_PIECES=1`: names once per pipeline from pieces
+    /// what its dropped draw or dispatch (`what`, with its counts) was aimed
+    /// at, when it has no host pipeline: the topology and every target's
+    /// size and format, and whether the target is a texture the title
+    /// presents. A scene composite that was lost shows as a presented
+    /// target of the output's size drawn with one triangle.
+    fn note_unbuilt(&self, what: &str, n: [u32; 3]) {
+        if !crate::pipeline::pieces::enabled() || crate::pipeline::host_pipeline(self.pipeline as This).is_some() {
+            return;
+        }
+        crate::pipeline::note_unbuilt(self.pipeline as This, || {
+            let targets: Vec<String> = self
+                .targets
+                .iter()
+                .map(|&t| match crate::resource::host_resource(t as This) {
+                    Some(texture) => {
+                        // SAFETY: `texture` is a live host resource held by its title resource.
+                        let d = unsafe { texture.GetDesc() };
+                        format!(
+                            "{}x{} format {} presented {}",
+                            d.Width,
+                            d.Height,
+                            d.Format.0,
+                            crate::streamline::presented(texture)
+                        )
+                    }
+                    None => "no host texture".to_owned(),
+                })
+                .collect();
+            format!(
+                "{what} {}x{}x{}, topology {}, depth {}, targets [{}]",
+                n[0],
+                n[1],
+                n[2],
+                self.topology,
+                self.depth != 0,
+                targets.join("; ")
+            )
+        });
+    }
+
     /// Whether the bound pipeline completes rectangles itself, in the
     /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
     fn completes_rects(&self) -> bool {
         crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
     }
 
+    /// Width, height and format of the draw's one render target, as the title made it (`crate::resource::texture_kind`, from our record of the title's description: no GetDesc, so it is cheap per draw); `None` for no target, several, or a buffer.
+    fn single_target_kind(&self) -> Option<(u64, u32, u32)> {
+        let &[target] = self.targets.as_slice() else {
+            return None;
+        };
+        crate::resource::texture_kind(target as This)
+    }
+
+    /// whether the bound pipeline's one-triangle draw is the title's interface composite.
+    /// `Some(true)`: the title's own hashes (`crate::streamline::INTERFACE_COMPOSITE`, all of
+    /// which must be among the stages), trusted as before.
+    /// `Some(false)`: by shape (`HostPipeline::over`) when the draw's one target is the
+    /// output's size (`output_sized` with `crate::dxgi::display_size()`).
+    /// `None`: anything else.
+    /// a shape fits more than the composite (a layer blended over another inside the
+    /// interface's own target), and the presented texture is not known at draw time (the
+    /// present learns it, in queue.rs and pipeline/host.rs), so the shape also has to draw
+    /// into a target of the output's size. the output's format is not known here either;
+    /// `name_taken` logs the taken target's size and format so a run shows whether it would
+    /// tell them apart. a shape-only draw that fails the target says so once, with the
+    /// target's kind, so a run explains a band that never fired.
+    fn interface_composite(&self, pipeline: &HostPipeline) -> Option<bool> {
+        let stock = crate::streamline::INTERFACE_COMPOSITE
+            .iter()
+            .all(|hash| pipeline.stages.iter().any(|stage| stage.shader.is(hash)));
+        if stock {
+            return Some(true);
+        }
+        if !pipeline.over {
+            return None;
+        }
+        let kind = self.single_target_kind();
+        let output = crate::dxgi::display_size();
+        if output_sized(kind, output) {
+            return Some(false);
+        }
+        static WHY: std::sync::Once = std::sync::Once::new();
+        WHY.call_once(|| {
+            tracing::info!(
+                pipeline = %pipeline.name,
+                target = ?kind,
+                output = ?output,
+                "a one-triangle draw of the interface composite's shape draws into a target that is not the output's size, so it is left alone (a layer blended inside the interface's own target); target is width, height, format"
+            )
+        });
+        None
+    }
+
     /// With a 1440p output (`VICTORY_NATIVE_1440P=1`, set by the runner when
     /// it patches the image for it): the frontend's last triangle is drawn
     /// in output pixels, but some screens project it against the legacy
     /// 3840x2160 canvas; for that draw the viewport is the canvas, so that
-    /// the projection lands on the 2560x1440 target. The scissor and target
-    /// stay 1440p. From DexNom's fork (`State::native_frontend_viewport`,
+    /// the projection lands on the output-sized target. The scissor and target
+    /// stay output-sized. The draw is found by the title's hashes or by the
+    /// composite's shape (`interface_composite`), the same draw
+    /// `interface_band` places. From DexNom's fork (`State::native_frontend_viewport`,
     /// GPL-3.0-or-later).
     fn native_frontend_viewport(&self) -> Option<D3D12_VIEWPORT> {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4844,13 +5024,17 @@ impl State {
         let [viewport] = self.viewports.as_slice() else {
             return None;
         };
-        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, 2560.0, 1440.0) {
+        // the output size, not a literal: a wide output (VICTORY_DISPLAY_WIDE)
+        // makes the title's viewport that wide too
+        let (out_w, out_h) = crate::dxgi::display_size();
+        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, out_w as f32, out_h as f32) {
             return None;
         }
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
-        if !pipeline.stages.iter().any(|stage| stage.shader.hash == "0602c2384acbb3b2")
-            || !pipeline.stages.iter().any(|stage| stage.shader.hash == "a78d088fa55aa495")
-        {
+        // the same rule as interface_band, so the pair of draws agrees: the
+        // title's hashes, or the composite's shape into an output-sized target
+        // (the hashes are ours-or-the-title's depending on VICTORY_PIPELINE_PIECES)
+        if self.interface_composite(pipeline).is_none() {
             return None;
         }
         let Root::Table(table) = self.roots_ref(false).first()? else {
@@ -4877,6 +5061,164 @@ impl State {
         static FIRST: std::sync::Once = std::sync::Once::new();
         FIRST.call_once(|| tracing::info!("the frontend's legacy 4K projection drawn on the 1440p target"));
         Some(D3D12_VIEWPORT { Width: 3840.0, Height: 2160.0, ..*viewport })
+    }
+
+    /// With a 1440p-class output (`VICTORY_NATIVE_1440P=1`) wider than the
+    /// interface's ratio (`VICTORY_UI_LETTERBOX`, parsed once by
+    /// `compose::ui_band`): where the title's interface composite (one
+    /// triangle into the presented texture: the pair of
+    /// `streamline::INTERFACE_COMPOSITE`, or a pipeline of its shape,
+    /// `HostPipeline::over`, taken only into a target of the output's size)
+    /// goes. Answers the band's left edge, its width
+    /// and the scissor for this draw (the title's first rect cut to the
+    /// band), or `None` for any other draw and whenever the switches are off.
+    /// Called for one-triangle draws.
+    fn interface_band(&self) -> Option<(u32, u32, RECT)> {
+        static BAND: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+        let (left, band) = (*BAND.get_or_init(|| {
+            if std::env::var("VICTORY_NATIVE_1440P").as_deref() != Ok("1") {
+                return None;
+            }
+            let (w, h) = crate::dxgi::display_size();
+            crate::compose::ui_band(w, h)
+        }))?;
+        if self.depth != 0 {
+            return None;
+        }
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let (w, h) = crate::dxgi::display_size();
+        // the composite is the title's pair of programs, or a pipeline of its
+        // shape drawing into an output-sized target (`interface_composite`):
+        // with VICTORY_PIPELINE_PIECES=1 the stage containers are ours, so the
+        // pair has other hashes there (the 2026-11-27 runs with it bound a
+        // pair that matched nothing, and the band never fired)
+        let stock = self.interface_composite(pipeline)?;
+        // each pipeline taken is named once, with where it draws, so that a
+        // run says which draws this took for the interface
+        self.name_taken(pipeline, stock, w, h);
+        // the composite is ours; if its viewport is not the whole output the
+        // interface stays stretched, and the log says why once
+        let placed = match (self.viewports.as_slice(), self.scissors.first()) {
+            ([viewport], Some(title))
+                if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height)
+                    == (0.0, 0.0, w as f32, h as f32) =>
+            {
+                Some(title)
+            }
+            _ => None,
+        };
+        let Some(title) = placed else {
+            static WHY: std::sync::Once = std::sync::Once::new();
+            WHY.call_once(|| {
+                let first = self.viewports.first();
+                tracing::warn!(
+                    viewports = self.viewports.len(),
+                    scissors = self.scissors.len(),
+                    x = first.map(|v| v.TopLeftX),
+                    y = first.map(|v| v.TopLeftY),
+                    width = first.map(|v| v.Width),
+                    height = first.map(|v| v.Height),
+                    output = ?(w, h),
+                    "the interface composite is not placed in the middle: its viewport is not the whole output, or the title set no scissor"
+                )
+            });
+            return None;
+        };
+        // the title's own rect, cut to the band; an empty result draws nothing,
+        // as the title's scissor would have had it
+        let scissor = RECT {
+            left: title.left.max(left as i32),
+            top: title.top.max(0),
+            right: title.right.min((left + band) as i32),
+            bottom: title.bottom.min(h as i32),
+        };
+        // a title rect wholly outside the band would come out inverted, which
+        // d3d12 leaves undefined; collapse it to empty instead
+        let scissor = RECT { right: scissor.right.max(scissor.left), bottom: scissor.bottom.max(scissor.top), ..scissor };
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                left,
+                band,
+                output = ?(w, h),
+                title_scissor = ?[title.left, title.top, title.right, title.bottom],
+                "the interface composite is drawn in the middle of the wide picture"
+            )
+        });
+        Some((left, band, scissor))
+    }
+
+    /// Says once per pipeline (eight at most) that `interface_band` took it
+    /// for the interface composite, by the title's hashes or the program they hold
+    /// (`stock`, which includes pipelines from pieces) or by its
+    /// shape: its shaders and state, the size and format of the target it
+    /// draws into and the viewports and scissors in force. The target tells
+    /// the draw into the presented texture from a layer drawn inside the
+    /// interface's own target; the next wide run reads which draw was placed
+    /// in the middle from this line.
+    fn name_taken(&self, pipeline: &HostPipeline, stock: bool, w: u32, h: u32) {
+        static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        let key = std::ptr::from_ref(pipeline) as usize;
+        {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() >= 8 || seen.contains(&key) {
+                return;
+            }
+            seen.push(key);
+        }
+        let target = self
+            .targets
+            .first()
+            .and_then(|t| crate::resource::host_resource(*t as This))
+            .map(|texture| {
+                // SAFETY: a live host resource, kept by the title's target.
+                let d = unsafe { texture.GetDesc() };
+                (d.Width, d.Height, d.Format.0)
+            });
+        let viewports: Vec<_> = self.viewports.iter().map(|v| (v.TopLeftX, v.TopLeftY, v.Width, v.Height)).collect();
+        tracing::info!(
+            pipeline = %pipeline.name,
+            state = %pipeline.state,
+            by_hash = stock,
+            target = ?target,
+            output = ?(w, h),
+            viewports = ?viewports,
+            scissors = self.scissors.len(),
+            "a one-triangle draw is taken for the interface composite (VICTORY_UI_LETTERBOX): by the title's hashes, or by its shape (premultiplied over, one output-sized target); target is width, height, format"
+        );
+    }
+
+    /// The viewport (and, in the middle band, the scissor) for the title's
+    /// one-triangle frontend draw: the legacy-canvas viewport of
+    /// `native_frontend_viewport`, narrowed into the band of `interface_band`
+    /// when that applies. The triangle spans its whole viewport in clip space
+    /// and carries its own uv, so shrinking the viewport to the band puts the
+    /// whole 16:9 interface in the band, whichever canvas (the legacy
+    /// 3840x2160 one or the output) the projection used; for the canvas
+    /// viewport the factor band / output width keeps the mapping, scaled into
+    /// the band. The scissor keeps the oversized triangle out of the bars,
+    /// which keep the world.
+    fn frontend_place(&self) -> Option<(D3D12_VIEWPORT, Option<RECT>)> {
+        let hacked = self.native_frontend_viewport();
+        let Some((left, band, scissor)) = self.interface_band() else {
+            return hacked.map(|v| (v, None));
+        };
+        let (w, _) = crate::dxgi::display_size();
+        // interface_band saw exactly one viewport, so indexing is safe
+        let (base, width) = match hacked {
+            // the legacy projection clips everything past x = 3840, so on a
+            // wider output the canvas viewport would show only the left part
+            // of the interface; the plain viewport is used and the band
+            // spans the triangle's whole clip range
+            Some(_) if w > 3840 => {
+                static WIDE: std::sync::Once = std::sync::Once::new();
+                WIDE.call_once(|| tracing::info!(w, "the legacy 4K projection on a wider output: drawn without the canvas viewport"));
+                (self.viewports[0], band as f32)
+            }
+            Some(canvas) => (canvas, canvas.Width * band as f32 / w as f32),
+            None => (self.viewports[0], band as f32),
+        };
+        Some((D3D12_VIEWPORT { TopLeftX: left as f32, Width: width, ..base }, Some(scissor)))
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -4976,6 +5318,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.note_unbuilt("indexed", [indices, instances, 1]);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -5369,6 +5712,26 @@ impl State {
     }
 }
 
+/// whether `kind` (width, height, format, as `crate::resource::texture_kind` answers) is a
+/// target of the `output` size. kept apart from `State::interface_composite` so it can be
+/// tested without a device.
+fn output_sized(kind: Option<(u64, u32, u32)>, output: (u32, u32)) -> bool {
+    kind.is_some_and(|(w, h, _)| w == u64::from(output.0) && h == output.1)
+}
+
+#[cfg(test)]
+mod interface_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_output_sized_target_is_taken_by_shape() {
+        assert!(output_sized(Some((5120, 1440, 28)), (5120, 1440)));
+        assert!(!output_sized(Some((3840, 2160, 28)), (5120, 1440)));
+        assert!(!output_sized(Some((5120, 1080, 28)), (5120, 1440)));
+        assert!(!output_sized(None, (5120, 1440)));
+    }
+}
+
 /// Before something is recorded into `list` for an indirect execution (a
 /// clamp pass, a binding): the execution held back is recorded first, and
 /// the list's run is no longer one the next execution can join without
@@ -5646,6 +6009,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // the compute-written textures of the pass being logged (VICTORY_RR_TARGETS), kept ungated for the release build
+            crate::streamline::targets::unordered(*resource as This);
             // Some compute-written textures are also read by the title CPU.
             list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.

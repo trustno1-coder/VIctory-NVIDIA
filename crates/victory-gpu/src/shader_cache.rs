@@ -112,6 +112,18 @@ pub(crate) fn translation() -> [u8; 32] {
     build()
 }
 
+/// What names a container that did not translate, for the list of them that
+/// pipelines from pieces keep between runs (`pipeline::pieces`): the
+/// container's BLAKE3 under the translator's identity ([`build`]), so that a
+/// changed translator or setting never meets an entry of an older one.
+/// Hashes only: nothing of the title's bytes goes into the list.
+pub(crate) fn untranslated_key(container: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(&build());
+    hash.update(blake3::hash(container).as_bytes());
+    *hash.finalize().as_bytes()
+}
+
 /// Puts the translation of `container` into the cache before any title asks
 /// for it (`victory shaders`): whether it was there already, or why it does
 /// not translate. The host is opened first, as a run does: what the card

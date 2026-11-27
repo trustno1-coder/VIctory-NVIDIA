@@ -51,9 +51,17 @@ pub const FEATURE_REQUIREMENTS: StructType =
 pub const DLSS_OPTIONS: StructType = guid(0x6ac8_26e4, 0x4c61, 0x4101, [0xa9, 0x2d, 0x63, 0x8d, 0x42, 0x10, 0x57, 0xb8]);
 pub const DLSS_OPTIMAL_SETTINGS: StructType =
     guid(0xef1d_0957, 0xfd58, 0x4df7, [0xb5, 0x04, 0x8b, 0x69, 0xd8, 0xaa, 0x6b, 0x76]);
+// the ray reconstruction (sl_dlss_d.h) structure ids.
+pub const DLSSD_OPTIONS: StructType = guid(0x0ad8_7504, 0x774e, 0x4bf3, [0x96, 0x33, 0xa4, 0x4d, 0x1f, 0x7f, 0x9c, 0xb8]);
+pub const DLSSD_OPTIMAL_SETTINGS: StructType =
+    guid(0xfbd0_c637, 0xa28f, 0x41f2, [0xbc, 0x91, 0xb4, 0x21, 0xfa, 0xee, 0x8e, 0x1e]);
+pub const DLSSD_STATE: StructType = guid(0x7187_3c14, 0xf8ca, 0x4767, [0x9e, 0xaf, 0x3b, 0x43, 0x93, 0xea, 0x98, 0xfa]);
 pub const DLSSG_OPTIONS: StructType = guid(0xfac5_f1cb, 0x2dfd, 0x4f36, [0xa1, 0xe6, 0x3a, 0x9e, 0x86, 0x52, 0x56, 0xc5]);
 pub const DLSSG_STATE: StructType = guid(0xcc8a_c8e1, 0xa179, 0x44f5, [0x97, 0xfa, 0xe7, 0x41, 0x12, 0xf9, 0xbc, 0x61]);
 pub const REFLEX_OPTIONS: StructType = guid(0xf03a_f81a, 0x6d0b, 0x4902, [0xa6, 0x51, 0xc4, 0x96, 0x5e, 0x21, 0x54, 0x34]);
+pub const REFLEX_REPORT: StructType = guid(0x0d56_9b37, 0xa1c8, 0x4453, [0xbe, 0x4d, 0x40, 0xf4, 0xde, 0x57, 0x95, 0x2b]);
+pub const REFLEX_REPORT2: StructType = guid(0x68bb_0632, 0x5e1c, 0x402b, [0x89, 0x9d, 0xb4, 0x9f, 0x63, 0x3c, 0x56, 0xc2]);
+pub const REFLEX_STATE: StructType = guid(0xf0bb_5985, 0xdaf9, 0x4728, [0xb2, 0xfd, 0xae, 0x80, 0xa2, 0xbd, 0x79, 0x89]);
 
 /// `sl::kSDKVersion` of the headers mirrored here (2.14.16).
 pub const SDK_VERSION: u64 = (2 << 48) | (14 << 32) | (16 << 16) | 0xfedc;
@@ -63,6 +71,7 @@ pub const FEATURE_DLSS: u32 = 0;
 pub const FEATURE_REFLEX: u32 = 3;
 pub const FEATURE_PCL: u32 = 4;
 pub const FEATURE_DLSS_G: u32 = 1000;
+pub const FEATURE_DLSS_RR: u32 = 1001;
 
 // Buffer types (`sl::BufferType`).
 pub const BUFFER_DEPTH: u32 = 0;
@@ -70,9 +79,54 @@ pub const BUFFER_MOTION_VECTORS: u32 = 1;
 pub const BUFFER_HUDLESS_COLOR: u32 = 2;
 pub const BUFFER_SCALING_INPUT_COLOR: u32 = 3;
 pub const BUFFER_SCALING_OUTPUT_COLOR: u32 = 4;
+pub const BUFFER_NORMALS: u32 = 5;
+pub const BUFFER_ROUGHNESS: u32 = 6;
+pub const BUFFER_ALBEDO: u32 = 7;
+pub const BUFFER_SPECULAR_ALBEDO: u32 = 8;
+pub const BUFFER_SPECULAR_MOTION_VECTORS: u32 = 10;
 pub const BUFFER_EXPOSURE: u32 = 13;
 pub const BUFFER_UI_COLOR_AND_ALPHA: u32 = 23;
+pub const BUFFER_NORMAL_ROUGHNESS: u32 = 14;
 pub const BUFFER_BIAS_CURRENT_COLOR_HINT: u32 = 29;
+pub const BUFFER_COLOR_BEFORE_TRANSPARENCY: u32 = 40;
+pub const BUFFER_SPECULAR_HIT_DISTANCE: u32 = 42;
+pub const BUFFER_LINEAR_DEPTH: u32 = 49;
+pub const BUFFER_TRANSPARENCY_LAYER: u32 = 51;
+pub const BUFFER_TRANSPARENCY_LAYER_OPACITY: u32 = 52;
+pub const BUFFER_SCREEN_SPACE_SUBSURFACE_SCATTERING_GUIDE: u32 = 58;
+pub const BUFFER_DEPTH_OF_FIELD_GUIDE: u32 = 64;
+
+/// The name of an `sl::BufferType`, for the log.
+pub fn buffer_name(kind: u32) -> &'static str {
+    match kind {
+        BUFFER_DEPTH => "depth",
+        BUFFER_MOTION_VECTORS => "motion vectors",
+        BUFFER_HUDLESS_COLOR => "colour without the interface",
+        BUFFER_SCALING_INPUT_COLOR => "input colour",
+        BUFFER_SCALING_OUTPUT_COLOR => "output colour",
+        BUFFER_NORMALS => "normals",
+        BUFFER_ROUGHNESS => "roughness",
+        BUFFER_ALBEDO => "diffuse albedo",
+        BUFFER_SPECULAR_ALBEDO => "specular albedo",
+        BUFFER_SPECULAR_MOTION_VECTORS => "specular motion vectors",
+        BUFFER_EXPOSURE => "exposure",
+        BUFFER_NORMAL_ROUGHNESS => "normals and roughness",
+        BUFFER_UI_COLOR_AND_ALPHA => "interface colour and alpha",
+        BUFFER_BIAS_CURRENT_COLOR_HINT => "bias current colour hint",
+        BUFFER_COLOR_BEFORE_TRANSPARENCY => "colour before transparency",
+        BUFFER_SPECULAR_HIT_DISTANCE => "specular hit distance",
+        BUFFER_LINEAR_DEPTH => "linear depth",
+        BUFFER_TRANSPARENCY_LAYER => "transparency layer",
+        BUFFER_TRANSPARENCY_LAYER_OPACITY => "transparency layer opacity",
+        BUFFER_SCREEN_SPACE_SUBSURFACE_SCATTERING_GUIDE => "subsurface scattering guide",
+        BUFFER_DEPTH_OF_FIELD_GUIDE => "depth of field guide",
+        _ => "?",
+    }
+}
+
+// `sl::DLSSDNormalRoughnessMode`: whether roughness rides in the normals' alpha.
+pub const DLSSD_UNPACKED: u32 = 0;
+pub const DLSSD_PACKED: u32 = 1;
 
 // `sl::ResourceType` (a char).
 pub const RESOURCE_TEX2D: u8 = 0;
@@ -138,6 +192,12 @@ pub const RENDER_SUBMIT_START: u32 = 2;
 pub const RENDER_SUBMIT_END: u32 = 3;
 pub const PRESENT_START: u32 = 4;
 pub const PRESENT_END: u32 = 5;
+// (6, the general input sample, is struck out of `sl_pcl.h` as deprecated;
+// the controller's is the one input sample the header still has.)
+pub const CONTROLLER_INPUT_SAMPLE: u32 = 13;
+
+/// `sl::kReflexFrameReportCount`: the frames a Reflex state reports on.
+pub const REFLEX_FRAME_REPORTS: usize = 64;
 
 /// `sl::Preferences` (version 1).
 #[repr(C)]
@@ -406,6 +466,114 @@ impl DlssOptions {
     }
 }
 
+/// `sl::DLSSDOptions` (version 3). The offsets were worked out from the
+/// header's C++ layout by hand (the SDK asserts none of them), as the other
+/// feature structures here are: `mode` 32, sizes 36 and 40, `sharpness` 44,
+/// `pre_exposure` 48, `exposure_scale` 52, the three flags 56 to 58,
+/// `normal_roughness_mode` 60, the matrices 64 and 128,
+/// `alpha_upscaling_enabled` 192, the six presets 196 to 216, 224 bytes in all.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DlssdOptions {
+    pub base: BaseStructure,
+    pub mode: u32,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub sharpness: f32,
+    pub pre_exposure: f32,
+    pub exposure_scale: f32,
+    pub color_buffers_hdr: u8,
+    pub indicator_invert_axis_x: u8,
+    pub indicator_invert_axis_y: u8,
+    pub normal_roughness_mode: u32,
+    pub world_to_camera_view: Float4x4,
+    pub camera_view_to_world: Float4x4,
+    pub alpha_upscaling_enabled: u8,
+    pub dlaa_preset: u32,
+    pub quality_preset: u32,
+    pub balanced_preset: u32,
+    pub performance_preset: u32,
+    pub ultra_performance_preset: u32,
+    pub ultra_quality_preset: u32,
+}
+
+impl DlssdOptions {
+    /// The header's defaults, with `mode` for an output of `output`. Both
+    /// matrices stay `INVALID_FLOAT` (the header's own default, "not
+    /// provided"): the title names no camera matrices, so none is made up.
+    /// The presets stay 0 (default): ray reconstruction has its own presets
+    /// (D, E, F) and the super resolution names would revert to default there.
+    pub fn new(mode: u32, output: [u32; 2]) -> Self {
+        DlssdOptions {
+            base: BaseStructure::new(DLSSD_OPTIONS, 3),
+            mode,
+            output_width: output[0],
+            output_height: output[1],
+            sharpness: 0.0,
+            pre_exposure: 1.0,
+            exposure_scale: 1.0,
+            // ray reconstruction takes high dynamic range input only
+            color_buffers_hdr: TRUE,
+            indicator_invert_axis_x: FALSE,
+            indicator_invert_axis_y: FALSE,
+            normal_roughness_mode: DLSSD_UNPACKED,
+            world_to_camera_view: [[INVALID_FLOAT; 4]; 4],
+            camera_view_to_world: [[INVALID_FLOAT; 4]; 4],
+            alpha_upscaling_enabled: FALSE,
+            dlaa_preset: 0,
+            quality_preset: 0,
+            balanced_preset: 0,
+            performance_preset: 0,
+            ultra_performance_preset: 0,
+            ultra_quality_preset: 0,
+        }
+    }
+}
+
+/// `sl::DLSSDOptimalSettings` (version 1): the same shape as the super
+/// resolution one.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DlssdOptimalSettings {
+    pub base: BaseStructure,
+    pub optimal_render_width: u32,
+    pub optimal_render_height: u32,
+    pub optimal_sharpness: f32,
+    pub render_width_min: u32,
+    pub render_height_min: u32,
+    pub render_width_max: u32,
+    pub render_height_max: u32,
+}
+
+impl Default for DlssdOptimalSettings {
+    fn default() -> Self {
+        DlssdOptimalSettings {
+            base: BaseStructure::new(DLSSD_OPTIMAL_SETTINGS, 1),
+            optimal_render_width: 0,
+            optimal_render_height: 0,
+            optimal_sharpness: 0.0,
+            render_width_min: 0,
+            render_height_min: 0,
+            render_width_max: 0,
+            render_height_max: 0,
+        }
+    }
+}
+
+/// `sl::DLSSDState` (version 1).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DlssdState {
+    pub base: BaseStructure,
+    pub estimated_vram_usage_in_bytes: u64,
+}
+
+impl Default for DlssdState {
+    fn default() -> Self {
+        DlssdState { base: BaseStructure::new(DLSSD_STATE, 1), estimated_vram_usage_in_bytes: 0 }
+    }
+}
+
 /// `sl::DLSSOptimalSettings`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -541,6 +709,97 @@ pub struct ReflexOptions {
     pub id_thread: u32,
 }
 
+/// `sl::ReflexReport` (version 1): the times of one frame as the driver saw
+/// them. The header names no unit for the time stamps; the two durations at
+/// the end are in microseconds by their names.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReflexReport {
+    pub base: BaseStructure,
+    pub frame_id: u64,
+    pub input_sample_time: u64,
+    pub sim_start_time: u64,
+    pub sim_end_time: u64,
+    pub render_submit_start_time: u64,
+    pub render_submit_end_time: u64,
+    pub present_start_time: u64,
+    pub present_end_time: u64,
+    pub driver_start_time: u64,
+    pub driver_end_time: u64,
+    pub os_render_queue_start_time: u64,
+    pub os_render_queue_end_time: u64,
+    pub gpu_render_start_time: u64,
+    pub gpu_render_end_time: u64,
+    pub gpu_active_render_time_us: u32,
+    pub gpu_frame_time_us: u32,
+}
+
+impl ReflexReport {
+    /// An empty report, as the header's constructor leaves it.
+    pub const fn empty() -> Self {
+        ReflexReport {
+            base: BaseStructure::new(REFLEX_REPORT, 1),
+            frame_id: 0,
+            input_sample_time: 0,
+            sim_start_time: 0,
+            sim_end_time: 0,
+            render_submit_start_time: 0,
+            render_submit_end_time: 0,
+            present_start_time: 0,
+            present_end_time: 0,
+            driver_start_time: 0,
+            driver_end_time: 0,
+            os_render_queue_start_time: 0,
+            os_render_queue_end_time: 0,
+            gpu_render_start_time: 0,
+            gpu_render_end_time: 0,
+            gpu_active_render_time_us: 0,
+            gpu_frame_time_us: 0,
+        }
+    }
+}
+
+/// `sl::ReflexReport2` (version 1): what version 2 of the state adds for
+/// each frame.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReflexReport2 {
+    pub base: BaseStructure,
+    pub camera_constructed_time: u64,
+    pub cross_adapter_copy_time_us: u32,
+}
+
+/// `sl::ReflexState` (version 2). The header's `bool`s are bytes here: the
+/// library writes them, and only zero or not is read.
+#[repr(C)]
+pub struct ReflexState {
+    pub base: BaseStructure,
+    pub low_latency_available: u8,
+    pub latency_report_available: u8,
+    pub stats_window_message: u32,
+    pub frame_report: [ReflexReport; REFLEX_FRAME_REPORTS],
+    pub flash_indicator_driver_controlled: u8,
+    pub frame_report2: [ReflexReport2; REFLEX_FRAME_REPORTS],
+}
+
+impl ReflexState {
+    /// A state to fill, every report in it with its own header as the
+    /// header's constructors make them. Boxed: it is 12,848 bytes.
+    pub fn new() -> Box<Self> {
+        let report2 =
+            ReflexReport2 { base: BaseStructure::new(REFLEX_REPORT2, 1), camera_constructed_time: 0, cross_adapter_copy_time_us: 0 };
+        Box::new(ReflexState {
+            base: BaseStructure::new(REFLEX_STATE, 2),
+            low_latency_available: 0,
+            latency_report_available: 0,
+            stats_window_message: 0,
+            frame_report: [ReflexReport::empty(); REFLEX_FRAME_REPORTS],
+            flash_indicator_driver_controlled: 0,
+            frame_report2: [report2; REFLEX_FRAME_REPORTS],
+        })
+    }
+}
+
 /// An opaque `sl::FrameToken` (a structure with a virtual table).
 pub type FrameToken = c_void;
 
@@ -567,9 +826,14 @@ pub type SlSetD3DDevice = unsafe extern "C" fn(*mut c_void) -> i32;
 // Per-feature functions (`slGetFeatureFunction`).
 pub type SlDlssGetOptimalSettings = unsafe extern "C" fn(*const DlssOptions, *mut DlssOptimalSettings) -> i32;
 pub type SlDlssSetOptions = unsafe extern "C" fn(*const ViewportHandle, *const DlssOptions) -> i32;
+pub type SlDlssdGetOptimalSettings = unsafe extern "C" fn(*const DlssdOptions, *mut DlssdOptimalSettings) -> i32;
+pub type SlDlssdSetOptions = unsafe extern "C" fn(*const ViewportHandle, *const DlssdOptions) -> i32;
+pub type SlDlssdGetState = unsafe extern "C" fn(*const ViewportHandle, *mut DlssdState) -> i32;
 pub type SlDlssgSetOptions = unsafe extern "C" fn(*const ViewportHandle, *const DlssgOptions) -> i32;
 pub type SlDlssgGetState = unsafe extern "C" fn(*const ViewportHandle, *mut DlssgState, *const DlssgOptions) -> i32;
 pub type SlReflexSetOptions = unsafe extern "C" fn(*const ReflexOptions) -> i32;
+pub type SlReflexSleep = unsafe extern "C" fn(*const FrameToken) -> i32;
+pub type SlReflexGetState = unsafe extern "C" fn(*mut ReflexState) -> i32;
 pub type SlPclSetMarker = unsafe extern "C" fn(u32, *const FrameToken) -> i32;
 
 /// The name of an `sl::Result`, for the log.
@@ -661,8 +925,59 @@ mod tests {
         assert_eq!(offset_of!(DlssgState, is_dynamic_mfg_supported), 80);
         assert_eq!(offset_of!(ReflexOptions, virtual_key), 42);
         assert_eq!(size_of::<ReflexOptions>(), 48);
+        // The Reflex state: 64 reports of 152 bytes behind two flags and a
+        // message id, one more flag, 64 reports of 48 bytes.
+        assert_eq!(offset_of!(ReflexReport, gpu_render_end_time), 136);
+        assert_eq!(offset_of!(ReflexReport, gpu_frame_time_us), 148);
+        assert_eq!(size_of::<ReflexReport>(), 152);
+        assert_eq!(offset_of!(ReflexReport2, cross_adapter_copy_time_us), 40);
+        assert_eq!(size_of::<ReflexReport2>(), 48);
+        assert_eq!(offset_of!(ReflexState, latency_report_available), 33);
+        assert_eq!(offset_of!(ReflexState, stats_window_message), 36);
+        assert_eq!(offset_of!(ReflexState, frame_report), 40);
+        assert_eq!(offset_of!(ReflexState, flash_indicator_driver_controlled), 9768);
+        assert_eq!(offset_of!(ReflexState, frame_report2), 9776);
+        assert_eq!(size_of::<ReflexState>(), 12848);
         assert_eq!(size_of::<Resource>(), 112);
         assert_eq!(size_of::<ResourceTag>(), 64);
+    }
+
+    /// Ray reconstruction's structures, laid out as sl_dlss_d.h's C++ would.
+    #[test]
+    fn ray_reconstruction_structures_lay_out_as_the_header() {
+        assert_eq!(offset_of!(DlssdOptions, color_buffers_hdr), 56);
+        assert_eq!(offset_of!(DlssdOptions, normal_roughness_mode), 60);
+        assert_eq!(offset_of!(DlssdOptions, world_to_camera_view), 64);
+        assert_eq!(offset_of!(DlssdOptions, camera_view_to_world), 128);
+        assert_eq!(offset_of!(DlssdOptions, alpha_upscaling_enabled), 192);
+        assert_eq!(offset_of!(DlssdOptions, dlaa_preset), 196);
+        assert_eq!(offset_of!(DlssdOptions, ultra_quality_preset), 216);
+        assert_eq!(size_of::<DlssdOptions>(), 224);
+        assert_eq!(offset_of!(DlssdOptimalSettings, render_height_max), 56);
+        assert_eq!(size_of::<DlssdOptimalSettings>(), 64);
+        assert_eq!(offset_of!(DlssdState, estimated_vram_usage_in_bytes), 32);
+        assert_eq!(size_of::<DlssdState>(), 40);
+    }
+
+    /// The defaults ray reconstruction starts from, and the buffer names.
+    #[test]
+    fn ray_reconstruction_defaults_and_buffer_names() {
+        let o = DlssdOptions::new(3, [2560, 1440]);
+        assert_eq!(o.base.version, 3);
+        assert_eq!(o.mode, 3);
+        assert_eq!((o.output_width, o.output_height), (2560, 1440));
+        assert_eq!(o.color_buffers_hdr, TRUE);
+        assert_eq!(o.normal_roughness_mode, DLSSD_UNPACKED);
+        for m in [o.world_to_camera_view, o.camera_view_to_world] {
+            assert!(m.iter().flatten().all(|&v| v == INVALID_FLOAT));
+        }
+        assert_eq!(
+            [o.dlaa_preset, o.quality_preset, o.balanced_preset, o.performance_preset, o.ultra_performance_preset, o.ultra_quality_preset],
+            [0; 6]
+        );
+        assert_eq!(buffer_name(BUFFER_ALBEDO), "diffuse albedo");
+        assert_eq!(buffer_name(BUFFER_NORMAL_ROUGHNESS), "normals and roughness");
+        assert_eq!(buffer_name(9999), "?");
     }
 
     #[test]

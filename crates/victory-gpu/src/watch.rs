@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -270,6 +271,8 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         let mut granularity = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        // a clock is read only inside `ask_once`, to split its time.
+        let in_ask = IN_ASK_ONCE.with(|f| f.get()).then(std::time::Instant::now);
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
@@ -281,6 +284,10 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
                 &mut granularity,
             )
         } != 0;
+        if let Some(at) = in_ask {
+            ASK_ONCE[2].fetch_add(1, Ordering::Relaxed);
+            ASK_ONCE[3].fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         {
             tally(10, u64::from(failed));
@@ -544,9 +551,47 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    // the flag lets `kernel_written` tell its own time from the rest of the
+    // asking (ranges held, the journal's locks, noting the answer).
+    IN_ASK_ONCE.with(|f| f.set(true));
+    let began = std::time::Instant::now();
     ask_once_end();
     ask_ahead(ranges);
     ask_rest(ranges);
+    IN_ASK_ONCE.with(|f| f.set(false));
+    ASK_ONCE[0].fetch_add(1, Ordering::Relaxed);
+    ASK_ONCE[1].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// Set while this thread is inside [`ask_once`].
+    static IN_ASK_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Per [`ask_line`]: askings made, their nanoseconds, kernel calls inside
+/// them, and the nanoseconds those took.
+static ASK_ONCE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Logs what [`ask_once`] took over `frames` frames and starts counting
+/// again; says nothing if it was not called.
+pub(crate) fn ask_line(frames: f64) {
+    let calls = ASK_ONCE[0].swap(0, Ordering::Relaxed);
+    let total = ASK_ONCE[1].swap(0, Ordering::Relaxed);
+    let kernel_calls = ASK_ONCE[2].swap(0, Ordering::Relaxed);
+    let kernel = ASK_ONCE[3].swap(0, Ordering::Relaxed);
+    if calls == 0 {
+        return;
+    }
+    let frames = frames.max(1.0);
+    let ms = |ns: u64| ns as f64 / 1e6 / frames;
+    tracing::info!(
+        "asking once per submission, per frame: {:.0} askings in {:.2} ms, of which {:.2} ms in {:.0} kernel calls and {:.2} ms elsewhere (the ranges held, the journal's locks, noting the answer)",
+        calls as f64 / frames,
+        ms(total),
+        ms(kernel),
+        kernel_calls as f64 / frames,
+        ms(total.saturating_sub(kernel)),
+    );
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
@@ -621,6 +666,29 @@ pub(crate) fn wrote(at: usize, len: usize) {
             j.note(other / PAGE, WHOLE, now);
         }
     }
+}
+
+/// The pages a write of ours at `[at, at + len)` leaves other than any host
+/// copy took them, as (from, to) title addresses on page lines, unjoined: the
+/// range widened to whole pages, then one page for each address
+/// [`elsewhere`] gives. These are the pages [`wrote`] notes in the journal and
+/// the two must name the same ones. It is not `wrote`'s return value because
+/// `wrote` returns at once when no asking stands, while the caller must take
+/// these pages off its own list either way, and needs them before the copy is
+/// done. Empty for `len == 0`.
+pub(crate) fn written_ranges(at: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let end = at.saturating_add(len);
+    let mut ranges = vec![(at / PAGE * PAGE, end.div_ceil(PAGE) * PAGE)];
+    for (_, others) in elsewhere(at, len) {
+        for other in others {
+            let from = other / PAGE * PAGE;
+            ranges.push((from, from + PAGE));
+        }
+    }
+    ranges
 }
 
 /// The blocks of `[at, at + len)` whose pages the title shows at other
@@ -3278,6 +3346,28 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    // no views are registered in these tests, so `elsewhere` adds nothing and
+    // only the widened range of the write itself is left.
+    #[test]
+    fn written_ranges_widen_to_whole_pages() {
+        assert_eq!(written_ranges(0x1_0010, 0x20), vec![(0x1_0000, 0x2_0000)]);
+    }
+
+    #[test]
+    fn written_ranges_cross_a_page_line_as_one_range() {
+        assert_eq!(written_ranges(0x1_fff0, 0x20), vec![(0x1_0000, 0x3_0000)]);
+    }
+
+    #[test]
+    fn written_ranges_of_nothing_are_empty() {
+        assert!(written_ranges(0x1_0010, 0).is_empty());
+    }
+
+    #[test]
+    fn written_ranges_ending_on_a_page_line_do_not_widen() {
+        assert_eq!(written_ranges(0x1_0000, PAGE), vec![(0x1_0000, 0x2_0000)]);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

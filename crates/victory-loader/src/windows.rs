@@ -154,6 +154,8 @@ fn map_dll(
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
+    // Crash reports name it as the title ships it, not as our copy.
+    crate::crash::name_image(image.base(), &name);
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((name, image));
     Ok(())

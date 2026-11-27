@@ -19,6 +19,9 @@ impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
     /// Native code another compiler made, in place of `DXIL` (VIctory upstream 0b35b7f).
     pub const ACCC: FourCC = FourCC(*b"ACCC");
+    /// A program a title passed as loose pieces, in a container of our own
+    /// making (`crate::pieces`); no title's container has this part.
+    pub const PIECES: FourCC = FourCC(*b"VPCS");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");
@@ -111,6 +114,15 @@ impl<'a> Container<'a> {
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
     }
+
+    /// The part that holds the container's native programs
+    /// ([`crate::native_programs`] reads its data): `DXIL`, else `ACCC`,
+    /// else the part of a program made from loose pieces.
+    pub fn native_part(&self) -> Option<&Part<'a>> {
+        self.part(FourCC::DXIL)
+            .or(self.part(FourCC::ACCC))
+            .or(self.part(FourCC::PIECES))
+    }
 }
 
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -179,5 +191,20 @@ mod tests {
         assert!(Container::parse(&bytes).is_err());
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn native_part_order_keeps_title_containers_as_they_were() {
+        // a title's container has a DXIL or ACCC part and never the pieces part
+        let both = build(&[(FourCC::PIECES, &[3]), (FourCC::ACCC, &[2]), (FourCC::DXIL, &[1])]);
+        let c = Container::parse(&both).unwrap();
+        assert_eq!(c.native_part().unwrap().data, &[1]);
+        let acc = build(&[(FourCC::PIECES, &[3]), (FourCC::ACCC, &[2])]);
+        assert_eq!(Container::parse(&acc).unwrap().native_part().unwrap().data, &[2]);
+        // only a container with none of the title's parts falls to the pieces
+        let pieces = build(&[(FourCC::PIECES, &[3])]);
+        assert_eq!(Container::parse(&pieces).unwrap().native_part().unwrap().data, &[3]);
+        let none = build(&[(FourCC::SFI0, &[0; 4])]);
+        assert!(Container::parse(&none).unwrap().native_part().is_none());
     }
 }

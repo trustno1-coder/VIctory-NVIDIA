@@ -167,6 +167,117 @@ fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
     at
 }
 
+/// How much of each kept container is read to find its HASH part, which lies
+/// after the small parts that precede it (a few KiB at most). A container
+/// whose HASH part lies beyond it simply has no entry.
+const PREFIX: usize = 8192;
+
+/// The program names the layer leaves out by name (`make::left_out`), which a
+/// container made from pieces does not carry as text. The index notes which
+/// programs hold one, so such a pipeline is still named. In every container
+/// of the book that has one, the name lies well inside `PREFIX`.
+pub(super) const NAMES: [&[u8]; 2] = [b"CS_RaytracingResolve", b"CS_ScreenProbes_ActivateRays"];
+
+/// What the index knows of one program of the title's own containers.
+#[derive(Default)]
+struct Known {
+    /// The logged hashes (first 16 hex digits of the blake3) of the containers that hold it.
+    /// Several containers can hold one program (variants of it share the hash), hence the list.
+    stock: Vec<String>,
+    /// Bit n is set when a container of it carries `NAMES[n]`.
+    named: u8,
+}
+
+/// The title's own program hash of each kept container, with what is known
+/// of it. The book is on disk and only a prefix of each kept container is
+/// read, once; nothing is kept but the 16-byte keys, the logged hashes and the
+/// name bits. The second number is how many containers gave no program (no
+/// HASH part inside the prefix), which would otherwise be a silent hole.
+fn index(dir: &Path) -> (HashMap<victory_shader::pieces::ProgramHash, Known>, usize) {
+    use std::os::windows::fs::FileExt;
+    let mut places = Vec::new();
+    walk_shaders(dir, |_, hash, at, len| places.push((hash, at, len)));
+    let mut map: HashMap<victory_shader::pieces::ProgramHash, Known> = HashMap::new();
+    let mut skipped = 0;
+    let Ok(file) = std::fs::File::open(dir.join(SHADERS)) else { return (map, skipped) };
+    let mut buf = vec![0u8; PREFIX];
+    for (hash, at, len) in places {
+        let want = (len as usize).min(PREFIX);
+        let Ok(n) = file.seek_read(&mut buf[..want], at) else { continue };
+        // containers made from pieces and anything without a HASH part have
+        // no program to give and are left out
+        let Some(program) = victory_shader::pieces::program_of_stock(&buf[..n]) else {
+            skipped += 1;
+            continue;
+        };
+        let known = map.entry(program).or_default();
+        known.stock.push(blake3::Hash::from_bytes(hash).to_hex()[..16].to_owned());
+        for (bit, name) in NAMES.iter().enumerate() {
+            if buf[..n].windows(name.len()).any(|w| w == *name) {
+                known.named |= 1 << bit;
+            }
+        }
+    }
+    (map, skipped)
+}
+
+/// The index of the book in the cache folder, built once. It does not depend
+/// on `VICTORY_PIPELINE_BOOK`, which only controls writing.
+fn programs() -> &'static HashMap<victory_shader::pieces::ProgramHash, Known> {
+    static PROGRAMS: OnceLock<HashMap<victory_shader::pieces::ProgramHash, Known>> = OnceLock::new();
+    PROGRAMS.get_or_init(|| {
+        // no cache folder configured gives an empty map
+        let began = std::time::Instant::now();
+        let (map, skipped) = super::library::folder().map(|dir| index(&dir)).unwrap_or_default();
+        // a digest held by several containers matches every list that names one of them, so the
+        // count shows how far a match by program reaches past a match by hash
+        let shared = map.values().filter(|k| k.stock.len() > 1).count();
+        tracing::info!(
+            programs = map.len(),
+            shared,
+            skipped,
+            ms = began.elapsed().as_secs_f64() * 1e3,
+            "programs of the title's containers known from earlier runs, which the stock hash lists match pipelines from pieces by (VICTORY_PIPELINE_PIECES=1); shared: digests of several containers; skipped: containers with no HASH part inside the prefix"
+        );
+        map
+    })
+}
+
+/// Builds the index on a worker from startup so the title's threads do not
+/// wait for it; a caller that asks before it is done waits on the `OnceLock`
+/// inside `programs`, which is correct and rare (the wait is logged).
+pub(super) fn prime() {
+    let _ = std::thread::Builder::new().name("victory-programs".into()).spawn(|| {
+        programs();
+    });
+}
+
+/// `programs()`, logging how long the caller waited when the worker was not
+/// done yet, since the title's thread may be the one asking.
+fn programs_waited() -> &'static HashMap<victory_shader::pieces::ProgramHash, Known> {
+    let began = std::time::Instant::now();
+    let map = programs();
+    let waited = began.elapsed();
+    if waited.as_millis() >= 5 {
+        tracing::info!(ms = waited.as_secs_f64() * 1e3, "a pipeline from pieces waited for the index of the book");
+    }
+    map
+}
+
+/// The logged hashes of the title's containers kept by earlier runs that hold
+/// `program`. Empty when the book has none, in which case a pipeline from
+/// pieces is matched by nothing and behaves as it did before.
+pub(super) fn stock_hashes(program: &victory_shader::pieces::ProgramHash) -> Vec<String> {
+    programs_waited().get(program).map(|k| k.stock.clone()).unwrap_or_default()
+}
+
+/// Whether a title container of `program` carries the name `name` (one of
+/// `NAMES`).
+pub(super) fn program_named(program: &victory_shader::pieces::ProgramHash, name: &[u8]) -> bool {
+    let Some(bit) = NAMES.iter().position(|n| *n == name) else { return false };
+    programs_waited().get(program).is_some_and(|k| k.named >> bit & 1 != 0)
+}
+
 /// Calls `f` with each pipeline's number and entry; where the last whole one
 /// ends.
 fn walk_pipelines(dir: &Path, mut f: impl FnMut(usize, &[u8])) -> u64 {
@@ -463,6 +574,75 @@ mod tests {
         assert_eq!(back.describe(), g.describe());
         assert!(GraphicsState::get(&bytes[..bytes.len() - 1]).is_none());
         assert!(GraphicsState::get(&bytes[..9]).is_none());
+    }
+
+    /// A container laid out like the title's own: header, one part (HASH: a
+    /// dword of flags, then the digest), and `extra` bytes after the part that
+    /// stand for a variant of the same program.
+    fn stock_with(digest: [u8; 16], extra: &[u8]) -> Vec<u8> {
+        let total = 0x24 + 8 + 20 + extra.len() as u32;
+        let mut c = b"DXBC".to_vec();
+        c.extend([0u8; 16]);
+        c.extend(1u32.to_le_bytes());
+        c.extend(total.to_le_bytes());
+        c.extend(1u32.to_le_bytes());
+        c.extend(0x24u32.to_le_bytes());
+        c.extend(b"HASH");
+        c.extend(20u32.to_le_bytes());
+        c.extend(0u32.to_le_bytes());
+        c.extend(digest);
+        c.extend(extra);
+        c
+    }
+
+    fn stock(digest: [u8; 16]) -> Vec<u8> {
+        stock_with(digest, &[])
+    }
+
+    /// One record of the shader book: stage, blake3, length, container.
+    fn record(stage: u8, container: &[u8]) -> Vec<u8> {
+        let mut r = vec![stage];
+        r.extend(blake3::hash(container).as_bytes());
+        r.extend((container.len() as u32).to_le_bytes());
+        r.extend(container);
+        r
+    }
+
+    fn logged(container: &[u8]) -> String {
+        blake3::hash(container).to_hex()[..16].to_owned()
+    }
+
+    // programs() and stock_hashes() are not tested: they read the process-wide
+    // cache folder, which a test must not touch.
+    #[test]
+    fn the_book_gives_the_stock_hashes_of_a_program() {
+        let dir = std::env::temp_dir().join(format!("victory-programs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (d, e) = ([0x11u8; 16], [0x22u8; 16]);
+        let (one, two) = (stock(d), stock(e));
+        let made = b"VPCS filler".to_vec();
+        let variant = stock_with(d, &[7, 7, 7, 7]);
+        let mut book = Vec::new();
+        for c in [&one, &two, &made, &variant] {
+            book.extend(record(5, c));
+        }
+        // a torn tail
+        book.extend_from_slice(&record(5, &one)[..20]);
+        std::fs::write(dir.join(SHADERS), &book).unwrap();
+        let (map, skipped) = index(&dir);
+        assert_eq!(map.len(), 2);
+        // the one container with no HASH part (the one made from pieces)
+        assert_eq!(skipped, 1);
+        assert_eq!(map[&d].stock, [logged(&one), logged(&variant)]);
+        assert_eq!(map[&e].stock, [logged(&two)]);
+        assert_eq!(map[&d].named, 0);
+        assert!(index(&dir.join("missing")).0.is_empty());
+        // a container that carries a name from `NAMES` marks its program with that name only
+        let named = stock_with([0x33; 16], b"..CS_ScreenProbes_ActivateRays\0");
+        std::fs::write(dir.join(SHADERS), record(5, &named)).unwrap();
+        let (map, _) = index(&dir);
+        assert_eq!(map[&[0x33; 16]].named, 0b10);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

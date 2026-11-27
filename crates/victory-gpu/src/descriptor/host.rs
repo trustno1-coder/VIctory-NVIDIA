@@ -1991,8 +1991,25 @@ impl HostHeap {
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
         let (heap, count, size) = if null == 0 {
-            match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
+            // a sampler heap gets room after the title's slots for the tables the pipeline
+            // layer writes there (`pipeline::host::sampler_tail`, 0 unless
+            // VICTORY_PIPELINE_SAMPLER_TABLE is on). those slots are not view slots: `dynamic`
+            // stays 0 for a sampler heap and only the heap's size grows. a heap too big for the
+            // card is made again without the tail, and a draw that needs a table is then dropped
+            // and counted by the pipeline layer.
+            let tail = if sampler { crate::pipeline::host::sampler_tail() } else { 0 };
+            match make(count + extra + tail) {
+                Ok(heap) => (heap, count, count + extra + tail),
+                Err(e) if tail != 0 => {
+                    tracing::warn!(error = %e, count, tail, "sampler heap with a table tail failed; made without it");
+                    match make(count) {
+                        Ok(heap) => (heap, count, count),
+                        Err(e) => {
+                            tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                            return None;
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;

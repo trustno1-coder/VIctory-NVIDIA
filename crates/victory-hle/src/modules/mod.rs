@@ -12,6 +12,8 @@
 pub mod apu;
 pub mod audio;
 pub mod bink;
+#[cfg(windows)]
+pub mod bvh_builder;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;

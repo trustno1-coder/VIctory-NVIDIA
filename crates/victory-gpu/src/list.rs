@@ -1699,6 +1699,9 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
         return std::ptr::null_mut();
     }
     let Some(mut block) = Upload::new(len) else {
+        // The title takes null as a failed call and the structure builder
+        // ends the run on it; say so here instead of as a crash later.
+        tracing::warn!(size, alignment, "allocate_upload: no room for the list's upload memory, answering null");
         return std::ptr::null_mut();
     };
     let start = block.start();

@@ -68,6 +68,10 @@ pub(super) const fn glyph(c: u8) -> [u8; 7] {
 pub(super) fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
     Some(match format {
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM => [&[0, 0, 0, 0xFF], &[0xFF; 4]],
+        // on a pq swap chain code 1023 is 10,000 nits, so the text is put at paper white instead.
+        DXGI_FORMAT_R10G10B10A2_UNORM if crate::hdr::active() => {
+            [&[0, 0, 0, 0xC0], crate::hdr::paper_white_pixel()]
+        }
         DXGI_FORMAT_R10G10B10A2_UNORM => [&[0, 0, 0, 0xC0], &[0xFF; 4]],
         // Halves of 0 and 1.
         DXGI_FORMAT_R16G16B16A16_FLOAT => [

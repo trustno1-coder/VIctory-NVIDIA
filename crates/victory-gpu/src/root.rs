@@ -198,6 +198,18 @@ pub(crate) extern "system" fn create(
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
 
+/// Whether `this`, a word out of title memory, is a root signature of
+/// ours: an object whose function table is this module's. Its first word is
+/// read through the fault-safe reader, since the address may be anything.
+#[cfg(windows)]
+pub(crate) fn is_ours(this: This) -> bool {
+    let mut table = [0u8; size_of::<usize>()];
+    !this.is_null()
+        && this.is_aligned()
+        && crate::host::read_into(this.cast(), &mut table)
+        && usize::from_ne_bytes(table) == FUNCTIONS.0.as_ptr() as usize
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &ROOT_SIGNATURE_IIDS).then_some(this);
     object::answer(ROOT_SIGNATURE, iid, found, out)

@@ -793,17 +793,132 @@ fn work(scheduler: &'static Scheduler) {
         }
         lanes = scheduler.lock();
         lanes.finish(&job, result);
-        lanes.count(&job, started);
+        let window = lanes.count(&job, started);
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
         }
         scheduler.finished.notify_all();
+        // Written with the scheduler's lock let go: the title takes it at
+        // every enqueue and submit, and a line goes to a pipe the launcher
+        // reads one line at a time. Only when it is written at all.
+        if let Some(window) = window
+            && (stats() || tracing::enabled!(tracing::Level::DEBUG))
+        {
+            drop(lanes);
+            window.log();
+            lanes = scheduler.lock();
+        }
+    }
+}
+
+/// Whether the storage summary is an info line, so that a release build's
+/// log has it (`VICTORY_DSTORAGE_STATS=1`, off by default; without it the
+/// line is debug, which only a diagnostics build can show). It says how
+/// much came in, how long the workers stood inside file reads, and how long
+/// the title waited from a submit to its status entry: the numbers that say
+/// whether a frame waits for the disk once the files are not all in
+/// memory, and by which changes to how files are read are judged. It saves
+/// nothing itself. `VICTORY_DSTORAGE_LOG` already gives a line per request;
+/// this is the cheap summary beside the frame lines. Compiled only, not
+/// read from a run yet.
+fn stats() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_STATS").is_some_and(|v| v == "1"))
+}
+
+/// Bytes the workers read from files (memory sources read none), for the
+/// summary ([`Lanes::count`]).
+static FILE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// With [`stats`]: the longest time from a submit to the status entry it
+/// carried, in microseconds, since the last summary. An entry with no read
+/// ahead of it is written inside the submit itself and reads 0; entries
+/// dropped with a closed queue are never counted.
+static STATUS_LONGEST: AtomicU64 = AtomicU64::new(0);
+
+/// What [`Lanes::count`] summed over one window.
+struct Window {
+    /// The window's length: from its first start to the first request that
+    /// finished 5 s or more after it, so a window after a pause covers the
+    /// pause.
+    secs: f64,
+    requests: u64,
+    /// Written to destinations, and read from files.
+    bytes: u64,
+    file_bytes: u64,
+    /// Worker seconds: busy with requests, inside file reads, on BCPack.
+    busy: f64,
+    reading: f64,
+    bcpack: f64,
+    bcpack_bytes: u64,
+    /// Starts turned away for staging room (one request can be turned away
+    /// many times).
+    refused: u64,
+    /// Requests still waiting.
+    waiting: usize,
+    longest_status_us: u64,
+}
+
+impl Window {
+    /// Info with [`stats`], debug without; never under the scheduler's lock.
+    fn log(&self) {
+        let per_s = |x: f64| x / self.secs.max(1e-9);
+        if stats() {
+            tracing::info!(
+                "dstorage, the last {:.1} s: {} requests, {:.1} MB written to destinations ({:.1} MB/s), {:.1} MB read \
+                 from files; worker ms: {:.0} busy ({:.2} workers), {:.0} inside file reads (retries and the copy into the \
+                 destination included), {:.0} on BCPack ({} MB); {} starts turned away for staging room; {} requests still \
+                 waiting; the longest from a submit to its status entry {:.1} ms (VICTORY_DSTORAGE_STATS)",
+                self.secs,
+                self.requests,
+                self.bytes as f64 / 1e6,
+                per_s(self.bytes as f64) / 1e6,
+                self.file_bytes as f64 / 1e6,
+                self.busy * 1e3,
+                per_s(self.busy),
+                self.reading * 1e3,
+                self.bcpack * 1e3,
+                self.bcpack_bytes / 1_000_000,
+                self.refused,
+                self.waiting,
+                self.longest_status_us as f64 / 1e3
+            );
+        } else {
+            tracing::debug!(
+                requests = self.requests,
+                mb_per_s = format_args!("{:.1}", per_s(self.bytes as f64) / 1e6),
+                busy_workers = format_args!("{:.2}", per_s(self.busy)),
+                reading_workers = format_args!("{:.2}", per_s(self.reading)),
+                staging_waits = self.refused,
+                bcpack_mb = self.bcpack_bytes / 1_000_000,
+                bcpack_workers = format_args!("{:.2}", per_s(self.bcpack)),
+                waiting = self.waiting,
+                "dstorage: last {:.1} s",
+                self.secs
+            );
+        }
     }
 }
 
 impl Lanes {
-    /// Counts a finished request; every 5 s a debug line sums them up.
-    fn count(&mut self, job: &Job, started: std::time::Instant) {
+    /// Reads submitted and not yet started, over all queues.
+    fn waiting(&self) -> usize {
+        self.lanes.values().map(|l| l.reads.len()).sum()
+    }
+
+    /// Tells the lines under the frame rate (`victory_gpu::loading`) how
+    /// many reads wait; called under the scheduler's lock wherever that
+    /// number changes, so the overlay needs no lock of its own.
+    fn publish_waiting(&self) {
+        victory_gpu::loading::DSTORAGE_WAITING.store(
+            u32::try_from(self.waiting()).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Counts a finished request; about every 5 s the window's sums, for
+    /// the caller to write once the lock is let go ([`Window::log`]).
+    fn count(&mut self, job: &Job, started: std::time::Instant) -> Option<Window> {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
         *bytes += u64::from(job.request.destination_size);
@@ -814,25 +929,28 @@ impl Lanes {
         }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
-        if elapsed.as_secs() >= 5 {
-            let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
-            let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
-            tracing::debug!(
-                requests = *requests,
-                mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
-                busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
-                reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
-                staging_waits = std::mem::take(&mut self.refused),
-                bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
-                waiting,
-                "dstorage: last {:.1} s",
-                elapsed.as_secs_f64()
-            );
-            self.done = Default::default();
-            self.bcpack = Default::default();
-            self.since = None;
+        if elapsed.as_secs() < 5 {
+            return None;
         }
+        // (Taken once a window, whether the line is written or not.)
+        let refused = std::mem::take(&mut self.refused);
+        let window = Window {
+            secs: elapsed.as_secs_f64(),
+            requests: *requests,
+            bytes: *bytes,
+            file_bytes: FILE_BYTES.swap(0, Ordering::Relaxed),
+            busy: busy.as_secs_f64(),
+            reading: READING.swap(0, Ordering::Relaxed) as f64 / 1e9,
+            bcpack: self.bcpack.1.as_secs_f64(),
+            bcpack_bytes: self.bcpack.0,
+            refused,
+            waiting: self.waiting(),
+            longest_status_us: STATUS_LONGEST.swap(0, Ordering::Relaxed),
+        };
+        self.done = Default::default();
+        self.bcpack = Default::default();
+        self.since = None;
+        Some(window)
     }
 
     /// Starts the next read of the class with the least virtual time, from
@@ -861,13 +979,16 @@ impl Lanes {
         self.clock[class] += size * COST[class];
         self.lane_now[class] = lane.clock;
         lane.clock += size;
-        Some(Job {
+        let job = Job {
             lane: id,
             seq,
             request,
             note,
             staging,
-        })
+        };
+        // the pop above is what changed the count
+        self.publish_waiting();
+        Some(job)
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
@@ -911,10 +1032,16 @@ impl Lanes {
                     read.note.submitted(&read.request, early);
                     lane.reads.push_back((seq, read));
                 }
-                Command::Status(status) => lane.statuses.push_back((seq, status)),
+                Command::Status(mut status) => {
+                    if stats() {
+                        status.submitted = Some(std::time::Instant::now());
+                    }
+                    lane.statuses.push_back((seq, status));
+                }
             }
         }
         lane.flush();
+        self.publish_waiting();
     }
 }
 
@@ -960,6 +1087,9 @@ impl Lane {
             status
                 .entry()
                 .store(first.unwrap_or(S_OK), Ordering::Release);
+            if let Some(at) = status.submitted {
+                STATUS_LONGEST.fetch_max(at.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -990,6 +1120,7 @@ fn close_lane(id: u64) {
     lane.unsubmitted.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
+    lanes.publish_waiting();
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
             .finished
@@ -1245,6 +1376,8 @@ struct Status {
     index: u32,
     /// For the log.
     enqueued: u64,
+    /// With [`stats`]: when the title submitted it.
+    submitted: Option<std::time::Instant>,
 }
 
 impl Drop for Status {
@@ -1286,7 +1419,7 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     entry.store(E_PENDING, Ordering::Release);
     add_ref_instance(array);
     let enqueued = stream_log::now();
-    queue(this, Command::Status(Status { array, index, enqueued }));
+    queue(this, Command::Status(Status { array, index, enqueued, submitted: None }));
 }
 
 /// Whether a queue submits itself once half of it is enqueued
@@ -1584,6 +1717,10 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         victory_gpu::kernel_will_write(out.as_ptr() as usize + done, out.len() - done);
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    FILE_BYTES.fetch_add(done as u64, Ordering::Relaxed);
+    // the 5 s summary swaps FILE_BYTES to 0, so the overlay's MB/s keeps a
+    // counter of its own, which the meter takes once a second
+    victory_gpu::loading::DSTORAGE_READ_BYTES.fetch_add(done as u64, Ordering::Relaxed);
     result
 }
 
@@ -2230,6 +2367,31 @@ mod tests {
         lane.unsubmitted.push(Command::Read(Read { request: r, note }));
     }
 
+    /// The summary's window: nothing before 5 s, then the window's sums,
+    /// the turned-away starts taken with it, and a fresh window after.
+    #[test]
+    fn a_window_is_summed_once_it_is_five_seconds_old() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        for _ in 0..3 {
+            read(&mut l, 0, 0, 1000);
+        }
+        l.submit(0, false);
+        let started = std::time::Instant::now();
+        let job = l.start().unwrap();
+        l.finish(&job, Ok(()));
+        assert!(l.count(&job, started).is_none());
+        l.refused = 4;
+        l.since = Some(started - std::time::Duration::from_secs(6));
+        let job = l.start().unwrap();
+        l.finish(&job, Ok(()));
+        let window = l.count(&job, started).unwrap();
+        assert_eq!((window.requests, window.bytes, window.refused, window.waiting), (2, 2000, 4, 1));
+        assert!(window.secs >= 6.0);
+        assert_eq!(l.refused, 0);
+        assert!(l.since.is_none());
+    }
+
     #[test]
     fn priorities_share_by_bytes_about_tenfold() {
         let mut l = lanes(STAGING);
@@ -2283,7 +2445,7 @@ mod tests {
         let array = status_array(2).cast::<Instance<StatusArray>>();
         let status = |index| {
             add_ref_instance(array);
-            Command::Status(Status { array, index, enqueued: 0 })
+            Command::Status(Status { array, index, enqueued: 0, submitted: None })
         };
         read(&mut l, 0, 0, 16);
         read(&mut l, 0, 0, 16);

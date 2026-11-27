@@ -195,22 +195,34 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
     if copies.is_empty() {
         return false;
     }
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            Step::Refresh(shadow, at, len) => copies
-                .iter()
-                .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow))),
-            Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
-            Step::Plane((at, len), _) => copies.iter().any(|w| w.from < at.saturating_add(*len) && *at < w.to),
-            _ => false,
-        })
-    })
+    let _walk = lean::walking(lean::Walk::CopiedRead);
+    // a set seen again in this call asks the same question as its first
+    // occurrence, so it contributes nothing the second time.
+    let mut once = sets::Once::default();
+    for list in runs {
+        for step in list.deferred().copies.iter() {
+            let hit = match step {
+                Step::Refresh(..) | Step::RefreshSet(_) => sets::refreshes(step, &mut once).any(|(shadow, at, len)| {
+                    copies
+                        .iter()
+                        .any(|w| w.from < at + len && at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow)))
+                }),
+                Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
+                Step::Plane((at, len), _) => copies.iter().any(|w| w.from < at.saturating_add(*len) && *at < w.to),
+                _ => false,
+            };
+            if hit {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// What a step of a submission does to title memory, as the plan sees it.
 /// `asked`: flights in the air stop it from being done on the CPU now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Does {
+pub(super) enum Does {
     Copy { dst: usize, src: usize, len: usize, asked: bool },
     /// `to`: its memory can be given the bytes on the card.
     Fill { src: usize, len: usize, asked: bool, to: bool },
@@ -413,13 +425,30 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
+pub(super) fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
+    let _walk = lean::walking(lean::Walk::DoesOf);
     let mut does = Vec::new();
+    // a set stands in a submission many times; its refreshes are the same
+    // every time, so only its first occurrence adds entries.
+    let mut once = sets::Once::default();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
+            if let Step::RefreshSet(set) = step {
+                if once.first(set) {
+                    for m in set.members() {
+                        does.push(Does::Refresh {
+                            shadow: Arc::as_ptr(&m.shadow) as usize,
+                            from: m.at,
+                            to: m.at + m.len,
+                        });
+                        steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+                    }
+                }
+                continue;
+            }
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
                     dst,
@@ -454,12 +483,33 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                 },
                 Step::Run(_) => Does::Run,
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
-                Step::GpuWrite(..) | Step::Host(..) => continue,
+                Step::RefreshSet(_) | Step::GpuWrite(..) | Step::Host(..) => continue,
             });
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
         }
     }
     (does, steps)
+}
+
+/// The refreshes of host copies in `runs` as (copy address, from, to),
+/// sorted and without repeats. `sets::begin` compares this between the set
+/// form and the naive expansion in check mode.
+pub(super) fn refresh_does(runs: &[&HostList]) -> Vec<(usize, usize, usize)> {
+    refreshes_of(does_of(&[], runs).0)
+}
+
+/// The sorted, deduplicated refreshes among `does`.
+fn refreshes_of(does: Vec<Does>) -> Vec<(usize, usize, usize)> {
+    let mut out: Vec<_> = does
+        .into_iter()
+        .filter_map(|d| match d {
+            Does::Refresh { shadow, from, to } => Some((shadow, from, to)),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// With flights in the air: before which of `runs` the submission is cut so
@@ -615,6 +665,46 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 /// bytes, and submissions that waited instead, refused by a check.
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Every reason [`plan`], [`holder`], [`take_steps`] and [`Host::card_steps`]
+/// give for leaving a submission to the wait, in the words they return them
+/// in. Each refusal is counted under its own place here, so the periodic
+/// line says what keeps the card from taking the steps (a test keeps this
+/// list and the places that refuse in step). The last place of [`WHY`] is
+/// for a reason that is not listed.
+const REASONS: [&str; 20] = [
+    "a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)",
+    "a fill of memory the card cannot be given the bytes of",
+    "a step of ours runs",
+    "a texture reads it",
+    "a copy onto itself",
+    "too many steps depend on it",
+    BEHIND_PLACED,
+    "a texture or expanded vertices read what it writes",
+    "a fill of memory the card cannot be given the bytes of reads what it writes",
+    "a read-back or a value behind a flight is written there",
+    "flights write it through two host copies",
+    "no host copy of it",
+    "no host copy holds all of it",
+    "a copy done on the card is read through another host copy",
+    "nothing to read",
+    "too much at once",
+    "not all of what it reads is mapped",
+    "another host copy of what it writes is read",
+    "not all of what it writes is mapped",
+    "no host list or buffer for it",
+];
+
+/// Since the last frame-rate line: submissions refused, by [`REASONS`]' place
+/// (a fixed table, so the counting is bounded), and the last place for a
+/// reason that is not in it. Counted in release, beside `DONE[3]`.
+static WHY: [std::sync::atomic::AtomicU64; REASONS.len() + 1] = [const { std::sync::atomic::AtomicU64::new(0) }; REASONS.len() + 1];
+
+/// Counts one refusal for `why`.
+fn count_refusal(why: &str) {
+    let at = REASONS.iter().position(|r| *r == why).unwrap_or(REASONS.len());
+    WHY[at].fetch_add(1, Ordering::Relaxed);
+}
+
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
 /// list by address, their place in it).
@@ -678,6 +768,7 @@ impl Host {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
+                count_refusal(why);
                 #[cfg(feature = "diagnostics")]
                 refused(why);
                 let _ = why;
@@ -913,6 +1004,19 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    // The refusals by reason, most often first (release too): what keeps
+    // the rest of the steps from being done on the card.
+    let mut why: Vec<(f64, &str)> = WHY
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.swap(0, Ordering::Relaxed) as f64 / frames, REASONS.get(i).copied().unwrap_or("another reason")))
+        .filter(|(n, _)| *n > 0.0)
+        .collect();
+    why.sort_by(|a, b| b.0.total_cmp(&a.0));
+    if !why.is_empty() {
+        let said: Vec<String> = why.iter().take(6).map(|(n, r)| format!("{n:.2} {r}")).collect();
+        tracing::info!("submissions refused by the card's steps, per frame, by reason: {}", said.join("; "));
+    }
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -944,6 +1048,22 @@ mod tests {
         Does::Copy { dst, src, len, asked }
     }
 
+    /// Only refreshes come out, in order, once each.
+    #[test]
+    fn refresh_list_is_sorted_and_deduplicated() {
+        let does = vec![
+            Does::Refresh { shadow: 9, from: 10, to: 20 },
+            copy(1, 2, 3, false),
+            Does::Refresh { shadow: 3, from: 50, to: 60 },
+            fill(5, 6, true),
+            Does::Run,
+            Does::Refresh { shadow: 9, from: 10, to: 20 },
+            Does::Refresh { shadow: 3, from: 0, to: 5 },
+        ];
+        assert_eq!(refreshes_of(does), vec![(3, 0, 5), (3, 50, 60), (9, 10, 20)]);
+        assert!(refreshes_of(vec![Does::Run, copy(1, 2, 3, true)]).is_empty());
+    }
+
     fn fill(src: usize, len: usize, asked: bool) -> Does {
         Does::Fill { src, len, asked, to: true }
     }
@@ -959,6 +1079,31 @@ mod tests {
 
     /// Only what is asked for is taken, all of it, and a step that stands
     /// in none of their ways stays where it is.
+    /// Every reason this file refuses with has a place in [`REASONS`], and
+    /// a refusal is counted at it, or in the last place if it is unknown.
+    #[test]
+    fn refusals_are_counted_by_reason() {
+        let source = include_str!("card_steps.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or("");
+        let mut found = 0;
+        for key in ["Err(\"", "ok_or(\""] {
+            for part in code.split(key).skip(1) {
+                let Some(text) = part.split('"').next() else {
+                    continue;
+                };
+                found += 1;
+                assert!(REASONS.contains(&text), "not in REASONS: {text}");
+            }
+        }
+        assert!(found >= REASONS.len() - 1, "{found}");
+        assert!(REASONS.contains(&BEHIND_PLACED));
+        let (first, last) = (WHY[0].load(Ordering::Relaxed), WHY[REASONS.len()].load(Ordering::Relaxed));
+        count_refusal(REASONS[0]);
+        count_refusal("a reason nobody listed");
+        assert!(WHY[0].load(Ordering::Relaxed) > first);
+        assert!(WHY[REASONS.len()].load(Ordering::Relaxed) > last);
+    }
+
     #[test]
     fn steps_apart_from_one_another_are_taken() {
         let does = [

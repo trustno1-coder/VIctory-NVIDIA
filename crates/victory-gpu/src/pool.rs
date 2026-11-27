@@ -377,9 +377,33 @@ impl Drop for StagingPiece {
     }
 }
 
-/// `bytes` of upload memory, all zeros: the buffer it lies in, where in
-/// that buffer, and its mapping. `None`: not pooled.
-pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
+/// Whether a staging piece the detiling is known to write whole may be
+/// handed out as it is, its zeros left to the detiling or to a fill where
+/// a copy from it is recorded (`VICTORY_STAGING_NO_ZERO=1`, off by
+/// default; see `crate::texture::Staging::zero_if_unwritten`). Without it
+/// every piece cut from a part of a block used before is zero-filled when
+/// it is handed out, and the detiling then writes the same bytes again:
+/// upload memory written twice per texture byte (46-75 MB a frame with the
+/// title's ray tracing while the world streams in), on the thread that
+/// makes the staging buffer and under the texture module's staging lock.
+/// It saves thread time of the texture pass and bytes written, not frame
+/// time: most passes stop at their time cap, so judge it by microseconds
+/// per upload, not by the totals.
+pub(crate) fn no_zero() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_NO_ZERO").is_some_and(|v| v == "1"))
+}
+
+/// `bytes` of upload memory: the buffer it lies in, where in that buffer,
+/// its mapping, and whether the piece was used before. All zeros, unless
+/// `leave` and it was used before ([`no_zero`]): then it holds what it held,
+/// and the caller sees to every byte a copy reads from it. `None`: not
+/// pooled.
+pub(crate) fn staging(
+    host: &crate::host::Host,
+    bytes: u64,
+    leave: bool,
+) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8, bool)> {
     if !on() {
         return None;
     }
@@ -400,13 +424,13 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
-    if again {
+    if again && !leave {
         // What is not detiled into it (an unmapped texture) uploads zeros,
         // as from a buffer of its own.
         // SAFETY: the piece is ours alone.
         unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
     }
-    Some((owned, memory.0, piece.start, data))
+    Some((owned, memory.0, piece.start, data, again))
 }
 
 /// An object the host texture holds and releases when it goes: its piece
@@ -880,13 +904,22 @@ mod tests {
         assert_eq!(resting(), before + 1);
         // SAFETY: the piece's mapping, 4096 bytes of it ours.
         unsafe {
-            let (piece, _, at, data) = staging(host, 4096).unwrap();
+            let (piece, _, at, data, _) = staging(host, 4096, false).unwrap();
             assert!(at.is_multiple_of(512));
             std::ptr::write_bytes(data, 0xAB, 4096);
             drop(piece);
             lock(&STAGING).rested(u64::MAX);
-            let (_piece, _, _, data) = staging(host, 4096).unwrap();
+            let (piece, _, _, data, again) = staging(host, 4096, false).unwrap();
+            assert!(again);
             assert!((0..4096).all(|i| *data.add(i) == 0));
+            // Left as it was (`VICTORY_STAGING_NO_ZERO`): what it held, and
+            // said to have been used before.
+            std::ptr::write_bytes(data, 0xCD, 4096);
+            drop(piece);
+            lock(&STAGING).rested(u64::MAX);
+            let (_piece, _, _, data, again) = staging(host, 4096, true).unwrap();
+            assert!(again);
+            assert!((0..4096).all(|i| *data.add(i) == 0xCD));
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }

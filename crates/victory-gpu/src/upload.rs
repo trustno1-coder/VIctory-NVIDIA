@@ -54,18 +54,80 @@ fn gap(taken: &[bool], n: usize) -> Option<usize> {
     None
 }
 
+/// As [`reserve`], for memory of ours that no shader finds by its address
+/// (the arenas of memory by address and its directory: a shader is given a
+/// copy's number and an offset, never where our side of the copy lies):
+/// where shaders reach if there is room, else anywhere below 2^40, which is
+/// as far as the write watch keeps its bits.
+///
+/// The title's own memory fills [4 GiB, 2^37): with the world streamed in
+/// there was no hole of 64 MiB left in it in two runs of three (rt-2 and
+/// rt-4), the twentieth arena could not be had, and every builder dispatch
+/// asked for it again.
+///
+/// `VICTORY_DISPLAY_WIDE` (read once, see [`wide`]) tries above 2^37 first: at
+/// 5120x1440 the title's screen-sized memory leaves about 150 MiB of room in
+/// the reachable window, and the arenas of memory by address (64 MiB each,
+/// which no shader finds by address) took 80 MiB of it, so the upload arenas
+/// ran out at the nineteenth and `allocate_upload` answered null to the
+/// structure builder, which then ended the run. Unset, the order is as it was.
+pub(crate) fn reserve_out_of_reach(len: usize) -> Option<usize> {
+    let [first, second] = out_of_reach_order(wide());
+    reserve_between(len, first.0, first.1).or_else(|| reserve_between(len, second.0, second.1))
+}
+
+/// The two windows [`reserve_out_of_reach`] tries, in order.
+fn out_of_reach_order(wide: bool) -> [(usize, usize); 2] {
+    let (near, far) = ((1 << 32, 1 << 37), (1 << 37, 1 << 40));
+    if wide { [far, near] } else { [near, far] }
+}
+
+/// Whether `VICTORY_DISPLAY_WIDE` is set (the launcher keeps it in the
+/// title's process): a wide output, whose bigger buffers leave the reachable
+/// window short of room. Read once.
+pub(crate) fn wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DISPLAY_WIDE").is_some())
+}
+
+/// The last error of this thread, for a log line after a failed call.
+pub(crate) fn last_error() -> u32 {
+    // SAFETY: a plain query of the calling thread's state.
+    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+}
+
+/// Gives memory of [`reserve`]'s back (all of it, from its start).
+pub(crate) fn release(at: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+    if at != 0 {
+        // SAFETY: a reservation of ours that nothing uses any more.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+/// Fresh zeroed write-watched memory of `len` bytes in `[lowest, end)`.
+fn reserve_between(len: usize, lowest: usize, end: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE};
+    allocate_between(len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, lowest, end).ok()
+}
+
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 const MEM_TOP_DOWN: u32 = 0x10_0000;
 
 /// `VirtualAlloc2` in [4 GiB, 2^37): its address, or the error.
 fn allocate_in_window(len: usize, kind: u32) -> Result<usize, u32> {
+    allocate_between(len, kind, 1 << 32, 1 << 37)
+}
+
+/// `VirtualAlloc2` in `[lowest, end)`: its address, or the error.
+fn allocate_between(len: usize, kind: u32, lowest: usize, end: usize) -> Result<usize, u32> {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::Memory::{
         MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER, MemExtendedParameterAddressRequirements, PAGE_READWRITE, VirtualAlloc2,
     };
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
-        LowestStartingAddress: (1usize << 32) as *mut _,
-        HighestEndingAddress: ((1usize << 37) - 1) as *mut _,
+        LowestStartingAddress: lowest as *mut _,
+        HighestEndingAddress: (end - 1) as *mut _,
         Alignment: 0,
     };
     let mut parameter = MEM_EXTENDED_PARAMETER::default();
@@ -242,10 +304,21 @@ impl Upload {
             None => {
                 let blocks = n.max(ARENA / BLOCK);
                 let Some(at) = reserve(blocks * BLOCK) else {
-                    // Better than null, which the title throws on, ending
-                    // the game: its shaders may read zeros from this.
+                    // Better than null, which the title's structure builder throws on
+                    // ("Failed to allocate upload buffer"), ending the game: its shaders
+                    // may read zeros from this. What Windows said goes in the log once
+                    // (1455: the PC's memory and page file are used up; 8: no free range left).
                     static TOLD: std::sync::Once = std::sync::Once::new();
-                    TOLD.call_once(|| tracing::warn!(bytes = len, "an upload from the process heap instead: ray tracing may miss some of it"));
+                    let error = last_error();
+                    let arenas = arenas.len();
+                    TOLD.call_once(|| {
+                        tracing::warn!(
+                            bytes = len,
+                            error,
+                            arenas,
+                            "no memory for lists' uploads where shaders reach it by address (between 4 GiB and 128 GiB): an upload from the process heap instead, ray tracing may miss some of it"
+                        )
+                    });
                     return Some(Upload(Kind::Heap(vec![0; len])));
                 };
                 crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
@@ -315,6 +388,12 @@ mod tests {
         // SAFETY: the bytes were handed out.
         unsafe { d.start().add(ARENA).write(1) };
         drop(b);
+    }
+
+    #[test]
+    fn wide_tries_above_the_reach_first_and_16_9_is_unchanged() {
+        assert_eq!(out_of_reach_order(false), [(1 << 32, 1 << 37), (1 << 37, 1 << 40)]);
+        assert_eq!(out_of_reach_order(true), [(1 << 37, 1 << 40), (1 << 32, 1 << 37)]);
     }
 
     #[test]

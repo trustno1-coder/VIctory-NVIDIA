@@ -25,25 +25,68 @@ const SCANOUT_RESERVATION: u32 = 0x0247_ad4a;
 const TEMPORAL_SCALE: u32 = 0x028f_1e7e;
 const UI_VIEWPORT_LOAD: u32 = 0x0580_48d4;
 
+/// A display wider than 16:9 asked for with `VICTORY_DISPLAY_WIDE=WxH`
+/// (5120x1440 for a 32:9 one): the size the output is patched to in place
+/// of 2560x1440, so that the title's own camera, its culling, its motion
+/// vectors and its rays are all made for the wide picture, and nothing of
+/// ours has to widen a projection on its way to the card (`VICTORY_ASPECT`
+/// does that to a copy and leaves the title's own value narrow).
+///
+/// The height is kept at 1440 (what the other patched fields were worked
+/// out for) and the width is a multiple of 8 from 2560 to 7680. `None`
+/// without the variable; an error names a value that is not such a size.
+pub(super) fn wide_asked() -> Result<Option<(u32, u32)>> {
+    let Ok(asked) = std::env::var("VICTORY_DISPLAY_WIDE") else {
+        return Ok(None);
+    };
+    wide_of(&asked).map(Some)
+}
+
+/// [`wide_asked`]'s reading of the variable's value.
+fn wide_of(asked: &str) -> Result<(u32, u32)> {
+    let size = asked.trim().split_once(['x', 'X']).and_then(|(w, h)| {
+        Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+    });
+    match size {
+        Some((w, HEIGHT)) if (WIDTH..=7680).contains(&w) && w % 8 == 0 => Ok((w, HEIGHT)),
+        _ => anyhow::bail!(
+            "VICTORY_DISPLAY_WIDE={asked}: not a size this output can be patched to (a width of 2560 to 7680, a multiple of 8, by 1440: 5120x1440)"
+        ),
+    }
+}
+
 /// Patches `image` for a 2560x1440 output; the scene is drawn at 2560x1440,
-/// or at 1920x1080 with `render_1080p`. Returns the scene's size.
+/// or at 1920x1080 with `render_1080p`. Returns the scene's size. (The
+/// runner asks through [`prepare_sized`]; this is the tests' short form.)
+#[cfg(test)]
 pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(u32, u32)> {
+    prepare_sized(image, (WIDTH, HEIGHT), render_1080p)
+}
+
+/// As [`prepare`], for an output of `output` (2560x1440, or a wider one of
+/// [`wide_asked`]). The 1080p scene is one of the 16:9 output alone.
+pub(super) fn prepare_sized(image: &mut PreparedImage, output: (u32, u32), render_1080p: bool) -> Result<(u32, u32)> {
     ensure!(
         image.original_hash.to_hex().as_str() == RETAIL_BUILD,
         "1440p output is only known for the retail build {RETAIL_BUILD}"
     );
+    let (width, height) = output;
+    ensure!(
+        !render_1080p || output == (WIDTH, HEIGHT),
+        "a 1920x1080 scene is only known for the 2560x1440 output"
+    );
 
     let mode = field::<16>(image, SDR_MODE)?;
     ensure!(*mode == STOCK_SDR_MODE, "unexpected Series X SDR mode");
-    mode[..4].copy_from_slice(&WIDTH.to_le_bytes());
-    mode[4..8].copy_from_slice(&HEIGHT.to_le_bytes());
+    mode[..4].copy_from_slice(&width.to_le_bytes());
+    mode[4..8].copy_from_slice(&height.to_le_bytes());
 
     // Two 64 KiB-aligned, tiled RGBA8 scanout buffers. The reservation is
     // rounded to 2 MiB, matching the title's allocation check.
     let texture = Texture::new(&TextureDesc {
         dimension: Dimension::Tex2d,
-        width: WIDTH,
-        height: HEIGHT,
+        width,
+        height,
         depth_or_array: 1,
         mips: 1,
         format: 28,
@@ -59,8 +102,9 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
 
     let scale = field::<4>(image, TEMPORAL_SCALE)?;
     ensure!(*scale == (2.0f32 / 3.0).to_le_bytes(), "unexpected Series X temporal scene scale");
-    let (render_width, render_height) = if render_1080p { (1920, 1080) } else { (WIDTH, HEIGHT) };
-    *scale = (render_width as f32 / WIDTH as f32).to_le_bytes();
+    // (One scale for both directions: the scene is the output's shape.)
+    let (render_width, render_height) = if render_1080p { (1920, 1080) } else { (width, height) };
+    *scale = (render_width as f32 / width as f32).to_le_bytes();
 
     // Settings lays out its preview panels with a viewport setter of its
     // own that loads the legacy UI size (3840x2160) even when a 1440p UI
@@ -175,6 +219,41 @@ mod tests {
             // Patched once, the image is no longer the stock one: refused.
             assert!(prepare(&mut image, render_1080p).is_err());
         }
+    }
+
+    /// What `VICTORY_DISPLAY_WIDE` takes: a width from 2560 on, a multiple
+    /// of 8, by 1440; anything else is named as an error, not passed over.
+    #[test]
+    fn wide_sizes() {
+        assert_eq!(wide_of("5120x1440").unwrap(), (5120, 1440));
+        assert_eq!(wide_of(" 3440 X 1440 ").unwrap(), (3440, 1440));
+        assert_eq!(wide_of("2560x1440").unwrap(), (2560, 1440));
+        for bad in ["", "5120", "5120x1080", "1920x1440", "5121x1440", "7688x1440", "widex1440", "5120x1440x2"] {
+            assert!(wide_of(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// With the retail executable (as above): a 5120x1440 output has the
+    /// mode at that size, the scene at the whole of it, and a scanout
+    /// reservation that holds two such buffers.
+    #[test]
+    fn patches_the_retail_image_for_a_wide_output() {
+        let Some(path) = std::env::var_os("VICTORY_DISPLAY_PROFILE_TEST_IMAGE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let mut image = victory_loader::prepare(&bytes).unwrap();
+        assert_eq!(prepare_sized(&mut image, (5120, 1440), false).unwrap(), (5120, 1440));
+        let mode = *field::<16>(&mut image, SDR_MODE).unwrap();
+        assert_eq!(mode[..4], 5120u32.to_le_bytes());
+        assert_eq!(mode[4..8], 1440u32.to_le_bytes());
+        assert_eq!(f32::from_le_bytes(*field::<4>(&mut image, TEMPORAL_SCALE).unwrap()), 1.0);
+        let reservation = *field::<5>(&mut image, SCANOUT_RESERVATION).unwrap();
+        let pool = u32::from_le_bytes(reservation[1..].try_into().unwrap());
+        assert!(pool >= 2 * 5120 * 1440 * 4 && pool % (2 << 20) == 0, "{pool}");
+        // A 1080p scene belongs to the 16:9 output.
+        let mut image = victory_loader::prepare(&bytes).unwrap();
+        assert!(prepare_sized(&mut image, (5120, 1440), true).is_err());
     }
 
     /// With the retail executable (as above): the upscaler path at each

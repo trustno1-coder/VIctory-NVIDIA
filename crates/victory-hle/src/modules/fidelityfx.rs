@@ -40,6 +40,7 @@ const PARAMETER: u32 = 6;
 // Description types.
 const CREATE_UPSCALE: u64 = 0x1_0000;
 const DISPATCH_UPSCALE: u64 = 0x1_0001;
+const QUERY_JITTER_PHASE_COUNT: u64 = 0x1_0004;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -96,6 +97,20 @@ struct DispatchUpscale {
     flags: u32,
 }
 
+/// The jitter phase count query: render width, display width, and where
+/// the answer goes. The title (game+0x28ef2e7) passes its upscaler's
+/// render and output widths and keeps the answer as the length of its
+/// jitter ring, which it later takes the frame's index modulo.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct QueryJitterPhaseCount {
+    header: Header,
+    render_width: u32,
+    display_width: u32,
+    phase_count: *mut i32,
+}
+
+const _: () = assert!(size_of::<QueryJitterPhaseCount>() == 0x20);
 const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
 const _: () = assert!(size_of::<Resource>() == 0x30);
 const _: () = assert!(size_of::<DispatchUpscale>() == 0x1b0);
@@ -290,7 +305,56 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         }
     }
     // SAFETY: the title's own function, with its arguments.
-    unsafe { std::mem::transmute::<*const (), Call>(query)(context, desc) }
+    let code = unsafe { std::mem::transmute::<*const (), Call>(query)(context, desc) };
+    // SAFETY: the kind was read above from the same non-null description.
+    if !desc.is_null() && unsafe { (*desc).kind } == QUERY_JITTER_PHASE_COUNT {
+        // SAFETY: a phase count query, by its type.
+        return answer_phase_count(unsafe { desc.cast::<QueryJitterPhaseCount>().read_unaligned() }, code);
+    }
+    code
+}
+
+/// FidelityFX's jitter phase count for an upscaling from `render_width` to
+/// `display_width`: 8 times the square of the scale (the SDK's
+/// `ffxFsr3GetJitterPhaseCount`), at least 1.
+fn phase_count(render_width: u32, display_width: u32) -> i32 {
+    if render_width == 0 {
+        return 8;
+    }
+    let scale = f64::from(display_width) / f64::from(render_width);
+    ((8.0 * scale * scale) as i32).max(1)
+}
+
+/// Makes sure the title's phase count query leaves a count of 1 or more.
+/// The shipping FSR4 refuses sizes it has no tables for, and a context it
+/// failed to make: then it writes nothing, the title's ring stays 0 long,
+/// and the title divides by zero in its next frame (a player's crash,
+/// 2026-11-27, integer division at game+0x28f03e8). Its own answer is kept
+/// whenever it gave one.
+fn answer_phase_count(q: QueryJitterPhaseCount, code: u32) -> u32 {
+    if q.phase_count.is_null() {
+        return code;
+    }
+    // SAFETY: the title's answer slot, which it passed for this call.
+    let given = unsafe { q.phase_count.read_unaligned() };
+    if code == OK && given > 0 {
+        return code;
+    }
+    let ours = phase_count(q.render_width, q.display_width);
+    // SAFETY: as above.
+    unsafe { q.phase_count.write_unaligned(ours) };
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, Relaxed) {
+        tracing::warn!(
+            code,
+            given,
+            ours,
+            render_width = q.render_width,
+            display_width = q.display_width,
+            "FidelityFX: the title's upscaler gave no jitter phase count; answered with FidelityFX's own formula"
+        );
+    }
+    OK
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
@@ -395,6 +459,29 @@ mod tests {
     use super::*;
     use std::mem::offset_of;
     use std::ptr::null_mut;
+
+    #[test]
+    fn a_missing_phase_count_is_answered() {
+        // the SDK's values: 8 at 1x, 18 at 1.5x, 32 at 2x
+        assert_eq!(phase_count(2560, 2560), 8);
+        assert_eq!(phase_count(1706, 2560), 18);
+        assert_eq!(phase_count(1280, 2560), 32);
+        assert_eq!(phase_count(0, 2560), 8);
+        let mut slot = 0i32;
+        let q = QueryJitterPhaseCount {
+            header: Header { kind: QUERY_JITTER_PHASE_COUNT, next: std::ptr::null_mut() },
+            render_width: 1280,
+            display_width: 2560,
+            phase_count: &raw mut slot,
+        };
+        // a refusal leaves nothing: ours goes in, and the call reads as done
+        assert_eq!(answer_phase_count(q, PARAMETER), OK);
+        assert_eq!(slot, 32);
+        // an answer of the title's own stays
+        slot = 5;
+        assert_eq!(answer_phase_count(q, OK), OK);
+        assert_eq!(slot, 5);
+    }
 
     #[test]
     fn descriptions_lay_out_as_the_sdk() {

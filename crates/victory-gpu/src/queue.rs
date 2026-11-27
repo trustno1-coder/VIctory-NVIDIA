@@ -44,6 +44,11 @@ struct Queue {
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
+/// The list type of a queue that draws (D3D12's direct type; 2 is compute,
+/// 3 copy): the queue a frame's render submissions go to.
+#[cfg(windows)]
+const DIRECT: u32 = 0;
+
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
@@ -591,9 +596,29 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    execute_tagged(this, count, lists, 0);
+}
+
+/// [`execute`] for lists the title tags with the frame token `token` (0:
+/// none).
+fn execute_tagged(this: This, count: u32, lists: *const This, token: u64) {
     if lists.is_null() {
         return;
     }
+    // `VICTORY_REFLEX`: a frame's first submission ends its simulation and
+    // begins its submissions. Marked here, at the title's call and on its
+    // thread, whichever way the lists then go (at once, held by a queue, or
+    // into the line of a thread of ours). Only for a queue that draws: what
+    // a streaming or upload thread sends to a copy or compute queue is not
+    // the frame's render submission, and taken for it, it would end the
+    // newest frame's simulation right after its sleep, before the title
+    // has read its input. Nothing without the switch.
+    #[cfg(windows)]
+    if !this.is_null() && queue(this).kind == DIRECT {
+        crate::streamline::title_submits(token);
+    }
+    #[cfg(not(windows))]
+    let _ = token;
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
@@ -712,10 +737,35 @@ fn overlay_resource(parameters: *const Plane) -> Option<This> {
     let resource = usize::from_ne_bytes(pointer) as This;
     crate::resource::is_resource(resource).then_some(resource)
 }
+
+/// The console's colour space for plane `index`, read at the 72-byte retail
+/// stride. The field's offset and its use of DXGI_COLOR_SPACE_TYPE values are
+/// a guess from the struct comment. Older single-plane callers pass only the
+/// 24-byte prefix, so the bytes may be garbage there; `hdr::plane_space`
+/// treats numbers it does not know by the plane's format. Gives
+/// `hdr::UNKNOWN_SPACE` for null parameters or an unreadable address.
+#[cfg(windows)]
+fn plane_colour_space(parameters: *const Plane, index: usize) -> u32 {
+    if parameters.is_null() {
+        return crate::hdr::UNKNOWN_SPACE;
+    }
+    let address = parameters
+        .cast::<RetailPlane>()
+        .wrapping_add(index)
+        .cast::<u8>()
+        .wrapping_add(std::mem::offset_of!(RetailPlane, color_space));
+    // fault-safe, like overlay_resource: the title's memory may not be mapped
+    let mut word = [0; 4];
+    if !crate::host::read_into(address, &mut word) {
+        return crate::hdr::UNKNOWN_SPACE;
+    }
+    u32::from_ne_bytes(word)
+}
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
-    execute(this, count, lists);
+/// (The token names the frame for Reflex's markers, with `VICTORY_REFLEX`.)
+extern "system" fn execute_x(this: This, count: u32, lists: *const This, token: u64, _flags: u32) {
+    execute_tagged(this, count, lists, token);
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
 /// submissions are complete when they return, so it signals at once.
@@ -951,6 +1001,32 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // the colour space of each plane, for the host's HDR10 composition; with
+    // `VICTORY_HDR` off nothing is read and the host sees unknown spaces
+    #[cfg(windows)]
+    let spaces = if crate::hdr::asked() {
+        [
+            if planes > 0 { plane_colour_space(plane_parameters, 0) } else { crate::hdr::UNKNOWN_SPACE },
+            if planes > 1 { plane_colour_space(plane_parameters, 1) } else { crate::hdr::UNKNOWN_SPACE },
+        ]
+    } else {
+        [crate::hdr::UNKNOWN_SPACE; 2]
+    };
+    // `VICTORY_REFLEX`: this present is bound to the frame it shows, here in
+    // the title's order (the host's present may come later, on the line's
+    // thread, when the title has begun its next frame): by the frame token
+    // of the first plane if the title gives one, else by order.
+    #[cfg(windows)]
+    if crate::streamline::reflex_marking() {
+        let token = if planes > 0 {
+            // SAFETY: the title passes `planes` plane descriptions (null is
+            // tolerated).
+            unsafe { plane_parameters.as_ref() }.map_or(0, |plane| plane.token)
+        } else {
+            0
+        };
+        crate::streamline::title_presents(frame, token);
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -1033,7 +1109,7 @@ extern "system" fn present(
             this,
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
-            Shown { frame, resource },
+            Shown { frame, resource, spaces },
         );
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1069,7 +1145,7 @@ extern "system" fn present(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
+            Shown { frame, resource: resource as usize, spaces },
         );
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
@@ -1103,6 +1179,9 @@ fn frame_ends() {
 struct Shown {
     frame: u64,
     resource: usize,
+    /// The title's colour space number for each plane (`hdr::UNKNOWN_SPACE`
+    /// when absent or with `VICTORY_HDR` off).
+    spaces: [u32; 2],
 }
 
 /// Shows `texture` (with optional `overlay` plane blended over it) in our window.
@@ -1116,7 +1195,7 @@ fn show_planes(
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    let shown = host.present_planes_with(texture, state, overlay, what.spaces, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]

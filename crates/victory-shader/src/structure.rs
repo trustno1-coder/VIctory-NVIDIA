@@ -443,6 +443,10 @@ pub struct Structured {
     /// SCC values a mask operation sets when some lane's bit of its result is set, with that
     /// lane bit: as data such an SCC is "some lane of the wave has it".
     pub scc_some: HashMap<Value, Bool>,
+    /// Masks that hold all lanes or none, set from a scalar condition
+    /// (`s_cselect_b64 vcc, -1, 0`), by their dwords. They derive from
+    /// no EXEC or VALU result, so `masks` leaves them out.
+    uniform_masks: Map<Key, Bool>,
 }
 
 impl Structured {
@@ -452,6 +456,13 @@ impl Structured {
             None => self.masks.get(&low),
         }
         .copied()
+    }
+
+    /// The bit every lane has of a mask that is all lanes or none, as the
+    /// scalar condition it was set from. A mask like that needs no lane
+    /// numbers: each lane's bit is the condition, on a wave of any size.
+    pub(crate) fn uniform_bits(&self, low: Value, high: Value) -> Option<Bool> {
+        self.uniform_masks.get(&(low, high)).copied()
     }
 }
 
@@ -849,7 +860,22 @@ impl<'a> Lanes<'a> {
         }
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
+        // The masks that read the same in every lane: only scalar conditions
+        // in them (a constant's support is empty).
+        let uniform_masks = self
+            .other
+            .iter()
+            .filter(|(k, _)| !split.contains(&k.0))
+            .filter(|&(_, &m)| {
+                self.b
+                    .support(m)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_)))
+            })
+            .map(|(&k, &m)| (k, m))
+            .collect();
         Ok(Structured {
+            uniform_masks,
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
@@ -1683,6 +1709,44 @@ mod tests {
             .expect("the select");
         let mask = select.write(Reg::S(3)).unwrap();
         assert_eq!(s.masks.get(&mask), Some(&Bool::FALSE));
+    }
+
+    #[test]
+    fn a_select_of_all_lanes_or_none_is_the_scalar_condition() {
+        let p = build(
+            &[
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0x85EA_80C1, // s_cselect_b64 vcc, -1, 0
+                0x0202_0702, // v_cndmask_b32 v1, v2, v3, vcc
+                0x858A_8002, // s_cselect_b64 s[10:11], s[2:3], 0
+                0xD501_0004,
+                0x002A_0702, // v_cndmask_b32 v4, v2, v3, s[10:11]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let pair = |name: &str, at: u8, n: usize| {
+            let select = p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| i.name() == name)
+                .nth(n)
+                .expect("the select");
+            (
+                select.write(Reg::S(at)).unwrap(),
+                select.write(Reg::S(at + 1)).unwrap(),
+            )
+        };
+        // all lanes or none, by a test the same in every lane: not a lane's own mask
+        let (lo, hi) = pair("s_cselect_b64", crate::ir::VCC, 0);
+        let m = s.uniform_bits(lo, hi).expect("a uniform mask");
+        assert!(matches!(s.bools.support(m)[..], [Atom::Uniform(_)]));
+        assert!(!s.masks.contains_key(&lo));
+        // a mask taken from registers the program did not set stays refused
+        let (lo, hi) = pair("s_cselect_b64", 10, 1);
+        assert_eq!(s.uniform_bits(lo, hi), None);
     }
 
     #[test]

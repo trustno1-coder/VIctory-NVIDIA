@@ -71,6 +71,35 @@ pub(super) fn folder() -> Option<PathBuf> {
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+
+/// What the calls of [`pipeline`] cost, for the "saved" line: for loads from
+/// the library, makes after a load that missed, and makes that bypassed the
+/// library (static samplers, or no library), each the count, the sum and the
+/// longest in microseconds. Written by the workers, read by the save.
+static CALL_TIMES: [[AtomicU64; 3]; 3] = [const { [const { AtomicU64::new(0) }; 3] }; 3];
+const LOAD_CALL: usize = 0;
+const MISS_CALL: usize = 1;
+const BYPASS_CALL: usize = 2;
+
+/// Counts one call of `kind` that took `since` until now.
+fn timed(kind: usize, since: std::time::Instant) {
+    let us = since.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    let [count, sum, longest] = &CALL_TIMES[kind];
+    count.fetch_add(1, Ordering::Relaxed);
+    sum.fetch_add(us, Ordering::Relaxed);
+    longest.fetch_max(us, Ordering::Relaxed);
+}
+
+/// The calls of `kind` as "count/sum ms/longest ms".
+fn call_times(kind: usize) -> String {
+    let [count, sum, longest] = &CALL_TIMES[kind];
+    format!(
+        "{}/{:.0}/{:.0}",
+        count.load(Ordering::Relaxed),
+        sum.load(Ordering::Relaxed) as f64 / 1e3,
+        longest.load(Ordering::Relaxed) as f64 / 1e3
+    )
+}
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
@@ -262,7 +291,10 @@ thread_local! {
 
 /// The pipelines this thread makes while the guard lives have static
 /// samplers (`samplers`): they are made, never loaded from or stored in the
-/// library, unless `VICTORY_LIBRARY_STATIC_SAMPLERS=1`.
+/// library, unless `VICTORY_LIBRARY_STATIC_SAMPLERS=1`. With
+/// `VICTORY_PIPELINE_SAMPLER_TABLE=1` (`host::sampler_table`) a stage's
+/// samplers are a table in the sampler heap and only the stages that cannot
+/// have one (no room, an integer border colour) come here.
 ///
 /// Why: the card's driver (NVIDIA, 4070 SUPER) keeps static samplers in a
 /// table of its own and puts their places in that table into the compiled
@@ -571,7 +603,10 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library().filter(|_| !STATIC_SAMPLERS.get()) else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let began = std::time::Instant::now();
+        let made = create();
+        timed(BYPASS_CALL, began);
+        return made;
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -586,6 +621,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            timed(LOAD_CALL, began);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -597,7 +633,10 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        let made_at = std::time::Instant::now();
+        let pso = create()?;
+        timed(MISS_CALL, made_at);
+        pso
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -693,6 +732,16 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            // count/sum ms/longest ms of the calls that load from the
+            // library, make after a miss, and make without the library
+            // (static samplers); with `VICTORY_PIPELINE_SAMPLER_TABLE=1`
+            // the last should be nearly empty and the first grow by them.
+            loads = %call_times(LOAD_CALL),
+            misses = %call_times(MISS_CALL),
+            bypass = %call_times(BYPASS_CALL),
+            // the sampler tables: blocks, slots, stages with a table, stages
+            // left static, draws dropped for want of room in the heap.
+            sampler_tables = ?crate::pipeline::host::sampler_stats(),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -843,6 +892,21 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// A timed call adds to its own kind's count, sum and longest only.
+    #[test]
+    fn call_times_count_sum_and_longest() {
+        let before = |k: usize| CALL_TIMES[k].each_ref().map(|a| a.load(Ordering::Relaxed));
+        let (a, b) = (before(BYPASS_CALL), before(LOAD_CALL));
+        timed(BYPASS_CALL, std::time::Instant::now() - std::time::Duration::from_millis(30));
+        let after = before(BYPASS_CALL);
+        assert_eq!(after[0], a[0] + 1);
+        assert!(after[1] >= a[1] + 30_000);
+        assert!(after[2] >= 30_000);
+        assert_eq!(before(LOAD_CALL), b);
+        let text = call_times(BYPASS_CALL);
+        assert_eq!(text.split('/').count(), 3);
     }
 
     /// A pipeline with static samplers is made, not looked up in the library

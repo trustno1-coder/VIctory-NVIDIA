@@ -44,13 +44,31 @@
 /// The switch: the interval in milliseconds our frame clock ticks at
 /// (`victory-gpu`'s `frame`), 0 for no wait at all. `None` if unset or
 /// malformed (said why).
+///
+/// `VICTORY_FRAME_INTERVAL_US` (the launcher's switch for the same clock,
+/// `victory-gpu`'s `frame`) counts too: with our clock alone made faster
+/// and the title's setting left at 30, its timers still step at least
+/// 1/30 s, so every frame shorter than 33.3 ms moved game time 33.3 ms and
+/// the game ran as many times too fast as frames were made above 30 a
+/// second ([`Kind::SimRate`]).
 pub fn asked_interval_ms() -> Option<f64> {
-    let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok()?;
-    let ms = parse_interval_ms(&spec);
-    if ms.is_none() {
+    let ms = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok();
+    let us = std::env::var("VICTORY_FRAME_INTERVAL_US").ok();
+    let interval = interval_ms_of(ms.as_deref(), us.as_deref());
+    if let (Some(spec), None) = (&ms, interval) {
         eprintln!("VIctory: VICTORY_FRAME_INTERVAL_MS={spec}: expected milliseconds from 0 (no wait) to 1000");
     }
-    ms
+    interval
+}
+
+/// The interval of the two switches, as `victory-gpu`'s `frame` picks it:
+/// the milliseconds if they are set and well formed, else the microseconds
+/// if they are within its 1,000..=1,000,000.
+pub fn interval_ms_of(ms: Option<&str>, us: Option<&str>) -> Option<f64> {
+    ms.and_then(parse_interval_ms).or_else(|| {
+        let us = us?.trim().parse::<u64>().ok()?;
+        (1_000..=1_000_000).contains(&us).then(|| us as f64 / 1000.0)
+    })
 }
 
 /// `16.667` â†’ 16.667; 0 is allowed (no wait), more than a second is not.
@@ -243,6 +261,22 @@ mod tests {
         assert_eq!(title_rate(16.667, Some("off")), None);
         assert_eq!(title_rate(0.0, Some("90")), Some(90));
         assert_eq!(title_rate(0.0, Some("lots")), None);
+    }
+
+    /// The launcher's microseconds give the title its rate as the
+    /// milliseconds do; the milliseconds go first, as for our clock.
+    #[test]
+    fn the_launchers_microseconds_count() {
+        assert_eq!(interval_ms_of(None, None), None);
+        assert_eq!(interval_ms_of(Some("16.667"), Some("1000")), Some(16.667));
+        assert_eq!(interval_ms_of(None, Some(" 16667 ")), Some(16.667));
+        // No cap (the launcher's 1000 us): the title's own "no limit".
+        assert_eq!(interval_ms_of(None, Some("1000")).and_then(|ms| title_rate(ms, None)), Some(1000));
+        assert_eq!(interval_ms_of(None, Some("8333")).and_then(|ms| title_rate(ms, None)), Some(120));
+        // Outside what our clock takes, or malformed: the title is left alone.
+        assert_eq!(interval_ms_of(None, Some("999")), None);
+        assert_eq!(interval_ms_of(None, Some("fast")), None);
+        assert_eq!(interval_ms_of(Some("fast"), Some("33333")), Some(33.333));
     }
 
     /// The title's own arithmetic: its 30 is the 33,333 us the log shows,
