@@ -44,9 +44,11 @@ pub(crate) struct Host {
     submitted: Mutex<u64>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
+    rtv_start: usize,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
     dsvs: ID3D12DescriptorHeap,
+    dsv_start: usize,
     dsv_size: u32,
     next_dsv: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
@@ -1035,6 +1037,9 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        // SAFETY: live descriptor heaps.
+        let rtv_start = unsafe { rtvs.GetCPUDescriptorHandleForHeapStart().ptr };
+        let dsv_start = unsafe { dsvs.GetCPUDescriptorHandleForHeapStart().ptr };
         tracing::info!("host D3D12 device ready");
         crate::upload::reserve_early();
         Ok(Host {
@@ -1044,8 +1049,10 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             event,
             rtvs,
+            rtv_start,
             rtv_size,
             dsvs,
+            dsv_start,
             dsv_size,
             next_dsv: AtomicU32::new(0),
             messages,
@@ -1296,6 +1303,9 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Set once `twins` is non-empty so `twins_written` skips locking on
+    /// lists with no depth twins.
+    has_twins: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one: taken
     /// from [`PRELUDES`] when a submission of the list first needs one, given
     /// back when the list is reset (every submission of it has run).
@@ -2738,6 +2748,28 @@ impl Deferred {
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
+    }
+    /// Clears all recorded entries while preserving heap allocations for reuse.
+    fn clear(&mut self) {
+        give_chunks(std::mem::take(&mut self.plane_uploads));
+        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        self.copies.clear();
+        self.uploads.clear();
+        self.prelude_uploads.clear();
+        self.upload_bytes = 0;
+        self.kept.clear();
+        self.bound.clear();
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
+        self.textures.clear();
+        self.writes.clear();
+        self.backs.clear();
+        self.back_wanted.clear();
+        self.texture_backs.clear();
+        self.budget_zeroed = false;
+        self.indirect_readable = 0;
     }
 }
 
@@ -4569,6 +4601,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                has_twins: std::sync::atomic::AtomicBool::new(false),
                 prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
@@ -6612,8 +6645,9 @@ impl Host {
         // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: self.rtv_start + (slot * self.rtv_size) as usize,
+            };
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
             handle
@@ -6629,8 +6663,9 @@ impl Host {
         let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: self.dsv_start + (slot * self.dsv_size) as usize,
+            };
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
@@ -6916,9 +6951,10 @@ impl HostList {
         self.upscale.store(0, Ordering::Relaxed);
         self.hudless.store(0, Ordering::Relaxed);
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.has_twins.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7115,6 +7151,7 @@ impl HostList {
             return false;
         };
         let side = usize::from(colour);
+        self.has_twins.store(true, Ordering::Relaxed);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let u = twins
             .entry(std::sync::Arc::as_ptr(&twin) as usize)
@@ -7275,6 +7312,9 @@ impl HostList {
     /// The draw or dispatch just prepared is recorded: the twins it writes
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
+        if !self.has_twins.load(Ordering::Relaxed) {
+            return;
+        }
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;

@@ -908,32 +908,59 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
+        let needs_uav = barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
-            host.push(UAV_BARRIER);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
-        }
-        if !host.is_empty() {
+        });
+        let submit = |slice: &[Barrier]| {
+            if slice.is_empty() {
+                return;
+            }
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
             // SAFETY: the same layout; borrowed resource pointers, never
             // released through this slice.
             let host = unsafe {
                 std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
+                    slice.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+                    slice.len(),
                 )
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+        };
+        if barriers.len() < 16 {
+            let mut stack = [const { std::mem::MaybeUninit::<Barrier>::uninit() }; 16];
+            let mut n = 0usize;
+            for b in barriers {
+                if let Some(hb) = host_barrier(list, b) {
+                    stack[n].write(hb);
+                    n += 1;
+                }
+            }
+            if needs_uav {
+                stack[n].write(UAV_BARRIER);
+                n += 1;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            }
+            // SAFETY: `stack[..n]` are all initialized.
+            let slice = unsafe { std::slice::from_raw_parts(stack.as_ptr().cast::<Barrier>(), n) };
+            submit(slice);
+            for item in &mut stack[..n] {
+                // SAFETY: initialized above and no longer borrowed by `slice`.
+                unsafe { item.assume_init_drop() };
+            }
+        } else {
+            let mut host: Vec<Barrier> = barriers
+                .iter()
+                .filter_map(|b| host_barrier(list, b))
+                .collect();
+            if needs_uav {
+                host.push(UAV_BARRIER);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            }
+            submit(&host);
         }
     }
     0
@@ -1881,16 +1908,27 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
+        let mut range_buf = [0u64; 8];
+        let handles_vec: Vec<u64>;
+        let handles: &[u64] = if one_range != 0 && !handles.is_null() {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
+            let n = count as usize;
+            if n <= range_buf.len() {
+                for (i, slot) in range_buf[..n].iter_mut().enumerate() {
+                    *slot = first + 128 * i as u64;
+                }
+                &range_buf[..n]
+            } else {
+                handles_vec = (0..u64::from(count)).map(|i| first + 128 * i).collect();
+                &handles_vec
+            }
         } else {
-            items(handles, count).to_vec()
+            items(handles, count)
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| s.set_targets(list, handles, depth));
     }
     pub(super) extern "system" fn draw(
         this: This,
