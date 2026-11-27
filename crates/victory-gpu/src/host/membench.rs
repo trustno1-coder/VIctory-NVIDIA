@@ -857,12 +857,18 @@ fn memory_bench_reclaims_and_regrows_with_correct_bytes() {
     frames(&mut rig, 40, WINDOWS, pace);
     for round in 0..2 {
         FREE_RAM_SAID.store(0, Relaxed);
+        // Refresh the cached pressure state before the next burst; otherwise
+        // a long burst may still retire its capacity using the previous round.
+        crate::residency::refresh();
         quiesce();
         // Make every piece differ in both bursts so the second one must
         // grow the fetch buffer again, rather than reuse a small matching tail.
         // SAFETY: the owned source allocation is idle and has SRC bytes.
         unsafe { std::slice::from_raw_parts_mut(rig.src.1 as *mut u8, SRC).fill(0x35 + round); }
         rig.spike();
+        let active_fetch = if relay() { "fetch buffer (relay)" } else { "fetch buffer (no relay)" };
+        let fetched = value(&census(), "card copies", active_fetch);
+        assert!(fetched >= BIG as u64, "round {round}: the burst fetched only {fetched} bytes of capacity" );
         // SAFETY: the rig owns both mapped allocations and spike waited for
         // every submitted copy and merge; no CPU or GPU writer is outstanding.
         unsafe {
@@ -875,9 +881,7 @@ fn memory_bench_reclaims_and_regrows_with_correct_bytes() {
         frames(&mut rig, 32, WINDOWS, pace);
         quiesce();
         let peak = census();
-        let active_fetch = if relay() { "fetch buffer (relay)" } else { "fetch buffer (no relay)" };
-        assert!(value(&peak, "card copies", active_fetch) >= BIG as u64,
-            "round {round}: the burst did not grow the fetch buffer" );
+
         FREE_RAM_SAID.store((1u64 << 30) + 1, Relaxed);
         frames_for(&mut rig, 3_500, 1);
         quiesce();
