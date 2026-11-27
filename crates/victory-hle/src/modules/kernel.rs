@@ -434,6 +434,14 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// The title placing a thread on processors it picked: logged, and with
+/// `VICTORY_TITLE_FAST_CORES=1` put on all the fast cores instead
+/// (`victory_gpu::title_group_affinity`).
+pub extern "system" fn SetThreadGroupAffinity(thread: *mut c_void, asked: *const c_void, previous: *mut c_void) -> i32 {
+    // SAFETY: the title's own arguments to the host function of that name.
+    unsafe { victory_gpu::title_group_affinity(thread, asked, previous) }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -442,6 +450,7 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-processtopology-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
@@ -469,6 +478,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            hle_export!(SetThreadGroupAffinity),
         ],
     }
 }

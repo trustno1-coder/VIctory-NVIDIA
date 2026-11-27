@@ -1094,6 +1094,9 @@ fn frame_ends() {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
             behind::leave();
         }
+        if switch == "VICTORY_TITLE_FAST_CORES" && was != will {
+            crate::cores::title_reapply(will);
+        }
     });
 }
 
