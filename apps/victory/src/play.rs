@@ -71,6 +71,12 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_AMBIENT", "0.8"),
     ("VICTORY_AMBIENT_AIR", "1.5"),
     ("VICTORY_AMBIENT_SPECULAR", "1"),
+    // Rays miss every node while the structure builder is off (no garbage
+    // light from unbuilt structures: purple/magenta plants)
+    ("VICTORY_BVH_MISS", "1"),
+    // NaN and infinity in written colours become 0 (no black blobs spread
+    // by blur and the temporal upscaler)
+    ("VICTORY_NAN_SCRUB", "1"),
     // Pixel programs keep the console's early depth test
     ("VICTORY_EARLY_DEPTH", "1"),
     // Left out: the decal heap's defragmentation and the heat-haze pass

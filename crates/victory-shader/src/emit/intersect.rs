@@ -59,6 +59,20 @@ struct Ray {
     inverse: [V; 3],
 }
 
+/// `VICTORY_BVH_MISS=1`: the node test misses every node. While the title's
+/// structure builder is off its structures are never built, and a walk of
+/// what lies in their memory brings back garbage light (purple/magenta on
+/// plants). Ported from rorodev6's victory-nvidia-megafork.
+fn bvh_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Never while the title's own builder runs (VICTORY_BVH_BUILDER=1, the F1
+    // menu's ray tracing): then the structures are real.
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1")
+            && !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+    })
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -191,11 +205,22 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = self.bvh_boxes(at, kind, &ray, sort);
+        // With `VICTORY_BVH_MISS=1` every node is missed without being read:
+        // a box returns no child and a triangle the triangle miss, so a walk
+        // ends at its first node.
+        let boxes = if bvh_miss() {
+            [self.s.m.i32(bvh::NONE); 4]
+        } else {
+            self.bvh_boxes(at, kind, &ray, sort)
+        };
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
-        let triangle = self.bvh_triangle(at, kind, &ray);
+        let triangle = if bvh_miss() {
+            bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
+        } else {
+            self.bvh_triangle(at, kind, &ray)
+        };
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
