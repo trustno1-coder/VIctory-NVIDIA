@@ -59,7 +59,8 @@
   6.6 the game shows a black screen and closes within seconds. So the first start
   there offers to fetch Microsoft's newer Direct3D 12 runtime (the D3D12 Agility
   SDK, `D3D12Core.dll`, about 22 MB from nuget.org). It goes into a `D3D12`
-  folder beside `victory.exe`. `victory.exe get-d3d12` does the same by hand.
+  folder beside `victory.exe`. `victory.exe get-d3d12` does the same by hand, and
+  `Get-D3D12.cmd` does it for a build of your own (into `target\release\D3D12`).
   The file is checked against Microsoft's signature and the tested SHA-256.
   Windows 11 keeps using its own runtime. A `D3D12` folder that is already
   there, for example from a repack or another guide (1.618, 1.620), is used
@@ -311,6 +312,7 @@ git clone https://github.com/trustno1-coder/VIctory-NVIDIA
 cd VIctory-NVIDIA
 copy victory.example.toml victory.toml      # then set game_dir to your dump's folder, outside this one
 .\Get-NVIDIA-DLSS.cmd                        # once: NVIDIA's DLSS and frame generation files, about 70 MB
+.\Get-D3D12.cmd                              # once, Windows 10 only: Microsoft's newer Direct3D 12 runtime, about 22 MB
 scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
 ```
 
