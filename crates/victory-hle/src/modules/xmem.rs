@@ -67,6 +67,12 @@ const GRAPHICS: u64 = 3;
 const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
+/// The last address bit the GPU's by-address directory reaches
+/// (`victory_shader::emit::MEMORY_PAGES` = 2^21 pages of 64 KiB = 128 GiB).
+/// Title memory above it is read as 0 by shaders that reach it by address
+/// (page 0x1fffff, "pages that had no copy"); placed there it loses vehicle
+/// panels and faces (#218). Kept here: this crate does not depend on the shader crate.
+const TITLE_TOP_BITS: u32 = 37;
 
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
@@ -81,7 +87,9 @@ fn address_range(flags: u64) -> (usize, usize) {
         (0, field) => 47 - field,
         _ => return (0, u32::MAX as usize),
     };
-    (1 << 32, (1 << bits) - 1)
+    // Below the by-address directory's reach: the title's pools fit there
+    // many times over, and shaders read nothing above it.
+    (1 << 32, (1 << bits.min(TITLE_TOP_BITS as u64)) - 1)
 }
 
 pub extern "system" fn XMemVirtualAlloc(
@@ -2868,6 +2876,18 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    #[test]
+    fn title_memory_stays_within_the_by_address_directory() {
+        // Every 64-bit request: no field (40 bits on the console), and fields 1..=7.
+        for field in 0..8u64 {
+            let (lowest, highest) = address_range(field << 12);
+            assert_eq!(lowest, 1 << 32);
+            assert!(highest < 1 << TITLE_TOP_BITS, "field {field}: highest {highest:#x}");
+        }
+        // 32-bit requests keep the low 4 GiB.
+        assert_eq!(address_range(ADDRESS_32BIT), (0, u32::MAX as usize));
     }
 
     #[test]
