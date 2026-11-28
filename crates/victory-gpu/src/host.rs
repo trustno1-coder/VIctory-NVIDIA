@@ -10074,6 +10074,30 @@ impl Meter {
                     crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3
                 );
             }
+            // `SLOT_EVICT` and `SLOT_STATE` were counted but never said: whether
+            // the memory stack's eviction frees anything on a small card was not
+            // to be seen.
+            if crate::resource::slot_evict_on() {
+                let e = crate::resource::SLOT_EVICT.each_ref().map(|a| a.load(Ordering::Relaxed));
+                let s = crate::resource::SLOT_STATE.each_ref().map(|a| a.load(Ordering::Relaxed));
+                tracing::info!(
+                    "textures let go with their slots under pressure (VICTORY_SLOT_EVICT), since the start: {} textures ({} MB), \
+                     {} slots put back to waiting, {} made again ({} of them within 2 s, away {:.1} s on average), {} given up \
+                     as a draw used them meanwhile; the last look: {}, of {} idle-looking textures {} kept as a table showed \
+                     them lately and {} not to be taken (a slot shaders pick by index shows them)",
+                    e[0],
+                    e[1] >> 20,
+                    e[2],
+                    e[3],
+                    e[4],
+                    e[5] as f64 / 10.0 / e[3].max(1) as f64,
+                    e[6],
+                    if s[0] != 0 { "evicting" } else { "not evicting" },
+                    s[3],
+                    s[1],
+                    s[2]
+                );
+            }
             {
                 let mode = crate::watch::page_writes();
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
