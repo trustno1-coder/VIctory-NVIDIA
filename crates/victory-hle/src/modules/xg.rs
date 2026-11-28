@@ -147,6 +147,9 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
         _ => return None,
     };
+    if !mode_allowed(desc, dimension, swizzle) {
+        return None;
+    }
     let texture = Texture::new(&TextureDesc {
         dimension,
         width: u32::try_from(desc.width).ok()?,
@@ -163,6 +166,18 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
 }
 
 const MIPS: usize = 15;
+
+/// The swizzle modes GFX10 refuses for a description: a 2D depth or
+/// stencil surface only takes the Z-order mode, the Z-order mode takes
+/// neither elements wider than 64 bits nor block-compressed formats, and
+/// there is no 4 KiB render mode.
+fn mode_allowed(desc: &ResourceDesc, dimension: Dimension, swizzle: Swizzle) -> bool {
+    let depth = desc.flags & ALLOW_DEPTH_STENCIL != 0 && dimension == Dimension::Tex2d;
+    let wide =
+        victory_formats::texture::format(desc.format).is_some_and(|f| f.bytes > 8 || f.block != 1);
+    let z = swizzle == Swizzle::SW_64KB_Z_X;
+    swizzle != Swizzle::SW_4KB_R_X && (!depth || z) && !(z && wide)
+}
 
 /// One mip in the layout the title reads (offsets 0x00, 0x08, 0x10 and
 /// 0x1c are read by the title; the rest follow the library's
@@ -770,6 +785,43 @@ mod tests {
             E_FAIL
         );
         assert_eq!(release(c), 0);
+    }
+
+    /// Modes GFX10 refuses: depth outside Z order, Z order for wide or
+    /// block-compressed elements, the 4 KiB render mode.
+    #[test]
+    fn refused_modes_fail() {
+        let mut c = std::ptr::null_mut();
+        let mut d = desc(64, 64, 1, 40, 0x105);
+        d.flags = ALLOW_DEPTH_STENCIL;
+        for layout in [ROW_MAJOR, 0x105, 0x109, 0x119, 0x11b] {
+            d.layout = layout;
+            assert_eq!(
+                XGCreateTextureComputer(&d, &mut c),
+                E_INVALIDARG,
+                "{layout:#x}"
+            );
+        }
+        for layout in [0, 0x118] {
+            d.layout = layout;
+            let c = create(&d);
+            slot::<extern "system" fn(This) -> u32>(c, 1)(c);
+        }
+        for format in [2, 71, 98] {
+            let d = desc(64, 64, 1, format, 0x118);
+            assert_eq!(
+                XGCreateTextureComputer(&d, &mut c),
+                E_INVALIDARG,
+                "{format}"
+            );
+        }
+        let d = desc(64, 64, 1, 28, 0x117);
+        assert_eq!(XGCreateTextureComputer(&d, &mut c), E_INVALIDARG);
+        // A 3D texture flagged for depth keeps its modes.
+        let mut d = desc(64, 64, 1, 40, 0x105);
+        (d.dimension, d.flags) = (TEXTURE_3D, ALLOW_DEPTH_STENCIL);
+        let c = create(&d);
+        slot::<extern "system" fn(This) -> u32>(c, 1)(c);
     }
 
     #[test]
