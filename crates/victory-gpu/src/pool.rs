@@ -549,7 +549,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let mut make = || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -560,7 +560,12 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
-    })?;
+    };
+    let (piece, memory, again) = if blocks_unlocked() {
+        take_from(&STAGING, bytes, 512, Ripe::ALL, &mut make).0?
+    } else {
+        lock(&STAGING).take(bytes, 512, now(), make)?
+    };
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -828,12 +833,14 @@ fn make_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
     heap
 }
 
-/// Whether a new block of textures is made with the pool's lock let go
-/// (`VICTORY_BLOCKS_UNLOCKED=0`: made under it, as before). Under it, every
-/// thread that placed a texture, in a block with room or not, waited until
-/// the new block was resident and mapped: as long as the paging queued
-/// before it, which is longest while a scene loads, when most textures are
-/// made.
+/// Whether a new block of textures, or of their staging, is made with its
+/// pool's lock let go (`VICTORY_BLOCKS_UNLOCKED=0`: made under it, as
+/// before). Under it, every thread that placed a texture, in a block with
+/// room or not, waited until the new block was resident and mapped: as
+/// long as the paging queued before it, which is longest while a scene
+/// loads, when most textures are made. A staging block is 64 MiB of the
+/// PC's memory that the system zeroes before it is there; meanwhile every
+/// texture's upload waited to be staged.
 fn blocks_unlocked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BLOCKS_UNLOCKED").is_none_or(|v| v != "0"))
@@ -844,36 +851,53 @@ fn blocks_unlocked() -> bool {
 /// one more empty block, kept or let go as such ([`room`]).
 fn take_unlocked(device: &ID3D12Device, len: u64, align: u64) -> Option<(Piece, ID3D12Heap, bool)> {
     let ripe = Ripe::now();
-    let mut pool = lock(&TEXTURES);
-    let (i, start) = match pool.place(len, align, now(), ripe) {
-        Ok(found) => found,
-        Err(false) => return None,
-        Err(true) => {
-            if now() < pool.retry_growth_at {
-                return None;
-            }
-            drop(pool);
-            let made = make_block(device);
-            pool = lock(&TEXTURES);
-            let Some(heap) = made else {
-                pool.retry_growth_at = now().saturating_add(500);
-                return None;
-            };
-            // (Made after the submissions counted before: those begun
-            // meanwhile may have lists that ran before it was there.)
-            let i = pool.add(heap, crate::host::submissions().0);
-            (i, pool.blocks[i].as_mut()?.free.take(len, align)?)
-        }
-    };
-    let taken = pool.finish(i, start, len, now(), ripe, &mut || make_block(device));
+    let (taken, pool) = take_from(&TEXTURES, len, align, ripe, &mut || make_block(device));
     // (Blocks made ahead by `finish` itself, with `VICTORY_RIPE_BLOCKS`,
     // leave this to it.)
-    let none_empty = ripe.ahead == 0 && !pool.blocks.iter().flatten().any(|b| b.free.whole(BLOCK));
+    let none_empty = taken.is_some() && ripe.ahead == 0 && !pool.blocks.iter().flatten().any(|b| b.free.whole(BLOCK));
     drop(pool);
     if none_empty {
         make_one_ahead();
     }
     taken
+}
+
+/// [`Pool::take_ripe`] of `pool`, with a block that none has room for
+/// made by `make` with the lock let go ([`blocks_unlocked`]); the lock,
+/// taken again, is given back with the piece.
+fn take_from<B: Clone>(
+    pool: &'static Mutex<Pool<B>>,
+    len: u64,
+    align: u64,
+    ripe: Ripe,
+    make: &mut impl FnMut() -> Option<B>,
+) -> (Option<(Piece, B, bool)>, std::sync::MutexGuard<'static, Pool<B>>) {
+    let mut held = lock(pool);
+    let (i, start) = match held.place(len, align, now(), ripe) {
+        Ok(found) => found,
+        Err(false) => return (None, held),
+        Err(true) => {
+            if now() < held.retry_growth_at {
+                return (None, held);
+            }
+            drop(held);
+            let made = make();
+            held = lock(pool);
+            let Some(memory) = made else {
+                held.retry_growth_at = now().saturating_add(500);
+                return (None, held);
+            };
+            // (Made after the submissions counted before: those begun
+            // meanwhile may have lists that ran before it was there.)
+            let i = held.add(memory, crate::host::submissions().0);
+            let Some(start) = held.blocks[i].as_mut().and_then(|b| b.free.take(len, align)) else {
+                return (None, held);
+            };
+            (i, start)
+        }
+    };
+    let taken = held.finish(i, start, len, now(), ripe, make);
+    (taken, held)
 }
 
 /// Whether one empty block of textures is kept made by a thread of ours,
@@ -882,6 +906,7 @@ fn take_unlocked(device: &ID3D12Device, len: u64, align: u64) -> Option<(Piece, 
 /// texture took the last empty one, while the texture queue has room
 /// (`crate::resource::room_lately`): at most one block more than the
 /// textures hold, which the pool keeps as a spare in any case ([`SPARE`]).
+/// (With blocks made under the pool's lock, [`blocks_unlocked`] off, none.)
 fn block_ahead() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BLOCK_AHEAD").is_none_or(|v| v != "0"))
@@ -1318,7 +1343,7 @@ mod tests {
         let Some(host) = crate::host::host() else { return };
         // (With `VICTORY_RIPE_BLOCKS` above 0, `Pool::finish` makes blocks
         // ahead itself: run with the launcher's `VICTORY_RIPE_BLOCKS=0`.)
-        if !block_ahead() || ahead() != 0 || !crate::resource::room_lately() {
+        if !block_ahead() || !blocks_unlocked() || ahead() != 0 || !crate::resource::room_lately() {
             return;
         }
         let made_before = MADE_AHEAD.load(Ordering::Relaxed);
@@ -1354,6 +1379,36 @@ mod tests {
         assert!(!MAKING_AHEAD.load(Ordering::Acquire), "the thread that makes it ahead did not end");
         assert!(MADE_AHEAD.load(Ordering::Relaxed) > made_before, "the empty block is not one made ahead");
         drop(held);
+    }
+
+    /// Threads that stage at once, some making new staging blocks (outside
+    /// the pool's lock), each get pieces of their own that begin as zeros.
+    #[test]
+    fn threads_that_stage_at_once_get_zeroed_pieces_of_their_own() {
+        let Some(host) = crate::host::host() else { return };
+        const BYTES: usize = 8 << 20;
+        // Bytes looked at: upload memory is write-combined, and the CPU
+        // reads it slowly. One in every 4 KiB, and the last.
+        let looked = |data: *mut u8| (0..BYTES).step_by(4096).chain([BYTES - 1]).map(move |i| unsafe { *data.add(i) });
+        std::thread::scope(|s| {
+            for t in 0..8u8 {
+                s.spawn(move || {
+                    // 8 of 8 MiB a thread: 64 MiB each, so new blocks are made.
+                    let pieces: Vec<_> = (0..8).filter_map(|_| staging(host, BYTES as u64)).collect();
+                    assert_eq!(pieces.len(), 8);
+                    for (_, _, _, data) in &pieces {
+                        // SAFETY: the piece's mapping, ours alone.
+                        unsafe {
+                            assert!(looked(*data).all(|b| b == 0), "a piece is not zeros");
+                            std::ptr::write_bytes(*data, t + 1, BYTES);
+                        }
+                    }
+                    for (_, _, _, data) in &pieces {
+                        assert!(looked(*data).all(|b| b == t + 1), "another thread wrote this piece");
+                    }
+                });
+            }
+        });
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not
