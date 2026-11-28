@@ -100,6 +100,21 @@
   it): DLSS, frame generation, frame rate cap and more.
 - **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
   memory numbers).
+- **Pads**: Xbox (XInput) pads, PlayStation 4 and 5 pads, and generic HID
+  pads (DirectInput pads), such as the no-name USB pads sold as "PC
+  Controller" or "USB Gamepad" (tested with a DragonRise "PC Controller",
+  0079:0126). An Xbox pad, while one is connected, is read instead of them.
+  Generic pads do not rumble. Their buttons follow the PlayStation
+  look-alike layout (Logitech and Nintendo pads get those makers' usual
+  numbering, not tested here). A flight stick or a wheel is read as a pad
+  too; if one moves the camera by itself, turn generic pads off (below). If
+  yours comes out wrong, run `victory.exe pads` in a command prompt and
+  press each button: it shows the number each one sends. Then add a line
+  `VICTORY_PAD_BUTTONS=` to `%LOCALAPPDATA%\victory\victory-settings.txt`,
+  with the numbers for A,B,X,Y,LB,RB,LT,RT,View,Menu,LS,RS (A is the bottom
+  button). The default is `VICTORY_PAD_BUTTONS=3,2,4,1,5,6,7,8,9,10,11,12`.
+  `VICTORY_GENERIC_PADS=0` turns generic pads off (`VICTORY_DUALSENSE=0`
+  turns off only the PlayStation pads).
 
 **Building it yourself instead**
 

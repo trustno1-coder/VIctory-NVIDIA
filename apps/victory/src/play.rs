@@ -210,6 +210,22 @@ fn home() -> Result<PathBuf> {
     Ok(PathBuf::from(base).join("victory"))
 }
 
+/// `victory pads`: the pad settings `victory-settings.txt` holds (`VICTORY_PAD_BUTTONS`,
+/// `VICTORY_GENERIC_PADS`, `VICTORY_DUALSENSE`) put into the environment, as a start puts them,
+/// so it shows what the game will read. One already in the environment is kept.
+pub fn pad_settings() {
+    let Ok(home) = home() else { return };
+    let text = std::fs::read_to_string(home.join("victory-settings.txt")).unwrap_or_default();
+    // The last line of a setting wins, as at a start.
+    for (k, v) in parse_menu(&text).into_iter().rev() {
+        let pads = k.starts_with("VICTORY_PAD_") || k == "VICTORY_GENERIC_PADS" || k == "VICTORY_DUALSENSE";
+        if pads && std::env::var_os(&k).is_none() {
+            // SAFETY: called before any other thread is started.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+}
+
 /// Where `victory get-dlss` puts NVIDIA's files.
 fn nvidia_home() -> Result<PathBuf> {
     Ok(home()?.join("nvidia-sdk"))
