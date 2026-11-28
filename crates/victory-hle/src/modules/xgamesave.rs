@@ -10,6 +10,14 @@
 //! A crash leaves the old version or the new one, never a mix; leftovers
 //! are removed on sight. Deleting a container renames it away first.
 //!
+//! The async calls (initialize, quota, delete, read, submit) do their disk
+//! work on one save thread, in the order the title made them, and return
+//! at once: an autosave's flushes and folder walk cost the title's thread
+//! nothing. A call completes once its work is done, so a save is on disk
+//! when it completes. The immediate calls (container info and listing,
+//! blob info, the immediate read) still read on the caller's thread, and
+//! see a version whole, before an update in flight or after it.
+//!
 //! Names are exact: a version's `manifest` holds the container's name, its
 //! display name and the blob names (blob `i` is the file `i`), so case,
 //! characters the host forbids, reserved device names and length never
@@ -22,7 +30,7 @@
 use std::ffi::{CString, c_char, c_void};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex, mpsc};
 
 use super::xasync::{self, AsyncBlock, E_INVALIDARG};
 use super::xgameruntime::{
@@ -384,16 +392,21 @@ fn used_bytes(root: &Path) -> u64 {
 struct Provider {
     root: PathBuf,
 }
+#[derive(Clone)]
 struct Container {
     name: String,
     dir: PathBuf,
 }
+/// Cloned when submitted: the save thread works from the clone, so the
+/// title may close or change the update while the save is under way.
+#[derive(Clone)]
 struct Update {
     name: String,
     dir: PathBuf,
     display: Option<String>,
-    /// Blob writes (`Some`) and deletions (`None`), in order.
-    changes: Vec<(String, Option<Vec<u8>>)>,
+    /// Blob writes (`Some`) and deletions (`None`), in order; shared with a
+    /// submitted clone, not copied, until changed again.
+    changes: Arc<Vec<(String, Option<Vec<u8>>)>>,
 }
 
 /// A handle we gave out.
@@ -425,11 +438,6 @@ impl Provider {
         let _saves = saves_lock();
         containers(&root); // converts old containers now
         Ok(Provider { root })
-    }
-
-    fn remaining(&self) -> u64 {
-        let _saves = saves_lock();
-        remaining(&self.root)
     }
 
     fn container(&self, name: &str) -> Container {
@@ -492,7 +500,7 @@ impl Update {
                 kept.map(|(i, n)| (n.as_str(), Source::Kept(v.blob(i))))
             })
             .collect();
-        for (name, data) in &self.changes {
+        for (name, data) in self.changes.iter() {
             blobs.retain(|(n, _)| n != name);
             if let Some(data) = data {
                 blobs.push((name, Source::Data(data)));
@@ -668,6 +676,157 @@ static DELETE: u8 = 0;
 static READ: u8 = 0;
 static SUBMIT: u8 = 0;
 
+/// The disk work of an async save call.
+type Work = Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>;
+
+/// `VICTORY_SYNC_SAVES=1`: the async save calls do their disk work inside
+/// the title's call, as they once did, and complete before it returns.
+/// Otherwise it runs on the save thread ([`save_call`]).
+fn inline_saves() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        let on = std::env::var("VICTORY_SYNC_SAVES").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("game saves: disk work on the title's thread (VICTORY_SYNC_SAVES)");
+        }
+        on
+    });
+    *ON
+}
+
+/// The save thread: runs the work of async save calls one at a time, in
+/// the order the title made them. One thread, not one per call, so that a
+/// second update to a container lands after the first, and a quota or read
+/// call sees the updates asked for before it, as the remaining-quota pages
+/// say ("outstanding writes, updates or deletes are handled first"). Not
+/// the block's work port: a title's own queue may be dispatched by hand, and
+/// the docs leave where a system API's work runs to the system.
+fn save_thread() -> &'static mpsc::Sender<Box<dyn FnOnce() + Send>> {
+    static SENDER: LazyLock<mpsc::Sender<Box<dyn FnOnce() + Send>>> = LazyLock::new(|| {
+        let (send, receive) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        std::thread::Builder::new()
+            .name("victory-saves".into())
+            .spawn(move || {
+                for job in receive {
+                    job();
+                }
+            })
+            .expect("the save thread starts");
+        send
+    });
+    &SENDER
+}
+
+/// Starts an async save call on `block` (as [`xasync::finished_with`] does
+/// for one that is over) whose result comes from `work`, run on the save
+/// thread. The title's call returns at once, as the async model asks of
+/// it; the call completes once the work is done, a save once it is on
+/// disk, so whatever reads after completion sees it.
+fn save_call(
+    block: *mut AsyncBlock,
+    identity: *const c_void,
+    work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
+) -> HRESULT {
+    save_call_in(inline_saves(), block, identity, Box::new(work))
+}
+
+/// The state of a call begun by [`save_call_in`], shared by the provider
+/// (through the call's context) and the save thread.
+struct SaveCall {
+    work: Mutex<Option<Work>>,
+    /// The result's bytes, set before the call completes.
+    bytes: Mutex<Vec<u8>>,
+    /// Canceled: the save thread must not complete the call, which the
+    /// cancel completed, and whose block the title may use again.
+    canceled: Mutex<bool>,
+}
+
+// XAsyncOp, as the provider is told.
+const OP_BEGIN: u32 = 0;
+const OP_GET_RESULT: u32 = 2;
+const OP_CANCEL: u32 = 3;
+const OP_CLEANUP: u32 = 4;
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn save_call_in(inline: bool, block: *mut AsyncBlock, identity: *const c_void, work: Work) -> HRESULT {
+    if inline {
+        return xasync::finished_with(block, identity, work());
+    }
+    extern "system" fn provider(op: u32, data: *const xasync::ProviderData) -> HRESULT {
+        // SAFETY: the runtime passes valid provider data; the context holds
+        // one count of the call's state until cleanup.
+        let data = unsafe { &*data };
+        let state = data.context.cast_const().cast::<SaveCall>();
+        // SAFETY: as above.
+        let call = unsafe { &*state };
+        match op {
+            // SAFETY: the count `save_call_in` gave the context.
+            OP_CLEANUP => drop(unsafe { Arc::from_raw(state) }),
+            OP_BEGIN => {
+                let work = lock(&call.work).take();
+                // SAFETY: as above; the save thread holds a count of its own.
+                let call = unsafe {
+                    Arc::increment_strong_count(state);
+                    Arc::from_raw(state)
+                };
+                let block = data.block as usize;
+                let job = move || {
+                    // Canceled before it began: nothing is written.
+                    let result = if *lock(&call.canceled) {
+                        Err(xasync::E_ABORT)
+                    } else {
+                        let work = work.ok_or(xasync::E_ABORT);
+                        work.and_then(|work| {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                                .unwrap_or(Err(NO_ACCESS))
+                        })
+                    };
+                    let (hr, len) = match result {
+                        Ok(bytes) => {
+                            let len = bytes.len();
+                            *lock(&call.bytes) = bytes;
+                            (S_OK, len)
+                        }
+                        Err(hr) => (hr, 0),
+                    };
+                    // Held while completing, so a cancel either comes
+                    // first (and this call is not completed by block, which
+                    // the title may have used again) or finds it complete.
+                    let canceled = lock(&call.canceled);
+                    if !*canceled {
+                        xasync::XAsyncComplete(block as *mut AsyncBlock, hr, len);
+                    }
+                };
+                if save_thread().send(Box::new(job)).is_err() {
+                    return NO_ACCESS; // fails the call
+                }
+            }
+            OP_CANCEL => *lock(&call.canceled) = true,
+            // SAFETY: the runtime checked the buffer's size.
+            OP_GET_RESULT => unsafe {
+                let bytes = lock(&call.bytes);
+                data.buffer.cast::<u8>().copy_from(bytes.as_ptr(), bytes.len());
+            },
+            _ => {}
+        }
+        S_OK
+    }
+    let state = Arc::new(SaveCall {
+        work: Mutex::new(Some(work)),
+        bytes: Mutex::new(Vec::new()),
+        canceled: Mutex::new(false),
+    });
+    let context = Arc::into_raw(state);
+    let hr = xasync::XAsyncBegin(block, context.cast_mut().cast(), identity, std::ptr::null(), Some(provider));
+    if hr < 0 {
+        // SAFETY: refused before the call existed; the count is still ours.
+        drop(unsafe { Arc::from_raw(context) });
+    }
+    hr
+}
+
 extern "system" fn initialize_async(
     _: This,
     _user: *const c_void,
@@ -676,12 +835,14 @@ extern "system" fn initialize_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     let saves = runtime::title().saves();
-    let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
-        Err(NO_ACCESS)
-    } else {
-        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
-    };
-    xasync::finished_with(block, (&raw const INIT).cast(), result)
+    if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return xasync::finished(block, (&raw const INIT).cast(), NO_ACCESS);
+    }
+    let config = text(config);
+    save_call(block, (&raw const INIT).cast(), move || {
+        // The handle as an address, which is `Send`.
+        Provider::open(&saves, config.as_deref()).map(|p| xasync::bytes(give(p) as usize))
+    })
 }
 extern "system" fn initialize_result(
     _: This,
@@ -699,10 +860,13 @@ extern "system" fn quota_async(
     provider: *const Provider,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = get(provider)
-        .ok_or(E_INVALIDARG)
-        .map(|p| xasync::bytes(p.remaining() as i64));
-    xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
+    let Some(root) = get(provider).map(|p| p.root.clone()) else {
+        return xasync::finished(block, (&raw const QUOTA_CALL).cast(), E_INVALIDARG);
+    };
+    save_call(block, (&raw const QUOTA_CALL).cast(), move || {
+        let _saves = saves_lock();
+        Ok(xasync::bytes(remaining(&root) as i64))
+    })
 }
 extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
@@ -714,12 +878,18 @@ extern "system" fn delete_async(
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let hr = match (get(provider), text(name)) {
-        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
-        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
-        _ => E_INVALIDARG,
-    };
-    xasync::finished(block, (&raw const DELETE).cast(), hr)
+    let identity = (&raw const DELETE).cast();
+    match (get(provider), text(name)) {
+        (Some(p), Some(name)) if valid_container(&name) => {
+            let root = p.root.clone();
+            save_call(block, identity, move || match delete(&root, &name) {
+                hr if hr < 0 => Err(hr),
+                _ => Ok(Vec::new()),
+            })
+        }
+        (Some(_), Some(_)) => xasync::finished(block, identity, INVALID_CONTAINER_NAME),
+        _ => xasync::finished(block, identity, E_INVALIDARG),
+    }
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
@@ -832,8 +1002,9 @@ extern "system" fn read_blobs(
     put(count, blobs.len() as u32)
 }
 
-/// Read at once; the result holds the layout with pointers relative to the
-/// title's buffer, fixed up when the title takes it.
+/// Read on the save thread, after the updates asked for before; the result
+/// holds the layout with pointers relative to the title's buffer, fixed up
+/// when the title takes it. The names are copied now.
 extern "system" fn read_async(
     _: This,
     container: *const Container,
@@ -841,11 +1012,13 @@ extern "system" fn read_async(
     count: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = match get(container) {
-        Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
-        None => Err(E_INVALIDARG),
+    let Some(c) = get(container).cloned() else {
+        return xasync::finished(block, (&raw const READ).cast(), E_INVALIDARG);
     };
-    xasync::finished_with(block, (&raw const READ).cast(), result)
+    let names = names(blob_names, count);
+    save_call(block, (&raw const READ).cast(), move || {
+        read(&c, names).map(|blobs| layout(&blobs, 0))
+    })
 }
 extern "system" fn read_result(
     _: This,
@@ -898,7 +1071,7 @@ extern "system" fn create_update(
             name: c.name.clone(),
             dir: c.dir.clone(),
             display: text(display),
-            changes: Vec::new(),
+            changes: Arc::default(),
         }),
     )
 }
@@ -929,7 +1102,7 @@ extern "system" fn write_blob(
         // SAFETY: the title passes `size` bytes.
         unsafe { std::slice::from_raw_parts(data, size) }.to_vec()
     };
-    update.changes.push((name, Some(data)));
+    Arc::make_mut(&mut update.changes).push((name, Some(data)));
     S_OK
 }
 
@@ -937,7 +1110,7 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
         (Some(update), Some(name)) if !name.is_empty() => {
-            update.changes.push((name, None));
+            Arc::make_mut(&mut update.changes).push((name, None));
             S_OK
         }
         _ => E_INVALIDARG,
@@ -945,8 +1118,13 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
 }
 
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
-    let hr = get(update).map_or(E_INVALIDARG, Update::submit);
-    xasync::finished(block, (&raw const SUBMIT).cast(), hr)
+    let Some(update) = get(update).cloned() else {
+        return xasync::finished(block, (&raw const SUBMIT).cast(), E_INVALIDARG);
+    };
+    save_call(block, (&raw const SUBMIT).cast(), move || match update.submit() {
+        hr if hr < 0 => Err(hr),
+        _ => Ok(Vec::new()),
+    })
 }
 extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
@@ -1078,16 +1256,58 @@ mod tests {
     }
 
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {
+        slot_update(root, display, changes).submit()
+    }
+
+    fn slot_update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> Update {
         Update {
             name: "Slot".into(),
             dir: container_dir(root, "Slot"),
             display: Some(display.into()),
-            changes: changes
-                .iter()
-                .map(|(n, d)| (n.to_string(), d.map(|d| d.as_bytes().to_vec())))
-                .collect(),
+            changes: Arc::new(
+                changes
+                    .iter()
+                    .map(|(n, d)| (n.to_string(), d.map(|d| d.as_bytes().to_vec())))
+                    .collect(),
+            ),
         }
-        .submit()
+    }
+
+    /// Submits `update` through the title's entry point; the call's block.
+    fn submit_through_title(update: &Update) -> Box<AsyncBlock> {
+        let mut b = Box::new(block());
+        assert_eq!(submit_async(&OBJECT, update, &mut *b), S_OK);
+        b
+    }
+
+    /// Waits for a call, then takes a submit's result as the title does.
+    fn submitted(b: &mut AsyncBlock) -> HRESULT {
+        let status = xasync::XAsyncGetStatus(b, true);
+        let hr = submit_result(&OBJECT, b);
+        assert_eq!(status, hr);
+        hr
+    }
+
+    /// Keeps the save thread busy until the returned sender is dropped, so
+    /// that calls made meanwhile are in flight.
+    fn hold_save_thread() -> mpsc::Sender<()> {
+        let (release, held) = mpsc::channel::<()>();
+        let (started, running) = mpsc::channel();
+        save_thread()
+            .send(Box::new(move || {
+                started.send(()).unwrap();
+                let _ = held.recv();
+            }))
+            .unwrap();
+        running.recv().unwrap();
+        release
+    }
+
+    /// Returns once the save thread has done everything asked of it so far.
+    fn drain_save_thread() {
+        let (done, wait) = mpsc::channel();
+        save_thread().send(Box::new(move || done.send(()).unwrap())).unwrap();
+        wait.recv().unwrap();
     }
 
     /// The container `Slot`: display name and blobs.
@@ -1110,8 +1330,12 @@ mod tests {
             return;
         };
         let root = PathBuf::from(root);
+        let changes = [("a", Some("new a")), ("b", None), ("c", Some("new c"))];
         let hr = if op == "update" {
-            update(&root, "two", &[("a", Some("new a")), ("b", None), ("c", Some("new c"))])
+            update(&root, "two", &changes)
+        } else if op == "async update" {
+            // On the save thread, as a title's call runs it.
+            submitted(&mut submit_through_title(&slot_update(&root, "two", &changes)))
         } else {
             delete(&root, "Slot")
         };
@@ -1119,13 +1343,13 @@ mod tests {
         println!("FINISHED");
     }
 
-    /// Kills a process in the middle of an update (and of a deletion) at
-    /// every step: what is left is the whole old container or the whole
-    /// new one.
+    /// Kills a process in the middle of an update (made inline, and through
+    /// the title's call on the save thread) and of a deletion at every step:
+    /// what is left is the whole old container or the whole new one.
     #[test]
     fn a_kill_at_any_step_leaves_old_or_new() {
         let new = Some(("two".into(), vec![("a".into(), "new a".into()), ("c".into(), "new c".into())]));
-        for (op, after) in [("update", new), ("delete", None)] {
+        for (op, after) in [("update", new.clone()), ("async update", new), ("delete", None)] {
             let mut seen = (0, 0);
             for stop in 1.. {
                 let dir = tempfile::tempdir().unwrap();
@@ -1224,10 +1448,12 @@ mod tests {
                 name: c.name.clone(),
                 dir: c.dir.clone(),
                 display: None,
-                changes: blobs
-                    .iter()
-                    .map(|b| (b.to_string(), Some(format!("{container}:{b}").into_bytes())))
-                    .collect(),
+                changes: Arc::new(
+                    blobs
+                        .iter()
+                        .map(|b| (b.to_string(), Some(format!("{container}:{b}").into_bytes())))
+                        .collect(),
+                ),
             };
             assert_eq!(u.submit(), S_OK, "{container}");
         }
@@ -1461,6 +1687,7 @@ mod tests {
         // Quota counts the blobs; deleting the container frees it.
         let mut b = block();
         assert_eq!(quota_async(this, provider, &mut b), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         let mut left = 0i64;
         assert_eq!(quota_result(this, &mut b, &mut left), S_OK);
         assert!(left as u64 <= QUOTA - 7);
@@ -1469,6 +1696,7 @@ mod tests {
             delete_async(this, provider, c"Slot_1".as_ptr(), &mut b),
             S_OK
         );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         assert_eq!(delete_result(this, &mut b), S_OK);
         found.clear();
         let context = (&raw mut found).cast();
@@ -1477,6 +1705,258 @@ mod tests {
             S_OK
         );
         assert!(found.is_empty());
+        close_container(this, container);
+        close_provider(this, provider);
+    }
+
+    /// The title's call returns before the disk work is done, which runs on
+    /// the save thread; with `VICTORY_SYNC_SAVES` it is done in the call,
+    /// on the title's thread, and the call is over when it returns.
+    #[test]
+    fn save_work_runs_on_the_save_thread_unless_switched_off() {
+        let identity = (&raw const SUBMIT).cast();
+        let caller = std::thread::current().id();
+        for inline in [false, true] {
+            let (ran, on) = mpsc::channel();
+            let mut b = block();
+            let release = (!inline).then(hold_save_thread);
+            let work: Work = Box::new(move || {
+                let me = std::thread::current();
+                ran.send((me.id(), me.name().map(str::to_owned))).unwrap();
+                Ok(Vec::new())
+            });
+            assert_eq!(save_call_in(inline, &mut b, identity, work), S_OK);
+            let status = xasync::XAsyncGetStatus(&mut b, false);
+            assert_eq!(status, if inline { S_OK } else { xasync::E_PENDING }, "inline: {inline}");
+            drop(release);
+            assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+            let (id, name) = on.recv().unwrap();
+            if inline {
+                assert_eq!(id, caller);
+            } else {
+                assert_ne!(id, caller);
+                assert_eq!(name.as_deref(), Some("victory-saves"));
+            }
+        }
+    }
+
+    /// Once an update's call has completed, every read sees it: the
+    /// immediate calls, and an async read; an async read asked for while
+    /// the update is in flight sees it too, since it runs after it.
+    #[test]
+    fn a_read_after_a_completed_update_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let new = Some(("two".into(), vec![("a".into(), "new a".into()), ("b".into(), "old b".into())]));
+        let container = give(Provider { root: root.into() }.container("Slot"));
+
+        let release = hold_save_thread();
+        let mut submit = submit_through_title(&slot_update(root, "two", &[("a", Some("new a"))]));
+        let mut read = block();
+        assert_eq!(read_async(&OBJECT, container, std::ptr::null(), 0, &mut read), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut *submit, false), xasync::E_PENDING);
+        assert_eq!(state(root), old_state(), "in flight");
+        drop(release);
+        assert_eq!(submitted(&mut submit), S_OK);
+        assert_eq!(state(root), new);
+
+        assert_eq!(xasync::XAsyncGetStatus(&mut read, true), S_OK);
+        let mut size = 0;
+        assert_eq!(xasync::XAsyncGetResultSize(&mut read, &mut size), S_OK);
+        let mut buffer = vec![0u64; size.div_ceil(8)];
+        let mut count = 0;
+        let out = buffer.as_mut_ptr().cast::<u8>();
+        assert_eq!(read_result(&OBJECT, &mut read, size, out, &mut count), S_OK);
+        assert_eq!(count, 2);
+        // SAFETY: blob 0's entry, as the read laid it out.
+        let a = unsafe {
+            let len = out.add(8).cast::<u32>().read_unaligned() as usize;
+            std::slice::from_raw_parts(out.add(16).cast::<*const u8>().read_unaligned(), len)
+        };
+        assert_eq!(a, b"new a");
+        close_container(&OBJECT, container);
+    }
+
+    extern "system" fn listed(info: *const ContainerInfo, context: *mut c_void) -> bool {
+        // SAFETY: valid during the callback; the context is the test's vector.
+        let (info, out) = unsafe { (&*info, &mut *context.cast::<Vec<(String, u32, u64)>>()) };
+        out.push((text(info.display_name).unwrap(), info.blob_count, info.total_size));
+        true
+    }
+
+    fn listing(provider: *const Provider) -> Vec<(String, u32, u64)> {
+        let mut found = Vec::new();
+        let context = (&raw mut found).cast();
+        assert_eq!(enumerate_containers(&OBJECT, provider, context, Some(listed)), S_OK);
+        found
+    }
+
+    /// A second update submitted while the first is in flight lands after
+    /// it; the title may close or change an update once it is submitted.
+    /// The container listing shows the old version while they are in
+    /// flight and the last one after; a quota call made meanwhile counts
+    /// both, as documented.
+    #[test]
+    fn a_second_save_while_one_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let old = "x".repeat(1000);
+        assert_eq!(update(root, "one", &[("a", Some(&old))]), S_OK);
+        let provider = give(Provider { root: root.into() });
+
+        let release = hold_save_thread();
+        let first = give(slot_update(root, "two", &[("a", Some("first")), ("b", Some("bb"))]));
+        let mut first_call = block();
+        assert_eq!(submit_async(&OBJECT, first, &mut first_call), S_OK);
+        // Changed and closed in flight: the submitted update is unchanged.
+        assert_eq!(write_blob(&OBJECT, first, c"c".as_ptr(), b"late".as_ptr(), 4), S_OK);
+        close_update(&OBJECT, first);
+        let mut second = submit_through_title(&slot_update(root, "three", &[("a", Some("second"))]));
+        let mut quota = block();
+        assert_eq!(quota_async(&OBJECT, provider, &mut quota), S_OK);
+
+        for b in [&mut first_call, &mut *second, &mut quota] {
+            assert_eq!(xasync::XAsyncGetStatus(b, false), xasync::E_PENDING);
+        }
+        assert_eq!(listing(provider), [("one".into(), 1, 1000)], "in flight");
+        drop(release);
+
+        assert_eq!(submitted(&mut first_call), S_OK);
+        assert_eq!(submitted(&mut second), S_OK);
+        let blobs = vec![("a".into(), "second".into()), ("b".into(), "bb".into())];
+        assert_eq!(state(root), Some(("three".into(), blobs)));
+        assert_eq!(listing(provider), [("three".into(), 2, 8)]);
+        let slot = container_dir(root, "Slot");
+        assert!(slot.join("v3").is_dir() && !slot.join("v2").exists() && !slot.join("v1").exists());
+
+        assert_eq!(xasync::XAsyncGetStatus(&mut quota, true), S_OK);
+        let mut left = 0i64;
+        assert_eq!(quota_result(&OBJECT, &mut quota, &mut left), S_OK);
+        if storage::disk_free(root) > QUOTA {
+            assert_eq!(left as u64, QUOTA - 8);
+        }
+        close_provider(&OBJECT, provider);
+    }
+
+    /// Failures on the save thread reach the title as the documented
+    /// errors, through the call's status and its result.
+    #[test]
+    fn a_failure_on_the_save_thread_reaches_the_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+
+        // Each blob fits; together they are more than one update may write.
+        let big = vec![7u8; 9 << 20];
+        let mut too_big = slot_update(root, "two", &[]);
+        too_big.changes = Arc::new(vec![("a".into(), Some(big.clone())), ("c".into(), Some(big))]);
+        assert_eq!(submitted(&mut submit_through_title(&too_big)), UPDATE_TOO_BIG);
+        assert_eq!(state(root), old_state());
+
+        // A read of a blob that is not there.
+        let container = give(Provider { root: root.into() }.container("Slot"));
+        let mut b = block();
+        let missing = [c"nothing".as_ptr()];
+        assert_eq!(read_async(&OBJECT, container, missing.as_ptr(), 1, &mut b), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), BLOB_NOT_FOUND);
+        let mut count = 0;
+        assert_eq!(read_result(&OBJECT, &mut b, 0, std::ptr::null_mut(), &mut count), BLOB_NOT_FOUND);
+        close_container(&OBJECT, container);
+
+        // A container whose saves no longer read: refused, and kept.
+        let slot = container_dir(root, "Slot");
+        std::fs::write(slot.join("v1").join(MANIFEST), [1, 2, 3]).unwrap();
+        let broken = slot_update(root, "two", &[("a", Some("new a"))]);
+        assert_eq!(submitted(&mut submit_through_title(&broken)), NO_ACCESS);
+        assert!(slot.join("v1").join("0").is_file());
+        assert!(!slot.join("v2").exists());
+    }
+
+    /// A save canceled before the save thread reaches it fails with
+    /// `E_ABORT` and writes nothing.
+    #[test]
+    fn a_save_canceled_before_it_runs_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let release = hold_save_thread();
+        let mut b = submit_through_title(&slot_update(root, "two", &[("a", Some("new a"))]));
+        xasync::XAsyncCancel(&mut *b);
+        assert_eq!(xasync::XAsyncGetStatus(&mut *b, false), xasync::E_ABORT);
+        drop(release);
+        drain_save_thread();
+        assert_eq!(state(root), old_state());
+        assert_eq!(submit_result(&OBJECT, &mut *b), xasync::E_ABORT);
+    }
+
+    /// What an autosave costs the thread that submits it: a realistic save
+    /// (four blobs, 5.3 MB, all rewritten each time) submitted through the
+    /// title's entry point; the time until `XGameSaveSubmitUpdateAsync`
+    /// returns, and until the save completes, and what the blob writes
+    /// before it (copies of the data) cost. Run by hand:
+    /// `cargo test --release -p victory-hle save_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement"]
+    fn save_time_on_the_calling_thread() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
+        let mut container = std::ptr::null_mut();
+        assert_eq!(create_container(this, provider, c"Autosave".as_ptr(), &mut container), S_OK);
+        let sizes = [(c"world", 4 << 20), (c"player", 1 << 20), (c"thumbnail", 256 << 10), (c"header", 64 << 10)];
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut fill = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed as u8
+                })
+                .collect()
+        };
+        let (mut copying, mut calling, mut whole) = (Vec::new(), Vec::new(), Vec::new());
+        for run in 0..21 {
+            let blobs: Vec<Vec<u8>> = sizes.iter().map(|&(_, len)| fill(len)).collect();
+            let mut update = std::ptr::null_mut();
+            assert_eq!(create_update(this, container, c"Chapter".as_ptr(), &mut update), S_OK);
+            let copy = std::time::Instant::now();
+            for ((name, _), data) in sizes.iter().zip(&blobs) {
+                assert_eq!(write_blob(this, update, name.as_ptr(), data.as_ptr(), data.len()), S_OK);
+            }
+            let copied = copy.elapsed();
+            let mut b = block();
+            let start = std::time::Instant::now();
+            assert_eq!(submit_async(this, update, &mut b), S_OK);
+            let returned = start.elapsed();
+            assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+            let done = start.elapsed();
+            assert_eq!(submit_result(this, &mut b), S_OK);
+            close_update(this, update);
+            if run > 0 {
+                // The first run creates the container; autosaves replace it.
+                copying.push(copied.as_secs_f64() * 1e3);
+                calling.push(returned.as_secs_f64() * 1e3);
+                whole.push(done.as_secs_f64() * 1e3);
+            }
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let line = |v: &[f64]| v.iter().map(|ms| format!("{ms:.2}")).collect::<Vec<_>>().join(" ");
+        println!("calling thread ms: {}", line(&calling));
+        println!("until complete ms: {}", line(&whole));
+        println!(
+            "median blob writes (copies) {:.3} ms, median calling thread {:.3} ms, median until complete {:.3} ms ({} runs)",
+            median(&mut copying),
+            median(&mut calling),
+            median(&mut whole),
+            calling.len()
+        );
+        let read = read(&Container { name: "Autosave".into(), dir: container_dir(&get(provider).unwrap().root, "Autosave") }, None).unwrap();
+        assert_eq!(read.iter().map(|(_, d)| d.len()).sum::<usize>(), sizes.iter().map(|s| s.1).sum::<usize>());
         close_container(this, container);
         close_provider(this, provider);
     }
