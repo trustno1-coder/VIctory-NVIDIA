@@ -59,7 +59,8 @@ if (Test-Path -LiteralPath $menuFile) {
 $fpsWanted = $Fps
 if ($menu.Contains('VICTORY_MENU_CONSOLE')) { $SeriesS = $menu['VICTORY_MENU_CONSOLE'] -eq 'series-s' }
 if ($menu['VICTORY_MENU_RES'] -in '1440', '1080to1440', '4k') { $Res = $menu['VICTORY_MENU_RES'] }
-if ($menu['VICTORY_MENU_DLSS'] -in 'off', 'dlaa', 'quality', 'balanced', 'performance') { $Dlss = $menu['VICTORY_MENU_DLSS'] }
+$hasSavedDlss = $menu['VICTORY_MENU_DLSS'] -in 'off', 'dlaa', 'quality', 'balanced', 'performance'
+if ($hasSavedDlss) { $Dlss = $menu['VICTORY_MENU_DLSS'] }
 $timesWanted = $FrameGenX
 if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
     # 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).
@@ -142,7 +143,7 @@ $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 # (-More is not carried over a restart from the menu).
 $settings.VICTORY_MENU_CONSOLE = $console
 $settings.VICTORY_MENU_RES = $Res
-$settings.VICTORY_MENU_DLSS = if ($settings.VICTORY_DLSS -eq '1') { $Dlss } else { 'off' }
+$settings.VICTORY_MENU_DLSS = if ($hasSavedDlss -or $settings.VICTORY_DLSS -eq '1') { $Dlss } else { 'off' }
 $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1' -or $settings.VICTORY_FSR_FRAMEGEN -eq '1') { [string]$settings.VICTORY_FRAMEGEN_X } else { '0' }
 $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
