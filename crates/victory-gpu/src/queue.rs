@@ -871,6 +871,8 @@ impl Written {
             #[cfg(windows)]
             windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
         }
+        // A fence's value: the events waiting for it are set.
+        crate::fence::written(at as usize, bytes);
     }
 }
 

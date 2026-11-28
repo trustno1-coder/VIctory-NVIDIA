@@ -2,6 +2,7 @@
 //! GPU yet, so only signals (the title's, later our queues') move one.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +40,18 @@ struct Fence {
     waiters: Mutex<Vec<(u64, usize)>>,
 }
 
+/// Live fences by the address of their value, which titles also write
+/// through a list's bottom-of-pipe writes ([`written`]).
+static LIVE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        LIVE.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&((&raw const self.value) as usize));
+    }
+}
+
 fn fence<'a>(this: This) -> &'a Fence {
     // SAFETY: called from fence methods only.
     unsafe { &*this.cast::<Fence>() }
@@ -58,6 +71,9 @@ pub(crate) extern "system" fn create(
         flags,
         waiters: Mutex::new(Vec::new()),
     });
+    LIVE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((&raw const fence.value) as usize, &raw const *fence as usize);
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
 
@@ -172,6 +188,31 @@ pub(crate) fn set(this: This, value: u64) {
         windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
     }
 }
+/// A list's bottom-of-pipe write of `bytes` at `at` has landed
+/// (`crate::queue::Written::write`). If it went into a fence's value (the
+/// console hands out its address), the events waiting for what the fence
+/// holds now are set, as a signal sets them.
+pub(crate) fn written(at: usize, bytes: usize) {
+    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((&start, &fence)) = live.range(..at + bytes).next_back() else {
+        return;
+    };
+    if start + size_of::<u64>() <= at {
+        return;
+    }
+    // SAFETY: a live fence: one being dropped is taken off the list first,
+    // under the lock held here.
+    let fence = unsafe { &*(fence as *const Fence) };
+    let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    let value = fence.value.load(Ordering::Acquire);
+    waiters.retain(|&(wanted, event)| {
+        let reached = wanted <= value;
+        if reached {
+            set_event(event);
+        }
+        !reached
+    });
+}
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let _called = crate::timeline::span("a fence set");
     set(this, value);
@@ -273,5 +314,41 @@ mod tests {
         assert_eq!(slot::<Flags>(queried, 0x58)(queried), 0x2);
         assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
         assert_eq!(slot::<Release>(f, 0x10)(f), 0);
+    }
+
+    /// A list's bottom-of-pipe write at the fence's GPU address sets the
+    /// events waiting for the value it writes, as a signal does.
+    #[cfg(windows)]
+    #[test]
+    fn a_write_at_the_fence_address_sets_waiting_events() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f) as *mut u8;
+        // SAFETY: plain auto-reset events.
+        let events = [(); 2].map(|()| unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) });
+        assert!(events.iter().all(|e| !e.is_null()));
+        assert_eq!(wait(f, 5, events[0]), S_OK);
+        assert_eq!(wait(f, 9, events[1]), S_OK);
+        // SAFETY (below): valid events.
+        let set = |e| unsafe { WaitForSingleObject(e, 0) } == WAIT_OBJECT_0;
+
+        crate::queue::Written::Value(5).write(at, 8);
+        assert_eq!(completed(f), 5);
+        assert!(set(events[0]), "the event for 5 is set");
+        assert!(!set(events[1]), "the event for 9 is not");
+        // Four bytes, the low half of the value.
+        crate::queue::Written::Value(9).write(at, 4);
+        assert_eq!(completed(f), 9);
+        assert!(set(events[1]), "the event for 9 is set");
+
+        for e in events {
+            // SAFETY: ours.
+            unsafe { CloseHandle(e) };
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }
