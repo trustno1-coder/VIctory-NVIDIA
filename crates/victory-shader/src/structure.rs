@@ -193,27 +193,57 @@ impl Bools {
         }
     }
 
-    fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+    fn known_ite(&self, f: Bool, g: Bool, h: Bool) -> Option<Bool> {
         if f == Bool::TRUE || g == h {
-            return g;
+            return Some(g);
         }
         if f == Bool::FALSE {
-            return h;
+            return Some(h);
         }
         if (g, h) == (Bool::TRUE, Bool::FALSE) {
-            return f;
+            return Some(f);
         }
-        if let Some(&r) = self.memo.get(&(f, g, h)) {
-            return r;
+        self.memo.get(&(f, g, h)).copied()
+    }
+
+    fn ite(&mut self, mut f: Bool, mut g: Bool, mut h: Bool) -> Bool {
+        struct Branch {
+            key: (Bool, Bool, Bool),
+            variable: u32,
+            high: (Bool, Bool, Bool),
+            low_result: Option<Bool>,
         }
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = top(f).min(top(g)).min(top(h));
-        let ((f0, f1), (g0, g1), (h0, h1)) = (self.split(f, v), self.split(g, v), self.split(h, v));
-        let lo = self.ite(f0, g0, h0);
-        let hi = self.ite(f1, g1, h1);
-        let r = self.mk(v, lo, hi);
-        self.memo.insert((f, g, h), r);
-        r
+
+        let mut pending: Vec<Branch> = Vec::new();
+        'descend: loop {
+            let Some(mut result) = self.known_ite(f, g, h) else {
+                let top = |b: Bool| self.nodes[b.0 as usize].0;
+                let variable = top(f).min(top(g)).min(top(h));
+                let (f0, f1) = self.split(f, variable);
+                let (g0, g1) = self.split(g, variable);
+                let (h0, h1) = self.split(h, variable);
+                pending.push(Branch {
+                    key: (f, g, h),
+                    variable,
+                    high: (f1, g1, h1),
+                    low_result: None,
+                });
+                (f, g, h) = (f0, g0, h0);
+                continue;
+            };
+            while let Some(branch) = pending.last_mut() {
+                if let Some(low) = branch.low_result {
+                    result = self.mk(branch.variable, low, result);
+                    self.memo.insert(branch.key, result);
+                    pending.pop();
+                } else {
+                    branch.low_result = Some(result);
+                    (f, g, h) = branch.high;
+                    continue 'descend;
+                }
+            }
+            return result;
+        }
     }
 
     fn and(&mut self, a: Bool, b: Bool) -> Bool {
@@ -1491,6 +1521,23 @@ mod tests {
                 .collect();
             meet_anew(b, next, budget)
         })
+    }
+
+    #[test]
+    fn selecting_lane_masks_preserves_both_branches() {
+        let mut b = Bools::new();
+        let atoms: Vec<_> = (0..8).map(|i| b.atom(Atom::Lane(Value(i)), 0)).collect();
+        let parity = atoms[..6].iter().copied().fold(Bool::FALSE, |p, a| b.xor(p, a));
+        let selected = b.ite(parity, atoms[6], atoms[7]);
+        assert_eq!(b.ite(parity, atoms[6], atoms[7]), selected);
+        for bits in 0u32..256 {
+            let mut node = selected;
+            while let Some((Atom::Lane(Value(i)), low, high)) = b.node(node) {
+                node = if bits & (1 << i) != 0 { high } else { low };
+            }
+            let output = if (bits & 63).count_ones() % 2 == 1 { 6 } else { 7 };
+            assert_eq!(node == Bool::TRUE, bits & (1 << output) != 0);
+        }
     }
 
     #[test]
