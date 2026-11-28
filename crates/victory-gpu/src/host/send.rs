@@ -190,7 +190,7 @@ pub(super) struct Own {
 const RUNS_AT_A_TIME: usize = 4096;
 
 /// Takes what `dirty` sends up out of the CPU sides.
-pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc<Vec<(usize, usize)>>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
     // Runs of whole words of the copy: only those are pairs. (A byte beside
@@ -264,7 +264,7 @@ impl Own {
         &self,
         host: &Host,
         list: &ID3D12GraphicsCommandList,
-        dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+        dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc<Vec<(usize, usize)>>)],
         looked: impl Fn(&Shadow) -> bool,
     ) {
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

@@ -29,7 +29,7 @@
 //! [`crate::watch::landed_beside`] notes the blocks written afterwards, so
 //! that the next refresh takes them as before.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 /// The unit pieces are cut in (of title memory), and the guards' blocks.
@@ -200,6 +200,8 @@ struct Pool {
     state: Mutex<State>,
     more: Condvar,
     idle: Condvar,
+    /// Lock-free index of the next work item in the current batch.
+    next: AtomicUsize,
     /// One batch at a time.
     turn: Mutex<()>,
     threads: usize,
@@ -208,7 +210,6 @@ struct Pool {
 struct State {
     /// What to do with each number below `count`.
     work: Option<Work>,
-    next: usize,
     count: usize,
     /// Helpers inside a call.
     running: usize,
@@ -229,9 +230,10 @@ impl Pool {
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
+            state: Mutex::new(State { work: None, count: 0, running: 0, panicked: false }),
             more: Condvar::new(),
             idle: Condvar::new(),
+            next: AtomicUsize::new(0),
             turn: Mutex::new(()),
             threads,
         }));
@@ -254,21 +256,37 @@ impl Pool {
         let mut priority = crate::cores::Priority::new();
         let mut state = self.state();
         loop {
-            let Some((work, i)) = take(&mut state) else {
+            let Some(work) = state.work else {
                 state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
                 continue;
             };
+            let count = state.count;
+            if self.next.load(Ordering::Relaxed) >= count {
+                state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
             state.running += 1;
             drop(state);
-            let working = crate::timeline::span("a landing's job");
-            // SAFETY: counted in `running`, so `each` has not returned.
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
-            working.end();
+            let mut panicked = false;
+            loop {
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                if i >= count {
+                    break;
+                }
+                let working = crate::timeline::span("a landing's job");
+                // SAFETY: counted in `running`, so `each` has not returned.
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+                working.end();
+                if ran.is_err() {
+                    panicked = true;
+                    break;
+                }
+            }
             priority.keep();
             state = self.state();
             state.running -= 1;
-            state.panicked |= ran.is_err();
-            if state.running == 0 {
+            state.panicked |= panicked;
+            if state.running == 0 && state.work.is_none() {
                 self.idle.notify_all();
             }
         }
@@ -287,7 +305,8 @@ impl Pool {
         // it does not before no helper is inside `f` and none can enter.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
         let mut state = self.state();
-        (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
+        self.next.store(0, Ordering::Release);
+        (state.work, state.count, state.panicked) = (Some(work), count, false);
         drop(state);
         if count > self.threads {
             self.more.notify_all();
@@ -296,12 +315,16 @@ impl Pool {
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let Some((_, i)) = take(&mut self.state()) else { break };
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                if i >= count {
+                    break;
+                }
                 f(i);
             }
         }));
-        let mut state = self.state();
         // (After a panic here: nothing more is begun.)
+        self.next.store(count, Ordering::Relaxed);
+        let mut state = self.state();
         state.work = None;
         while state.running > 0 {
             state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
@@ -313,16 +336,6 @@ impl Pool {
         }
         assert!(!panicked, "a job of landing panicked");
     }
-}
-
-/// The next number of the batch, if there is one.
-fn take(state: &mut State) -> Option<(Work, usize)> {
-    let work = state.work?;
-    if state.next >= state.count {
-        return None;
-    }
-    state.next += 1;
-    Some((work, state.next - 1))
 }
 
 /// [`Pool::each`] on the threads kept for landing.
