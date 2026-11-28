@@ -93,8 +93,46 @@ This got past the first shader only to stop at the second.
 - A full `PROTON_LOG=1` log reached about 290 MB in one short run.
   `PROTON_LOG='-seh,-unwind'` kept it far smaller.
 
+## DLSS Super Resolution (checked without the title)
+
+`Get-NVIDIA-DLSS.cmd` and the built-in download run Windows PowerShell, which
+a Proton prefix does not have. `scripts/get-nvidia-dlss.sh` does the same on
+Linux (curl and python3): it fetches NVIDIA's Streamline release from NVIDIA's
+GitHub and puts the eight files and NVIDIA's licences where `victory.exe`
+looks, `%LOCALAPPDATA%\victory\nvidia-sdk\Streamline\bin\x64` in the prefix.
+With the files there the launcher does not try to download them.
+
+```sh
+scripts/get-nvidia-dlss.sh "$HOME/Games/victory-prefix"
+```
+
+Checked on 2026-11-28 with `victory upscaler-check --device`, which runs DLSS
+on stand-in textures and needs no game files:
+
+| | |
+|---|---|
+| System | CachyOS, kernel 7.3.5 |
+| Card and driver | GeForce RTX 3080, NVIDIA 620.73.04 |
+| Build | commit `63b902f`, cross-compiled on Linux with `cargo-xwin` |
+| Proton | Proton Experimental 11.0-20261123b, `umu-launcher`, `PROTON_ENABLE_NVAPI=1` |
+
+- `sl.interposer.dll` passed the signature check (`WinVerifyTrust` under
+  Wine), and Streamline verified its plugins' signatures.
+- `DLSS Super Resolution loaded streamline=2.14.16 ngx=310.9.16`, then `DLSS
+  ran three times on stand-in textures; the device is fine` and `Streamline
+  shut down: ok (0)`.
+- Frame generation was reported as not supported, as it is on an RTX 30 card.
+- Streamline's log showed a memory budget of 0.00 GB under Proton.
+- Streamline still starts the driver's `nvngx_update.exe` (NVIDIA's model
+  updater), though no downloaded plugins are loaded.
+
+Run under `umu-run`, the check's own lines did not reach the terminal;
+`umu-run cmd /c "C:\victory.exe upscaler-check --device > C:\check.txt 2>&1"`
+writes them to a file. `VICTORY_STREAMLINE_DIR` takes the Windows path, for
+example `C:\users\steamuser\AppData\Local\victory\nvidia-sdk\Streamline\bin\x64`.
+
 ## Not tested
 
-DLSS, frame generation (DLSS or FSR 3), HDR, other cards and drivers, and long
-play sessions. `Get-NVIDIA-DLSS.cmd` and the built-in download need Windows
-PowerShell, which was not set up in these runs.
+DLSS in the title, frame generation (DLSS or FSR 3), HDR, other cards and
+drivers, and long play sessions. Whether DLSS needs `PROTON_ENABLE_NVAPI=1`
+was not tried.
