@@ -761,7 +761,7 @@ pub(crate) fn before_present(
             tracing::info!(display = ?size, max_render = ?render, "FSR 3 frame generation: its context is made again for other sizes");
         }
         if live.framegen.is_none() && live.refused != Some((size, render)) {
-            match create_context(ffx, device, size, render, format, flags, hudless_format, live.ml) {
+            match create_context(ffx, device, size, render, (format, hudless_format), flags, live.ml) {
                 Some(context) => {
                     tracing::info!(
                         display = ?size,
@@ -921,11 +921,11 @@ fn create_context(
     device: &ID3D12Device,
     size: [u32; 2],
     render: [u32; 2],
-    format: DXGI_FORMAT,
+    formats: (DXGI_FORMAT, DXGI_FORMAT),
     flags: u32,
-    hudless_format: DXGI_FORMAT,
     ml: Option<MlProviders>,
 ) -> Option<Box<Context>> {
+    let (format, hudless_format) = formats;
     let mut backend = CreateBackend { header: Header::new(CREATE_BACKEND_DX12), device: device.as_raw() };
     // The colour without the interface in a format of its own (else the back buffer's is assumed).
     let mut hudless = Version { header: Header::new(CREATE_FRAMEGENERATION_HUDLESS), version: surface_format(hudless_format) };
