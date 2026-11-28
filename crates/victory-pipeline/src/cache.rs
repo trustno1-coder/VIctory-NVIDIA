@@ -64,10 +64,14 @@ impl Cache {
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(error) = published {
             let _ = std::fs::remove_file(&tmp);
+            // Another writer may have published this key after the miss. On
+            // Windows, a reader can keep that file from being replaced.
+            if !path.is_file() {
+                return Err(error.into());
+            }
         }
-        published?;
         Ok(path)
     }
 }
@@ -154,6 +158,55 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_concurrent_winner_can_be_read_when_the_destination_cannot_be_replaced() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::Mutex;
+
+        struct PublishingConverter {
+            path: PathBuf,
+            reader: Mutex<Option<File>>,
+        }
+
+        impl Converter for PublishingConverter {
+            fn id(&self) -> &'static str {
+                "test.concurrent"
+            }
+
+            fn version(&self) -> u32 {
+                1
+            }
+
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                let output = input.to_ascii_uppercase();
+                std::fs::create_dir_all(self.path.parent().unwrap())?;
+                std::fs::write(&self.path, &output)?;
+                // A reader opened the result published after the initial
+                // cache miss. It shares reads, but prohibits replacement.
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(&self.path)?;
+                *self.reader.lock().unwrap() = Some(file);
+                Ok(output)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let mut conv = PublishingConverter {
+            path: PathBuf::new(),
+            reader: Mutex::new(None),
+        };
+        conv.path = cache.path_for(&CacheKey::new(&conv, b"abc"));
+
+        let result = cache.get_or_convert(&conv, b"abc").unwrap();
+        assert_eq!(result, conv.path);
+        assert_eq!(std::fs::read(&result).unwrap(), b"ABC");
+        assert_eq!(std::fs::read_dir(result.parent().unwrap()).unwrap().count(), 1);
     }
 
     #[test]
