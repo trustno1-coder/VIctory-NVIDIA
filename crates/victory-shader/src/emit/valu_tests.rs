@@ -295,6 +295,58 @@ fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     });
 }
 
+#[test]
+fn scalar_pack_joins_two_halves() {
+    let cases = [
+        [0x1234_5678, 0x9abc_def0, 0, 0],
+        [u32::MAX, 0, 0, 0],
+        [0, u32::MAX, 0, 0],
+        [0xdead_beef, 0xcafe_f00d, 0, 0],
+    ];
+    // (opcode, expected): s_pack_ll, s_pack_lh and s_pack_hh_b32_b16 s16, s0, s1.
+    type Pack = fn(u32, u32) -> u32;
+    let packs: [(u8, Pack); 3] = [
+        (0x32, |a, b| a & 0xFFFF | b << 16),
+        (0x33, |a, b| a & 0xFFFF | b & 0xFFFF_0000),
+        (0x34, |a, b| a >> 16 | b & 0xFFFF_0000),
+    ];
+    for (opcode, expect) in packs {
+        let shader = build_valu_cs(&[
+            sop2(opcode, 16, 0, 1),
+            vop1(1, 0, sgpr(16)), // v_mov_b32 v0, s16
+        ]);
+        run_cases(&shader, &cases, |backend, _, inputs, got| {
+            assert_eq!(got, expect(inputs[0], inputs[1]), "{backend}, opcode {opcode:#x}, {inputs:x?}");
+        });
+    }
+}
+
+#[test]
+fn scalar_wide_bit_operations_fill_both_dwords() {
+    let cases = [
+        [0, 0, 0, 0],
+        [0x8000_0001, 3, 0, 0],
+        [0xdead_beef, 0x0000_0045, 0, 0],
+        [u32::MAX, 63, 0, 0],
+        [12, 35, 0, 0],
+    ];
+    let replicate = |x: u32| (0..32).filter(|i| x >> i & 1 == 1).fold(0u64, |r, i| r | 3 << (2 * i));
+    let mask = |a: u32, b: u32| (1u64 << (a & 63)).wrapping_sub(1) << (b & 63);
+    for half in 0..2u8 {
+        let take = move |v: u64| (v >> (32 * half)) as u32;
+        // s_bitreplicate_b64_b32 s[16:17], s0
+        let shader = build_valu_cs(&[0xBE90_3B00, vop1(1, 0, sgpr(16 + half))]);
+        run_cases(&shader, &cases, |backend, _, inputs, got| {
+            assert_eq!(got, take(replicate(inputs[0])), "{backend}, bitreplicate dword {half}, {inputs:x?}");
+        });
+        // s_bfm_b64 s[16:17], s0, s1
+        let shader = build_valu_cs(&[sop2(0x25, 16, 0, 1), vop1(1, 0, sgpr(16 + half))]);
+        run_cases(&shader, &cases, |backend, _, inputs, got| {
+            assert_eq!(got, take(mask(inputs[0], inputs[1])), "{backend}, bfm dword {half}, {inputs:x?}");
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
