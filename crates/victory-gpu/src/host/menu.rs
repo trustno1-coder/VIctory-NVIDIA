@@ -1311,7 +1311,7 @@ mod tests {
 
     #[test]
     fn the_picture_line_is_the_consoles() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: vec![String::new(); ITEMS.len() + BINDS.len()], started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, capturing: None, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         let at = |var: &str| ITEMS.iter().position(|i| i.var == var).expect("in the menu");
         let (console, x, s, dlss) = (at(CONSOLE), at(X_RES), at(S_RES), at(DLSS));
