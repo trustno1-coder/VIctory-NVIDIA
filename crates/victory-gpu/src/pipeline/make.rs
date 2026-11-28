@@ -187,7 +187,16 @@ impl Pending {
         self.make_with(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            let took = began.elapsed();
+            super::library::note_time(&self.key, took.as_millis() as u64);
+            use super::tally::Kind;
+            let kind = match &made {
+                None => Kind::Refused,
+                Some(p) if p.compute => Kind::Compute,
+                Some(p) if p.mesh => Kind::Mesh,
+                Some(_) => Kind::Graphics,
+            };
+            super::tally::TALLY.made(kind, took.as_micros() as u64, || format!("{:?}", self.shaders));
             made
         });
     }

@@ -346,6 +346,46 @@ fn carded(shadow: &Arc<Shadow>) {
     }
 }
 
+/// Copies given a side in the card's memory since the last
+/// [`take_card_made`]: how many, their bytes, and the largest's length and
+/// start.
+static CARD_MADE: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+
+/// Adds a copy of `len` bytes at `start` to `made` (as [`CARD_MADE`]).
+fn add_card_made(made: &mut [u64; 4], start: u64, len: u64) {
+    made[0] += 1;
+    made[1] += len;
+    if len > made[2] {
+        made[2] = len;
+        made[3] = start;
+    }
+}
+
+/// A copy of title memory at `start`, `len` bytes, was given a side in the
+/// card's memory.
+fn note_card_made(start: u64, len: u64) {
+    add_card_made(&mut CARD_MADE.lock().unwrap_or_else(|e| e.into_inner()), start, len);
+}
+
+/// The copies given a side in the card's memory since the last call: how
+/// many, their bytes, the largest's length and start.
+pub(crate) fn take_card_made() -> [u64; 4] {
+    std::mem::take(&mut *CARD_MADE.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+#[cfg(test)]
+mod card_made_tests {
+    #[test]
+    fn copies_made_on_the_card_are_counted_with_the_largest() {
+        let mut made = [0; 4];
+        super::add_card_made(&mut made, 0x3133_0000, 0x10_0000);
+        super::add_card_made(&mut made, 0x5000_0000, 0xAE0_0000);
+        super::add_card_made(&mut made, 0x6000_0000, 0xAE0_0000);
+        super::add_card_made(&mut made, 0x7000_0000, 0x2_0000);
+        assert_eq!(made, [4, 0x10_0000 + 2 * 0xAE0_0000 + 0x2_0000, 0xAE0_0000, 0x5000_0000]);
+    }
+}
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
@@ -5486,7 +5526,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let (buffer, card) = match card_for(size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
+                // Counted for the line on copies in the card's memory
+                // ([`take_card_made`]); one line each at debug
+                // (`VICTORY_LOG=victory_gpu::shadow=debug,info`).
+                note_card_made(key.0, len);
+                tracing::debug!(
                     start = format_args!("{:#x}", key.0),
                     len,
                     "a buffer's host copy is in the card's memory"

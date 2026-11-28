@@ -148,7 +148,9 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                let began = std::time::Instant::now();
                 let done = translate(&self.container);
+                tally::TALLY.translated(done.is_ok(), began.elapsed().as_micros() as u64, || format!("{self:?}"));
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -165,7 +167,9 @@ impl Shader {
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
-                    Ok(t) => tracing::info!(
+                    // Counted for the pipelines' line every 5 seconds
+                    // (`tally`); `VICTORY_LOG=victory_gpu::pipeline=debug,info`.
+                    Ok(t) => tracing::debug!(
                         stage = self.stage,
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
@@ -432,8 +436,10 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
-/// List method: logs each pipeline's shaders the first time a list binds
-/// it, so a run lists the shaders its frames need first.
+/// List method: counts each pipeline the first time a list binds it for the
+/// pipelines' line every 5 seconds (`tally`), and logs its shaders at
+/// debug (`VICTORY_LOG=victory_gpu::pipeline=debug,info`), so a run can list
+/// the shaders its frames need first.
 pub(crate) fn bound(this: This) {
     if this.is_null() {
         return;
@@ -442,10 +448,20 @@ pub(crate) fn bound(this: This) {
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    #[cfg(windows)]
+    tally::TALLY.bound(p.shaders.len());
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::debug!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
+}
+
+/// The pipelines' line ([`tally`]) since the last one, if anything
+/// happened or pipelines are being made; with the frame-rate line.
+#[cfg(windows)]
+pub(crate) fn tally_line() -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    tally::TALLY.line(std::time::Instant::now(), making(), [library::MADE.load(Relaxed), library::LOADED.load(Relaxed)])
 }
 
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
@@ -772,6 +788,8 @@ mod library;
 mod make;
 #[cfg(windows)]
 pub(crate) mod samplers;
+#[cfg(windows)]
+pub(crate) mod tally;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

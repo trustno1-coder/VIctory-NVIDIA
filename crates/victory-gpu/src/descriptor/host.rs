@@ -5050,11 +5050,23 @@ fn make_twinned(
             };
             // The first such views of depth textures are logged as the
             // title describes them (format, dimension, then mip, slices and
-            // plane): they say which planes shaders write, and as what.
+            // plane): they say which planes shaders write, and as what. The
+            // first 32 at info, then up to 512 at debug
+            // (`VICTORY_LOG=victory_gpu::descriptor::host=debug,info`): a run
+            // made 512 in its first seconds, the most of them alike; the
+            // frame-rate line counts the textures ("depth textures with
+            // unordered access").
             if crate::resource::depth_and_unordered(resource) {
                 static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 512 {
+                let n = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 32 {
                     tracing::info!(
+                        ?resource,
+                        view = ?desc,
+                        "unordered access view of a depth texture"
+                    );
+                } else if n < 512 {
+                    tracing::debug!(
                         ?resource,
                         view = ?desc,
                         "unordered access view of a depth texture"
