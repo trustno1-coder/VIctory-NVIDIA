@@ -53,6 +53,10 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
+#[cfg(test)]
+mod bench;
+mod lean;
+
 use crate::host::{HostList, host};
 
 /// Programs of the title the stand-in follows.
@@ -278,8 +282,11 @@ void place(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef GATHER
+#ifndef GATHER_X
+#define GATHER_X 8
+#endif
 [RootSignature(RS)]
-[numthreads(8, 2, 1)]
+[numthreads(GATHER_X, 2, 1)]
 void gather(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
@@ -507,6 +514,9 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     reflect: ID3D12PipelineState,
+    /// The lean forms asked for (`VICTORY_AMBIENT_LEAN`), if they compiled.
+    gather_wide: Option<ID3D12PipelineState>,
+    mean_wide: Option<ID3D12PipelineState>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -515,10 +525,10 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
-fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
+fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>, bits: u32) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}{}", lean::SOURCE), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
@@ -539,6 +549,17 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let reflect = pipeline("REFLECT", s!("reflect_light"))?;
+    let mut lean_form = |bit, part: &str, entry| {
+        (bits & bit != 0)
+            .then(|| {
+                pipeline(part, entry)
+                    .inspect_err(|e| tracing::warn!(error = %e, part, "a lean form of the stand-in did not compile: the plain one runs"))
+                    .ok()
+            })
+            .flatten()
+    };
+    let gather_wide = lean_form(lean::GATHER_WIDE, "GATHER\n#define GATHER_X 16", s!("gather"));
+    let mean_wide = lean_form(lean::MEAN_WIDE, "KEEP\n#define MEAN_WIDE", s!("mean_wide"));
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -549,6 +570,8 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         reflect,
+        gather_wide,
+        mean_wide,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -558,7 +581,7 @@ fn pass() -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let host = host()?;
-        make(&host.device, |bytes| host.uav_buffer(bytes))
+        make(&host.device, |bytes| host.uav_buffer(bytes), lean::lean())
             .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
             .ok()
     })
@@ -742,25 +765,39 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             l.Dispatch(x, y, z);
             uav_barrier(l);
         };
+        // The points of this depth (`VICTORY_AMBIENT_LEAN`: in groups of
+        // 32, or left out when the list's last gather made them).
+        let points = || {
+            if !lean::gather_needed(list, views.depth.ptr, views.depth_size) {
+                return;
+            }
+            run(&pass.place, 8, 9, 1);
+            match pass.gather_wide.as_ref().filter(|_| lean::has(lean::GATHER_WIDE)) {
+                Some(wide) => run(wide, 10, 45, 1),
+                None => run(&pass.gather, 20, 45, 1),
+            }
+        };
         match role {
             Role::Radiance => {
                 run(&pass.keep, 8, 9, 1);
-                run(&pass.mean, 1, 1, 1);
+                match pass.mean_wide.as_ref().filter(|_| lean::has(lean::MEAN_WIDE)) {
+                    Some(wide) => run(wide, 1, 1, 1),
+                    None => run(&pass.mean, 1, 1, 1),
+                }
+                lean::kept();
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
-                    run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    points();
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
             Role::Miss => {
                 // The points afresh, from this frame's depth: the diffuse
                 // stand-in makes them later in the frame.
-                run(&pass.place, 8, 9, 1);
-                run(&pass.gather, 20, 45, 1);
+                points();
                 run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
@@ -856,6 +893,7 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        let pass = make(&host.device, |bytes| host.uav_buffer(bytes), 7).expect("the passes");
+        assert!(pass.gather_wide.is_some() && pass.mean_wide.is_some(), "the lean forms");
     }
 }
