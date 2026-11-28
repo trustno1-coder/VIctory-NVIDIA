@@ -150,6 +150,11 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     Ok(())
 }
 
+fn library_workers(jobs: Option<usize>, pipelines: usize) -> usize {
+    let requested = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()) * 2 / 3);
+    requested.max(1).min(pipelines)
+}
+
 /// `victory preload`'s last step: the pipelines a run makes while it loads
 /// (the early list) and those that take a second or more, made again in this
 /// process and stored in the host pipeline library the runs load at their
@@ -174,7 +179,7 @@ pub fn into_library(jobs: Option<usize>) -> Result<()> {
         })
         .collect();
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
-    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()) * 2 / 3).max(1);
+    let threads = library_workers(jobs, all.len());
     println!("into the pipeline library: {} pipelines (loading and slow ones), {threads} threads", all.len());
     let began = Instant::now();
     let (count, made) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -284,4 +289,17 @@ fn make(dir: &Path, these: &str) -> Result<()> {
     // Without what a run's end does (nothing to save, the host's threads).
     let _ = out.flush();
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::library_workers;
+
+    #[test]
+    fn library_workers_each_have_a_pipeline() {
+        assert_eq!(library_workers(Some(64), 0), 0);
+        assert_eq!(library_workers(Some(64), 3), 3);
+        assert_eq!(library_workers(Some(2), 9), 2);
+        assert_eq!(library_workers(Some(0), 1), 1);
+    }
 }
