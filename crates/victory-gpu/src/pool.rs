@@ -228,10 +228,28 @@ impl<B: Clone> Pool<B> {
         ripe: Ripe,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
+        // A failed 64 MiB block must not trigger another driver call for each
+        // small texture. Existing free ranges remain usable during backoff.
+        let (i, start) = match self.place(len, align, now, ripe) {
+            Ok(found) => found,
+            Err(false) => return None,
+            Err(true) => {
+                let memory = self.grow(now, &mut make)?;
+                let i = self.add(memory, ripe.started);
+                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
+            }
+        };
+        self.finish(i, start, len, now, ripe, &mut make)
+    }
+
+    /// Where a piece of `len` bytes goes, if a block has room for it:
+    /// `Err(true)`: none has, a new block would take it; `Err(false)`: it is
+    /// not pooled.
+    fn place(&mut self, len: u64, align: u64, now: u64, ripe: Ripe) -> Result<(usize, u64), bool> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
         if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
-            return None;
+            return Err(false);
         }
         self.rested(now);
         let mut found = None;
@@ -251,16 +269,20 @@ impl<B: Clone> Pool<B> {
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
-        // A failed 64 MiB block must not trigger another driver call for each
-        // small texture. Existing free ranges remain usable during backoff.
-        let (i, start) = match found {
-            Some(found) => found,
-            None => {
-                let memory = self.grow(now, &mut make)?;
-                let i = self.add(memory, ripe.started);
-                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
-            }
-        };
+        found.ok_or(true)
+    }
+
+    /// The piece at `start` of block `i`, just taken: the blocks made ahead
+    /// ([`Ripe`]) and what the block says of its memory.
+    fn finish(
+        &mut self,
+        i: usize,
+        start: u64,
+        len: u64,
+        now: u64,
+        ripe: Ripe,
+        make: &mut impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
         if ripe.ahead > 0 {
             if !ripe.is(self.blocks[i].as_ref()?) {
                 let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -270,7 +292,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
-                && let Some(memory) = self.grow(now, &mut make)
+                && let Some(memory) = self.grow(now, make)
             {
                 self.add(memory, ripe.started);
             }
@@ -782,6 +804,70 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece, small: u64) {
     }
 }
 
+/// A new block of texture memory, resident and mapped (waited for).
+fn make_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: BLOCK,
+        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    // SAFETY: plain creation.
+    if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+        crate::residency::allocation_error(&e);
+        tracing::warn!(error = %e, "no block of texture memory");
+    }
+    if let Some(h) = &heap
+        && let Err(e) = crate::host::resident(device, h, crate::host::Made::Block)
+            .and_then(|()| crate::host::mapped(device, crate::host::Made::Block))
+    {
+        tracing::warn!(error = %e, "a block of texture memory is not resident");
+        return None;
+    }
+    heap
+}
+
+/// Whether a new block of textures is made with the pool's lock let go
+/// (`VICTORY_BLOCKS_UNLOCKED=0`: made under it, as before). Under it, every
+/// thread that placed a texture, in a block with room or not, waited until
+/// the new block was resident and mapped: as long as the paging queued
+/// before it, which is longest while a scene loads, when most textures are
+/// made.
+fn blocks_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BLOCKS_UNLOCKED").is_none_or(|v| v != "0"))
+}
+
+/// [`Pool::take_ripe`] of [`TEXTURES`] with a new block made outside the
+/// lock. Two threads that both found no room both make one: the second is
+/// one more empty block, kept or let go as such ([`room`]).
+fn take_unlocked(device: &ID3D12Device, len: u64, align: u64) -> Option<(Piece, ID3D12Heap, bool)> {
+    let ripe = Ripe::now();
+    let mut pool = lock(&TEXTURES);
+    let (i, start) = match pool.place(len, align, now(), ripe) {
+        Ok(found) => found,
+        Err(false) => return None,
+        Err(true) => {
+            if now() < pool.retry_growth_at {
+                return None;
+            }
+            drop(pool);
+            let made = make_block(device);
+            pool = lock(&TEXTURES);
+            let Some(heap) = made else {
+                pool.retry_growth_at = now().saturating_add(500);
+                return None;
+            };
+            // (Made after the submissions counted before: those begun
+            // meanwhile may have lists that ran before it was there.)
+            let i = pool.add(heap, crate::host::submissions().0);
+            (i, pool.blocks[i].as_mut()?.free.take(len, align)?)
+        }
+    };
+    pool.finish(i, start, len, now(), ripe, &mut || make_block(device))
+}
+
 /// A texture of `desc` (no target, depth or unordered access) in a block;
 /// `None`: not pooled, or the host refused.
 ///
@@ -822,29 +908,13 @@ pub(crate) unsafe fn texture(
     } else {
         0
     };
+    let (len, align) = (info.SizeInBytes, info.Alignment.max(1));
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        // SAFETY: plain creation.
-        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
-            tracing::warn!(error = %e, "no block of texture memory");
-        }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h, crate::host::Made::Block)
-                .and_then(|()| crate::host::mapped(device, crate::host::Made::Block))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
-        }
-        heap
-    })?;
+    let (piece, heap, again) = if blocks_unlocked() {
+        take_unlocked(device, len, align)?
+    } else {
+        lock(&TEXTURES).take_ripe(len, align, now(), Ripe::now(), || make_block(device))?
+    };
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -1035,6 +1105,63 @@ mod tests {
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);
         assert_eq!(made.get(), n);
         assert!(pool.take(BLOCK, 65536, 0, make).is_none());
+    }
+
+    /// Threads that place textures at once, some of them making new blocks
+    /// (outside the pool's lock, [`blocks_unlocked`]), get every texture,
+    /// each in a piece of its own.
+    #[test]
+    fn threads_that_place_textures_at_once_make_blocks_and_keep_their_pieces_apart() {
+        let Some(host) = crate::host::host() else { return };
+        // 4 MiB each: 16 to a block, so 8 threads of 24 need new blocks
+        // while others place theirs.
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let made: Vec<ID3D12Resource> = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..24)
+                            // SAFETY: a valid description.
+                            .filter_map(|_| unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads.into_iter().flat_map(|t| t.join().unwrap()).collect()
+        });
+        assert_eq!(made.len(), 8 * 24, "every texture was placed");
+        // Each texture's piece is its own: no two of a block overlap.
+        let pool = lock(&TEXTURES);
+        let mut taken: Vec<(usize, u64, u64)> = Vec::new();
+        for (i, block) in pool.blocks.iter().enumerate() {
+            let Some(block) = block else { continue };
+            let mut at = 0;
+            for (&start, &len) in &block.free.0 {
+                if start > at {
+                    taken.push((i, at, start));
+                }
+                at = start + len;
+            }
+            if at < BLOCK {
+                taken.push((i, at, BLOCK));
+            }
+        }
+        let held: u64 = taken.iter().map(|&(_, a, b)| b - a).sum();
+        drop(pool);
+        assert!(held >= 8 * 24 * (4 << 20), "the pieces held cover every texture");
+        drop(made);
+        // SAFETY: plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not
