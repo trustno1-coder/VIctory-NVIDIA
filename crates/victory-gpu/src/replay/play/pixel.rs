@@ -199,10 +199,15 @@ fn transition(res: u32, sub: u32, before: u32, after: u32) -> Barrier {
 struct Textures {
     /// Formats copies have.
     copied_as: HashMap<u32, i32>,
+    depth_copies: HashMap<(u32, u32), D3D12_SUBRESOURCE_FOOTPRINT>,
     /// Textures shaders may write and that have the picture's shape.
     shaped: Vec<u32>,
     /// The viewport targets of a size were last drawn through.
     drawn: HashMap<(u32, u32), [f32; 4]>,
+}
+
+fn depth_texel_offset(f: &D3D12_SUBRESOURCE_FOOTPRINT, x: u32, y: u32) -> u64 {
+    u64::from(f.RowPitch) * u64::from(y) + x as u64 * texel_bytes(f.Format.0) as u64
 }
 
 impl Player {
@@ -425,6 +430,7 @@ impl Player {
             .collect();
         Textures {
             copied_as,
+            depth_copies: HashMap::new(),
             shaped,
             drawn: HashMap::new(),
         }
@@ -537,20 +543,16 @@ impl Player {
                 });
                 continue;
             }
-            // Depth is only copied whole.
-            let mip = s.sub % u32::from(r.desc.mips.max(1));
-            let w = (r.desc.width as u32 >> mip).max(1);
-            let h = (r.desc.height >> mip).max(1);
-            let bytes = texel_bytes(s.format) as u64;
-            let pitch = (w * bytes as u32).next_multiple_of(256);
-            *scratch = (*scratch).max(u64::from(pitch) * u64::from(h));
+            // D3D12 only copies a depth or stencil plane in full.
+            let f = &t.depth_copies[&(s.res, s.sub)];
+            *scratch = (*scratch).max(u64::from(f.RowPitch) * u64::from(f.Height));
             copies.push(Cmd::CopyTexture {
                 dst: Loc::Placed {
                     res: SCRATCH,
                     offset: 0,
-                    format: t.copied_as.get(&s.res).copied().unwrap_or(r.desc.format),
-                    size: [w, h, 1],
-                    pitch,
+                    format: f.Format.0,
+                    size: [f.Width, f.Height, f.Depth],
+                    pitch: f.RowPitch,
                 },
                 at: [0; 3],
                 src: Loc::Sub {
@@ -566,8 +568,8 @@ impl Player {
                 dst: PROBE,
                 dst_at: offset,
                 src: SCRATCH,
-                src_at: u64::from(pitch) * u64::from(s.y) + u64::from(s.x) * bytes,
-                len: bytes,
+                src_at: depth_texel_offset(f, s.x, s.y),
+                len: texel_bytes(s.format) as u64,
             });
             copies.push(Cmd::Barriers {
                 all: vec![transition(SCRATCH, ALL, COPY_SOURCE, COPY_DEST)],
@@ -704,8 +706,21 @@ impl Player {
                         }
                     }
                     let mut seen = HashSet::new();
-                    spots.retain(|s| {
-                        (p.depth || !s.depth) && texel_bytes(s.format) > 0 && seen.insert(*s)
+                    spots.retain_mut(|s| {
+                        if s.depth {
+                            let Some(r) = self.texture(s.res).filter(|_| p.depth) else {
+                                return false;
+                            };
+                            let f = t.depth_copies.entry((s.res, s.sub)).or_insert_with(|| {
+                                gpu::footprints(&self.device, &gpu::to_desc(&r.desc), s.sub, 1).0[0]
+                                    .Footprint
+                            });
+                            if s.x >= f.Width || s.y >= f.Height {
+                                return false;
+                            }
+                            s.format = f.Format.0;
+                        }
+                        texel_bytes(s.format) > 0 && seen.insert(*s)
                     });
                     let what = match c {
                         Cmd::Draw { .. } => "Draw",
@@ -819,6 +834,32 @@ mod tests {
         // Too few bytes, or a format that is not read.
         assert_eq!(texel_text(41, &[1]), "[01]");
         assert_eq!(texel_text(98, &[1, 2]), "[01, 02]");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn depth_probe_reads_the_copied_plane_layout() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_SAMPLE_DESC};
+
+        let device = &crate::host::host().unwrap().device;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2560,
+            Height: 1440,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32G8X24_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let (planes, _) = gpu::footprints(device, &desc, 0, 2);
+        let depth = &planes[0].Footprint;
+        let stencil = &planes[1].Footprint;
+        assert_eq!(texel_bytes(depth.Format.0), 4);
+        assert_eq!(depth_texel_offset(depth, 1076, 362), 362 * 10240 + 1076 * 4);
+        assert_eq!(texel_bytes(stencil.Format.0), 1);
+        assert_eq!(depth_texel_offset(stencil, 1076, 362), 362 * 2560 + 1076);
     }
 
     #[test]
