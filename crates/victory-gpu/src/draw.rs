@@ -4681,8 +4681,10 @@ impl State {
                 }
                 // A stage that did not make the copy tells of the textures
                 // it reads, once, as the maker did of its own (below): the
-                // copy was made for it too.
+                // copy was made for it too. (Only with VICTORY_TABLES_ONCE=1:
+                // off, this branch is as it was.)
                 let tells = match known.told.iter().position(|&t| t == reader.0 || t == 0) {
+                    _ if !tables_once() => None,
                     Some(i) if known.told[i] == 0 => {
                         known.told[i] = reader.0;
                         title_first
@@ -4869,8 +4871,10 @@ impl State {
         slot_stats::made(n, compute);
         match self.fresh_longest.get(&table).copied() {
             Some((longest, _, hashed)) if longest > n => {
-                // (Only if the longer copy's records are the title's still.)
-                if records_hash(table, longest) == hashed {
+                // (Only if the longer copy's records are the title's still;
+                // reading them again costs, so only where the copy could be
+                // used: diagnostics builds or VICTORY_TABLES_ONCE=1.)
+                if (cfg!(feature = "diagnostics") || tables_once()) && records_hash(table, longest) == hashed {
                     slot_stats::cache(LONGER, n);
                 }
             }
