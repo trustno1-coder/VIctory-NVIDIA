@@ -214,15 +214,86 @@ static WAITS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(No
 /// their microseconds, and the longest one's.
 static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
 
+/// With `VICTORY_GPU_TIMING`: the commands' time on the card since the last
+/// line by what was recorded with them (`crate::host::between`'s bits, as
+/// the note's text ends): how many, and their nanoseconds.
+static COMMANDS_BY_BETWEEN: Mutex<Option<HashMap<u32, (u64, u64)>>> = Mutex::new(None);
+
 /// A command took `ms` on the card (timing run). `op` is its note: the
-/// kind and size first, then the pipeline in brackets, then what it binds.
+/// kind and size first, then the pipeline in brackets, then what it binds,
+/// then what was recorded with it (`crate::host::between`).
+///
+/// Summed in nanoseconds: in whole microseconds a command of 0.9 counted
+/// as 0, and a frame's 13,000 commands lost some 6 ms of their sum (run
+/// 410's lines are that much too low, and its "0.7 microseconds each" for
+/// the cheapest draws is 0.7 to 1.7).
 pub(crate) fn command_took(op: &str, ms: f64) {
-    let us = (ms * 1e3) as u64;
-    let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
-    e.0 += 1;
-    e.1 += us;
-    e.2 = e.2.max(us);
+    let ns = (ms * 1e6) as u64;
+    {
+        let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += ns;
+        e.2 = e.2.max(ns);
+    }
+    let mark = crate::host::between::MARK;
+    if let Some(at) = op.rfind(mark)
+        && let Ok(bits) = u32::from_str_radix(op[at + mark.len()..].trim(), 16)
+    {
+        // Draws and mesh dispatches apart from compute work: bit 31.
+        let word = op.split(' ').next().unwrap_or("");
+        let compute = word == "dispatch" || op.contains("[compute ");
+        let draws = matches!(word, "indirect" | "mesh" | "draw" | "indexed") && !compute;
+        if draws {
+            let mut by = COMMANDS_BY_BETWEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let e = by.get_or_insert_with(HashMap::new).entry(bits).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += ns;
+        }
+    }
+}
+
+/// The frame lines of [`COMMANDS_BY_BETWEEN`]: the draws' time on the card
+/// by what was recorded between each and the next, and by where the draw's
+/// buffers lie.
+fn between_lines(frames: f64) {
+    use crate::host::between as b;
+    let Some(by) = COMMANDS_BY_BETWEEN.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    // (How many a frame, microseconds each) of the draws `pick` takes.
+    let of = |pick: &dyn Fn(u32) -> bool| {
+        let (n, ns) = by.iter().filter(|(bits, _)| pick(**bits)).fold((0u64, 0u64), |a, (_, e)| (a.0 + e.0, a.1 + e.1));
+        format!("{:.0} at {:.2} us", n as f64 / frames, ns as f64 / 1e3 / n.max(1) as f64)
+    };
+    let all: (u64, u64) = by.values().fold((0, 0), |a, e| (a.0 + e.0, a.1 + e.1));
+    tracing::info!(
+        "  the card's time of draws by what was recorded up to the next command (timing run): all {:.0} a frame, {:.1} ms; \
+         with nothing else {}; with a state change of ours {}; a barrier call of the title's {}; a clamp pass of ours {}; \
+         another pipeline {}; another root signature {}; heaps set {}; targets set {} (a draw counts under each it has)",
+        all.0 as f64 / frames,
+        all.1 as f64 / 1e6 / frames,
+        of(&|bits| bits & b::BETWEEN == 0),
+        of(&|bits| bits & b::OUR_BARRIER != 0),
+        of(&|bits| bits & b::TITLE_BARRIER != 0),
+        of(&|bits| bits & b::CLAMP != 0),
+        of(&|bits| bits & b::PIPELINE != 0),
+        of(&|bits| bits & b::ROOT != 0),
+        of(&|bits| bits & b::HEAPS != 0),
+        of(&|bits| bits & b::TARGETS != 0)
+    );
+    tracing::info!(
+        "  the card's time of draws by where their buffers lie (timing run; with VICTORY_READY_ONCE=0 and \
+         VICTORY_LIST_VIEWS=0 every draw is asked, else only a table's first draw in its list): of the draws with \
+         nothing else recorded: reading a copy in the PC's memory {}, picking buffers by an index {}, neither {}; \
+         of all draws: {}, {}, {}",
+        of(&|bits| bits & b::BETWEEN == 0 && bits & b::READS_PC != 0),
+        of(&|bits| bits & b::BETWEEN == 0 && bits & (b::READS_PC | b::PICKS) == b::PICKS),
+        of(&|bits| bits & b::BETWEEN == 0 && bits & (b::READS_PC | b::PICKS) == 0),
+        of(&|bits| bits & b::READS_PC != 0),
+        of(&|bits| bits & (b::READS_PC | b::PICKS) == b::PICKS),
+        of(&|bits| bits & (b::READS_PC | b::PICKS) == 0)
+    );
 }
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
@@ -918,11 +989,16 @@ fn log_memory() {
     // Round 2: what the view table still holds and what goes around it,
     // what host lists cost, the card's share that is the layer's own or
     // the title's no more, and which big blocks are ours.
+    let pool = crate::upload::pool_state();
     let lists: Vec<u64> = crate::host::LISTS.iter().map(|l| l.load(Relaxed)).collect();
     tracing::info!(
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
-         views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
+         views and {} views of placed memory; shapes of placed views kept: {}; ownerless views: \
+         {} entries evicted by VICTORY_OWNERLESS_VIEWS, {} lookups of a view whose generation was \
+         gone (read as no view; includes views freed with their resource); upload pool: {} of {} \
+         pieces reserved (VirtualAlloc2 error {}), {} uploads served from the process heap; \
+         host lists: {} \
          made by the host, {} preludes made for them ({} alive), private bytes grew {:.0} MB while \
          lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
@@ -933,6 +1009,12 @@ fn log_memory() {
         views[3],
         views[4],
         views[5],
+        views[8],
+        views[9],
+        pool[0],
+        pool[1],
+        pool[2],
+        crate::upload::heap_uploads(),
         lists[0],
         lists[1],
         crate::host::PRELUDES_ALIVE.load(Relaxed),
@@ -1350,21 +1432,23 @@ pub(crate) fn log(frames: f64) {
         }
         kinds.sort_by_key(|k| std::cmp::Reverse(k.2));
         let all: u64 = kinds.iter().map(|k| k.2).sum();
+        // (Nanoseconds: `command_took`.)
         let text: Vec<String> =
-            kinds.iter().map(|(word, n, us)| format!("{word} {:.1} ms in {:.0}", *us as f64 / 1e3 / frames, *n as f64 / frames)).collect();
+            kinds.iter().map(|(word, n, ns)| format!("{word} {:.1} ms in {:.0}", *ns as f64 / 1e6 / frames, *n as f64 / frames)).collect();
         tracing::info!(
             "  the card's time by command (timing run), all {} kinds together: {:.1} ms a frame; by first word: {}",
             by.len(),
-            all as f64 / 1e3 / frames,
+            all as f64 / 1e6 / frames,
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    between_lines(frames);
+    for (what, (n, ns, longest)) in by.into_iter().take(40) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
-            us as f64 / 1e3 / frames,
+            ns as f64 / 1e6 / frames,
             n as f64 / frames,
-            longest as f64 / 1e3
+            longest as f64 / 1e6
         );
     }
     tracing::info!(

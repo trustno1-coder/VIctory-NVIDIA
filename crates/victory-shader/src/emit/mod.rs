@@ -113,6 +113,7 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+mod water_tile_slots;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -272,6 +273,17 @@ pub fn group_sync() -> u8 {
 pub fn builder_fences() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
+}
+
+/// Whether a load by address in a program that walks the title's structures
+/// takes the copy an earlier load of the same 64 KiB page found, without a
+/// look in the directory of its own (`lower.rs` `memory_near`;
+/// `VICTORY_MEMORY_NEAR=1`; off by default: every load looks). The same bytes
+/// are read either way: the switch is for measuring what the looks cost. Part
+/// of the translation: the shader cache keys on it.
+pub fn memory_near() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_NEAR").is_some_and(|v| v == "1"))
 }
 
 /// Whether the structure builder's accesses through its root views stay near
@@ -483,13 +495,24 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
+/// Brings a console program into the form this host translates, where one differs from the
+/// program as the title has it: on a host of 32-lane waves the water light's tile lists take
+/// a slot a lane ([`water_tile_slots`]). [`translate`] does this itself; a caller that parses
+/// the container and calls [`emit`] calls this first. Returns whether the program changed.
+pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
+    lower::host_max_wave() == 32
+        && c.digest == water_tile_slots::CONTAINER
+        && water_tile_slots::on()
+        && water_tile_slots::rewrite(native)
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -501,6 +524,9 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    // The water light's tile lists on a host of 32-lane waves: a slot a lane
+    // ([`water_tile_slots`]), so no tile is lost between the two host waves of a group.
+    host_form(&c, &mut native);
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -2753,7 +2779,7 @@ mod tests {
         let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
-        let l = super::lower::lower(&super::lower::Parts {
+        super::lower::lower(&super::lower::Parts {
             native: &native,
             p: &p,
             st: &st,
@@ -2764,8 +2790,7 @@ mod tests {
             prims: Vec::new(),
             mesh_stride: 0,
         })
-        .unwrap();
-        l
+        .unwrap()
     }
 
     #[test]

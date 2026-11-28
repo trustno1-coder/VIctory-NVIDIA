@@ -47,7 +47,39 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || keyed(n) || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// With a capture folder: F9 pressed makes one coming frame a listed one (saved with its
+/// passes when `VICTORY_DUMP_TARGETS` is set), once per press. For a fault that only shows
+/// where the player has walked to: no list of frame numbers can name that moment ahead.
+/// The key is looked at once per presented frame.
+#[cfg(feature = "diagnostics")]
+fn keyed(n: u64) -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LOOKED: AtomicU64 = AtomicU64::new(u64::MAX);
+    static HELD: AtomicBool = AtomicBool::new(false);
+    if folder().is_none() {
+        return false;
+    }
+    let now = crate::queue::presented();
+    if LOOKED.swap(now, Relaxed) != now {
+        // SAFETY: a plain query of a key's state (0x78: F9).
+        let down = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x78) } < 0;
+        if !down {
+            HELD.store(false, Relaxed);
+        } else if !HELD.swap(true, Relaxed) {
+            FRAME.store(now + 3, Relaxed);
+            tracing::info!(frame = now + 3, "F9: this frame is saved with its passes (VICTORY_CAPTURE)");
+        }
+    }
+    n == FRAME.load(Relaxed)
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn keyed(_: u64) -> bool {
+    false
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -144,6 +176,9 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    let Some(folder) = folder() else {
+        return false;
+    };
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
@@ -152,7 +187,25 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    n.is_power_of_two() || listed(n) || before_world || in_world || asked(folder, n)
+}
+
+/// A file named `now` in the capture folder asks for the next frame (and
+/// is removed), so a tool (`scripts\bench.ps1`) can look at the screen of a
+/// title running in the background whenever it wants. The frame asked for
+/// stays wanted for every check of it.
+fn asked(folder: &std::path::Path, n: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ASKED: AtomicU64 = AtomicU64::new(u64::MAX);
+    if ASKED.load(Relaxed) == n {
+        return true;
+    }
+    let now = folder.join("now");
+    if now.exists() && std::fs::remove_file(&now).is_ok() {
+        ASKED.store(n, Relaxed);
+        return true;
+    }
+    false
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -461,6 +514,32 @@ fn dump_one(
                 (v.len(), v.into_iter().take(12).collect::<Vec<_>>())
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
+        }
+        // Small one-word textures in full, row by row: the water's tile masks are a few texels
+        // of R32_UINT words, 8 x 4 tile bits a word, and a picture of them shows no bits. With
+        // the frame's `ops` file (which pass binds which texture) they say which blocks the
+        // water's classification marked in the frame whose pictures are saved beside them.
+        if matches!(d.Format.0, 39..=43) && f.Width <= 64 && f.Height <= 32 {
+            let words: Vec<String> = (0..f.Height as usize)
+                .map(|y| {
+                    (0..f.Width as usize)
+                        .map(|x| {
+                            let at = y * pitch + x * 4;
+                            format!("{:08x}", u32::from_le_bytes(rows[at..at + 4].try_into().unwrap_or([0; 4])))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            tracing::info!(
+                ?resource,
+                frame,
+                width = f.Width,
+                height = f.Height,
+                format = d.Format.0,
+                "a small word texture of a dumped frame, row by row: {}",
+                words.join(" | ")
+            );
         }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(

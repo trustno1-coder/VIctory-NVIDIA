@@ -246,9 +246,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// submission, on pointers that had become bounding-box bit patterns).
 ///
 /// So a builder dispatch runs only while every builder pipeline the title
-/// has created has a host pipeline; the first builder dispatch makes them
-/// all on the spot instead of over the next frames (a stage "still being
-/// made" would be a dropped stage). While one cannot be made the builder
+/// has created has a host pipeline (a stage "still being made" would be a
+/// dropped stage). The first builder dispatch queues them all for the
+/// pipeline workers and waits for them within a budget per frame
+/// ([`builder_wait`]), holding no lock; if they are not all made by then the
+/// builder is off for that frame (all of it, to the frame's end) and is looked
+/// at again in the next. While one cannot be made the builder
 /// is off; it is looked at again when the title creates another. A stage
 /// that could not be bound stops the stages after it for the rest of that
 /// frame and the next ([`builder_rests`]); it turned the builder off for the
@@ -267,15 +270,63 @@ struct Builder {
     off: usize,
     /// No stage runs before this frame.
     rests: u64,
+    /// The frame the programs were waited for in, and when its wait ends: one
+    /// deadline for all the threads that dispatch in it.
+    waited: Option<(u64, std::time::Instant)>,
+    /// The builder was not whole at the end of this frame's wait: off for all
+    /// of the frame, even if the last program is made a moment later (a frame
+    /// whose first stages were dropped must not run its last ones).
+    declined: Option<u64>,
 }
 
 #[cfg(windows)]
-static BUILDER: Mutex<Builder> = Mutex::new(Builder {
-    pipelines: Vec::new(),
-    whole: false,
-    off: 0,
-    rests: 0,
-});
+impl Builder {
+    const fn new() -> Self {
+        Builder { pipelines: Vec::new(), whole: false, off: 0, rests: 0, waited: None, declined: None }
+    }
+}
+
+#[cfg(windows)]
+static BUILDER: Mutex<Builder> = Mutex::new(Builder::new());
+
+/// How the first dispatch of the structure builder gets its programs.
+#[cfg(windows)]
+enum BuilderWait {
+    /// Made by the dispatching thread, one after the other, with the builder's
+    /// lock held (the old behaviour).
+    OnTheSpot,
+    /// Queued for the workers; waited for at most this long per frame.
+    Budget(std::time::Duration),
+}
+
+/// `VICTORY_BVH_BUILDER_WAIT_MS` (default 2000; 0: queue and answer "off"
+/// without waiting) is the wait per title frame for the 53 programs of the
+/// structure builder, all threads together. `VICTORY_BVH_BUILDER_ON_THE_SPOT=1`
+/// restores the old behaviour.
+///
+/// On by default, against the rule that a risky change starts off: the old
+/// behaviour is what ends the run. On a cold pipeline cache the first
+/// dispatch made the 53 programs on the title's recording thread, one after
+/// the other and holding the builder's lock (up to 0.4 s of translation and
+/// 3.4 s of the driver's compile each); the title's recording threads stood
+/// still for ~30 s and its watchdog (30 s without the end of a frame) aborted
+/// the process. The new behaviour changes nothing once the programs are made
+/// (a warm cache, or a run after one that listed them as used), and before
+/// that it costs the builder some frames off, which it was off for anyway.
+#[cfg(windows)]
+fn builder_wait() -> &'static BuilderWait {
+    static WAIT: OnceLock<BuilderWait> = OnceLock::new();
+    WAIT.get_or_init(|| {
+        if std::env::var_os("VICTORY_BVH_BUILDER_ON_THE_SPOT").is_some_and(|v| v == "1") {
+            return BuilderWait::OnTheSpot;
+        }
+        let millis = std::env::var("VICTORY_BVH_BUILDER_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(2000);
+        BuilderWait::Budget(std::time::Duration::from_millis(millis))
+    })
+}
 
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
@@ -333,6 +384,88 @@ pub(crate) fn builder_runs() -> bool {
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }
+    match builder_wait() {
+        BuilderWait::OnTheSpot => builder_runs_on_the_spot(),
+        BuilderWait::Budget(budget) => builder_check(&BUILDER, crate::frame::current(), *budget),
+    }
+}
+
+/// [`builder_runs`] with the programs queued for the workers and waited for
+/// within `budget` of frame `frame`; `state` is not held while waiting.
+#[cfg(windows)]
+fn builder_check(state: &Mutex<Builder>, frame: u64, budget: std::time::Duration) -> bool {
+    let (pipelines, deadline) = {
+        let mut b = state.lock().unwrap_or_else(|e| e.into_inner());
+        if b.off == b.pipelines.len() || frame < b.rests || b.declined == Some(frame) {
+            return false;
+        }
+        if b.whole {
+            return true;
+        }
+        let deadline = match b.waited {
+            Some((f, d)) if f == frame => d,
+            _ => {
+                let d = std::time::Instant::now() + budget;
+                b.waited = Some((frame, d));
+                d
+            }
+        };
+        (b.pipelines.clone(), deadline)
+    };
+    let settled = make::settle(&pipelines, deadline);
+    let mut b = state.lock().unwrap_or_else(|e| e.into_inner());
+    // A program the title created while we waited was not waited for.
+    let covered = b.pipelines.len() == pipelines.len();
+    match settled {
+        make::Settled::Missing(missing) => {
+            // (As the old behaviour: off until the title creates another.)
+            b.off = pipelines.len();
+            let which: Vec<String> = missing.iter().map(|p| make::hashes(p)).collect();
+            tracing::warn!(
+                missing = which.len(),
+                of = pipelines.len(),
+                which = ?which,
+                "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
+            );
+            false
+        }
+        make::Settled::Unfinished(n) => {
+            b.declined = Some(frame);
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if said < 20 || said.is_power_of_two() {
+                tracing::info!(
+                    frame,
+                    unfinished = n,
+                    of = pipelines.len(),
+                    budget_ms = budget.as_millis() as u64,
+                    "the ray-tracing structure builder is off for this frame: its programs are still being made"
+                );
+            }
+            false
+        }
+        make::Settled::Whole if !covered || b.declined == Some(frame) => {
+            b.declined = Some(frame);
+            false
+        }
+        make::Settled::Whole => {
+            b.off = 0;
+            if !b.whole {
+                tracing::info!(
+                    pipelines = pipelines.len(),
+                    "the ray-tracing structure builder runs: all of its programs have host pipelines"
+                );
+            }
+            b.whole = true;
+            true
+        }
+    }
+}
+
+/// The old [`builder_runs`]: makes every program on this thread, holding
+/// the builder's lock (`VICTORY_BVH_BUILDER_ON_THE_SPOT=1`).
+#[cfg(windows)]
+fn builder_runs_on_the_spot() -> bool {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
         return false;
@@ -814,6 +947,76 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    fn builder_of(pipelines: Vec<Arc<make::Pending>>) -> Arc<Mutex<Builder>> {
+        let mut b = Builder::new();
+        b.pipelines = pipelines;
+        Arc::new(Mutex::new(b))
+    }
+
+    /// A builder program still being made: the dispatch is off when the budget ends, without
+    /// the builder's lock held meanwhile, and stays off for the rest of that frame even if the
+    /// program is made a moment later; no stage of a frame runs after one was dropped.
+    #[cfg(windows)]
+    #[test]
+    fn builder_off_at_the_end_of_the_budget_and_no_lock_held_while_waiting() {
+        use std::time::{Duration, Instant};
+        let p = make::stuck("builder-wait-test");
+        let state = builder_of(vec![p.clone()]);
+        let budget = Duration::from_millis(400);
+        let started = Instant::now();
+        let asking = {
+            let state = state.clone();
+            std::thread::spawn(move || builder_check(&state, 10, budget))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        // The waiting thread does not hold the builder's lock (a title thread that creates a
+        // pipeline, or a stage that rests, would stand behind it).
+        assert!(state.try_lock().is_ok());
+        assert!(!asking.join().unwrap());
+        assert!(started.elapsed() >= budget);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(state.lock().unwrap().declined, Some(10));
+        // Made a moment late: still off for frame 10, answered at once.
+        make::finish(&p);
+        let again = Instant::now();
+        assert!(!builder_check(&state, 10, budget));
+        assert!(again.elapsed() < Duration::from_millis(100));
+    }
+
+    /// One deadline per frame for all the threads, and no wait at all for a budget of zero.
+    #[cfg(windows)]
+    #[test]
+    fn builder_budget_is_one_per_frame() {
+        use std::time::{Duration, Instant};
+        let state = builder_of(vec![make::stuck("builder-budget-test")]);
+        let started = Instant::now();
+        assert!(!builder_check(&state, 20, Duration::ZERO));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        // The next frame is looked at again, with its own deadline.
+        assert_eq!(state.lock().unwrap().declined, Some(20));
+        assert!(!builder_check(&state, 21, Duration::from_millis(150)));
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!(state.lock().unwrap().declined, Some(21));
+        assert_eq!(state.lock().unwrap().waited.map(|w| w.0), Some(21));
+    }
+
+    /// A program that cannot be made turns the builder off until the title creates another.
+    #[cfg(windows)]
+    #[test]
+    fn builder_with_a_missing_program_is_off_without_waiting_for_the_rest() {
+        use std::time::{Duration, Instant};
+        let stuck = make::stuck("builder-missing-test");
+        let gone = make::stuck("builder-missing-test-2");
+        make::finish(&gone);
+        let state = builder_of(vec![stuck, gone]);
+        let started = Instant::now();
+        assert!(!builder_check(&state, 30, Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(state.lock().unwrap().off, 2);
+        assert!(!builder_check(&state, 31, Duration::from_secs(30)));
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

@@ -37,6 +37,8 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// Taken by a worker from the resolves' own line ([`Queue::resolves`]).
+    as_resolve: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -49,7 +51,20 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// A per-material ray-tracing resolve (`*:CS_RaytracingResolve`): while it
+    /// is being made its dispatches are dropped at once, never waited for.
+    /// There are about a thousand of these programs and the card's driver
+    /// takes seconds for one. Run 403 (ray tracing on): for the 3 minutes some
+    /// were being made, the threads that translate the title's lists slept the
+    /// frame's wait budget on them and dropped the dispatch anyway: 279 ms a
+    /// frame (20 readings) against 54 ms (5 readings) once none was being
+    /// made, at the same 3,000-4,000 draws.
+    no_wait: bool,
 }
+
+/// Dispatches dropped because their resolve was still being made
+/// ([`Pending::no_wait`]), since the start.
+static NOT_WAITED: AtomicU64 = AtomicU64::new(0);
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
@@ -165,14 +180,17 @@ impl Pending {
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
         let left_out = left_out(&shaders);
+        let no_wait = named(&shaders, b"CS_RaytracingResolve");
         Pending {
             screen,
             scene_input,
             left_out,
+            no_wait,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            as_resolve: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -293,6 +311,14 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// A still-pending pipeline was requested by the title too. Prewarm it
+/// on the next launch, even if this run never got to use it.
+fn note_used(p: &Pending) {
+    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+        super::library::note_used(&p.key);
+    }
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
@@ -300,14 +326,21 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         LEFT_OUT.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    // A still-pending pipeline was requested by the title too. Prewarm it
-    // on the next launch, even if this run never got to use it.
-    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
-    }
+    note_used(p);
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.no_wait {
+            let n = NOT_WAITED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(
+                    n,
+                    being_made = WAITING.load(Ordering::Relaxed),
+                    "ray-tracing resolves dropped while their pipeline is being made, not waited for"
+                );
+            }
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -320,6 +353,65 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
+}
+
+/// A pipeline that a worker has taken and never finishes (tests).
+#[cfg(test)]
+pub(crate) fn stuck(key: &str) -> Arc<Pending> {
+    let mut p = Pending::new(Vec::new(), None);
+    p.key = key.to_owned();
+    p.queue_state.store(MAKING, Ordering::Relaxed);
+    Arc::new(p)
+}
+
+/// Finishes a [`stuck`] pipeline as a worker would, without a host pipeline (tests).
+#[cfg(test)]
+pub(crate) fn finish(p: &Pending) {
+    p.make_with(|| None);
+}
+
+/// How a group of pipelines stands at [`settle`].
+pub(crate) enum Settled {
+    /// Every one has a host pipeline.
+    Whole,
+    /// At least one will never have one (refused, or left out on purpose).
+    Missing(Vec<Arc<Pending>>),
+    /// None is known to be missing, but this many are still being made at the deadline.
+    Unfinished(usize),
+}
+
+/// Queues every pipeline of `ps` for the workers (as requested by the title,
+/// and noted as used so that the next run starts them at the load) and waits
+/// for all of them until `deadline`, without making any on this thread (unless
+/// there are no workers). Gives up early as soon as one is known to be missing.
+/// Holds nothing of the caller's: the wait is on [`DONE`] alone.
+pub(crate) fn settle(ps: &[Arc<Pending>], deadline: Instant) -> Settled {
+    for p in ps {
+        if p.left_out.is_none() {
+            note_used(p);
+            start(p, REQUESTED);
+        }
+    }
+    let missing = |p: &Arc<Pending>| p.left_out.is_some() || matches!(p.made.get(), Some(None));
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // `make` sets `made` before it takes the lock to notify: checked under
+    // the lock, no wake-up is missed.
+    while !ps.iter().any(missing) && ps.iter().any(|p| p.made.get().is_none()) {
+        let Some(rest) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+            break;
+        };
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let absent: Vec<Arc<Pending>> = ps.iter().filter(|p| missing(p)).cloned().collect();
+    if !absent.is_empty() {
+        return Settled::Missing(absent);
+    }
+    match ps.iter().filter(|p| p.made.get().is_none()).count() {
+        0 => Settled::Whole,
+        n => Settled::Unfinished(n),
+    }
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -386,6 +478,25 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if waited >= Duration::from_millis(50) {
+        // Which pipeline a frame's wait went on, in every build.
+        static LONG: AtomicU64 = AtomicU64::new(0);
+        static LONG_MS: AtomicU64 = AtomicU64::new(0);
+        let ms = waited.as_millis() as u64;
+        let all_ms = LONG_MS.fetch_add(ms, Ordering::Relaxed) + ms;
+        let n = LONG.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n.is_multiple_of(64) {
+            tracing::info!(
+                n,
+                all_ms,
+                ms,
+                made = p.made.get().is_some(),
+                being_made = WAITING.load(Ordering::Relaxed),
+                shaders = ?p.shaders,
+                "a host pipeline was waited for 50 ms or more"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -436,6 +547,16 @@ fn slow_limit() -> usize {
     })
 }
 
+/// How many workers may make ray-tracing resolves at once: all but a quarter
+/// of them, which stay free for the pipelines draws ask for.
+fn resolve_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let workers = worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get()));
+        (workers - workers / 4).max(1)
+    })
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
@@ -446,6 +567,14 @@ struct Queue {
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// Requested per-material ray-tracing resolves ([`Pending::no_wait`]), and
+    /// how many are being made ([`resolve_limit`]). They are hundreds at once
+    /// and take seconds each: in the one line of requested pipelines every
+    /// other pipeline a draw asked for stood behind them, and the frame's wait
+    /// budget went on that one each frame (run 405: 300 ms frames with the
+    /// resolves not waited for, 90 to 530 draws a frame dropped).
+    resolves: VecDeque<Arc<Pending>>,
+    resolves_now: usize,
 }
 
 impl Queue {
@@ -456,6 +585,8 @@ impl Queue {
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            resolves: VecDeque::new(),
+            resolves_now: 0,
         }
     }
 
@@ -473,6 +604,8 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
+        } else if priority == REQUESTED && p.no_wait {
+            self.resolves.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
@@ -490,7 +623,17 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self.requested.pop_front();
+            if p.is_none() && self.resolves_now < resolve_limit() {
+                p = self.resolves.pop_front();
+                if let Some(p) = &p {
+                    p.as_resolve.store(true, Ordering::Relaxed);
+                    self.resolves_now += 1;
+                }
+            }
+            if p.is_none() {
+                p = unclaimed(&mut self.early);
+            }
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -594,6 +737,11 @@ fn workers() -> bool {
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
+                            AVAILABLE.notify_all();
+                        }
+                        if p.as_resolve.load(Ordering::Relaxed) {
+                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                            queue.resolves_now -= 1;
                             AVAILABLE.notify_all();
                         }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
@@ -703,6 +851,34 @@ mod tests {
             missing(&p).as_deref(),
             Some("left out on purpose: shades ray-tracing hits without BVH, left out")
         );
+    }
+
+    /// A group with a pipeline still being made is not waited for past the deadline, and
+    /// is not made by the asking thread.
+    #[test]
+    fn settle_gives_up_at_the_deadline() {
+        let p = stuck("settle-stuck-test");
+        let started = Instant::now();
+        let settled = settle(std::slice::from_ref(&p), started + Duration::from_millis(100));
+        assert!(matches!(settled, Settled::Unfinished(1)));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(p.made.get().is_none());
+        // Requested by the title as far as the next launch is concerned.
+        assert!(super::super::library::wanted_early("settle-stuck-test"));
+    }
+
+    /// A pipeline known to be missing ends the wait at once: all or none is lost already.
+    #[test]
+    fn settle_does_not_wait_for_the_rest_once_one_is_missing() {
+        let stuck = stuck("settle-rest-test");
+        let mut gone = Pending::new(Vec::new(), None);
+        gone.left_out = Some("test");
+        let gone = Arc::new(gone);
+        let started = Instant::now();
+        let settled = settle(&[stuck, gone], started + Duration::from_secs(30));
+        assert!(matches!(settled, Settled::Missing(m) if m.len() == 1));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
