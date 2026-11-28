@@ -3832,6 +3832,34 @@ impl HostHeap {
         self.keep(index, holds.then(|| buffer.clone()));
     }
 
+    /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
+    /// one) show the constant buffer of `size` bytes at `gpu` of `buffer`
+    /// (title memory in place) with nothing copied: its raw twin a raw view
+    /// of those bytes, which translated shaders read; the slot itself a
+    /// constant buffer view of them where that can be (on 256 bytes), else a
+    /// null one. Whether the twin was made (`false`: the caller copies the
+    /// bytes as before).
+    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+        let Some(host) = host() else { return false };
+        let Some(twin) = self.twin(index) else { return false };
+        // SAFETY: a live buffer.
+        let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+        let Some((cbv, Some(raw))) = constant_descs(base, width, gpu, size) else {
+            return false;
+        };
+        // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
+        // zero location makes a null constant buffer view).
+        unsafe {
+            host.device.CreateConstantBufferView(Some(&cbv), self.at(index));
+            host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+        }
+        self.put(index);
+        self.twin_made(index, true);
+        self.write_stride(index, 0);
+        self.keep(index, Some(buffer.clone()));
+        true
+    }
+
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
     /// a slot of this thread's in a heap the card does not see
     /// ([`staged`]), or the slot itself.
@@ -4918,6 +4946,73 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+/// Host CBV and raw-SRV descriptions for a constant buffer of `size` bytes at
+/// `gpu` inside a buffer starting at `base` of `width` bytes (`None`: `gpu` is
+/// out of `[base, base + width)` or not 16-byte aligned).
+fn constant_descs(
+    base: u64,
+    width: u64,
+    gpu: u64,
+    size: u32,
+) -> Option<(D3D12_CONSTANT_BUFFER_VIEW_DESC, Option<D3D12_SHADER_RESOURCE_VIEW_DESC>)> {
+    let offset = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o))?;
+    let room = width - offset;
+    let want = u64::from(constant_bytes(size));
+    let cbv_size = want.min(room & !255) as u32;
+    let cbv = if gpu.is_multiple_of(256) && cbv_size > 0 {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: cbv_size,
+        }
+    } else {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+    };
+    let bytes = want.min(room) & !3;
+    let raw = (bytes > 0).then_some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: offset / 4,
+                NumElements: (bytes / 4) as u32,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            },
+        },
+    });
+    Some((cbv, raw))
+}
+
+/// Renderer port 5 ([`crate::port_cbv`]): the constant buffer of `size` bytes
+/// at `gpu` of `buffer` as a constant buffer view at `at` where it can be (on
+/// 256 bytes; else a null one) and a raw view of its bytes at `twin`, which
+/// translated shaders read. `false` (nothing made): not on 16 bytes.
+fn constant_twinned(
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    size: u32,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> bool {
+    let Some(host) = host() else { return false };
+    // SAFETY: a live buffer.
+    let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+    let Some((cbv, raw)) = constant_descs(base, width, gpu, size) else {
+        return false;
+    };
+    // SAFETY: slots of our heaps; the ranges lie in the live buffer.
+    unsafe {
+        host.device.CreateConstantBufferView(Some(&cbv), at);
+        match raw {
+            Some(raw) => host.device.CreateShaderResourceView(buffer, Some(&raw), twin),
+            None => null_buffer_view(twin),
+        }
+    }
+    crate::port_cbv::twinned();
+    true
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4938,6 +5033,13 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
+            if let Some(twin) = twin.filter(|_| crate::port_cbv::on()) {
+                // Renderer port 5: shaders read constant buffers as raw bytes
+                // through the twin; a constant buffer view there would be read
+                // raw, with no end on AMD.
+                return constant_twinned(&shadow.buffer, gpu, size, at, twin)
+                    .then(|| Some(shadow.buffer.clone()));
+            }
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),
@@ -6068,6 +6170,40 @@ mod tests {
         assert_eq!(twin_window(none, 1, 3, 24, false, 4096), Some((4, 20, 8)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4096), Some((0, 11, 4)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4), None);
+    }
+
+    /// Renderer port 5 (`port_cbv`): constant buffer twins require 16-byte
+    /// alignment, keep a null CBV when not 256-byte aligned (or under 256
+    /// bytes of room), and clamp without overflowing 32-bit width.
+    #[test]
+    fn constant_buffer_raw_twins_respect_alignment_and_bounds() {
+        let base = 0x1_0000_0000u64;
+        // Not 16-byte aligned or outside the buffer -> rejected.
+        assert!(constant_descs(base, 4096, base + 8, 64).is_none());
+        assert!(constant_descs(base, 4096, base + 4096, 64).is_none());
+        assert!(constant_descs(base, 4096, base - 16, 64).is_none());
+        // 16-byte aligned (not 256): null CBV, raw SRV covers rounded CB bytes.
+        let (cbv, raw) = constant_descs(base, 4096, base + 16, 64).unwrap();
+        assert_eq!((cbv.BufferLocation, cbv.SizeInBytes), (0, 0));
+        // SAFETY: `raw` is a buffer SRV initialized above.
+        let buf = unsafe { raw.unwrap().Anonymous.Buffer };
+        assert_eq!((buf.FirstElement, buf.NumElements, buf.Flags), (4, 64, D3D12_BUFFER_SRV_FLAG_RAW));
+        // 256-byte aligned with >4 GiB remaining width: CBV is not truncated.
+        let (cbv, raw) = constant_descs(base, 0x1_0000_1000, base + 256, 300).unwrap();
+        assert_eq!((cbv.BufferLocation, cbv.SizeInBytes), (base + 256, 512));
+        // SAFETY: `raw` is a buffer SRV initialized above.
+        let buf = unsafe { raw.unwrap().Anonymous.Buffer };
+        assert_eq!((buf.FirstElement, buf.NumElements), (64, 128));
+        // 256-byte aligned with <256 bytes of room: null CBV, raw SRV clamped.
+        let (cbv, raw) = constant_descs(base, 320, base + 256, 64).unwrap();
+        assert_eq!((cbv.BufferLocation, cbv.SizeInBytes), (0, 0));
+        // SAFETY: `raw` is a buffer SRV initialized above.
+        let buf = unsafe { raw.unwrap().Anonymous.Buffer };
+        assert_eq!((buf.FirstElement, buf.NumElements), (64, 16));
+        // Zero-size CBV: null CBV, no raw SRV.
+        let (cbv, raw) = constant_descs(base, 4096, base, 0).unwrap();
+        assert_eq!((cbv.BufferLocation, cbv.SizeInBytes), (0, 0));
+        assert!(raw.is_none());
     }
 
     /// What a slot is made as is made beside the heap and copied in whole: the
