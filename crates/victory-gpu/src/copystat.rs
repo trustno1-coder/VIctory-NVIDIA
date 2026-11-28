@@ -129,6 +129,11 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// The title's barrier group calls by what they say of unordered
+    /// access: one ends, one only begins, none named.
+    GroupsEndWrites,
+    GroupsBeginWrites,
+    GroupsOther,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -262,6 +267,16 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
     if us > longest.0 {
         *longest = (us, text);
     }
+}
+
+/// The barriers of the title's groups by `(kind, [sync before, sync after,
+/// access before, access after])`, counted.
+static GROUP_BARRIERS: Mutex<Option<HashMap<(u32, [u32; 4]), u64>>> = Mutex::new(None);
+
+/// A barrier of one of the title's groups.
+pub(crate) fn group_barrier(kind: u32, values: [u32; 4]) {
+    let mut seen = GROUP_BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
+    *seen.get_or_insert_with(HashMap::new).entry((kind, values)).or_default() += 1;
 }
 
 /// Whether an experiment on barriers is on (`VICTORY_BARRIER_TEST`): bit 0
@@ -1376,6 +1391,23 @@ pub(crate) fn log(frames: f64) {
         c[C::IndirectBounded as usize],
         barrier_test()
     );
+    tracing::info!(
+        "  the title's barrier group calls, per frame: {:.0} end an unordered access, {:.0} only begin one, \
+         {:.0} name none",
+        c[C::GroupsEndWrites as usize],
+        c[C::GroupsBeginWrites as usize],
+        c[C::GroupsOther as usize]
+    );
+    let barriers = GROUP_BARRIERS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut barriers: Vec<_> = barriers.into_iter().flatten().collect();
+    barriers.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    for ((kind, [sync_before, sync_after, before, after]), n) in barriers.into_iter().take(24) {
+        tracing::info!(
+            "  barriers in groups: {:.1} a frame of kind {kind} (0 global, 1 texture, 2 buffer), sync \
+             {sync_before:#x} -> {sync_after:#x}, access {before:#x} -> {after:#x}",
+            n as f64 / frames
+        );
+    }
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();

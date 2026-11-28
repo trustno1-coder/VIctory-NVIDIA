@@ -2260,16 +2260,139 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// One of the title's barrier groups, laid out as the PC's
+/// `D3D12_BARRIER_GROUP`: the kind of its barriers (0 global, 1 texture,
+/// 2 buffer), how many, and where they are.
+#[repr(C)]
+struct Group {
+    kind: u32,
+    count: u32,
+    barriers: *const u8,
+}
+
+/// What the barriers of a call say of unordered access (what shaders write).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GroupWrites {
+    /// A barrier ends an unordered access: what shaders wrote is used next.
+    /// Also what is not understood (a kind unknown, no groups given).
+    Ended,
+    /// Unordered access only begins.
+    Begun,
+    /// Other accesses and layouts alone.
+    Other,
+}
+
+/// Each barrier of the groups as `(kind, [sync before, sync after, access
+/// before, access after])`: barriers of all kinds begin with those four
+/// (16, 64 and 40 bytes a global, texture and buffer barrier). `false` if
+/// a group is not one of those kinds, and nothing more is read.
+///
+/// # Safety
+/// `groups` holds `count` groups of the title, live for the call.
+unsafe fn group_barriers(groups: *const u8, count: u32, mut each: impl FnMut(u32, [u32; 4])) -> bool {
+    const SIZES: [usize; 3] = [16, 64, 40];
+    if groups.is_null() {
+        return false;
+    }
+    // SAFETY: the caller's.
+    let groups = unsafe { std::slice::from_raw_parts(groups.cast::<Group>(), count as usize) };
+    for g in groups {
+        let Some(&size) = SIZES.get(g.kind as usize) else { return false };
+        if g.count > 0 && g.barriers.is_null() {
+            return false;
+        }
+        for i in 0..g.count as usize {
+            // SAFETY: `count` barriers of that size, each beginning with four 32-bit values.
+            each(g.kind, unsafe { g.barriers.add(i * size).cast::<[u32; 4]>().read_unaligned() });
+        }
+    }
+    true
+}
+
+/// What the groups say of unordered access ([`GroupWrites`]).
+///
+/// # Safety
+/// As [`group_barriers`].
+unsafe fn group_writes(groups: *const u8, count: u32) -> GroupWrites {
+    const UNORDERED: u32 = 0x10;
+    let mut found = GroupWrites::Other;
+    // SAFETY: the caller's.
+    let known = unsafe {
+        group_barriers(groups, count, |_, [_, _, before, after]| {
+            if before & UNORDERED != 0 {
+                found = GroupWrites::Ended;
+            } else if after & UNORDERED != 0 && found == GroupWrites::Other {
+                found = GroupWrites::Begun;
+            }
+        })
+    };
+    if known { found } else { GroupWrites::Ended }
+}
+
+/// Which of the title's barrier groups record a wait for every earlier
+/// shader write (`VICTORY_GROUP_WAITS`): `all` of them (unset: as it was),
+/// `named` (the groups that name unordered access, before or after), or
+/// `ended` (only the groups that end one). With `VICTORY_AB` naming the
+/// switch (diagnostics builds): `all` in its phases on, `ended` in the others.
+#[cfg(windows)]
+fn group_waits(writes: GroupWrites) -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_GROUP_WAITS")) {
+            return crate::ab::on(bit) || writes == GroupWrites::Ended;
+        }
+    }
+    match group_waits_set() {
+        0 => true,
+        1 => writes != GroupWrites::Other,
+        _ => writes == GroupWrites::Ended,
+    }
+}
+
+/// `VICTORY_GROUP_WAITS`: 0 unset (`all`), 1 `named`, 2 `ended`.
+#[cfg(windows)]
+fn group_waits_set() -> u8 {
+    static SET: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| match std::env::var("VICTORY_GROUP_WAITS").as_deref() {
+        Ok("named") => 1,
+        Ok("ended") => 2,
+        _ => 0,
+    })
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    // The groups are read only where what they say is used: in diagnostics
+    // builds, or with `VICTORY_GROUP_WAITS` set. Else every call waits, as
+    // before, and nothing of them is looked at.
+    #[cfg(windows)]
+    let writes = if cfg!(feature = "diagnostics") || group_waits_set() != 0 {
+        // SAFETY: the title's groups, for this call.
+        unsafe { group_writes(groups, count) }
+    } else {
+        GroupWrites::Ended
+    };
+    // Diagnostics: counted by what they say, and left out under
+    // `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
-        crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+        use crate::copystat::C;
+        crate::copystat::add(C::WaitsForGroups, 1);
+        crate::copystat::add(
+            match writes {
+                GroupWrites::Ended => C::GroupsEndWrites,
+                GroupWrites::Begun => C::GroupsBeginWrites,
+                GroupWrites::Other => C::GroupsOther,
+            },
+            1,
+        );
+        // SAFETY: as above.
+        unsafe { group_barriers(groups, count, crate::copystat::group_barrier) };
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
@@ -2280,13 +2403,16 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
+        if !group_waits(writes) {
+            return;
+        }
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2520,6 +2646,27 @@ mod tests {
         assert_eq!(stale(std::iter::empty(), 1000, 100), 0);
         // A clock that reads earlier than a push does not make it stale.
         assert_eq!(stale([2000u64].into_iter(), 1000, 100), 0);
+    }
+
+    /// What barrier groups say of unordered access, from the access before
+    /// and after of each barrier; groups not understood count as ending one.
+    #[test]
+    fn barrier_groups_are_read_for_unordered_access() {
+        const UNORDERED: u32 = 0x10;
+        // Global barriers: sync before, sync after, access before, access after.
+        let global = |access: [[u32; 2]; 2]| access.map(|[before, after]| [0u32, 0, before, after]);
+        let writes = |kind: u32, barriers: &[[u32; 4]]| {
+            let group = Group { kind, count: barriers.len() as u32, barriers: barriers.as_ptr().cast() };
+            // SAFETY: one group of that many barriers, alive for the call.
+            unsafe { group_writes(std::ptr::from_ref(&group).cast(), 1) }
+        };
+        assert_eq!(writes(0, &global([[1, 2], [UNORDERED, 2]])), GroupWrites::Ended);
+        assert_eq!(writes(0, &global([[1, UNORDERED], [2, 4]])), GroupWrites::Begun);
+        assert_eq!(writes(0, &global([[1, 2], [4, 8]])), GroupWrites::Other);
+        // A kind unknown, and no groups given.
+        assert_eq!(writes(3, &global([[1, 2], [4, 8]])), GroupWrites::Ended);
+        // SAFETY: nothing is read.
+        assert_eq!(unsafe { group_writes(std::ptr::null(), 2) }, GroupWrites::Ended);
     }
 
     #[test]
