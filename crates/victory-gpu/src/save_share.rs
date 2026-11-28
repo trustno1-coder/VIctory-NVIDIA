@@ -431,7 +431,7 @@ pub fn stage(data: &Path, share: &Path, name: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Moves the game's settings containers in `old` (the save being replaced) to the same places
+/// Copies the game's settings containers in `old` (the save being replaced) to the same places
 /// in `new` (the import, which has none), so the player's settings outlast the import.
 fn keep_settings(old: &Path, new: &Path) -> io::Result<()> {
     for entry in std::fs::read_dir(old)? {
@@ -442,10 +442,7 @@ fn keep_settings(old: &Path, new: &Path) -> io::Result<()> {
         let target = new.join(entry.file_name());
         if is_settings(&entry.file_name().to_string_lossy()) {
             if !target.exists() {
-                std::fs::create_dir_all(new)?;
-                if std::fs::rename(entry.path(), &target).is_err() {
-                    copy_dir(&entry.path(), &target, true)?;
-                }
+                copy_dir(&entry.path(), &target, true)?;
             }
         } else {
             keep_settings(&entry.path(), &target)?;
@@ -468,6 +465,31 @@ pub fn apply(data: &Path, share: &Path, stamp: &str) -> io::Result<Option<PathBu
     if !staged(data) {
         return Ok(None);
     }
+
+    let parts: Vec<_> = PARTS
+        .into_iter()
+        .filter(|&part| part == NEEDED || pending.join(part).is_dir())
+        .collect();
+    let work = tempfile::Builder::new().prefix("import-apply-").tempdir_in(data)?;
+    let prepared = work.path().join("prepared");
+    let previous = work.path().join("previous");
+    std::fs::create_dir(&previous)?;
+    let mut originals = Vec::with_capacity(parts.len());
+    for &part in &parts {
+        let old = data.join(part);
+        let next = prepared.join(part);
+        copy_dir(&pending.join(part), &next, false)?;
+        match std::fs::metadata(&old) {
+            Ok(metadata) if metadata.is_dir() => {
+                keep_settings(&old, &next)?;
+                originals.push(part);
+            }
+            Ok(_) => return Err(bad(format!("{}: expected a save directory", old.display()))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
     let name = format!("backup before import {stamp}");
     let backup = if data.join(NEEDED).is_dir() {
         match export(data, share, &name) {
@@ -478,23 +500,43 @@ pub fn apply(data: &Path, share: &Path, stamp: &str) -> io::Result<Option<PathBu
     } else {
         None
     };
-    for part in PARTS {
-        let new = pending.join(part);
-        if !new.is_dir() {
-            continue;
+
+    // Retain the original directories and the queued import until every
+    // replacement is in place. Reverse only the renames that succeeded.
+    let mut moves = Vec::with_capacity(2 * parts.len() + 1);
+    let mut move_path = |from: PathBuf, to: PathBuf| -> io::Result<()> {
+        std::fs::rename(&from, &to)?;
+        moves.push((from, to));
+        Ok(())
+    };
+    let applied = (|| {
+        for part in originals {
+            move_path(data.join(part), previous.join(part))?;
         }
-        let old = data.join(part);
-        if old.is_dir() {
-            keep_settings(&old, &new)?;
+        for part in parts {
+            move_path(prepared.join(part), data.join(part))?;
         }
-        if old.exists() {
-            std::fs::remove_dir_all(&old)?;
+        move_path(pending, work.path().join("queued"))
+    })();
+    if let Err(error) = applied {
+        let mut restore_error = None;
+        for (from, to) in moves.into_iter().rev() {
+            if let Err(error) = std::fs::rename(to, from) {
+                let _ = restore_error.get_or_insert(error);
+            }
         }
-        if std::fs::rename(&new, &old).is_err() {
-            copy_dir(&new, &old, true)?;
+        if let Some(restore_error) = restore_error {
+            let recovery = work.keep();
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "could not apply the import ({error}). Could not restore a directory ({restore_error}). Recovery files are at {}",
+                    recovery.display(),
+                ),
+            ));
         }
+        return Err(error);
     }
-    std::fs::remove_dir_all(&pending)?;
     Ok(Some(backup.unwrap_or_else(|| data.join(PARTS[0]))))
 }
 
@@ -515,8 +557,8 @@ pub fn start(data: &Path, game: &Path) -> Option<String> {
             Some(format!("save imported (the save it replaced was zipped to {})", backup.display()))
         }
         Err(e) => {
-            tracing::warn!(error = %e, "save import: not put in place; the save is as it was");
-            Some(format!("the save import failed ({e}); the save is as it was"))
+            tracing::warn!(error = %e, "save import could not be applied");
+            Some(format!("the save import failed ({e})"))
         }
     }
 }
@@ -581,6 +623,46 @@ mod tests {
         let error = stage(data.path(), share.path(), "invalid.zip").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!data.path().join(PENDING).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_storage_directory_leaves_the_live_and_queued_saves_intact() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let data = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let settings = format!("saves/{USER}/{SCID}/{SETTINGS}~0123456789abcdef/v1/0");
+        let live_storage = data.path().join("storage/cache");
+        put(&data.path().join(SLOT), "current progress");
+        put(&data.path().join(&settings), "current settings");
+        put(&live_storage, "current storage");
+        put(&share.path().join("replacement").join(SLOT), "replacement progress");
+        put(&share.path().join("replacement/storage/cache"), "replacement storage");
+        stage(data.path(), share.path(), "replacement").unwrap();
+
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(data.path().join("storage"))
+            .unwrap();
+        assert!(apply(data.path(), share.path(), "locked").is_err());
+        assert_eq!(read(&data.path().join(SLOT)), "current progress");
+        assert_eq!(read(&data.path().join(&settings)), "current settings");
+        assert_eq!(read(&live_storage), "current storage");
+        assert!(staged(data.path()));
+        drop(held);
+
+        put(&data.path().join(&settings), "updated settings");
+        apply(data.path(), share.path(), "unlocked").unwrap().unwrap();
+        assert_eq!(read(&data.path().join(SLOT)), "replacement progress");
+        assert_eq!(read(&data.path().join(&settings)), "updated settings");
+        assert_eq!(read(&live_storage), "replacement storage");
+        assert!(!staged(data.path()));
     }
 
     #[test]
