@@ -1099,26 +1099,10 @@ fn noted(ops: &[Op]) {
     }
 }
 
-/// Why submissions were refused since the last line, and how often (few a frame: a list is enough).
-static REFUSALS: std::sync::Mutex<Vec<(&'static str, u32)>> = std::sync::Mutex::new(Vec::new());
-
-fn count_refusal(why: &'static str) {
-    let mut all = REFUSALS.lock().unwrap_or_else(|e| e.into_inner());
-    match all.iter_mut().find(|(w, _)| std::ptr::eq(*w, why)) {
-        Some((_, n)) => *n += 1,
-        None => all.push((why, 1)),
-    }
-}
-
 /// For the frame-rate line.
 pub(super) fn log(frames: f64) {
     if stage() == 0 {
         return;
-    }
-    let refusals = std::mem::take(&mut *REFUSALS.lock().unwrap_or_else(|e| e.into_inner()));
-    if !refusals.is_empty() {
-        let all: Vec<String> = refusals.iter().map(|(why, n)| format!("{:.2} {why}", f64::from(*n) / frames)).collect();
-        tracing::info!("submissions refused for the card's steps, per frame: {}", all.join("; "));
     }
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
