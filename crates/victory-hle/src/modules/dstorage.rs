@@ -181,16 +181,19 @@ extern "system" fn create_status_array(
     put(out, array)
 }
 
-/// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field the title sets to 1.
+/// The queue's description, `DSTORAGE_QUEUE_DESC1`: as in 2020 (source
+/// type, capacity, priority, name), plus `DSTORAGE_QUEUE_OPTIONS`.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
     priority: i8,
     name: *const c_char,
-    unknown: u64,
+    options: u64,
 }
+
+/// `DSTORAGE_QUEUE_OPTIONS`, bit 0: the queue never submits itself.
+const AUTO_SUBMIT_DISABLED: u64 = 1;
 
 extern "system" fn create_queue(
     _: Factory,
@@ -208,7 +211,7 @@ extern "system" fn create_queue(
         capacity = desc.capacity,
         priority = desc.priority,
         name,
-        unknown = desc.unknown,
+        options = desc.options,
         iid = iid_text(iid),
         "dstorage: queue"
     );
@@ -218,7 +221,7 @@ extern "system" fn create_queue(
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
+    let lane = Lane::new(desc.priority, desc.capacity).auto_submit(auto_submits(desc.options));
     lanes.lanes.insert(id, lane);
     drop(lanes);
     put(
@@ -581,6 +584,8 @@ struct Lane {
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
+    /// Submits itself once half of it is enqueued ([`auto_submits`]).
+    auto_submit: bool,
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
@@ -952,7 +957,13 @@ impl Lane {
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
             closed: false,
+            auto_submit: false,
         }
+    }
+
+    fn auto_submit(mut self, auto_submit: bool) -> Lane {
+        self.auto_submit = auto_submit;
+        self
     }
 
     /// Requests and status entries held, submitted or not.
@@ -1311,9 +1322,13 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index, enqueued }));
 }
 
-/// Whether a queue submits itself once half of it is enqueued
-/// (`VICTORY_DSTORAGE_HALF=1`), as DirectStorage for the PC does and as ours
-/// did. The title's batches (up to 4,095 requests, in queues of 4,159) hold
+/// Whether a queue submits itself once half of it is enqueued since its
+/// last submission: unless its description's options have
+/// `AutoSubmitDisabled` (`DSTORAGE_QUEUE_OPTIONS`, bit 0), as the console
+/// does. `VICTORY_DSTORAGE_HALF=1` (or `=0`) turns it on (or off) for every
+/// queue whatever its options.
+///
+/// The title disables it on its queues, and must: its batches (up to 4,095 requests, in queues of 4,159) hold
 /// more than half now and then, and it maps the pages they go to and fills
 /// in their page lists in its own submit, after it has enqueued them all
 /// (image +0xe88f0: the batch's mapping list first, at +0xf2c470, which
@@ -1322,9 +1337,14 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 /// page 0, or, worse, of the pages the addresses had shown before: their
 /// data went into whatever those pages belonged to by then, and the pages it
 /// was for stayed as they were.
-fn half_submits() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HALF").is_some_and(|v| v == "1"))
+fn auto_submits(options: u64) -> bool {
+    static FORCED: OnceLock<Option<bool>> = OnceLock::new();
+    let forced = *FORCED.get_or_init(|| match std::env::var("VICTORY_DSTORAGE_HALF").as_deref().map(str::trim) {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    });
+    forced.unwrap_or(options & AUTO_SUBMIT_DISABLED == 0)
 }
 
 /// Adds a command to the queue; blocks while the queue is full. A queue
@@ -1364,13 +1384,13 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if half_submits() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if lane.auto_submit && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id, true);
         scheduler.work.notify_all();
     }
 }
 
-/// The title's submit, where its page lists become valid ([`half_submits`]):
+/// The title's submit, where its page lists become valid ([`auto_submits`]):
 /// the pages are mapped just before, also those under addresses without a
 /// list (memory only the CPU sees).
 extern "system" fn submit(this: QueueRef) {
@@ -1734,7 +1754,7 @@ fn read_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
 /// here. It is only ever overwritten: an address the title unmapped keeps
 /// the number of the page it had, which the title maps elsewhere soon after,
 /// so a number the title owns says nothing about whether it is the right
-/// one ([`half_submits`]). Page 0 does (an address never mapped yet): a list
+/// one ([`auto_submits`]). Page 0 does (an address never mapped yet): a list
 /// with a page the title does not own is read again for a while, up to
 /// 1.5 s; what it holds then is used as it is.
 fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
@@ -1840,7 +1860,7 @@ mod tests {
             capacity: 0x80,
             priority: 0,
             name: c"test".as_ptr(),
-            unknown: 1,
+            options: AUTO_SUBMIT_DISABLED,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -1919,7 +1939,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source), 0x20);
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
-        assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+        assert_eq!(std::mem::offset_of!(QueueDesc, options), 0x18);
     }
 
     fn compress_zlib(plain: &[u8]) -> Vec<u8> {
@@ -2054,6 +2074,45 @@ mod tests {
         assert!(bytes(right) == plain.repeat(100), "not written to the page the list names");
     }
 
+    /// A queue whose options leave auto-submit on submits itself once half
+    /// of it is enqueued since its last submission; one with
+    /// `AutoSubmitDisabled` waits for Submit.
+    #[test]
+    fn auto_submit_follows_the_queue_options() {
+        let data = pattern(64);
+        let (_dir, file) = file_with(&data);
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        for options in [0, AUTO_SUBMIT_DISABLED] {
+            let desc = QueueDesc {
+                source_type: 0,
+                capacity: 8,
+                priority: 0,
+                name: c"half".as_ptr(),
+                options,
+            };
+            let mut queue = std::ptr::null_mut();
+            assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+            let array = status_array(1);
+            let mut outs = [[0u8; 16]; 3];
+            for out in &mut outs {
+                enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+            }
+            // Four entries of eight.
+            enqueue_status(queue, array, 0);
+            if options == AUTO_SUBMIT_DISABLED {
+                std::thread::sleep(Duration::from_millis(50));
+                assert_eq!(result(array, 0), E_PENDING, "not submitted");
+                void(queue, 0x30);
+            }
+            assert_eq!(wait(array, 0), S_OK, "options {options}");
+            assert!(outs.iter().all(|o| o[..] == data[8..24]));
+            void(queue, 0x40);
+            void(queue, 0x10);
+            void(array, 0x10);
+        }
+    }
+
     #[test]
     fn a_full_queue_submits_itself() {
         let (_dir, file) = file_with(&pattern(64));
@@ -2064,7 +2123,7 @@ mod tests {
             capacity: 4,
             priority: 1,
             name: c"small".as_ptr(),
-            unknown: 1,
+            options: AUTO_SUBMIT_DISABLED,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
