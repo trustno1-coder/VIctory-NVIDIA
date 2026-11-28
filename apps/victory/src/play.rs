@@ -789,13 +789,32 @@ fn check_shader_model() -> Result<()> {
         now.0,
         now.1,
         if to.join("D3D12Core.dll").is_file() {
-            "Microsoft's newer runtime is in place (D3D12 beside victory.exe), so it is the graphics \
-             driver: update it, or use Windows 11"
+            runtime_in_place_advice(crate::windows_build())
         } else {
             "`victory get-d3d12` fetches Microsoft's newer runtime into D3D12 beside victory.exe; \
              or use Windows 11"
+                .to_owned()
         }
     )
+}
+
+/// What to do when Microsoft's runtime is beside victory.exe and the card still runs below 6.6,
+/// on Windows `build`. Windows 10 loads that runtime only from version 1909 with its updates
+/// (build 18363.1350, or 19041.789 for 2004 and 20H2; Microsoft's "Getting started with the
+/// Agility SDK"), so there an older Windows is as likely as the driver: #1035 had the runtime
+/// fetched and still 6.5, on a card whose driver runs 6.8.
+fn runtime_in_place_advice(build: Option<u32>) -> String {
+    match build {
+        Some(build) if build < 22000 => format!(
+            "Microsoft's newer runtime is in place (D3D12 beside victory.exe), and this Windows 10 \
+             (build {build}) did not take it. Windows 10 loads it from version 1909 with its updates \
+             (build 18363.1350, or 19041.789 for 2004 and 20H2; 1809 and LTSC 2019 not at all): \
+             update Windows (Windows Update), or the graphics driver"
+        ),
+        _ => "Microsoft's newer runtime is in place (D3D12 beside victory.exe), so it is the graphics \
+              driver: update it, or use Windows 11"
+            .to_owned(),
+    }
 }
 
 /// DLLs beside this program under the names of Windows' own that it loads (a
@@ -1178,6 +1197,21 @@ mod tests {
         // Workstation cards (#312): Ada and Blackwell have it, Turing and Ampere not.
         assert!(fg("NVIDIA RTX PRO 4000 Blackwell SFF Edition") && fg("NVIDIA RTX 2000 Ada Generation") && fg("NVIDIA RTX 6000 Ada Generation"));
         assert!(!fg("Quadro RTX 5000") && !fg("NVIDIA Quadro RTX 4000") && !fg("NVIDIA RTX A4500") && !fg("NVIDIA RTX A2000 12GB"));
+    }
+
+    /// With Microsoft's runtime in place and still below 6.6, Windows 10 is told its floor for
+    /// that runtime, not only the driver.
+    #[test]
+    fn the_runtime_in_place_advice_names_windows_10s_floor() {
+        // Windows 10: its version is as likely as the driver (#1035).
+        let ten = runtime_in_place_advice(Some(17763));
+        assert!(ten.contains("build 17763") && ten.contains("1909") && ten.contains("18363.1350"), "{ten}");
+        assert!(ten.contains("update Windows") && ten.contains("graphics driver"), "{ten}");
+        // Windows 11, or the build unknown: the driver, as before.
+        for build in [Some(22631), None] {
+            let other = runtime_in_place_advice(build);
+            assert!(other.contains("so it is the graphics driver") && !other.contains("1909"), "{other}");
+        }
     }
 
     /// MFG Unlocker is offered only to RTX 20 and 30 cards.
