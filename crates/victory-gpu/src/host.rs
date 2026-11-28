@@ -939,7 +939,7 @@ fn say_separation_switches() {
     let (inplace, unsupported_late) = inplace_notes(crate::inplace::level(), late_stage() > 0);
     if inplace {
         tracing::warn!(
-            "memory separation: VICTORY_INPLACE={} gives the GPU the title's own system memory (opt-in placement exception)",
+            "memory separation: VICTORY_INPLACE={} gives the GPU the title's own system memory (opt-in placement exception); a heap opened on private title pages makes the title's own VirtualFree/VirtualProtect there fail while it stands, which is why the fallback substitution is gated to copies the policy refuses and the page pool route opens a view of ours instead",
             crate::inplace::level()
         );
     }
@@ -959,11 +959,9 @@ fn say_separation_switches() {
         tracing::warn!(
             "memory separation: VICTORY_INPLACE_VIEW={view} places page-pool windows (title buffers too at 2) over the title's own memory where the copy would stay in system memory"
         );
-        if late_stage() > 0 {
-            tracing::info!(
-                "memory separation: direct placements are only tried with nothing in flight, so VICTORY_INPLACE_VIEW is inert while VICTORY_RELAY/VICTORY_LATE_WAIT are on"
-            );
-        }
+        tracing::info!(
+            "memory separation: shader writes through a placed copy are declared to the copy machinery, so the direct placements are ordered under the relay like any copy's writes"
+        );
     }
     if crate::inplace::level() >= 3 {
         tracing::warn!(
@@ -12376,6 +12374,37 @@ mod placement_tests {
             && let Some((mapped, _)) = host.mapped_card_buffer(4096, false)
         {
             assert_eq!(crate::residency::class_of(&mapped), HeapClass::MappedVram);
+        }
+    }
+
+    /// A placed copy's shader writes are declared to the copy machinery: a flight that writes
+    /// title memory through it is recorded like a copy's write, so the late waits can order a CPU
+    /// reader behind it instead of letting it read ahead of the GPU's writes.
+    #[test]
+    fn a_placed_copy_declares_its_shader_writes() {
+        use windows_sys::Win32::System::Memory as mem;
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(host) = crate::host::host() else { return; };
+        if windows::core::Interface::cast::<windows::Win32::Graphics::Direct3D12::ID3D12Device13>(&host.device).is_err() {
+            return;
+        }
+        const K: usize = 64 << 10;
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 8 * K, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            let start = base as u64;
+            let len = 2 * K as u64;
+            let placed = crate::inplace::place_part(&host.device, start, len).expect("a placed buffer");
+            let shadow = std::sync::Arc::new(crate::shadow::Shadow::placed(placed, start, len, false));
+            let list = host.new_list().expect("a list");
+            shadow.gpu_writes(&list, start, len);
+            let declared = list.deferred().copies.iter().any(|step| {
+                matches!(step, super::Step::GpuWrite(written, _, _) if std::sync::Arc::ptr_eq(written, &shadow))
+            });
+            assert!(declared, "the placed copy's shader write is declared to the list");
+            assert!(shadow.written(), "the copy knows shaders wrote it");
+            list.close();
         }
     }
 }

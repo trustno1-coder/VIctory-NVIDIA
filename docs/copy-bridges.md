@@ -519,65 +519,68 @@ memory, at any address. It is behind its own switch, off by default.
 2. `inplace::SectionView` maps **our own view** of that run of the section (the port's old
    mechanism, generalised and now owned by the Phase 2 registry);
 
-## 14. Phase 4 implemented: the migration of the refused copies
 
-The copy classes the audit ranked as removable now have a policy that replaces them where the
-memory can be opened - and only there. It is one decision, in one place.
+## 15. Phase 5 implemented: coherence and lifecycle safety
 
-### 14.1 The policy
+The placed copies now take part in the copy machinery's ordering, and the lifecycle holes the audit
+found are wired. The prototype's flight gate is gone because the reason for it is fixed.
 
-`inplace::place_fallback(start, len, window)` is asked by the copy paths exactly where the
-device-local admission has already refused the copy, i.e. where it would have stayed a system
-memory mirror. It tries, in order:
+### 15.1 Placed shader writes are declared
 
-1. the page pool's view memory (`VICTORY_INPLACE_VIEW=1` for windows, `=2` for title buffers and
-   view-byte copies) through `place_view_checked` - our own view of the section run, a heap on it,
-   a placed buffer (Phase 3);
-2. private title memory (`VICTORY_INPLACE=3` and more) through the first mechanism's
-   `place_private` - a committed part of the allocation opened as a heap.
+`Shadow::gpu_writes` for a placed copy no longer returns in silence: it marks the copy written and
+records the range through `HostList::defer_gpu_write`, exactly the declaration path a copy's
+shaders use. The copy machinery builds each submission's written-range list from those declarations,
+so the late waits and settles now make a CPU reader of those title bytes wait for the flight that
+may write them - a refresh of an overlapping copy, a fill of upload memory, a title buffer copy or
+texture staging. That was guarantee G18 in the audit and the reason `VICTORY_INPLACE=2` was called
+unsupported with submissions in the air; the fallback placements (`VICTORY_INPLACE_VIEW`, and the
+`VICTORY_INPLACE=3` private path) are therefore no longer gated on the relay being off.
+The old, pre-existing shortcut is unchanged and documented: a host copy of the same bytes that a
+shader writes through a *different* copy is not told, because the card's writes are not seen by
+write watching. Placement does not widen it.
 
-Both are refused while any submission can be in the air (`shadow::flights_air`), however the
-switches are set: the placed-write declarations that would make it safe under the relay are
-Phase 5. The paths are a pure function (`fallback_paths`) and unit-tested.
+A test in the host's placement tests places a copy over private title memory, declares a shader
+write to a host list, and asserts the range reached the list's deferred steps and the copy's
+written flag: the declaration path is the one the machinery already uses for copies.
 
-`VICTORY_INPLACE=1`/`=2` keep their old meaning (place wherever the memory can be opened, before
-any admission decision) and are no longer taken for `=3` and more: from 3 on, only the refused
-copies are placed, so no copy a VRAM side would have served is replaced by system-memory access.
+### 15.2 The title's free, decommit and protect let go of placed copies
 
-### 14.2 Where it is wired
+- `watch::title_memory_freed` (called by the title's `VirtualFree` hook for free, decommit and
+  release) now calls `inplace::title_memory_freeing` before the kernel call, so a placed copy is out
+  of the tables and retired rather than silently blocking the title's call.
+- `VirtualProtect` is now intercepted unconditionally (it used to be an export only with
+  `VICTORY_SOFT_VIEWS`) and lets go of what is in place in the range before forwarding.
+- `XMemFreeDefault`'s raw `VirtualFree` for the title's 32-bit allocations does the same.
+- The device's part-opening call (`ID3D12Device13`) is probed once; a run without it refuses every
+  placement as `HostUnavailable` (counted in the ledger) and makes copies as before, instead of
+  failing a host call per ask.
 
-- `shadow::lookup` (title buffers): the card admission is asked, and when it refused, the
-  fallback placement is tried before the CPU staging buffer exists. A placed buffer makes no
-  staging side, no card side, no hash twin and no send/fetch/compare state; the GPU reads and
-  writes the title's own pages, the memory class the refused copy would have been in.
-- `shadow::loose` (windows outside buffers): same, after `window_admission`.
-- `shadow::exact` (a view's own bytes, system memory by design): same policy for its copy; with
-  `VICTORY_INPLACE_VIEW=2` or `VICTORY_INPLACE=3` those copies can be the title's memory too.
+### 15.3 Why the page-pool route is the safe one
 
-Every placement is counted in the in-place census and the placement ledger (Phase 2); every
-refusal is counted with its reason (`NotOpenable`, `Cap`, `HostRefused`, `HostUnavailable`,
-`InFlight`). The startup line names `VICTORY_INPLACE` and `VICTORY_INPLACE_VIEW`, and says that
-the direct placements are inert while the relay/late waits are on, so a log cannot show the
-switches set without saying why nothing was placed.
+A heap opened on the title's **private** pages pins them: the title's own `VirtualFree` and
+`VirtualProtect` there fail with error 87 while it stands, and the heap is released through
+`host::retire` (deferred by the bury lag), so a title call that races the retirement is the
+documented private-placement exception. That is why the recommended migration is the page pool:
+a heap opened on **our own view** of a section leaves the title's views, placeholders and kernel
+calls alone.
 
-### 14.3 What is not migrated, and why
+The section's pages cannot be recycled under that heap either: the section object stays alive while
+our view exists, so unmapping the title's view, freeing page numbers and closing the section handle
+do not touch the bytes our heap reads. A WARP test writes a pattern through a title view, maps our
+own `SectionView` of the same section, unmaps the title's view, closes the section handle, and
+asserts the pattern is still readable through our view. The remaining invalidation - the title maps
+other pages at an address, or the section ends - is already wired through
+`title_memory_changed`/`title_memory_freeing`/`port::section_gone`.
 
-- Copies the card admitted: replacing a device-local side with GPU access to system memory is a
-  memory-class downgrade (section 9's rule) and is not done without hardware measurement.
-- By-address shader memory: raw-address shaders need a GPU address a title CPU address cannot be
-  (the audit's anti-candidate).
-- Textures, render targets and depth: the console's tiled sizes and layouts, the depth+UAV
-  restriction and the missing PC formats block a direct representation (sections 4.2, 10).
-- Scattered or holed title memory: multi-run composition is unresolved; those copies keep the
-  mirror.
-- The layer's own CPU-authored buffers (per-draw scratch, descriptor-stride table, indirect
-  clamp): they are not copies of title bytes.
+### 15.4 Tests and checks
 
-### 14.4 Tests and checks
-
-- `the_fallback_paths_follow_the_switches_and_the_flight_gate` covers the policy matrix (legacy
-  levels, 3, view 1/2, windows/buffers, flights on/off).
-- The Phase 3 WARP tests exercise both mechanisms' data paths; the Phase 2 tests exercise the
-  invalidation, the ledger and the view ownership. A run of the title is needed to measure how
-  much of the refused class is openable on a real save; no run is available here.
+- `a_placed_copy_declares_its_shader_writes` (host placement tests, WARP): a placed copy's shader
+  write reaches the copy machinery's declaration list.
+- `our_view_keeps_the_sections_pages_after_the_title_lets_go` (WARP): the section's pages survive
+  the title unmapping its view and closing the handle, through our view.
+- The Phase 2-4 tests (openability, invalidation, view ownership, direct accounting, page-pool
+  placement) are unchanged and still pass on CI.
 - `cargo check --workspace --all-targets --locked`: PASS; clippy shows only the baseline lint.
+- Not tested here: the ordering the declaration buys under a live relay needs a run with
+  submissions actually in the air (the unit only proves the declaration is recorded); the target
+  driver's behaviour remains unverified as stated in section 11.

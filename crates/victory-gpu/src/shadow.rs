@@ -1142,15 +1142,6 @@ pub(crate) fn relay() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
 }
 
-/// Whether a submission may be in the air when a copy is prepared: the relay, or the late wait.
-/// A direct placement (`crate::inplace::place_view`) is only tried while this is false: a placed
-/// copy declares no shader writes yet, so the layer's own CPU reads of title memory (constant
-/// fills, the title's buffer copies, texture staging) could otherwise read ahead of a flight's
-/// writes through the placed buffer.
-pub(crate) fn flights_air() -> bool {
-    relay() || crate::host::late()
-}
-
 /// The submission being prepared (its number among those started): what
 /// [`Shadow::writing`] counts a declared range for ([`Flights`]).
 static PREPARED: AtomicU64 = AtomicU64::new(0);
@@ -3547,7 +3538,7 @@ impl Shadow {
     /// over it in a heap opened on it. Shaped as a copy so that everything
     /// that binds, views or keeps a copy works on it unchanged; what
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
-    fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
+    pub(crate) fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
         // Not a copy: not counted with them, and nothing asks what the
@@ -3634,12 +3625,19 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
-        // shortcut: another host copy of the same bytes (a title buffer
-        // inside this one with a copy of its own, a texture in it) is not
-        // told: the card's writes are not seen by write watching.
+        // In place the shaders write title memory itself: no snapshot, no compare and nothing to
+        // copy back. The range is still *declared*, so the copy machinery and the late waits know
+        // a flight may write these title bytes: a CPU step that reads them (a refresh of an
+        // overlapping copy, a fill of upload memory, a buffer copy) then waits for the flight
+        // instead of reading ahead of the GPU's writes. That declaration is what makes a placed
+        // copy safe under the relay (Phase 5 of docs/copy-bridges.md).
+        // shortcut (pre-existing, not placement's): a host copy of the same bytes that a shader
+        // writes through a *different* copy is not told: the card's writes are not seen by write
+        // watching.
         if self.place.is_some() {
+            self.written.store(true, Ordering::Relaxed);
+            let len = len.min(self.left(address));
+            list.defer_gpu_write(self, address as usize, len as usize);
             return;
         }
         // Write-combined title memory, which the title's CPU does not read

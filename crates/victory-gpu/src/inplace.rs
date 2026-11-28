@@ -292,6 +292,10 @@ fn place_private(start: u64, len: u64, window: bool) -> Option<Placed> {
         crate::residency::direct_refused(len, crate::residency::NoDirect::HostUnavailable);
         return None;
     };
+    if !part_opening(&host.device) {
+        crate::residency::direct_refused(len, crate::residency::NoDirect::HostUnavailable);
+        return None;
+    }
     match place_part(&host.device, start, len) {
         Ok(placed) => {
             counted(window, len);
@@ -310,6 +314,14 @@ fn place_private(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// Whether the device has the part-opening call (`ID3D12Device13`,
+/// `OpenExistingHeapFromAddress1`), asked once per process: without it every placement is refused
+/// as `HostUnavailable` and the copy is made as before, without a failed host call per ask.
+pub(crate) fn part_opening(device: &ID3D12Device) -> bool {
+    static CAPABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CAPABLE.get_or_init(|| device.cast::<ID3D12Device13>().is_ok())
 }
 
 /// [`place_view`]'s work: our own view of the aligned run of the section that holds
@@ -358,6 +370,10 @@ fn place_view_checked(start: u64, len: u64, window: bool) -> Option<Placed> {
         crate::residency::direct_refused(bytes, NoDirect::HostUnavailable);
         return None;
     };
+    if !part_opening(&host.device) {
+        crate::residency::direct_refused(bytes, NoDirect::HostUnavailable);
+        return None;
+    }
     match place_view_part(&host.device, start, len) {
         Ok(placed) => {
             counted(window, len);
@@ -377,13 +393,9 @@ fn place_view_checked(start: u64, len: u64, window: bool) -> Option<Placed> {
 
 /// Which direct-placement paths a copy that was refused a device-local side may take, in order:
 /// the page pool's view memory (`VICTORY_INPLACE_VIEW`), then private memory
-/// (`VICTORY_INPLACE=3` and more, the fallback substitution). No path while a submission can be
-/// in the air (a placed copy declares no shader writes yet; see [`crate::shadow::flights_air`]).
-/// Pure, so the policy can be tested without a device or the environment.
-fn fallback_paths(level: u8, view: u8, window: bool, flights: bool) -> (bool, bool) {
-    if flights {
-        return (false, false);
-    }
+/// (`VICTORY_INPLACE=3` and more, the fallback substitution). Pure, so the policy can be tested
+/// without a device or the environment.
+fn fallback_paths(level: u8, view: u8, window: bool) -> (bool, bool) {
     let view = view >= if window { 1 } else { 2 };
     let private = level >= 3;
     (view, private)
@@ -396,12 +408,7 @@ fn fallback_paths(level: u8, view: u8, window: bool, flights: bool) -> (bool, bo
 /// `None` leaves the caller to make the copy as before, which is the behaviour with the switches
 /// off. Every refusal of an asked-for path is counted with its reason.
 pub(crate) fn place_fallback(start: u64, len: u64, window: bool) -> Option<Placed> {
-    let flights = crate::shadow::flights_air();
-    let (view, private) = fallback_paths(level(), view_on(), window, flights);
-    if flights {
-        crate::residency::direct_refused(len, crate::residency::NoDirect::InFlight);
-        return None;
-    }
+    let (view, private) = fallback_paths(level(), view_on(), window);
     if view && let Some(placed) = place_view_checked(start, len, window) {
         return Some(placed);
     }
@@ -2030,26 +2037,57 @@ pub(crate) mod tests {
         }
     }
 
-    /// The fallback policy: view memory first when its switch asks, private memory when
-    /// `VICTORY_INPLACE=3` asks, neither while submissions can be in the air.
+    /// Our view keeps a section's pages alive after the title's own view is unmapped and the
+    /// section handle closed: a page-free or a section close cannot recycle the bytes under a
+    /// placed heap.
     #[test]
-    fn the_fallback_paths_follow_the_switches_and_the_flight_gate() {
-        // Nothing asked for: no path.
-        assert_eq!(fallback_paths(0, 0, true, false), (false, false));
-        assert_eq!(fallback_paths(2, 1, false, false), (false, false));
-        // The legacy levels do not take the fallback path for a title buffer; =3 does, for both.
-        assert_eq!(fallback_paths(2, 0, true, false), (false, false));
-        assert_eq!(fallback_paths(2, 0, false, false), (false, false));
-        assert_eq!(fallback_paths(3, 0, true, false), (false, true));
-        assert_eq!(fallback_paths(3, 0, false, false), (false, true));
-        // View memory: windows from level 1, title buffers from level 2.
-        assert_eq!(fallback_paths(0, 1, true, false), (true, false));
-        assert_eq!(fallback_paths(0, 1, false, false), (false, false));
-        assert_eq!(fallback_paths(0, 2, false, false), (true, false));
-        assert_eq!(fallback_paths(3, 2, false, false), (true, true));
-        // Submissions in the air: no placement at any switch setting.
-        for (level, view, window) in [(3u8, 2u8, true), (3, 2, false), (0, 1, true), (2, 1, true)] {
-            assert_eq!(fallback_paths(level, view, window, true), (false, false));
+    fn our_view_keeps_the_sections_pages_after_the_title_lets_go() {
+        const K: usize = 64 << 10;
+        // SAFETY (the whole test): the section, placeholder and views made here.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let section = mem::CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE | mem::SEC_RESERVE,
+                0,
+                4 * K as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let hole = mem::VirtualAlloc2(process, std::ptr::null(), 4 * K, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0).cast::<u8>();
+            assert!(!hole.is_null());
+            let view = mem::MapViewOfFile3(section, process, hole.cast(), 0, 4 * K, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert!(!view.Value.is_null());
+            assert!(!mem::VirtualAlloc(view.Value, 4 * K, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            std::ptr::write_bytes(view.Value.cast::<u8>(), 0x5a, 4 * K);
+            let ours = super::SectionView::map(section as usize, 0, 4 * K).expect("a view of ours");
+            // The title lets go of its view, then of the section.
+            assert_ne!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER), 0);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            let bytes = std::slice::from_raw_parts(ours.base() as *const u8, 4 * K);
+            assert!(bytes.iter().all(|&b| b == 0x5a), "the section's pages stay with our view");
+            drop(ours);
+            mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
         }
+    }
+
+    /// The fallback policy: view memory first when its switch asks, private memory when
+    /// `VICTORY_INPLACE=3` asks.
+    #[test]
+    fn the_fallback_paths_follow_the_switches() {
+        // Nothing asked for: no path.
+        assert_eq!(fallback_paths(0, 0, true), (false, false));
+        assert_eq!(fallback_paths(2, 1, false), (false, false));
+        // The legacy levels do not take the fallback path for a title buffer; =3 does, for both.
+        assert_eq!(fallback_paths(2, 0, true), (false, false));
+        assert_eq!(fallback_paths(2, 0, false), (false, false));
+        assert_eq!(fallback_paths(3, 0, true), (false, true));
+        assert_eq!(fallback_paths(3, 0, false), (false, true));
+        // View memory: windows from level 1, title buffers from level 2.
+        assert_eq!(fallback_paths(0, 1, true), (true, false));
+        assert_eq!(fallback_paths(0, 1, false), (false, false));
+        assert_eq!(fallback_paths(0, 2, false), (true, false));
+        assert_eq!(fallback_paths(3, 2, false), (true, true));
     }
 }
