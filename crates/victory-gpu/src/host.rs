@@ -11263,13 +11263,22 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        // `VICTORY_WINDOW_OFFSCREEN=1` (background test runs): off every
+        // screen, no taskbar button, never activated, as the title's window
+        // (`victory_hle`'s lifecycle module).
+        let off = std::env::var_os("VICTORY_WINDOW_OFFSCREEN").is_some_and(|v| v == "1");
+        let (ex, at) = if off {
+            (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, -32000)
+        } else {
+            (WINDOW_EX_STYLE(0), CW_USEDEFAULT)
+        };
         CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            ex,
             CLASS,
             w!("VIctory"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            at,
+            at,
             rect.right - rect.left,
             rect.bottom - rect.top,
             None,

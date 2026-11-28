@@ -153,7 +153,7 @@ static MOUSE_CAPTURE: std::sync::LazyLock<Mutex<MouseCapture>> =
     std::sync::LazyLock::new(|| Mutex::new(MouseCapture::default()));
 
 fn capture_mouse(hwnd: HWND, active: bool) {
-    if !enabled("VICTORY_MOUSE_CAPTURE") { return; }
+    if !enabled("VICTORY_MOUSE_CAPTURE") || offscreen() { return; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: runs on the window thread; local geometry, balanced cursor count.
     unsafe {
@@ -223,6 +223,7 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, x, y) = offscreen_at_creation(parent, ex_style, x, y);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -249,6 +250,7 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, x, y) = offscreen_at_creation(parent, ex_style, x, y);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -257,6 +259,33 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+/// Whether the title's window is kept off every screen
+/// (`VICTORY_WINDOW_OFFSCREEN=1`; off by default): background test runs
+/// (nothing of a test may show on the user's screen). The top-level window
+/// is made at -32000,-32000 with no taskbar button, is never activated (it
+/// does not take the keyboard from the user), and every later move of it
+/// stays there ([`window_proc`], `WM_WINDOWPOSCHANGING`, on the title's own
+/// thread, so no move from outside can lose a race with it). It is not
+/// minimized or hidden: the title renders and presents as on screen. The
+/// scripted keys (`VICTORY_KEYS`) work without focus. Fullscreen and mouse
+/// capture are skipped for it. (Port of ScarlettPort 5831360.)
+fn offscreen() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_OFFSCREEN").is_some_and(|v| v == "1"))
+}
+
+/// Where [`offscreen`] puts a window.
+const OFFSCREEN: i32 = -32000;
+
+/// [`offscreen`]: a top-level window's extended style and place at creation.
+fn offscreen_at_creation(parent: HWND, ex_style: u32, x: i32, y: i32) -> (u32, i32, i32) {
+    if !offscreen() || !parent.is_null() {
+        return (ex_style, x, y);
+    }
+    tracing::info!("the title's window is kept off the screen (VICTORY_WINDOW_OFFSCREEN=1)");
+    (ex_style | wm::WS_EX_TOOLWINDOW | wm::WS_EX_NOACTIVATE, OFFSCREEN, OFFSCREEN)
 }
 
 /// A console title sizes its window to its render target (
@@ -349,7 +378,7 @@ fn hook(hwnd: HWND) {
         let title = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
-        if wm::GetParent(hwnd).is_null() {
+        if wm::GetParent(hwnd).is_null() && !offscreen() {
             fullscreen(hwnd);
             english_input();
             capture_mouse(hwnd, true);
@@ -386,6 +415,20 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    // `VICTORY_WINDOW_OFFSCREEN`: a move of a top-level window stays off the
+    // screen, and nothing activates it.
+    if message == wm::WM_WINDOWPOSCHANGING
+        && lparam != 0
+        && offscreen()
+        // SAFETY: a plain query of the window this message is for.
+        && unsafe { wm::GetParent(hwnd) }.is_null()
+    {
+        // SAFETY: the system passes a WINDOWPOS with this message.
+        let pos = unsafe { &mut *(lparam as *mut wm::WINDOWPOS) };
+        pos.x = OFFSCREEN;
+        pos.y = OFFSCREEN;
+        pos.flags = (pos.flags & !wm::SWP_NOMOVE) | wm::SWP_NOACTIVATE;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
