@@ -1980,11 +1980,13 @@ fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
 
 /// What [`room`] weighs now, in MB, for the log: the card's budget, its
 /// use, the free part of the texture blocks, what is kept for card copies
-/// of title buffers and for render targets, and the line. `None` without
-/// the system's numbers, or under `VICTORY_TEXTURE_BUDGET_MB` (which
-/// weighs the textures' own bytes instead).
+/// of title buffers and for render targets, and the line; then, for
+/// information only (not weighed by [`room`]), the bytes of windows' and
+/// by-address arenas' device-local sides alive now. `None` without the
+/// system's numbers, or under `VICTORY_TEXTURE_BUDGET_MB` (which weighs the
+/// textures' own bytes instead).
 #[cfg(windows)]
-pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
+pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 8]> {
     if std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
         return None;
     }
@@ -1997,6 +1999,8 @@ pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
             crate::shadow::card_room_kept(),
             targets_room_kept(),
             room_line(budget),
+            crate::shadow::window_card_bytes(),
+            crate::shadow::address_card_bytes(),
         ]
         .map(|bytes| bytes >> 20),
     )

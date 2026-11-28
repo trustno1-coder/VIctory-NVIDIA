@@ -37,11 +37,13 @@
 //!
 //! Why our own view: a heap opened from an address holds the pages it was
 //! opened on: the title could not unmap, decommit or protect them while it
-//! stands. Opened on our view, the title's own views stay free to change.
-//! When the title maps other pages at such an address, what is in place
-//! there is let go (`crate::inplace::title_memory_freeing`) and the region
-//! forgotten; the view of ours stays (shortcut: it is never unmapped, a
-//! few hundred MB of address space at most).
+//! stands. Opened on our view, the title's own views stay free to change: a
+//! section page's commit is shared by its views and survives unmapping one of
+//! them, and the test reprotects a title view and unmaps another under the
+//! heap while the placed buffer still reads the section's pages. When the
+//! title maps other pages at such an address, what is in place there is let go
+//! (`crate::inplace::title_memory_freeing`) and the region forgotten; our view
+//! itself goes when its last placed buffer and heap do (`SectionView`).
 //!
 //! What it assumes: the CPU steps of ours that read this memory at
 //! submission (fills of constant buffers, the title's buffer copies done on
@@ -54,8 +56,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
-use windows_sys::Win32::System::Memory as mem;
-
 use crate::inplace::{Placed, cover, stretch};
 
 const K64: u64 = 64 << 10;
@@ -82,7 +82,12 @@ pub(crate) fn on() -> bool {
 struct Region {
     start: u64,
     end: u64,
+    /// The section the stretch is a run of (the runtime's handle number, for a section close).
+    section: usize,
     heap: ID3D12Heap,
+    /// Our own view of the stretch; the heap was opened on it and every placed buffer keeps it
+    /// alive, so the title's own views of the same pages stay free to change.
+    view: std::sync::Arc<crate::inplace::SectionView>,
 }
 
 // SAFETY: D3D12 heaps are free-threaded.
@@ -131,6 +136,12 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             Some(placed)
         }
         Err((at, why)) => {
+            let reason = match at {
+                3 | 4 => crate::residency::NoDirect::NotOpenable,
+                5 | 6 => crate::residency::NoDirect::HostRefused,
+                _ => crate::residency::NoDirect::HostUnavailable,
+            };
+            crate::residency::direct_refused(len, reason);
             let n = STATS[at].fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
                 tracing::warn!(start = format_args!("{start:#x}"), len, window, why, "renderer port 1: title memory not in place, a copy as before");
@@ -164,7 +175,7 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
     let buffer = crate::inplace::place(device, &region.heap, at - region.start, end - at).map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at })
+    Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at, keep: Some(region.view.clone()) })
 }
 
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
@@ -190,54 +201,29 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     if first > at || first + bytes < end || offset % K64 != 0 {
         return Err((3, format!("the stretch {first:#x}+{bytes:#x} does not hold it")));
     }
-    // SAFETY: the section of a view the title has; the runtime keeps its
-    // handle open while a view of it is there, and the range is inside it.
-    let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize;
-    if view == 0 {
-        return Err((5, format!("no view of the stretch: {}", std::io::Error::last_os_error())));
-    }
-    let unmap = || {
-        // SAFETY: our own view, nothing opened on it.
-        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+    // Our own view of the stretch (a view of the section the runtime made; its handle stays open
+    // while the title has a view of it). The view is unmapped when the last placed buffer that
+    // holds it goes, not before.
+    let Some(view) = crate::inplace::SectionView::map(section, offset, bytes as usize) else {
+        return Err((5, format!("no view of the stretch: {bytes:#x} bytes at offset {offset:#x}")));
     };
-    if !committed(view, bytes as usize) {
-        unmap();
+    if !crate::inplace::committed(view.base(), bytes as usize) {
         return Err((4, "pages of the stretch are not committed".to_owned()));
     }
-    match crate::inplace::open(device, crate::inplace::From::Part(view, bytes as usize)) {
+    match crate::inplace::open(device, crate::inplace::From::Part(view.base(), bytes as usize)) {
         Ok(heap) => {
             tracing::info!(
                 start = format_args!("{first:#x}"),
                 bytes,
                 section = format_args!("{section:#x}"),
                 offset = format_args!("{offset:#x}"),
-                view = format_args!("{view:#x}"),
+                view = format_args!("{:#x}", view.base()),
                 "renderer port 1: a stretch of the title's graphics memory opened as a host heap through a view of ours"
             );
-            // shortcut: the view stays mapped for good (the heap holds its
-            // pages while anything names it).
-            Ok(Region { start: first, end: first + bytes, heap })
+            Ok(Region { start: first, end: first + bytes, section, heap, view })
         }
-        Err(e) => {
-            unmap();
-            Err((5, format!("refused by the host: {e}")))
-        }
+        Err(e) => Err((5, format!("refused by the host: {e}"))),
     }
-}
-
-/// Whether every page of `[at, at + len)` is committed.
-fn committed(at: usize, len: usize) -> bool {
-    let mut here = at;
-    while here < at + len {
-        // SAFETY: plain data filled in by the query.
-        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        if unsafe { mem::VirtualQuery(here as *const _, &mut info, size_of_val(&info)) } == 0 || info.State != mem::MEM_COMMIT {
-            return false;
-        }
-        here = (info.BaseAddress as usize).saturating_add(info.RegionSize);
-    }
-    true
 }
 
 fn bounds(regions: &[Region]) {
@@ -257,6 +243,17 @@ pub(crate) fn forget(at: usize, len: usize) {
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
     let before = regions.len();
     regions.retain(|r| r.end <= at || r.start >= end);
+    STATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
+    bounds(&regions);
+}
+
+/// The runtime let go of `section`: the regions over it are forgotten, so no heap or view of
+/// ours outlives the section it came from. What is placed there is let go by the caller
+/// (`crate::inplace::title_memory_section_gone`).
+pub(crate) fn section_gone(section: usize) {
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = regions.len();
+    regions.retain(|r| r.section != section);
     STATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
     bounds(&regions);
 }
@@ -314,6 +311,7 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Memory as mem;
 
     /// Only the title's 32-bit memory is asked for.
     #[test]
@@ -386,12 +384,34 @@ mod tests {
             let second = place_in(&device, base + 6 * K as u64, 100).unwrap_or_else(|e| panic!("not placed: {e:?}"));
             assert_eq!(REGIONS.lock().unwrap().len(), regions, "one region for the stretch");
             assert_eq!(second.bias, 0);
-            // The title's views may change under the heap.
+            // The title's own views may change under the heap: ours is a view of the section,
+            // not of their placeholders. Protect one read-only and unmap the other; the placed
+            // buffer reads the section's committed pages all the same. What the placed buffer
+            // must still read is saved first: after the title's view is unmapped its address
+            // range is a placeholder, and reading it on the CPU (as a comparison against it
+            // would) faults - which is exactly what the placed buffer must not do.
+            let expected: Vec<u8> = std::slice::from_raw_parts(start as *const u8, len as usize).to_vec();
+            let mut old = 0;
+            assert_ne!(
+                mem::VirtualProtect(views[0].Value, 256, mem::PAGE_READONLY, &mut old),
+                0,
+                "the title's view can be made read-only under the heap"
+            );
+            assert_ne!(mem::VirtualProtect(views[0].Value, 256, mem::PAGE_READWRITE, &mut old), 0);
+            assert_ne!(
+                mem::UnmapViewOfFile2(process, views[1], mem::MEM_PRESERVE_PLACEHOLDER),
+                0,
+                "the title's view can be unmapped under the heap"
+            );
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(got == expected, "the card still reads the section's pages after the title's view went");
+            // The section going away does not take the placed buffer's own view with it.
+            crate::port::section_gone(section as usize);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(got == expected, "the placed buffer keeps its pages");
             drop((placed, second));
             forget(base as usize, 8 * K);
-            for view in views {
-                assert!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER) != 0, "the title's own view can be unmapped");
-            }
+            assert!(mem::UnmapViewOfFile2(process, views[0], mem::MEM_PRESERVE_PLACEHOLDER) != 0, "the title's own view can be unmapped");
             crate::inplace::views_gone(base as usize, 8 * K);
             mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
             mem::VirtualFree(hole.add(3 * K).cast(), 0, mem::MEM_RELEASE);

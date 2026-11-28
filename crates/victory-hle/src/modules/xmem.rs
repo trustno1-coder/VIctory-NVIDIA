@@ -376,6 +376,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // The title's own memory, served by `XMemVirtualAlloc`: anything of ours opened on
+            // it must let go before the kernel releases it.
+            victory_gpu::title_memory_freed(address as usize, 0);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -2818,9 +2821,12 @@ extern "system" fn title_virtual_query(address: *const c_void, out: *mut MEMORY_
     unsafe { VirtualQuery(address, out, size) }
 }
 
-/// The title's own `VirtualProtect`, as [`title_virtual_query`].
+/// The title's own `VirtualProtect`, as [`title_virtual_query`]. A heap opened on the pages
+/// would make the call fail (the pages are pinned while it stands), so what is in place there is
+/// let go first, through the same path a mapping change uses.
 extern "system" fn title_virtual_protect(address: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
     use windows_sys::Win32::System::Memory::VirtualProtect;
+    victory_gpu::title_memory_freeing(address as usize, size.max(1));
     materialize_for(address as usize, size, Touch::TitleCall);
     // SAFETY: the title's own arguments.
     unsafe { VirtualProtect(address, size, protect, old) }
@@ -2830,30 +2836,34 @@ pub(crate) fn module() -> HleModule {
     // (Asked of the environment here, not of [`soft_views`], which says what
     // it does to a log that is not open yet.)
     let soft = std::env::var_os("VICTORY_SOFT_VIEWS").is_some_and(|v| v != "0");
-    let asks = [
-        crate::HleExport { name: "VirtualQuery", address: title_virtual_query as *const () as usize },
+    let mut exports = vec![
+        crate::HleExport { name: "VirtualFree", address: title_virtual_free as *const () as usize },
+        // Always: a heap opened on title pages must let go before the title protects them, or the
+        // kernel call fails (VICTORY_INPLACE / VICTORY_INPLACE_VIEW runs).
         crate::HleExport { name: "VirtualProtect", address: title_virtual_protect as *const () as usize },
     ];
+    if soft {
+        exports.push(crate::HleExport { name: "VirtualQuery", address: title_virtual_query as *const () as usize });
+    }
+    exports.extend([
+        hle_export!(XMemAlloc),
+        hle_export!(XMemFree),
+        hle_export!(XMemAllocDefault),
+        hle_export!(XMemFreeDefault),
+        hle_export!(XMemIsToolsMemAvailable),
+        hle_export!(XMemAllocatePhysicalPages),
+        hle_export!(XMemFreePhysicalPages),
+        hle_export!(XMemMapPhysicalPages),
+        hle_export!(XMemMapPhysicalPagesScatter),
+        hle_export!(XMemVirtualAlloc),
+        hle_export!(XMemVirtualQuery),
+        hle_export!(XMemGetWorkingSetStatistics),
+        hle_export!(XMemTransferMemory),
+    ]);
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
-        exports: soft.then_some(asks).into_iter().flatten().chain([
-            crate::HleExport { name: "VirtualFree", address: title_virtual_free as *const () as usize },
-            hle_export!(XMemAlloc),
-            hle_export!(XMemFree),
-            hle_export!(XMemAllocDefault),
-            hle_export!(XMemFreeDefault),
-            hle_export!(XMemIsToolsMemAvailable),
-            hle_export!(XMemAllocatePhysicalPages),
-            hle_export!(XMemFreePhysicalPages),
-            hle_export!(XMemMapPhysicalPages),
-            hle_export!(XMemMapPhysicalPagesScatter),
-            hle_export!(XMemVirtualAlloc),
-            hle_export!(XMemVirtualQuery),
-            hle_export!(XMemGetWorkingSetStatistics),
-            hle_export!(XMemTransferMemory),
-        ])
-        .collect(),
+        exports,
     }
 }
 

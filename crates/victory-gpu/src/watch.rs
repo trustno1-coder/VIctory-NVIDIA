@@ -2852,6 +2852,13 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // Nothing of ours may keep the pages the title is about to free, decommit or release: a heap
+    // opened on them would make the kernel call fail. The placed copies go first (their heaps and
+    // views are released through `host::retire`, as always); what that cannot finish in time is
+    // the documented private-placement exception, said in docs/copy-bridges.md.
+    if crate::inplace::level() > 0 || crate::inplace::view_on() > 0 {
+        crate::inplace::title_memory_freeing(at, len);
+    }
     crate::shadow::write_combined_freed(at, len);
     let mut g = guards();
     let first = at / BLOCK;
