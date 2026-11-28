@@ -204,13 +204,20 @@ fn mirror(handle: u64) {
     let Some(index) = heap.index(handle) else {
         return;
     };
+    mirror_slots(heap, [(index, handle)]);
+}
+
+#[cfg(windows)]
+fn mirror_slots(heap: &Heap, slots: impl IntoIterator<Item = (u32, u64)>) {
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
-        None => pending.push(index),
+        None => pending.extend(slots.into_iter().map(|(index, _)| index)),
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
-                host.mirror(index, handle, false);
+                for (index, handle) in slots {
+                    host.mirror(index, handle, false);
+                }
             }
         }
     }
@@ -235,18 +242,7 @@ fn mirror_copy(dst: u64, count: u32, kind: u32, step: u64) {
         return;
     }
     let first = ((dst - start) / step) as u32;
-    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
-    match heap.host.get() {
-        None => pending.extend(first..first + count),
-        Some(host) => {
-            drop(pending);
-            if let Some(host) = host {
-                for i in first..first + count {
-                    host.mirror(i, start + u64::from(i) * step, false);
-                }
-            }
-        }
-    }
+    mirror_slots(heap, (first..first + count).map(|i| (i, start + u64::from(i) * step)));
 }
 
 /// Whether [`sync_heaps`] is done (`VICTORY_HEAP_SYNC=0`: not).
