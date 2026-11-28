@@ -24,12 +24,31 @@ V vs(uint id : SV_VertexID) {
     return v;
 }
 [RootSignature(RS)]
+// Bit-level NaN/Inf-safe saturate (from aki-gta6/aki-runtime 33c21b9 via ProjectLeonida/mandy a8d2f48):
+// plain saturate(NaN) evaluates to 0.0 (black specks / black sun).
+float clean1(float x) {
+#if CLEAN
+    return (asuint(x) & 0x7FFFFFFFu) > 0x7F800000u ? 1.0 : saturate(x);
+#else
+    return saturate(x);
+#endif
+}
+float3 clean(float3 x) {
+    return float3(clean1(x.r), clean1(x.g), clean1(x.b));
+}
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
-    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+    return float4(clean(o.rgb + s.rgb * (1 - clean1(o.a))), 1);
 }
 "#;
+
+/// Whether the composer's clamp keeps a NaN from coming out black
+/// (`VICTORY_COMPOSE_NAN=0`: plain `saturate`, as before).
+fn clean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPOSE_NAN").is_none_or(|v| v != "0"))
+}
 
 pub(crate) struct Composer {
     root: ID3D12RootSignature,
@@ -43,13 +62,14 @@ unsafe impl Send for Composer {}
 unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
+    let source = format!("#define CLEAN {}\n{SOURCE}", u8::from(clean()));
     let mut code: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
     unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("compose"),
             None,
             None,
