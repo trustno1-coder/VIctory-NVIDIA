@@ -8,9 +8,9 @@ use super::*;
 use crate::shadow::Shadow;
 
 /// The stage (`VICTORY_CARD_STEPS`; off by default): `1` constant buffers
-/// of descriptor tables (`Step::Fill` with a slot of its own), `2` the
-/// title's buffer copies (`Step::Copy`) too, with the steps of the same
-/// submission that depend on them. Only with the relay's second stage
+/// (`Step::Fill` with a descriptor slot of its own or shared scratch memory),
+/// `2` the title's buffer copies (`Step::Copy`) too, with the steps of the
+/// same submission that depend on them. Only with the relay's second stage
 /// (`relay_exact`).
 ///
 /// Why: eleven dispatches a frame (the skinning passes, in two early
@@ -225,8 +225,8 @@ pub(super) enum FillTo {
     /// A descriptor slot that shows the fill's memory, and nothing else does
     /// (title heap, slot): it is made to show our buffer instead.
     Slot(usize, u32),
-    /// A buffer the card can write, filled from its beginning.
-    Buffer(ID3D12Resource),
+    /// A buffer the card can write, and the byte offset in it.
+    Buffer(ID3D12Resource, u64),
 }
 
 /// Title memory something in the air writes: the host copy it goes through
@@ -638,8 +638,8 @@ enum To {
     Copy(Arc<Shadow>, usize),
     /// A descriptor slot (title heap, slot).
     Slot(usize, u32),
-    /// A buffer's beginning.
-    Buffer(ID3D12Resource),
+    /// A buffer, and the byte offset in it.
+    Buffer(ID3D12Resource, u64),
 }
 
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
@@ -879,7 +879,7 @@ impl Host {
                 }
                 _ => match fill_to(runs, steps[i]) {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
-                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
+                    Some(FillTo::Buffer(buffer, offset)) => To::Buffer(buffer, offset),
                     None => continue,
                 },
             };
@@ -935,7 +935,7 @@ impl Host {
                 }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
-                    To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                    To::Buffer(buffer, offset) => writes.push((buffer, *offset, op.at, len)),
                     To::Slot(..) => {}
                 }
             }
@@ -1002,7 +1002,7 @@ fn noted(ops: &[Op]) {
     for op in ops {
         let (to, dst) = match &op.to {
             To::Copy(to, dst) => (to.span(), *dst),
-            To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
+            To::Slot(..) | To::Buffer(..) => ((0, 0), 0),
         };
         let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
         *e = (e.0 + 1, op.from.1, dst);
@@ -1496,5 +1496,375 @@ mod tests {
         eprintln!("{done} of 48 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
         eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));
         assert!(done >= 20, "only {done} copies were done on the card");
+    }
+
+    const ROOT_CBV_SHADER: &str = r#"
+#define RS "CBV(b0), CBV(b1), CBV(b2), UAV(u0)"
+cbuffer A : register(b0) { uint4 a0; uint4 a1; };
+cbuffer B : register(b1) { uint4 b0; uint4 b1; };
+cbuffer C : register(b2) { uint4 c0; uint4 c1; };
+RWByteAddressBuffer out_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    out_buf.Store4(0, a0);
+    out_buf.Store4(16, a1);
+    out_buf.Store4(32, b0);
+    out_buf.Store4(48, b1);
+    out_buf.Store4(64, c0);
+    out_buf.Store4(80, c1);
+}
+"#;
+
+    fn root_cbv_pipeline(host: &Host) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let code = compile(ROOT_CBV_SHADER, windows::core::s!("main"), windows::core::s!("cs_5_1")).unwrap();
+        // SAFETY: valid compiled bytecode with embedded root signature.
+        unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        }
+    }
+
+    /// Unaligned root constant buffers in `shared_scratch` (two overlapping an
+    /// in-flight UAV buffer at `+0x10` and `+0x50` across one or two levels,
+    /// plus a CPU-filled slot in the middle of the same chunk) are accepted by
+    /// `plan` with zero refusals, copied into their exact 256-byte-aligned
+    /// offsets without clobbering adjacent bytes, and read back through
+    /// `SetComputeRootConstantBufferView` on the host GPU.
+    #[test]
+    fn shared_scratch_root_constants_plan_and_record_on_gpu() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (root, pso) = root_cbv_pipeline(host);
+        let uav_title = vec![0x11u8; 4096];
+        let mut cpu_title = vec![0x22u8; 4096];
+        for i in 0..0x20usize {
+            cpu_title[0x30 + i] = 0x40 + i as u8;
+        }
+        let (uav_base, cpu_base) = (uav_title.as_ptr() as usize, cpu_title.as_ptr() as usize);
+
+        let list = host.new_list().unwrap();
+        let src0 = (uav_base + 0x10) as *const u8;
+        let src_cpu = (cpu_base + 0x30) as *const u8;
+        let src1 = (uav_base + 0x50) as *const u8;
+
+        let gpu0 = list.fill_scratch_shared((src0 as usize, 0x20), src0, 0x20).unwrap();
+        let gpu0_dup = list.fill_scratch(src0, 0x20).unwrap();
+        assert_eq!(gpu0_dup, gpu0, "duplicate fill_scratch must reuse the first slot");
+        let gpu_cpu = list.fill_scratch_shared((src_cpu as usize, 0x20), src_cpu, 0x20).unwrap();
+        let gpu1 = list.fill_scratch_shared((src1 as usize, 0x20), src1, 0x20).unwrap();
+
+        assert_eq!(gpu0 % 256, 0);
+        assert_eq!(gpu_cpu, gpu0 + 256);
+        assert_eq!(gpu1, gpu0 + 512);
+        assert_eq!(list.scratch_kept(), SCRATCH_FIRST);
+
+        // Plan check: stage 1 takes the two UAV-overlapping fills (0 and 2)
+        // with 0 refusals and leaves the middle CPU-filled slot (1) on CPU.
+        let written = [(uav_base, uav_base + uav_title.len())];
+        let (does, steps) = does_of(&written, &[&list]);
+        assert_eq!(does.len(), 3);
+        assert_eq!(plan(&does, 1, true, &mut None), Ok(vec![(0, 0), (2, 0)]));
+
+        let Some(FillTo::Buffer(chunk0, 0)) = fill_to(&[&list], steps[0]) else {
+            panic!("expected FillTo::Buffer(_, 0)");
+        };
+        let Some(FillTo::Buffer(chunk_cpu, 256)) = fill_to(&[&list], steps[1]) else {
+            panic!("expected FillTo::Buffer(_, 256)");
+        };
+        let Some(FillTo::Buffer(chunk1, 512)) = fill_to(&[&list], steps[2]) else {
+            panic!("expected FillTo::Buffer(_, 512)");
+        };
+        assert_eq!(chunk0.as_raw(), chunk_cpu.as_raw());
+        assert_eq!(chunk0.as_raw(), chunk1.as_raw());
+
+        // Verify the middle step's CPU destination is `chunk_ptr + 256`,
+        // populate it directly (avoiding `ReadProcessMemory` / `watch` global
+        // state in the shared unit-test process; the isolated child-process
+        // test below exercises full `run_deferred` + `card_steps` end-to-end),
+        // and poison all surrounding bytes of the `shared_scratch` chunk.
+        let chunk_ptr = list.shared_scratch.lock().unwrap().chunks[0].0.data as *mut u8;
+        assert!(matches!(
+            list.deferred().copies[1],
+            Step::Fill(dst, src, 0x20, Some(FillTo::Buffer(_, 256)))
+                if dst == chunk_ptr as usize + 256 && src == cpu_base + 0x30
+        ));
+        list.deferred().copies.clear();
+        // SAFETY: `chunk_ptr` maps `SCRATCH_FIRST` bytes of the shared chunk.
+        let chunk_slice = unsafe { std::slice::from_raw_parts_mut(chunk_ptr, 1024) };
+        chunk_slice.fill(0xa5);
+        chunk_slice[256..256 + 0x20].copy_from_slice(&cpu_title[0x30..0x50]);
+
+        // Simulated Shadow buffer written by an earlier GPU pass, then read at
+        // +0x10 (level 0) and +0x50 (level 1, after an intra-buffer GPU copy)
+        // into the same shared_scratch chunk.
+        let (uav_buf, uav_data) = host.shared_buffer(4096).unwrap();
+        // SAFETY: 4096-byte mapping.
+        let uav_bytes = unsafe { std::slice::from_raw_parts_mut(uav_data, 4096) };
+        for (i, b) in uav_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(3) ^ 0x11;
+        }
+        let writer = host.new_list().unwrap();
+        let (patch, patch_data) = host.upload_buffer(256).unwrap();
+        for i in 0..0x20usize {
+            // SAFETY: inside 256-byte mapping.
+            unsafe {
+                patch_data.add(i).write(0x80 + i as u8);
+                patch_data.add(0x40 + i).write(0xc0 + i as u8);
+            }
+        }
+        // SAFETY: open list, live buffers.
+        unsafe {
+            writer.list.CopyBufferRegion(&uav_buf, 0x10, &patch, 0, 0x20);
+            writer.list.CopyBufferRegion(&uav_buf, 0x200, &patch, 0x40, 0x20);
+            writer
+                .list
+                .ResourceBarrier(&[transition(&uav_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+        writer.close();
+
+        let own = host.own_list().unwrap();
+        // Level 0: fill slot 0 (`+0`) from `+0x10`, and copy `+0x200 -> +0x50` in `uav_buf`.
+        record(
+            true,
+            &own.list.list,
+            &own.between,
+            &[(&uav_buf, 0x10, 0, 0x20), (&uav_buf, 0x200, 256, 0x20)],
+            &[(&chunk0, 0, 0, 0x20), (&uav_buf, 0x50, 256, 0x20)],
+        );
+        // Level 1: fill slot 2 (`+512`) in the SAME shared_scratch chunk from `+0x50`.
+        record(false, &own.list.list, &own.between, &[(&uav_buf, 0x50, 512, 0x20)], &[(&chunk1, 512, 512, 0x20)]);
+        own.list.close();
+
+        let (out_buf, out_data) = host.shared_buffer(256).unwrap();
+        // SAFETY: open list, live root signature, PSO, and 256B-aligned buffers.
+        unsafe {
+            std::ptr::write_bytes(out_data, 0, 256);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootConstantBufferView(0, gpu0);
+            list.list.SetComputeRootConstantBufferView(1, gpu_cpu);
+            list.list.SetComputeRootConstantBufferView(2, gpu1);
+            list.list.SetComputeRootUnorderedAccessView(3, out_buf.GetGPUVirtualAddress());
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&writer, &own.list, &list]);
+        assert_eq!(host.log_messages(), None);
+
+        // SAFETY: GPU execution finished (`host.execute` waits).
+        let got = unsafe { std::slice::from_raw_parts(out_data.cast_const(), 96) };
+        let want0: Vec<u8> = (0..0x20u8).map(|i| 0x80 + i).collect();
+        let want_cpu: Vec<u8> = (0..0x20u8).map(|i| 0x40 + i).collect();
+        let want1: Vec<u8> = (0..0x20u8).map(|i| 0xc0 + i).collect();
+        assert_eq!(&got[0..32], &want0[..], "b0 from +0x10");
+        assert_eq!(&got[32..64], &want_cpu[..], "b1 CPU-filled slot in same chunk");
+        assert_eq!(&got[64..96], &want1[..], "b2 from +0x50 at level 1");
+        assert!(chunk_slice[0x20..256].iter().all(|&x| x == 0xa5), "padding after slot 0 clobbered");
+        assert!(chunk_slice[256 + 0x20..512].iter().all(|&x| x == 0xa5), "padding after CPU slot clobbered");
+        assert!(chunk_slice[512 + 0x20..768].iter().all(|&x| x == 0xa5), "padding after slot 2 clobbered");
+
+        // Pooling & oversized allocation checks on `shared_scratch`.
+        let raw_chunk = chunk0.as_raw();
+        drop((chunk0, chunk_cpu, chunk1));
+        POOL.lock().unwrap().push(own);
+        list.reset();
+        let list2 = host.new_list().unwrap();
+        let _ = list2.fill_scratch_shared((src0 as usize, 0x20), src0, 0x20).unwrap();
+        let reused_raw = list2.shared_scratch.lock().unwrap().chunks[0].0.buffer.as_raw();
+        assert_eq!(reused_raw, raw_chunk, "SPARE_SHARED must recycle reset shared_scratch chunks");
+        let (big_buf, big_at, _) = list2.scratch_from(&list2.shared_scratch, SCRATCH_CHUNK + 256).unwrap();
+        assert_eq!(big_at, 0);
+        // SAFETY: live oversized buffer.
+        assert_eq!(unsafe { big_buf.GetGPUVirtualAddress() } % 256, 0);
+        list2.close();
+        list2.reset();
+        trim_spare_chunks();
+    }
+
+    /// End-to-end submission benchmark & verification on the host GPU: compares
+    /// `VICTORY_SCRATCH_SHARED=1` (`card_steps` zero-wait GPU handoff) against
+    /// `VICTORY_SCRATCH_SHARED=0` (upload `scratch`, forcing a flight settle)
+    /// under `VICTORY_RELAY=2 VICTORY_CARD_STEPS=2`.
+    #[test]
+    fn shared_scratch_eliminates_flight_settle_end_to_end() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const ENV_MODE: &str = "VICTORY_SCRATCH_E2E_CHILD";
+        let Ok(mode) = std::env::var(ENV_MODE) else {
+            let Some(_) = host() else {
+                return;
+            };
+            let exe = std::env::current_exe().unwrap();
+            for (mode, shared) in [("upload", "0"), ("shared", "1")] {
+                let out = std::process::Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "host::card_steps::tests::shared_scratch_eliminates_flight_settle_end_to_end",
+                        "--nocapture",
+                    ])
+                    .env(ENV_MODE, mode)
+                    .env("VICTORY_RELAY", "2")
+                    .env("VICTORY_CARD_STEPS", "2")
+                    .env("VICTORY_SCRATCH_SHARED", shared)
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                eprint!("{stderr}");
+                assert!(out.status.success(), "child ({mode}) failed:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            }
+            return;
+        };
+
+        let Some(host) = host() else {
+            return;
+        };
+        assert!(relay_exact() && stage() == 2);
+        let shared_on = mode == "shared";
+        assert_eq!(scratch_shared(), shared_on);
+
+        const LEN: usize = 4 << 20;
+        const HALF: usize = LEN / 2;
+        const ROUNDS: usize = 8;
+        let (title, start) = {
+            // SAFETY: private test allocation, kept for child process lifetime.
+            let base = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE) }.cast::<u8>();
+            assert!(!base.is_null());
+            // SAFETY: `LEN` committed bytes.
+            (unsafe { std::slice::from_raw_parts_mut(base, LEN) }, base as usize)
+        };
+        crate::shadow::register(0x3333, start as u64, HALF as u64);
+        crate::shadow::register(0x4444, (start + HALF) as u64, HALF as u64);
+        let uav_shadow = crate::shadow::find(start as u64, 64).unwrap();
+        let (root, pso) = root_cbv_pipeline(host);
+        let (slow_from, slow_to) = (host.uav_buffer(64 << 20).unwrap(), host.uav_buffer(64 << 20).unwrap());
+
+        let fills_before = DONE[0].load(Ordering::Relaxed);
+        let refused_before = DONE[3].load(Ordering::Relaxed);
+        let read_wait_before = LATE_WAITED[WHY_READ].load(Ordering::Relaxed);
+        let mut submit_us = Vec::with_capacity(ROUNDS);
+        let mut kept = Vec::new();
+
+        for round in 0..ROUNDS {
+            for i in 0..0x100usize {
+                title[i] = (round * 17 + i * 5 + 3) as u8;
+            }
+            let (patch, patch_data) = host.upload_buffer(256).unwrap();
+            for i in 0..0x10usize {
+                // SAFETY: within 256-byte upload buffer.
+                unsafe {
+                    patch_data.add(i).write(0xa0 ^ (round * 29 + i) as u8);
+                    patch_data.add(0x40 + i).write(0xd0 ^ (round * 37 + i) as u8);
+                }
+            }
+            let flight = host.new_list().unwrap();
+            uav_shadow.refresh(&flight, start as u64, HALF as u64);
+            uav_shadow.gpu_writes(&flight, start as u64, HALF as u64);
+            // SAFETY: open list, live buffers.
+            unsafe {
+                for _ in 0..24 {
+                    flight.list.CopyBufferRegion(&slow_to, 0, &slow_from, 0, 64 << 20);
+                }
+                flight.list.CopyBufferRegion(&uav_shadow.buffer, 0x18, &patch, 0, 0x10);
+                flight.list.CopyBufferRegion(&uav_shadow.buffer, 0x50, &patch, 0x40, 0x10);
+                flight.list.ResourceBarrier(&[transition(
+                    &uav_shadow.buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            flight.keep(&patch);
+            flight.close();
+            host.execute_own(&flight);
+
+            // While `flight` is executing on the GPU, update the separate CPU
+            // buffer and submit a compute pass binding two UAV-overlapping
+            // unaligned Root CBVs (`+0x10`, `+0x50`) plus one CPU-filled slot.
+            for i in 0..0x20usize {
+                title[HALF + 0x30 + i] = 0x60 ^ (round * 11 + i) as u8;
+            }
+            let (out_buf, out_data) = host.shared_buffer(256).unwrap();
+            let pass = host.new_list().unwrap();
+            let gpu0 = pass.fill_scratch((start + 0x10) as *const u8, 0x20).unwrap();
+            let gpu_cpu = pass.fill_scratch((start + HALF + 0x30) as *const u8, 0x20).unwrap();
+            let gpu1 = pass.fill_scratch((start + 0x50) as *const u8, 0x20).unwrap();
+            // SAFETY: open list, live buffers and pipeline.
+            unsafe {
+                std::ptr::write_bytes(out_data, 0, 256);
+                pass.list.SetComputeRootSignature(&root);
+                pass.list.SetPipelineState(&pso);
+                pass.list.SetComputeRootConstantBufferView(0, gpu0);
+                pass.list.SetComputeRootConstantBufferView(1, gpu_cpu);
+                pass.list.SetComputeRootConstantBufferView(2, gpu1);
+                pass.list.SetComputeRootUnorderedAccessView(3, out_buf.GetGPUVirtualAddress());
+                pass.list.Dispatch(1, 1, 1);
+            }
+            pass.keep(&out_buf);
+            pass.close();
+
+            let t0 = std::time::Instant::now();
+            let num = host.execute_own(&pass);
+            submit_us.push(t0.elapsed().as_micros() as u64);
+
+            settle_now(WHY_SYNC);
+            assert!(FINISHED.load(Ordering::Acquire) >= num);
+            // SAFETY: flight and pass have landed.
+            let got = unsafe { std::slice::from_raw_parts(out_data.cast_const(), 96) };
+            let want0: Vec<u8> = (0..0x20usize)
+                .map(|i| {
+                    if (0x08..0x18).contains(&i) {
+                        0xa0 ^ (round * 29 + (i - 0x08)) as u8
+                    } else {
+                        (round * 17 + (0x10 + i) * 5 + 3) as u8
+                    }
+                })
+                .collect();
+            let want_cpu: Vec<u8> = (0..0x20usize).map(|i| 0x60 ^ (round * 11 + i) as u8).collect();
+            let want1: Vec<u8> = (0..0x20usize)
+                .map(|i| {
+                    if i < 0x10 {
+                        0xd0 ^ (round * 37 + i) as u8
+                    } else {
+                        (round * 17 + (0x50 + i) * 5 + 3) as u8
+                    }
+                })
+                .collect();
+            assert_eq!(&got[0..32], &want0[..], "round {round} b0 (+0x10)");
+            assert_eq!(&got[32..64], &want_cpu[..], "round {round} b1 (CPU slot)");
+            assert_eq!(&got[64..96], &want1[..], "round {round} b2 (+0x50)");
+            kept.extend([flight, pass]);
+        }
+
+        assert_eq!(host.log_messages(), None);
+        let fills_done = DONE[0].load(Ordering::Relaxed) - fills_before;
+        let refused = DONE[3].load(Ordering::Relaxed) - refused_before;
+        let read_wait_us = LATE_WAITED[WHY_READ].load(Ordering::Relaxed) - read_wait_before;
+        submit_us.sort_unstable();
+        let median_us = submit_us[ROUNDS / 2];
+        let total_us: u64 = submit_us.iter().sum();
+        eprintln!(
+            "[RTX bench mode={mode}] rounds={ROUNDS} median_submit={median_us} us total_submit={total_us} us \
+             card_fills={fills_done} refused={refused} read_wait={read_wait_us} us samples_us={submit_us:?}"
+        );
+        if shared_on {
+            assert_eq!(refused, 0, "expected 0 refusals with VICTORY_SCRATCH_SHARED=1");
+            assert_eq!(fills_done, (ROUNDS * 2) as u64, "expected 2 GPU fills per round");
+            assert_eq!(read_wait_us, 0, "expected 0 us WHY_READ wait with VICTORY_SCRATCH_SHARED=1");
+        } else {
+            assert_eq!(refused, ROUNDS as u64, "expected 1 refusal per round with VICTORY_SCRATCH_SHARED=0");
+            assert_eq!(fills_done, 0);
+        }
     }
 }
