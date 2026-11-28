@@ -37,6 +37,9 @@ use super::{Host, HostList, transition};
 
 const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
+const SELECTION_MARKER: [u8; GLYPH.1 as usize] = [
+    0b10000, 0b11000, 0b11110, 0b11111, 0b11110, 0b11000, 0b10000,
+];
 const COLUMNS: u32 = 60;
 /// Lines of the box: a title, a help line, a blank, the settings shown, a
 /// blank, what the line picked does (`ABOUT`, else blank), a note and the
@@ -344,7 +347,9 @@ fn lit(lines: &[String], x: u32, y: u32) -> bool {
     let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
         return false;
     };
-    (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
+    // Only the leading `>` is a selection marker. The value brackets keep their normal glyphs.
+    let bitmap = if x < CELL.0 && c == b'>' { SELECTION_MARKER } else { glyph(c.to_ascii_uppercase()) };
+    (bitmap[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
 }
 
 fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
@@ -917,6 +922,17 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_marker_is_filled_without_changing_value_brackets() {
+        let lines = ["> >".to_owned(), "  >".to_owned()];
+        let center_y = RIM + GLYPH.1 / 2;
+        for x in 0..GLYPH.0 {
+            assert!(lit(&lines, RIM + x, center_y));
+            assert_eq!(lit(&lines, RIM + 2 * CELL.0 + x, center_y), x == GLYPH.0 - 1);
+            assert!(!lit(&lines, RIM + x, center_y + CELL.1));
+        }
+    }
 
     #[test]
     fn a_change_is_saved_at_once_however_the_game_was_started() {
