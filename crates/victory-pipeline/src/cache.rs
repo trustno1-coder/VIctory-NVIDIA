@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -13,11 +15,20 @@ pub struct CacheKey(blake3::Hash);
 
 impl CacheKey {
     pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+        Self::from_chunks(converter, &[input])
+    }
+
+    /// Like [`CacheKey::new`] but hashes a sequence of chunks in order
+    /// without concatenating them first. The result matches what `new`
+    /// would produce on the same bytes joined end-to-end.
+    pub fn from_chunks(converter: &dyn Converter, chunks: &[&[u8]]) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(converter.id().as_bytes());
         h.update(&[0]);
         h.update(&converter.version().to_le_bytes());
-        h.update(input);
+        for c in chunks {
+            h.update(c);
+        }
         CacheKey(h.finalize())
     }
 
@@ -27,9 +38,25 @@ impl CacheKey {
 }
 
 /// Content-addressed store under the user's cache directory.
+///
+/// Cheap to clone (reference-counted inside). Within one process,
+/// concurrent callers asking for the same key share one conversion: the
+/// first thread does the work, the rest wait and read the published file.
+/// Across processes two workers may still race; both outputs are
+/// byte-identical (the key covers converter + input), so the publish
+/// side treats a file already on disk as success rather than an error.
 #[derive(Debug, Clone)]
 pub struct Cache {
+    inner: Arc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
     root: PathBuf,
+    // Per-key work slot. Threads converting the same key take the same
+    // `Mutex` in turn: the first does the conversion, later arrivals see
+    // the published file on their second check and skip `convert`.
+    inflight: Mutex<HashMap<CacheKey, Arc<Mutex<()>>>>,
 }
 
 impl Cache {
@@ -38,37 +65,162 @@ impl Cache {
         let root = root.into();
         victory_core::ensure_outside_repo(&root)?;
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
-        Ok(Cache { root })
+        Ok(Cache {
+            inner: Arc::new(Inner {
+                root,
+                inflight: Mutex::new(HashMap::new()),
+            }),
+        })
     }
 
     pub fn path_for(&self, key: &CacheKey) -> PathBuf {
         let hex = key.to_hex();
-        self.root.join(&hex[..2]).join(&hex[2..])
+        self.inner.root.join(&hex[..2]).join(&hex[2..])
+    }
+
+    /// Path of a cached entry, if one is on disk. No conversion is run.
+    pub fn peek(&self, key: &CacheKey) -> Option<PathBuf> {
+        let path = self.path_for(key);
+        path.is_file().then_some(path)
     }
 
     /// Returns the cached output for `input`, converting it first if needed.
+    ///
+    /// Concurrent callers of this `Cache` with the same key share the
+    /// work: only one `Converter::convert` runs, and the rest wait and
+    /// read the published path.
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
+        self.get_or_convert_inner(converter, key, || converter.convert(input))
+    }
+
+    /// As [`get_or_convert`], but hashes a sequence of chunks in order
+    /// without concatenating them. On a hit nothing is allocated; on a
+    /// miss the chunks are concatenated exactly once before being handed
+    /// to `Converter::convert`.
+    ///
+    /// Useful when the cache input is naturally built from a fixed prefix
+    /// (a build fingerprint, settings) plus one large payload: concatenating
+    /// those on every call allocates and memcpys bytes that never need to
+    /// exist together in memory unless there is a cache miss.
+    pub fn get_or_convert_chunks(
+        &self,
+        converter: &dyn Converter,
+        chunks: &[&[u8]],
+    ) -> Result<PathBuf> {
+        let key = CacheKey::from_chunks(converter, chunks);
+        self.get_or_convert_inner(converter, key, || {
+            let total: usize = chunks.iter().map(|c| c.len()).sum();
+            let mut input = Vec::with_capacity(total);
+            for c in chunks {
+                input.extend_from_slice(c);
+            }
+            converter.convert(&input)
+        })
+    }
+
+    fn get_or_convert_inner(
+        &self,
+        converter: &dyn Converter,
+        key: CacheKey,
+        convert: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+    ) -> Result<PathBuf> {
         let path = self.path_for(&key);
         if path.is_file() {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
-        let output = converter
-            .convert(input)
-            .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
-        let dir = path.parent().expect("hashed path has a parent");
-        std::fs::create_dir_all(dir)?;
-        // Write-then-rename so readers never see partial output.
-        let (tmp, mut file) = tempfile_in(dir)?;
-        let written = file.write_all(&output);
-        drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
-            let _ = std::fs::remove_file(&tmp);
+
+        // Single-flight: one worker per key inside this process.
+        let slot = self.slot_for(key);
+        let _work = lock(&slot);
+
+        // Another thread may have published while we waited.
+        if path.is_file() {
+            drop(_work);
+            self.release_slot(&key, slot);
+            tracing::trace!(
+                converter = converter.id(),
+                key = %key.to_hex(),
+                "cache hit after wait",
+            );
+            return Ok(path);
         }
-        published?;
-        Ok(path)
+
+        let result = (|| -> Result<PathBuf> {
+            let output = convert().with_context(|| {
+                format!("converter {} v{}", converter.id(), converter.version())
+            })?;
+            let dir = path.parent().expect("hashed path has a parent");
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+            publish(&output, dir, &path)?;
+            tracing::trace!(
+                converter = converter.id(),
+                key = %key.to_hex(),
+                bytes = output.len(),
+                "cache miss: converted and published",
+            );
+            Ok(path.clone())
+        })();
+
+        drop(_work);
+        self.release_slot(&key, slot);
+        result
+    }
+
+    fn slot_for(&self, key: CacheKey) -> Arc<Mutex<()>> {
+        let mut guard = lock(&self.inner.inflight);
+        guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn release_slot(&self, key: &CacheKey, slot: Arc<Mutex<()>>) {
+        let mut guard = lock(&self.inner.inflight);
+        // Drop the caller's clone first, then only remove the entry when
+        // the map's Arc is the sole remaining one (no other waiter is
+        // about to take this slot).
+        drop(slot);
+        if let Some(slot) = guard.get(key)
+            && Arc::strong_count(slot) == 1
+        {
+            guard.remove(key);
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Writes `output` into `dir` under a temporary name and renames it over
+/// `path`. If the rename fails but `path` is already a file (a sibling
+/// process won the race with byte-identical content), it counts as success.
+fn publish(output: &[u8], dir: &Path, path: &Path) -> Result<()> {
+    let (tmp, mut file) =
+        tempfile_in(dir).with_context(|| format!("staging in {}", dir.display()))?;
+    let written = file.write_all(output);
+    drop(file);
+    let renamed = written.and_then(|()| std::fs::rename(&tmp, path));
+    match renamed {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            if path.is_file() {
+                // Another worker (another process, typically) published
+                // the same content first. The key is content-addressed,
+                // so by definition the bytes match.
+                tracing::trace!(
+                    path = %path.display(),
+                    "publish lost race; accepting peer's entry",
+                );
+                Ok(())
+            } else {
+                Err(e).with_context(|| format!("publishing {}", path.display()))
+            }
+        }
     }
 }
 
@@ -138,6 +290,71 @@ mod tests {
     }
 
     #[test]
+    fn chunks_hash_matches_concatenation_and_skips_concat_on_hit() {
+        use std::cell::Cell;
+
+        // A converter that records how many bytes its `convert` saw. Its
+        // key hash still matches whatever `CacheKey::new` produces on the
+        // concatenated bytes.
+        struct Recording {
+            seen: Cell<usize>,
+        }
+        // SAFETY: not actually sent between threads in this test.
+        unsafe impl Send for Recording {}
+        unsafe impl Sync for Recording {}
+        impl Converter for Recording {
+            fn id(&self) -> &'static str {
+                "test.recording"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                self.seen.set(input.len());
+                Ok(input.to_vec())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Recording { seen: Cell::new(0) };
+        let prefix: &[u8] = b"build-prefix";
+        let body: &[u8] = b"container-body-xyz";
+
+        // The chunked key matches the key of the joined bytes.
+        let joined: Vec<u8> = [prefix, body].concat();
+        assert_eq!(
+            CacheKey::from_chunks(&conv, &[prefix, body]),
+            CacheKey::new(&conv, &joined),
+        );
+
+        // First call misses: convert runs with the concatenated bytes.
+        let path = cache.get_or_convert_chunks(&conv, &[prefix, body]).unwrap();
+        assert_eq!(conv.seen.get(), prefix.len() + body.len());
+        assert_eq!(std::fs::read(&path).unwrap(), joined);
+
+        // Second call hits: convert is not called.
+        conv.seen.set(usize::MAX);
+        let again = cache.get_or_convert_chunks(&conv, &[prefix, body]).unwrap();
+        assert_eq!(path, again);
+        assert_eq!(conv.seen.get(), usize::MAX, "convert must not run on hit");
+    }
+
+    #[test]
+    fn peek_finds_only_entries_that_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let key = CacheKey::new(&conv, b"abc");
+        assert!(cache.peek(&key).is_none());
+        cache.get_or_convert(&conv, b"abc").unwrap();
+        assert_eq!(cache.peek(&key), Some(cache.path_for(&key)));
+    }
+
+    #[test]
     fn failed_publication_removes_the_staging_file() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
@@ -154,6 +371,97 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+    }
+
+    #[test]
+    fn concurrent_callers_share_one_conversion() {
+        use std::thread;
+        use std::time::Duration;
+
+        struct Slow {
+            runs: AtomicUsize,
+        }
+        impl Converter for Slow {
+            fn id(&self) -> &'static str {
+                "test.slow"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                // Sleep so later arrivals pile up on the slot behind us.
+                thread::sleep(Duration::from_millis(80));
+                self.runs.fetch_add(1, Ordering::Relaxed);
+                Ok(input.to_vec())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let slow = Arc::new(Slow {
+            runs: AtomicUsize::new(0),
+        });
+
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let cache = cache.clone();
+                let slow = Arc::clone(&slow);
+                thread::spawn(move || {
+                    // Stagger starts a hair so one arrives first.
+                    if i > 0 {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    cache.get_or_convert(&*slow, b"payload").unwrap()
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(slow.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn inflight_map_cleans_up_after_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        cache.get_or_convert(&conv, b"abc").unwrap();
+        assert!(lock(&cache.inner.inflight).is_empty());
+        // Error path too (a directory at the target makes publish fail).
+        let path = cache.path_for(&CacheKey::new(&conv, b"xyz"));
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(cache.get_or_convert(&conv, b"xyz").is_err());
+        assert!(lock(&cache.inner.inflight).is_empty());
+    }
+
+    #[test]
+    fn publish_accepts_a_prewritten_entry_when_rename_fails() {
+        // Make the rename fail (destination is a non-empty directory) and
+        // then satisfy the race-recovery path by dropping a plain file at
+        // the same path. The first call returns an error; the second,
+        // after cleanup + peer-publish, succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("x"), b"x").unwrap();
+        let err = publish(b"ABC", dir.path(), &blocked).unwrap_err();
+        assert!(format!("{err:#}").contains("publishing"));
+
+        // Peer publishes the same bytes first; our rename still fails
+        // (destination is still a dir) but path.is_file() stays false,
+        // so we expect an error. Replace the dir with a plain file to
+        // exercise the recovery branch.
+        std::fs::remove_dir_all(&blocked).unwrap();
+        std::fs::write(&blocked, b"ABC").unwrap();
+        // Hold a read handle open so a Windows rename-over would hit a
+        // sharing violation; on Linux the rename simply succeeds.
+        let _held = std::fs::OpenOptions::new().read(true).open(&blocked).unwrap();
+        publish(b"ABC", dir.path(), &blocked).unwrap();
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"ABC");
     }
 
     #[test]

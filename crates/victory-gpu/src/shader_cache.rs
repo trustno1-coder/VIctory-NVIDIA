@@ -159,6 +159,8 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
+        // On a miss the cache concatenates [build, container] back into
+        // `input` for us; the build prefix is always 32 bytes.
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
@@ -170,14 +172,15 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
+        // Chunks API: on a hit no concatenation happens, so a warm cache
+        // adds no per-shader allocation beyond reading the entry.
         let path = cache
-            .get_or_convert(&converter, &input)
+            .get_or_convert_chunks(&converter, &[&build[..], container])
             .map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {

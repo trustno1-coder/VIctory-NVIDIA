@@ -404,10 +404,16 @@ fn big_blocks() -> String {
 
 /// The system's allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
+///
+/// A plain release build uses the system allocator directly: before this
+/// gate it was still routed through `Counting`, so every allocation paid
+/// two atomics plus a small-block branch for stats nobody read.
+#[cfg(any(feature = "diagnostics", test))]
 struct Counting;
 
 // SAFETY: every call goes to the system's allocator unchanged; only
 // counters are kept beside it.
+#[cfg(any(feature = "diagnostics", test))]
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
@@ -449,6 +455,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 }
 
+#[cfg(any(feature = "diagnostics", test))]
 #[global_allocator]
 static HEAP: Counting = Counting;
 
