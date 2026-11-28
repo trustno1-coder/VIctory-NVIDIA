@@ -25,6 +25,11 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[path = "branch_state.rs"]
+mod branch_state;
+use branch_state::CompareJoins;
+pub(super) use branch_state::scalar_splits;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -1509,6 +1514,50 @@ thread_local! {
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_WAVE_WIDE=1`: a console wave run as two host waves may take branches wave-wide,
+/// with group barriers inside them. [`THREAD_WAVE_WIDE`] turns it on for one thread: tests,
+/// which must not change the environment that other tests read while they translate.
+pub(super) fn wave_wide_on() -> bool {
+    THREAD_WAVE_WIDE.get() || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+}
+
+/// Correct scalar/mask state in a single complete guest-wave group by default.
+/// All threads share its decision, so the existing group barriers are valid.
+/// Larger groups still need the explicit paired-wave policy; an explicit 0
+/// retains the upstream opt-out.
+pub(super) fn wave_state_wide_on(native: &NativeProgram) -> bool {
+    wave_wide_on()
+        || (std::env::var_os("VICTORY_WAVE_WIDE").is_none()
+            && native.wave64
+            && matches!(native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64))
+}
+
+thread_local! {
+    pub(super) static THREAD_WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// See [`with_per_lane_compare_joins`].
+    static PER_LANE_COMPARE_JOINS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with the joins [`CompareJoins::skipped`] finds lowered per lane, as before
+/// the console's zeros were followed there: the lanes that skipped a compare keep their old
+/// mask. For a program whose branches around such joins cannot be taken wave-wide, which
+/// otherwise would no longer translate.
+pub(super) fn with_per_lane_compare_joins<R>(translate: impl FnOnce() -> R) -> R {
+    let before = PER_LANE_COMPARE_JOINS.replace(true);
+    let result = translate();
+    PER_LANE_COMPARE_JOINS.set(before);
+    result
+}
+
+/// `VICTORY_SCALAR_SPLITS=0`: no branch is taken wave-wide for the scalars it writes
+/// ([`scalar_splits`]), in no caller of `widen`.
+pub(super) fn scalar_splits_on() -> bool {
+    std::env::var_os("VICTORY_SCALAR_SPLITS").is_none_or(|v| v != "0")
+}
+
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     // A scalar select uses the condition of the whole guest wave, even
     // when the preceding mask operation has no scalar-dword consumers.
@@ -1732,6 +1781,15 @@ impl<'a> Lower<'a> {
             s.flags |= flags::EARLY_DEPTH_STENCIL;
         }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+        // A group of at most 32 threads fits one host wave; first-lane reads alone
+        // do not require a fixed wave size there.
+        // Descriptor waterfall reads are deliberately lowered to each lane's
+        // own descriptor, so they need no wave layout or cross-half exchange.
+        let first_lane_crosses = |i: &Inst| {
+            i.name() == "v_readfirstlane_b32"
+                && matches!(x.native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 32)
+                && !i.writes.first().is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+        };
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
@@ -1765,6 +1823,8 @@ impl<'a> Lower<'a> {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
             s.title_lds_dwords = s.lds_dwords;
+            // A first-lane read also needs the guest wave: two host halves may have
+            // different first values even when no readlane or mask-as-data is present.
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -1775,6 +1835,7 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || first_lane_crosses(i)
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
@@ -1796,6 +1857,7 @@ impl<'a> Lower<'a> {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        || first_lane_crosses(i)
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
@@ -6748,7 +6810,8 @@ impl<'a> Lower<'a> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                // SCC is whether S0 was chosen (S0 < S1, S0 > S1), not D != 0.
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -8579,7 +8642,9 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        let mut guard = self.guard(b, i)?;
+        // Unlike ordinary VALU writes, WRITELANE writes its selected lane
+        // regardless of EXEC. scalar_splits keeps that lane in the host branch.
+        let mut guard = if name == "v_writelane_b32" { None } else { self.guard(b, i)? };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d)?;
             guard = match (guard, enable) {
@@ -9553,7 +9618,16 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let host_lane = self.mask_data == MaskData::Host && !matches!(lane, V::Const(_));
+                // The console reads lane S1[4:0] (wave32) or S1[5:0] (wave64): a select
+                // past the wave wraps.
+                let lane = if host_lane {
+                    lane
+                } else {
+                    let wm = self.s.m.i32(self.wave() - 1);
+                    self.s.m.bin(self.cur, Bin::And, lane, wm)
+                };
+                if host_lane {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
@@ -9616,6 +9690,9 @@ impl<'a> Lower<'a> {
                     return Err("a lane write in a half-wave");
                 }
                 let me = self.console_lane();
+                // The lane is S1[4:0] (wave32) or S1[5:0] (wave64), as for `v_readlane_b32`.
+                let wm = self.s.m.i32(self.wave() - 1);
+                let lane = self.s.m.bin(c, Bin::And, lane, wm);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -13490,12 +13567,34 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// Whether a join that reads a compare's mask past a per-lane branch
+    /// ([`CompareJoins::skipped`]) stops this lowering with [`LANE_MASK`], naming the region for
+    /// `emit`'s retry, which takes the branch wave-wide. Compute programs (console lanes), not
+    /// with each host wave on its own, not with `VICTORY_WAVE_WIDE=0` (no such retry) nor in
+    /// [`with_per_lane_compare_joins`]; a console wave run as two host waves only with
+    /// `VICTORY_WAVE_WIDE=1`, or a single complete guest-wave group where those
+    /// group barriers synchronize exactly the guest wave.
+    fn compare_zeros(&self) -> bool {
+        self.mask_data == MaskData::Console
+            && !LOCAL_WAVES.get()
+            && !LOCAL_ANY.get()
+            && !PER_LANE_COMPARE_JOINS.get()
+            && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0")
+            && (!(self.x.native.wave64 && host_max_wave() == 32) || wave_state_wide_on(self.x.native))
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // Lane-mask joins first (what an edge brings may ask for more joins,
         // of masks and of numbers): each edge's mask as the structure
         // tracked it, a constant or a scalar-built one included.
         let st = self.x.st;
+        // (where joins of a compare's mask follow the console)
+        let joins = if self.compare_zeros() {
+            CompareJoins::new(p, st)
+        } else {
+            None
+        };
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
@@ -13503,6 +13602,13 @@ impl<'a> Lower<'a> {
                 .phi_masks
                 .get(&phi.value)
                 .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
+            if let Some(joins) = &joins {
+                let around = joins.skipped(p, b, i, Some(args));
+                if !around.is_empty() {
+                    around.into_iter().for_each(need);
+                    return Err(unsupported(offset, LANE_MASK));
+                }
+            }
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -13528,6 +13634,22 @@ impl<'a> Lower<'a> {
         } else {
             Vec::new()
         };
+        // With branches taken wave-wide (`widen`, which a join of a compare's mask asks for):
+        // the joins of an SGPR that a read join of it is made of are read too, so that a mask
+        // joined twice (a compare in a nested branch, read as data after the outer join) is
+        // not that zero. Not in the per-lane form, which stays as it was; a wave-wide form this
+        // stops leaves `emit` with its other forms.
+        if joins.is_some() && !st.wide.is_empty() {
+            let sgpr = |v: &Value| {
+                let at = self.phi_at.get(v);
+                at.is_some_and(|&(b, i)| matches!(p.blocks[b].phis[i].reg, Reg::S(_)))
+            };
+            work.extend(self.read_phis.iter().copied().filter(sgpr));
+        }
+        // A mask read as data may reach the read through a loop-header and
+        // another uniform join. Its intermediate phi is live even without a
+        // lane-divergent region; otherwise it silently becomes zero.
+        work.extend(self.read_phis.iter().copied().filter(|v| st.masks.contains_key(v) || st.highs.contains_key(v)));
         while let Some(v) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
@@ -13538,9 +13660,35 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // (joins of SGPRs looked at for a compare's mask: none of them had one)
+        let mut checked = HashSet::new();
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            // A compare's mask read as data after a per-lane branch: through this join or
+            // through a join it is made of (which may be read only through this one).
+            if let Some(joins) = &joins
+                && matches!(phi.reg, Reg::S(_))
+                && self.read_phis.contains(&phi.value)
+            {
+                let (mut around, mut work) = (Vec::new(), vec![(b, i)]);
+                while let Some((jb, ji)) = work.pop() {
+                    if !checked.insert((jb, ji)) {
+                        continue;
+                    }
+                    for r in joins.skipped(p, jb, ji, None) {
+                        if !around.contains(&r) {
+                            around.push(r);
+                        }
+                    }
+                    let args = p.blocks[jb].phis[ji].args.iter();
+                    work.extend(args.filter_map(|a| self.phi_at.get(a).copied()));
+                }
+                if !around.is_empty() {
+                    around.into_iter().for_each(need);
+                    return Err(unsupported(p.blocks[b].offset, LANE_MASK));
+                }
+            }
             // A join of numbers with dead registers (`dead`): the paths that bring those
             // never read the result, so they bring zero. Not for a join that is itself a
             // lane mask (a ballot gives that one as data).

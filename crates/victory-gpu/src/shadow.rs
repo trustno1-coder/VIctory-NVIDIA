@@ -1705,7 +1705,7 @@ fn workers() -> &'static Workers {
                                 std::hint::spin_loop();
                             }
                             turns = turns.wrapping_add(1);
-                            if turns % 16 == 0 {
+                            if turns.is_multiple_of(16) {
                                 std::thread::yield_now();
                             }
                         }
@@ -3175,7 +3175,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// For the memory line: the windows let go since the start and their
 /// bytes, and of the bytes of the windows alive, how many lie between the
 /// lowest and the highest address ever asked for in each.
-#[cfg(feature = "diagnostics")]
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
         let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
@@ -3277,7 +3277,7 @@ pub(crate) fn let_go_idle() {
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
 /// buffers kept for reuse and the bytes they reserve.
-#[cfg(feature = "diagnostics")]
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
         let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());

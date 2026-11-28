@@ -128,8 +128,20 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
+/// For tests (the memory bench, `membench`): the free physical RAM that
+/// [`available_physical_ram`] and the pressure of [`crate::residency`] tell,
+/// plus one; 0 (the default): the system's. What is kept by free RAM
+/// (`ram_idle_ms`) is looked at with it.
+#[cfg(test)]
+pub(crate) static FREE_RAM_SAID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
 pub(crate) fn available_physical_ram() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(said) = FREE_RAM_SAID.load(Ordering::Relaxed).checked_sub(1) {
+        return Some(said);
+    }
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
@@ -429,6 +441,13 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// Pressure-only retirement of idle host lists and oversized fetch buffers.
+/// A process-wide opt-out for matched measurements and compatibility diagnosis.
+fn idle_reclaim() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_IDLE_RECLAIM").is_none_or(|v| v != "0"))
+}
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
@@ -454,6 +473,9 @@ fn sweep() {
     crate::book::check();
     crate::residency::refresh();
     if crate::residency::pressured() {
+        if idle_reclaim() {
+            crate::list::trim_idle(now);
+        }
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
@@ -2256,6 +2278,13 @@ fn scratch_pool() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Whether a list gives its scratch chunks back when its submission lands
+/// ([`HostList::release_scratch`]; on by default, `VICTORY_SCRATCH_AT_LANDING=0`: at its reset).
+fn scratch_at_landing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_AT_LANDING").is_none_or(|v| v != "0"))
+}
+
 /// Things of some sizes that nothing holds now, kept for whoever next asks
 /// for one of the same size.
 struct Spare<T> {
@@ -2389,6 +2418,30 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// [`give_chunks`] for a list whose submission has landed but which is reset only after the
+/// bury lag ([`HostList::release_scratch`]): the chunks the spare pool takes go there, and
+/// the others are handed back, to be freed at that reset as before (nothing is freed earlier
+/// than it was).
+fn spare_what_fits(chunks: Vec<(Chunk, u64)>) -> Vec<(Chunk, u64)> {
+    let mut kept = Vec::new();
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let limit = if keep_freed() && !crate::residency::limited_host_ram() {
+        SPARE_KEPT
+    } else {
+        SPARE_MOST
+    };
+    for (chunk, size) in chunks {
+        match spare.give(chunk, size, limit) {
+            None => {
+                ALIVE[3].fetch_add(1, Ordering::Relaxed);
+                ALIVE[4].fetch_add(size, Ordering::Relaxed);
+            }
+            Some(chunk) => kept.push((chunk, size)),
+        }
+    }
+    kept
+}
+
 /// Bytes of spare scratch chunks freed by the trim ([`allocator_trim`])
 /// since the start.
 pub(crate) static SPARE_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2433,6 +2486,8 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    /// Last time this capacity was needed, not merely read from.
+    fetched_large_at: u64,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -3914,6 +3969,8 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// Last time this capacity was needed, not merely read from.
+    buffer_large_at: u64,
     /// Pieces caught while a later flight was writing them.
     suspects: torn::Suspects,
     /// What earlier fetches brought of flights not landed yet.
@@ -4199,6 +4256,8 @@ mod card_steps;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod indirects;
 mod font;
+#[cfg(test)]
+mod membench;
 mod menu;
 mod panel;
 mod place;
@@ -4753,6 +4812,7 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                fetched_large_at: 0,
                 taken: 0,
                 out: 0,
             })
@@ -5105,9 +5165,43 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                buffer_large_at: 0,
                 suspects: torn::Suspects::default(),
                 had: crate::land::Had::default(),
             })
+        }
+    }
+
+    /// Reuse ordinary fetch capacity; release a peak only after two seconds
+    /// below that size and under memory pressure. Called between completed
+    /// fetch/merge operations, never while GPU or CPU users hold the mapping.
+    fn resize_fetch(
+        &self,
+        buffer: &mut Option<(ID3D12Resource, usize, u64)>,
+        large_at: &mut u64,
+        needed: u64,
+    ) {
+        let now = now_ms();
+        let capacity = buffer.as_ref().map_or(0, |b| b.2);
+        let wanted = needed.next_multiple_of(16 << 20);
+        let grow = needed > capacity;
+        if wanted >= capacity {
+            *large_at = now;
+        }
+        let shrink = idle_reclaim() && crate::residency::pressured()
+            && wanted < capacity && now.saturating_sub(*large_at) >= 2_000;
+        if grow || shrink {
+            if wanted == 0 {
+                *buffer = None;
+            } else {
+                let replacement = self.shared_buffer(wanted).map(|(b, p)| (b, p as usize, wanted));
+                // Failed shrinking leaves a usable old allocation. Failed growth
+                // keeps the existing caller's allocation-failure path.
+                if grow || replacement.is_some() {
+                    *buffer = replacement;
+                }
+            }
+            *large_at = now;
         }
     }
 
@@ -5223,6 +5317,13 @@ impl Host {
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.
         let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
+        if let Some(f) = fetch.as_mut() {
+            // The preceding fetch and its CPU readers finished on this same
+            // relay thread before this call; none refers to the old mapping now.
+            self.resize_fetch(&mut f.buffer, &mut f.buffer_large_at, total);
+            #[cfg(test)]
+            membench::RELAY_FETCH.store(f.buffer.as_ref().map_or(0, |b| b.2), Ordering::Relaxed);
+        }
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next
             // fetch, if that goes to the queue the sends went to.
@@ -5236,10 +5337,6 @@ impl Host {
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
         };
-        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
-        }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
@@ -5452,6 +5549,7 @@ impl Host {
                     }
                     for detached in &mut flight.lists {
                         detached.release_tables();
+                        detached.release_scratch();
                     }
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
@@ -5553,11 +5651,10 @@ impl Host {
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
         let mut written = vec![0usize; plan.ranges.len()];
+        // Serialized by CARD_WORK and the submission lock; the previous copy
+        // fence and CPU merge were waited for before returning.
+        self.resize_fetch(&mut work.fetched, &mut work.fetched_large_at, total);
         if !pieces.is_empty() {
-            if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
-                let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
-            }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
             };
@@ -5932,6 +6029,7 @@ impl Host {
                         }
                         for detached in &mut flight.lists {
                             detached.release_tables();
+                            detached.release_scratch();
                         }
                         landed.push((flight.lists, flight.order));
                     }
@@ -6929,6 +7027,22 @@ impl HostList {
         // SAFETY: our list, open; what went into it goes with the reset.
         let _ = unsafe { self.list.Close() };
         false
+    }
+
+    /// Its submission has landed: the card read its scratch chunks for the last time, so
+    /// the next lists may take them now ([`spare_what_fits`]) rather than at its reset,
+    /// after the bury lag (16 or 64 submissions, [`bury_lag`]; a list held its chunks all
+    /// that time, 130 MB for 42 landed lists in the memory bench at only 8 lists a frame).
+    /// Only with shared chunks ([`scratch_pool`]); `VICTORY_SCRATCH_AT_LANDING=0`: at the
+    /// reset, as before.
+    pub(crate) fn release_scratch(&self) {
+        if !scratch_pool() || !scratch_at_landing() {
+            return;
+        }
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        (scratch.current, scratch.used) = (0, 0);
+        let chunks = std::mem::take(&mut scratch.chunks);
+        scratch.chunks = spare_what_fits(chunks);
     }
 
     /// Its prelude to [`PRELUDES`] (or gone, past [`PRELUDES_KEPT`]). Only
