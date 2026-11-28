@@ -483,7 +483,12 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
         lines.push("NVIDIA DOES NOT SUPPORT IT: IF IT FAILS, REMOVE IT".into());
     } else if dlss_live {
         lines.push("FRAME GEN: DLSS, SUPPORTED HERE (F1 MENU: 2X-6X)".into());
-        lines.push("MORE THAN 2X NEEDS AN RTX 50 CARD".into());
+        // FORCE 3X ON RTX 40 (F1): MFG Unlocker answers for the card past 2x.
+        if std::env::var_os("VICTORY_MFG_UNLOCKER_DLL").is_some_and(|v| !v.is_empty()) {
+            lines.push("MORE THAN 2X: UNLOCKED BY MFG UNLOCKER (A MOD)".into());
+        } else {
+            lines.push("MORE THAN 2X NEEDS AN RTX 50 CARD".into());
+        }
     } else if fsr_live {
         lines.push(if no_dlss_fg {
             "USING AMD FSR 3 FRAME GEN INSTEAD: 2X AT MOST".into()

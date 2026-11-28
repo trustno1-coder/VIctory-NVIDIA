@@ -90,6 +90,14 @@ fn shown_name(name: &str) -> String {
 
 /// The setting that turns MFG Unlocker on, and what is said of it while it is picked.
 const MFG: &str = "VICTORY_MFG_UNLOCKER";
+/// The setting that forces 3x DLSS frame generation on an RTX 40 card through MFG Unlocker, and
+/// what is said of it while it is picked.
+const FORCE_MFG: &str = "VICTORY_FORCE_MFG_RTX40";
+const ABOUT_FORCE_MFG: [&str; 3] = [
+    "RTX 40: 3X DLSS FRAME GEN THROUGH MFG UNLOCKER (A MOD).",
+    "NO FLIP METERING ON RTX 40: PACING IS LESS EVEN THAN 2X.",
+    "IF THE CARD GIVES FEWER, 2X STAYS. APPLIES AT NEXT START.",
+];
 const ABOUT_MFG: [&str; 3] = [
     "A MOD, NOT OURS: DLSS FRAME GEN ON RTX 20 AND 30 CARDS.",
     "ON: DOWNLOADED FROM ITS GITHUB AT THE NEXT START, THEN RUN.",
@@ -154,6 +162,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MENU_FG_TYPE", label: "FRAME GEN TYPE", values: &[("auto", "AUTO"), ("dlss", "DLSS"), ("fsr", "FSR 3 (OLDER CARDS)")], live: false },
     // Someone else's mod (apps\victory\src\play.rs): downloaded at the next start, then loaded.
     Item { var: MFG, label: "MFG UNLOCKER (MOD, RTX 20/30)", values: UNSET_ON, live: false },
+    Item { var: FORCE_MFG, label: "FORCE 3X ON RTX 40 (MOD)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
     Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
@@ -563,6 +572,8 @@ impl Menu {
             ABOUT_MFG
         } else if ITEMS.get(self.at).is_some_and(|i| i.var == S_RES) {
             ABOUT_S_RES
+        } else if ITEMS.get(self.at).is_some_and(|i| i.var == FORCE_MFG) {
+            ABOUT_FORCE_MFG
         } else if ITEMS.get(self.at).is_some_and(|i| i.var == DLSS)
             && !matches!(self.values[self.at].as_str(), "" | "off")
             && std::env::var_os("VICTORY_STREAMLINE_DIR").is_none()
@@ -1097,6 +1108,8 @@ mod tests {
                     assert_eq!(about, ABOUT_MFG);
                 } else if at < ITEMS.len() && ITEMS[at].var == S_RES {
                     assert_eq!(about, ABOUT_S_RES);
+                } else if at < ITEMS.len() && ITEMS[at].var == FORCE_MFG {
+                    assert_eq!(about, ABOUT_FORCE_MFG);
                 } else {
                     assert!(about.iter().all(String::is_empty), "{about:?}");
                 }
@@ -1112,6 +1125,7 @@ mod tests {
             assert!(line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
         }
         assert!(ABOUT_MFG.iter().all(|l| l.len() <= COLUMNS as usize));
+        assert!(ABOUT_FORCE_MFG.iter().all(|l| l.len() <= COLUMNS as usize && l.bytes().all(|c| glyph(c) != glyph(b'#'))));
         for line in ABOUT_NO_DLSS {
             assert!(line.len() <= COLUMNS as usize && line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
         }

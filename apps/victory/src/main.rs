@@ -526,6 +526,12 @@ fn main() -> Result<()> {
             title_args,
         } => {
             victory_hle::runtime::set_title_args(title_args);
+            // MFG Unlocker named by the script launcher (`play-foxhound.ps1 -ForceMfg` sets
+            // VICTORY_MFG_UNLOCKER_DLL), loaded as `play` loads it: before the device and Streamline.
+            #[cfg(windows)]
+            if execute {
+                play::load_mfg();
+            }
             run::run(&exe, unimplemented, strict, execute, console)
         }
         #[cfg(all(windows, feature = "diagnostics"))]

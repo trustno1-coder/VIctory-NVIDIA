@@ -6,6 +6,7 @@
 #   .\scripts\play-foxhound.ps1 -Exe ... -Dlss balanced -FrameGen
 #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)
 #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
+#   .\scripts\play-foxhound.ps1 -Exe ... -FrameGen -ForceMfg   3x DLSS frame generation on an RTX 40 through MFG Unlocker (a mod)
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
 #
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
@@ -41,6 +42,7 @@ param(
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
     [ValidateRange(1, 1000)][int]$Fps = 1000,
+    [switch]$ForceMfg,
     # Every shader and the loading pipelines made first (`victory preload`), then the game; the F1 menu's
     # PRELOAD SHADERS starts this again with it.
     [switch]$Preload,
@@ -70,6 +72,11 @@ if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
     if ($menu['VICTORY_MENU_FRAMEGEN'] -match '^[2-6]$') { $timesWanted = [int]$menu['VICTORY_MENU_FRAMEGEN'] }
 }
 if ($menu['VICTORY_MENU_FG_TYPE'] -in 'auto', 'dlss', 'fsr') { $FgType = $menu['VICTORY_MENU_FG_TYPE'] }
+# F1's FORCE 3X ON RTX 40: MFG Unlocker (github.com/dashdogy/MFG-Unlocker, someone else's MIT mod, fetched and
+# checked by scripts\get-mfg-unlocker.ps1) loaded by victory.exe, and 3x where frame generation is on at 2x. The
+# layer keeps 2x if the card still reports one generated frame at most.
+if ($menu.Contains('VICTORY_FORCE_MFG_RTX40')) { $ForceMfg = $menu['VICTORY_FORCE_MFG_RTX40'] -eq '1' }
+if ($ForceMfg -and $timesWanted -eq 2) { $timesWanted = 3 }
 if ($menu['VICTORY_MENU_FPS'] -match '^\d+$' -and [int]$menu['VICTORY_MENU_FPS'] -ge 1 -and [int]$menu['VICTORY_MENU_FPS'] -le 1000) { $fpsWanted = [int]$menu['VICTORY_MENU_FPS'] }
 $settings = @{
     # Submission and copy machinery
@@ -150,6 +157,16 @@ $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 $settings.VICTORY_MENU_CONSOLE = $console
 $settings.VICTORY_MENU_RES = $Res
 $settings.VICTORY_MENU_DLSS = if ($settings.VICTORY_DLSS -eq '1') { $Dlss } else { 'off' }
+if ($ForceMfg -and $settings.VICTORY_DLSS -eq '1') {
+    $mfgDir = Join-Path $env:LOCALAPPDATA 'victory\mfg-unlocker'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'get-mfg-unlocker.ps1') -To $mfgDir
+    $mfgDll = Join-Path $mfgDir 'MFGUnlocker.dll'
+    if (Test-Path -LiteralPath $mfgDll) {
+        $settings.VICTORY_MFG_UNLOCKER = '1'; $settings.VICTORY_MFG_UNLOCKER_DLL = $mfgDll; $settings.VICTORY_FORCE_MFG_RTX40 = '1'
+    } else {
+        Write-Warning 'MFG Unlocker did not arrive: frame generation stays at what the card gives (2x on RTX 40).'
+    }
+}
 $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1' -or $settings.VICTORY_FSR_FRAMEGEN -eq '1') { [string]$settings.VICTORY_FRAMEGEN_X } else { '0' }
 $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
