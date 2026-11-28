@@ -1992,11 +1992,18 @@ fn targets_seen(last: u64, since: u64, targets: u64, now: u64) -> (u64, u64) {
 }
 
 /// What [`targets_room_kept`] keeps of `most`: what the targets do not
-/// hold yet, or nothing once they hold half of it or more and have not
-/// grown for `settle` ms (`still_ms`; `settle` 0: always kept).
+/// hold yet, or nothing once they hold half of it, or 1 GiB, or more and
+/// have not grown for `settle` ms (`still_ms`; `settle` 0: always kept).
+///
+/// (Half alone was never reached on the Series S profile: its world's
+/// targets level off at about 1,420 MB, under half of 3,072, so 1,650 MB
+/// stayed kept for the whole run while 2,000 textures waited "no room"
+/// (RTX 3070 Ti, 2026-11-28, five minutes in the world). Before the world
+/// they are some 650 MB, under either.)
 #[cfg(any(windows, test))]
 fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
-    if settle > 0 && targets >= most / 2 && still_ms >= settle {
+    const ENOUGH: u64 = 1 << 30;
+    if settle > 0 && targets >= (most / 2).min(ENOUGH) && still_ms >= settle {
         0
     } else {
         most.saturating_sub(targets)
@@ -5251,6 +5258,11 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(targets_kept(most, 2432 * MIB, 20_000, 20_000), 0);
         // `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS=0`: kept as before.
         assert_eq!(targets_kept(most, 2432 * MIB, 600_000, 0), 640 * MIB);
+        // Series S: its world's targets level off at 1,420 MB, under half
+        // the most, and still settle (1 GiB is enough); a menu's do not.
+        assert_eq!(targets_kept(most, 1420 * MIB, 20_000, 20_000), 0);
+        assert_eq!(targets_kept(most, 1420 * MIB, 5_000, 20_000), 1652 * MIB);
+        assert_eq!(targets_kept(most, 652 * MIB, 600_000, 20_000), 2420 * MIB);
 
         // The most kept: 3,072 MiB on big cards, three tenths of an 8 GB
         // card's budget, and what the switch says whatever the card.
