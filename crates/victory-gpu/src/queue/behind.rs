@@ -269,14 +269,27 @@ impl<W: Work> Lane<W> {
             let (asked, limit) = {
                 let mut state = self.lock();
                 while state.asked == state.served {
+                    // What it stands idle for ([`STOOD`]): nothing in the
+                    // line, lists in it not translated yet, or waits.
+                    let began = Instant::now();
+                    let untranslated = |e: &Entry<W>| e.what.folded() && e.what.ask().is_some_and(|ask| !W::met(&ask));
+                    let why = if state.items.is_empty() {
+                        0
+                    } else if state.items.iter().any(untranslated) {
+                        1
+                    } else {
+                        2
+                    };
                     if state.items.is_empty() {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                        STOOD[why].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                     } else {
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
+                        STOOD[why].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                         if out.timed_out() {
                             break;
                         }
@@ -707,6 +720,12 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// not met at a present; parts joined; what our thread spent taking the
 /// lists of submissions whose translation was done out of the line.
 static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+/// Since the last frame-rate line, microseconds our thread stood with
+/// nothing free to run: with nothing in the line (the title had not
+/// submitted), with a submission in it whose lists were not all translated
+/// (`crate::list::thin`), and at waits alone. In every build: two clock reads
+/// a wait. Not in `BUSY`: the frame's time less `BUSY` is these three.
+static STOOD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -963,6 +982,15 @@ pub(super) fn line(frames: f64) {
         s[DRAINS] / frames,
         s[FORCED] / frames,
         s[JOINED] / frames
+    );
+    let stood = STOOD.each_ref().map(|s| s.swap(0, Relaxed) as f64 / 1000.0 / frames);
+    tracing::info!(
+        "the thread that prepares submissions stood with nothing free to run, per frame: {:.1} ms with nothing in the line \
+         (the title had not submitted), {:.1} ms with lists in the line that were not translated yet (VICTORY_THIN), \
+         {:.1} ms at waits alone",
+        stood[0],
+        stood[1],
+        stood[2]
     );
 }
 
