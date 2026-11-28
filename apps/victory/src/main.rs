@@ -273,7 +273,9 @@ enum Command {
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
     /// driver's cache on disk has them before a run needs one: once per change
-    /// of the translator or the driver. Goes on where it was stopped.
+    /// of the translator or the driver. Goes on where it was stopped. One that
+    /// ended a process is left out (`warm-bad.txt`) until the translator, the
+    /// driver or the card changes; `VICTORY_WARM_BAD=0` tries those again too.
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
@@ -282,7 +284,7 @@ enum Command {
         /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
-        /// Those made before too.
+        /// Those made before too, and those that ended a process.
         #[arg(long)]
         again: bool,
         /// Only the pipelines earlier runs drew with.
