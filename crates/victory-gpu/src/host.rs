@@ -9795,6 +9795,7 @@ impl Meter {
         late_line(frames);
         crate::queue::behind_line(frames);
         crate::streamline::line(frames);
+        crate::resource::slot_evict_line();
         card_clock_line(frames, ms);
         two_queues::line(frames);
         #[cfg(feature = "diagnostics")]
