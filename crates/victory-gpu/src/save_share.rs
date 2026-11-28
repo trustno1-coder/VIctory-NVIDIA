@@ -282,8 +282,11 @@ fn place(name: &str) -> io::Result<Option<PathBuf>> {
     if parts.iter().any(|p| is_settings(p)) {
         return Ok(None);
     }
-    match parts.iter().take(2).position(|p| PARTS.iter().any(|k| p.eq_ignore_ascii_case(k))) {
-        Some(at) => Ok(Some(parts[at..].iter().collect::<PathBuf>())),
+    // The part as [`PARTS`] names it: a zip's `Saves` was found here, but [`unzip`] looks
+    // for the import's `saves` by its exact name and refused it ("no save in that zip").
+    let part = parts.iter().take(2).enumerate().find_map(|(at, p)| PARTS.iter().find(|k| p.eq_ignore_ascii_case(k)).map(|k| (at, *k)));
+    match part {
+        Some((at, part)) => Ok(Some(std::iter::once(part).chain(parts[at + 1..].iter().copied()).collect::<PathBuf>())),
         None => Ok(inside_saves(&parts)),
     }
 }
@@ -584,6 +587,34 @@ mod tests {
         std::fs::write(share.join("not a zip.zip"), b"hello").unwrap();
         assert!(stage(&data, &share, "not a zip.zip").is_err());
         assert!(!staged(&data));
+        for f in [data, share] {
+            let _ = std::fs::remove_dir_all(f);
+        }
+    }
+
+    /// A zip whose parts are named in other letters (`Saves`, `STORAGE`, as a player may
+    /// name the folders they zip) imports, into the parts as the game names them.
+    #[test]
+    fn a_zip_with_its_parts_named_in_capitals_imports() {
+        let (data, share) = (folder("capitals"), folder("share-capitals"));
+        let slot = SLOT.strip_prefix("saves/").unwrap();
+        let zipped = zip::write(
+            &[
+                (format!("my save/Saves/{slot}"), b"progress".to_vec()),
+                ("my save/STORAGE/settings/a".to_owned(), b"storage".to_vec()),
+            ],
+            (0, 0),
+        )
+        .unwrap();
+        std::fs::write(share.join("capitals.zip"), zipped).unwrap();
+        stage(&data, &share, "capitals.zip").unwrap();
+        assert!(staged(&data));
+        apply(&data, &share, "t").unwrap();
+        assert_eq!(read(&data.join(SLOT)), "progress");
+        assert_eq!(read(&data.join("storage/settings/a")), "storage");
+        let names: Vec<String> = std::fs::read_dir(&data).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.contains(&"saves".to_owned()) && names.contains(&"storage".to_owned()), "{names:?}");
+        assert_eq!(place("Saves/a").unwrap(), Some(PathBuf::from("saves/a")));
         for f in [data, share] {
             let _ = std::fs::remove_dir_all(f);
         }
