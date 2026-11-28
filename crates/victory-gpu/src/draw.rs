@@ -515,8 +515,13 @@ pub(crate) struct State {
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    /// Smallest effective `(width, height)` across the bound render target and
+    /// depth views (`None` when none is bound), for clamping host scissors.
+    target_bounds: Option<(i32, i32)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
+    /// Scissor rectangles last sent to the host list.
+    host_scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
@@ -1488,16 +1493,17 @@ impl State {
         self.depth_state = DEPTH_WRITE;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
+            let desc = record.depth_desc();
             self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            self.depth_state = depth_state(texture, desc.as_ref());
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some((texture, record))
+            Some((texture, record.key(), desc))
         });
-        let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
+        let now = (keys, dsv.as_ref().map(|&(texture, key, _)| (texture.as_raw() as usize, key)));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
             && self.host_targets.as_ref() == Some(&now)
@@ -1505,8 +1511,27 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
+        let mut bounds: Option<(i32, i32)> = None;
+        let mut fold_bounds = |(w, h): (i32, i32)| {
+            bounds = Some(match bounds {
+                Some((bw, bh)) => (bw.min(w), bh.min(h)),
+                None => (w, h),
+            });
+        };
+        for &(texture, ref desc) in &views {
+            if let Some(t) = texture
+                && let Some(b) = rtv_bounds(t, desc.as_ref())
+            {
+                fold_bounds(b);
+            }
+        }
+        if let Some((texture, _, desc)) = &dsv {
+            fold_bounds(dsv_bounds(texture, desc.as_ref()));
+        }
+        let bounds_changed = self.target_bounds != bounds;
+        self.target_bounds = bounds;
         let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
-        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        let dsv = dsv.map(|(texture, _, desc)| host.dsv(texture, desc.as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1516,6 +1541,9 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        if bounds_changed {
+            self.sync_scissors(list, false);
+        }
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -1533,20 +1561,37 @@ impl State {
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
-        if scissor_test() {
-            // The experiment: every rectangle the title sets is widened to
-            // the largest target there is, so nothing is cut by one. What
-            // the listing shows (`op_text`) stays the title's own.
-            let full = RECT {
-                left: 0,
-                top: 0,
-                right: 16384,
-                bottom: 16384,
-            };
-            crate::draw::scissors(list, &vec![full; rects.len()]);
+        if rects.is_empty() {
+            self.host_scissors.clear();
+            crate::draw::scissors(list, rects);
             return;
         }
-        crate::draw::scissors(list, rects);
+        self.sync_scissors(list, true);
+    }
+
+    /// Sends `self.scissors` to `list`, clamped to `self.target_bounds` when a
+    /// render target or depth buffer is bound so viewport/scissor render area
+    /// never exceeds the bound target (`D3D12_MESSAGE_ID_DRAW_POTENTIALLY_OUTSIDE_OF_VALID_RENDER_AREA`).
+    fn sync_scissors(&mut self, list: &HostList, force: bool) {
+        if self.scissors.is_empty() {
+            return;
+        }
+        let full = RECT {
+            left: 0,
+            top: 0,
+            right: 16384,
+            bottom: 16384,
+        };
+        let mut clamped: Few<RECT, 16> = Few::default();
+        for &r in &self.scissors {
+            let base = if scissor_test() { full } else { r };
+            clamped.push(clamp_scissor(base, self.target_bounds));
+        }
+        if force || self.host_scissors.as_slice() != &*clamped {
+            self.host_scissors.clear();
+            self.host_scissors.extend_from_slice(&clamped);
+            crate::draw::scissors(list, &clamped);
+        }
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
@@ -1585,6 +1630,8 @@ impl State {
             self.set_topology(list, self.topology);
         }
         self.host_targets = None;
+        self.target_bounds = None;
+        self.host_scissors.clear();
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
@@ -1592,9 +1639,8 @@ impl State {
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
         }
-        if !self.scissors.is_empty() {
-            let rects = std::mem::take(&mut self.scissors);
-            self.set_scissors(list, &rects);
+        if !self.scissors.is_empty() && self.host_scissors.is_empty() {
+            self.sync_scissors(list, true);
         }
         if let Some(factor) = self.blend {
             crate::draw::blend_factor(list, Some(&factor));
@@ -4329,15 +4375,16 @@ impl State {
 
     /// A mesh draw under `VICTORY_MESH_TEST=scissor` rasterises one pixel:
     /// the scissors before it (`on`), the title's after it.
-    fn mesh_scissor(&self, list: &HostList, on: bool) {
+    fn mesh_scissor(&mut self, list: &HostList, on: bool) {
         if mesh_test() != 2 {
             return;
         }
         if on {
-            let one = RECT { left: 0, top: 0, right: 1, bottom: 1 };
+            let one = clamp_scissor(RECT { left: 0, top: 0, right: 1, bottom: 1 }, self.target_bounds);
+            self.host_scissors.clear();
             crate::draw::scissors(list, &vec![one; self.scissors.len().max(1)]);
-        } else if !self.scissors.is_empty() {
-            crate::draw::scissors(list, &self.scissors);
+        } else {
+            self.sync_scissors(list, true);
         }
     }
 
@@ -5881,6 +5928,80 @@ const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
+/// Effective `(width, height)` of a bound render target view at its mip slice.
+fn rtv_bounds(texture: &ID3D12Resource, desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>) -> Option<(i32, i32)> {
+    // SAFETY: a live resource.
+    let r = unsafe { texture.GetDesc() };
+    if r.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        return None;
+    }
+    let mip = match desc {
+        // SAFETY: each arm reads the union variant matching `d.ViewDimension`.
+        Some(d) => unsafe {
+            match d.ViewDimension {
+                D3D12_RTV_DIMENSION_TEXTURE1D => d.Anonymous.Texture1D.MipSlice,
+                D3D12_RTV_DIMENSION_TEXTURE1DARRAY => d.Anonymous.Texture1DArray.MipSlice,
+                D3D12_RTV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.MipSlice,
+                D3D12_RTV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.MipSlice,
+                D3D12_RTV_DIMENSION_TEXTURE3D => d.Anonymous.Texture3D.MipSlice,
+                _ => 0,
+            }
+        },
+        None => 0,
+    };
+    let w = (r.Width >> mip).max(1).min(i32::MAX as u64) as i32;
+    let h = if r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D {
+        1
+    } else {
+        (r.Height >> mip).max(1).min(i32::MAX as u32) as i32
+    };
+    Some((w, h))
+}
+
+/// Effective `(width, height)` of a bound depth-stencil view at its mip slice.
+fn dsv_bounds(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>) -> (i32, i32) {
+    // SAFETY: a live resource.
+    let r = unsafe { texture.GetDesc() };
+    let mip = match desc {
+        // SAFETY: each arm reads the union variant matching `d.ViewDimension`.
+        Some(d) => unsafe {
+            match d.ViewDimension {
+                D3D12_DSV_DIMENSION_TEXTURE1D => d.Anonymous.Texture1D.MipSlice,
+                D3D12_DSV_DIMENSION_TEXTURE1DARRAY => d.Anonymous.Texture1DArray.MipSlice,
+                D3D12_DSV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.MipSlice,
+                D3D12_DSV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.MipSlice,
+                _ => 0,
+            }
+        },
+        None => 0,
+    };
+    let w = (r.Width >> mip).max(1).min(i32::MAX as u64) as i32;
+    let h = if r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D {
+        1
+    } else {
+        (r.Height >> mip).max(1).min(i32::MAX as u32) as i32
+    };
+    (w, h)
+}
+
+/// Clamps `rect` to `[0..width, 0..height]` when target bounds are present so
+/// the viewport/scissor render area never exceeds the smallest bound target.
+fn clamp_scissor(rect: RECT, bounds: Option<(i32, i32)>) -> RECT {
+    match bounds {
+        Some((w, h)) => {
+            let left = rect.left.clamp(0, w);
+            let top = rect.top.clamp(0, h);
+            RECT {
+                left,
+                top,
+                right: rect.right.clamp(left, w),
+                bottom: rect.bottom.clamp(top, h),
+            }
+        }
+        None => rect,
+    }
+}
+
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
@@ -6038,6 +6159,368 @@ mod tests {
         assert_eq!(got.len(), 1024);
         assert_eq!(got.first(), Some(&2999));
         assert!(bake_candidates(vec![0, 0], |_| true).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scissor_clamp_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::s;
+
+    #[test]
+    fn scissors_clamp_to_smallest_target_and_preserve_unbounded_draws() {
+        let full_1440p = RECT { left: 0, top: 0, right: 2560, bottom: 1440 };
+        assert_eq!(clamp_scissor(full_1440p, None), full_1440p);
+        assert_eq!(
+            clamp_scissor(full_1440p, Some((1706, 960))),
+            RECT { left: 0, top: 0, right: 1706, bottom: 960 }
+        );
+        let inside = RECT { left: 531, top: 0, right: 1200, bottom: 800 };
+        assert_eq!(clamp_scissor(inside, Some((1706, 960))), inside);
+        let straddling = RECT { left: 531, top: 0, right: 1789, bottom: 1337 };
+        assert_eq!(
+            clamp_scissor(straddling, Some((1706, 960))),
+            RECT { left: 531, top: 0, right: 1706, bottom: 960 }
+        );
+        let negative = RECT { left: -16, top: -8, right: 2560, bottom: 1440 };
+        assert_eq!(
+            clamp_scissor(negative, Some((1706, 960))),
+            RECT { left: 0, top: 0, right: 1706, bottom: 960 }
+        );
+        let outside = RECT { left: 1800, top: 1000, right: 2560, bottom: 1440 };
+        assert_eq!(
+            clamp_scissor(outside, Some((1706, 960))),
+            RECT { left: 1706, top: 960, right: 1706, bottom: 960 }
+        );
+    }
+
+    /// Reproduces the `#726` DLSS Quality scenario (`2560x1440` viewport and
+    /// scissor over a `1706x960` render target, switching targets in both
+    /// orders, mip-sliced RTVs, and `State::replay`) on the hardware GPU with
+    /// the D3D12 debug layer enabled when installed, asserting zero `id=1378`
+    /// (`DRAW_POTENTIALLY_OUTSIDE_OF_VALID_RENDER_AREA`) warnings or errors.
+    #[test]
+    fn oversized_2560x1440_viewport_and_scissor_on_1706x960_target_runs_cleanly() {
+        // SAFETY: optional debug-layer enablement before creating devices.
+        unsafe {
+            let mut dbg: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut dbg).is_ok()
+                && let Some(d) = &dbg
+            {
+                d.EnableDebugLayer();
+            }
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+
+        // 1. Verify `State` target/scissor tracking across all bind orders, mip slices, and `replay`.
+        let make_title_rt = |width: u64, height: u32, mips: u16| -> This {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: width,
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: mips,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            };
+            let mut out: This = std::ptr::null();
+            let hr = crate::resource::create_committed(
+                std::ptr::null(),
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0x4,
+                std::ptr::null(),
+                &crate::resource::PAGEABLE_IIDS[0],
+                &mut out,
+            );
+            assert_eq!(hr, crate::object::S_OK);
+            out
+        };
+        let rt_960 = make_title_rt(1706, 960, 1);
+        let rt_1440 = make_title_rt(2560, 1440, 1);
+        let rt_mipped = make_title_rt(2048, 2048, 4);
+        let mut rtv_slots = vec![[0u64; 16]; 3];
+        let h_960 = rtv_slots[0].as_mut_ptr() as u64;
+        let h_1440 = rtv_slots[1].as_mut_ptr() as u64;
+        let h_mip2 = rtv_slots[2].as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(std::ptr::null(), rt_960, std::ptr::null(), h_960);
+        crate::descriptor::create_rtv(std::ptr::null(), rt_1440, std::ptr::null(), h_1440);
+        // R8G8B8A8_UNORM (28), TEXTURE2D (4), MipSlice = 2 (512x512), PlaneSlice = 0
+        let mip2_desc = [28u32, 4, 2, 0, 0, 0];
+        crate::descriptor::create_rtv(std::ptr::null(), rt_mipped, &mip2_desc, h_mip2);
+
+        let vp_1440 = D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: 2560.0,
+            Height: 1440.0,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let sc_1440 = RECT { left: 0, top: 0, right: 2560, bottom: 1440 };
+        let sc_960 = RECT { left: 0, top: 0, right: 1706, bottom: 960 };
+
+        let list1 = host.new_list().expect("host list");
+        let mut state = State::default();
+        // Order A: viewport & scissor set BEFORE binding the 1706x960 target.
+        state.set_viewports(&list1, &[vp_1440]);
+        state.set_scissors(&list1, &[sc_1440]);
+        assert_eq!(state.host_scissors, vec![sc_1440]);
+        state.set_targets(&list1, &[h_960], 0);
+        assert_eq!(state.scissors, vec![sc_1440], "title scissor must remain untouched");
+        assert_eq!(state.target_bounds, Some((1706, 960)));
+        assert_eq!(state.host_scissors, vec![sc_960], "host scissor must clamp to 1706x960 target");
+
+        // Switching to a 2560x1440 target without re-setting scissors widens back to 2560x1440.
+        state.set_targets(&list1, &[h_1440], 0);
+        assert_eq!(state.target_bounds, Some((2560, 1440)));
+        assert_eq!(state.host_scissors, vec![sc_1440]);
+
+        // Multiple targets (2560x1440 + 1706x960): clamps to the smallest (1706x960).
+        state.set_targets(&list1, &[h_1440, h_960], 0);
+        assert_eq!(state.target_bounds, Some((1706, 960)));
+        assert_eq!(state.host_scissors, vec![sc_960]);
+
+        // Mip-sliced RTV (MipSlice = 2 of 2048x2048 => 512x512).
+        state.set_targets(&list1, &[h_mip2], 0);
+        assert_eq!(state.target_bounds, Some((512, 512)));
+        assert_eq!(state.host_scissors, vec![RECT { left: 0, top: 0, right: 512, bottom: 512 }]);
+
+        // Order B + replay onto a second host list: 1706x960 target bound first, then 2560x1440 scissor.
+        state.set_targets(&list1, &[h_960], 0);
+        state.set_scissors(&list1, &[sc_1440]);
+        assert_eq!(state.host_scissors, vec![sc_960]);
+        list1.close();
+
+        let list2 = host.new_list().expect("second host list");
+        state.replay(&list2);
+        assert_eq!(state.target_bounds, Some((1706, 960)));
+        assert_eq!(state.host_scissors, vec![sc_960]);
+        list2.close();
+
+        // 2. Execute the actual draw on a standalone hardware device + InfoQueue and read back corner texels.
+        let Some((adapter, _, _)) = victory_shader::emit::host::hardware_adapter() else {
+            return;
+        };
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain hardware device creation.
+        if unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            return;
+        }
+        let Some(device) = device else { return };
+        let info = device.cast::<ID3D12InfoQueue>().ok();
+        if let Some(q) = &info {
+            // SAFETY: clears startup messages before recording.
+            unsafe { q.ClearStoredMessages() };
+        }
+
+        const SHADER: &[u8] = br#"
+#define RS "RootFlags(0)"
+[RootSignature(RS)]
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+[RootSignature(RS)]
+float4 ps() : SV_Target { return float4(0, 1, 0, 1); }
+"#;
+        // SAFETY: compiles a minimal fullscreen triangle PSO, draws with a 2560x1440 viewport
+        // and clamped scissor onto 1706x960, and verifies InfoQueue + pixel readback.
+        unsafe {
+            let compile = |entry, target| -> ID3DBlob {
+                let mut blob = None;
+                D3DCompile(SHADER.as_ptr().cast(), SHADER.len(), s!("sc"), None, None, entry, target, 0, 0, &mut blob, None).unwrap();
+                blob.unwrap()
+            };
+            let (vs, ps) = (compile(s!("vs"), s!("vs_5_1")), compile(s!("ps"), s!("ps_5_1")));
+            let vs_bytes = std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize());
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, vs_bytes).unwrap();
+            let mut pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.GetBufferPointer(), BytecodeLength: vs.GetBufferSize() },
+                PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.GetBufferPointer(), BytecodeLength: ps.GetBufferSize() },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+            let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&pso_desc).unwrap();
+
+            let clear = D3D12_CLEAR_VALUE {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
+            };
+            let mut target: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 1706,
+                        Height: 960,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    Some(&clear),
+                    &mut target,
+                )
+                .unwrap();
+            let target = target.unwrap();
+            let rtv_heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            device.CreateRenderTargetView(&target, None, rtv);
+
+            let mut readback: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+            let readback = readback.unwrap();
+
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).unwrap();
+
+            let bounds = rtv_bounds(&target, None);
+            assert_eq!(bounds, Some((1706, 960)));
+            let clamped = clamp_scissor(sc_1440, bounds);
+            assert_eq!(clamped, sc_960);
+
+            list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.SetGraphicsRootSignature(&root);
+            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.RSSetViewports(&[vp_1440]);
+            list.RSSetScissorRects(&[clamped]);
+            list.DrawInstanced(3, 1, 0, 0);
+
+            if let Some(q) = &info {
+                let mut bad = Vec::new();
+                for i in 0..q.GetNumStoredMessages() {
+                    let mut size = 0;
+                    if q.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u64; size.div_ceil(8)];
+                    let m = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if q.GetMessage(i, Some(m), &mut size).is_ok()
+                        && ((*m).Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+                            || (*m).ID == D3D12_MESSAGE_ID_DRAW_POTENTIALLY_OUTSIDE_OF_VALID_RENDER_AREA)
+                    {
+                        let text = std::slice::from_raw_parts((*m).pDescription, (*m).DescriptionByteLength);
+                        bad.push(format!("id={} sev={}: {}", (*m).ID.0, (*m).Severity.0, String::from_utf8_lossy(text).trim_end_matches('\0')));
+                    }
+                }
+                q.ClearStoredMessages();
+                assert!(bad.is_empty(), "unexpected D3D12 draw validation messages: {bad:?}");
+            }
+
+            // Copy bottom-right pixel (1705, 959) to verify rasterization reached the target edge.
+            list.ResourceBarrier(&[crate::host::transition(
+                &target,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&target),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            Width: 1,
+                            Height: 1,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let box_ = D3D12_BOX { left: 1705, top: 959, front: 0, right: 1706, bottom: 960, back: 1 };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, Some(&box_));
+            list.Close().unwrap();
+
+            let cmd: ID3D12CommandList = list.cast().unwrap();
+            queue.ExecuteCommandLists(&[Some(cmd)]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+
+            assert!(device.GetDeviceRemovedReason().is_ok());
+            let mut ptr = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut ptr)).unwrap();
+            let pixel = ptr.cast::<[u8; 4]>().read();
+            readback.Unmap(0, None);
+            assert_eq!(pixel, [0, 255, 0, 255]);
+
+            for r in [rt_960, rt_1440, rt_mipped] {
+                crate::object::slot::<extern "system" fn(This) -> u32>(r, 0x10)(r);
+            }
+        }
     }
 }
 
