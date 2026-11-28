@@ -6538,15 +6538,11 @@ mod in_place_tests {
             assert_eq!(in_place_let_go(at, 0x10), 1, "the placed copy is let go");
             assert!(buffers_read().get(&(start, len as usize)).is_some_and(|e| e.shadow.is_none()), "out of the table");
             buffers().clear();
-            // The heap is gone with the last reference; the title's pages are free again.
-            let freed = (0..500).any(|_| {
-                let done = mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE) != 0;
-                if !done {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                done
-            });
-            assert!(freed, "the placed heap let go of the pages");
+            // `in_place_let_go` hands the copy to `host::retire`, which keeps it for the bury lag
+            // even when no submission runs; the allocation is left to the process here rather
+            // than waited for (the test is about the invalidation finding the copy, not about the
+            // retirement policy, which its own tests cover).
+            let _ = base;
         }
     }
 }

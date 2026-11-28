@@ -617,14 +617,15 @@ mod tests {
 
     #[test]
     fn a_directly_backed_copy_is_counted_while_it_lives_and_after() {
-        // The counters are process-wide: other tests may count too, so compare deltas.
-        let live = || (DIRECT_LIVE[direct_slot(false)][0].load(Ordering::Relaxed), DIRECT_LIVE[direct_slot(false)][1].load(Ordering::Relaxed));
-        let made = || (DIRECT_TOTAL[direct_slot(false)][0].load(Ordering::Relaxed), DIRECT_TOTAL[direct_slot(false)][1].load(Ordering::Relaxed));
+        // The counters are process-wide: other tests may count too, so compare deltas, on the
+        // window slot no other test places into.
+        let live = || (DIRECT_LIVE[direct_slot(true)][0].load(Ordering::Relaxed), DIRECT_LIVE[direct_slot(true)][1].load(Ordering::Relaxed));
+        let made = || (DIRECT_TOTAL[direct_slot(true)][0].load(Ordering::Relaxed), DIRECT_TOTAL[direct_slot(true)][1].load(Ordering::Relaxed));
         let (live_before, made_before) = (live(), made());
-        direct_add(false, 3 << 20);
+        direct_add(true, 3 << 20);
         assert_eq!(live(), (live_before.0 + 1, live_before.1 + (3 << 20)));
         assert_eq!(made(), (made_before.0 + 1, made_before.1 + (3 << 20)));
-        direct_freed(false, 3 << 20);
+        direct_freed(true, 3 << 20);
         assert_eq!(live(), live_before);
         assert_eq!(made(), (made_before.0 + 1, made_before.1 + (3 << 20)), "what was made stays counted");
     }
