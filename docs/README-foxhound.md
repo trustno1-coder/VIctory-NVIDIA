@@ -140,6 +140,7 @@ Every `VICTORY_...` switch is described in a comment where the code reads it. Th
 | `VICTORY_PRELUDE_UPLOADS`, `VICTORY_SHOW_NEW_LATER`, `VICTORY_TABLED_REREAD` | on | texture upload order and slot changes (flicker, device losses) |
 | `VICTORY_SYNC_IN_PLACE`, `VICTORY_SPANS_QUICK`, `VICTORY_HEAP_SYNC_AT_SUBMIT` | on | cheaper descriptor-heap bookkeeping |
 | `VICTORY_PORT_CONSTANTS` | off | the title's constants heap read in place: less CPU, but on a 12 GB card the GPU then waits (slower overall) |
+| `VICTORY_SPARE_SCALE` | off | `--set VICTORY_SPARE_SCALE=1`: below 85% use, the cap is `min(existing_limit, 64, max(budget_bytes / 32 / BLOCK, VICTORY_RIPE_BLOCKS, 8))` with `BLOCK = 64 MiB`. With the default of 12 ripe blocks, 8, 12, 16, and 24 GiB budgets each keep up to 12 blocks (768 MiB). The floor preserves the ripe-block device-loss safeguard and the staging pool's existing limit. |
 | `VICTORY_FRAME_INTERVAL_MS` | off | experimental: the title's own 30 fps setting patched to a higher rate |
 | `VICTORY_BVH_BUILDER` | off | the title's ray tracing (slow, broken) |
 
