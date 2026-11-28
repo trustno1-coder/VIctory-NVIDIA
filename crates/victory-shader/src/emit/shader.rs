@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -163,6 +163,25 @@ pub fn set_view_heap_limit(null_slot: u32) {
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether view indices are slots of the title's heap that the host places
+/// in its own heap through a table ([`set_view_remap`]).
+static VIEW_REMAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator that the host's view heaps are smaller than the title's (NVIDIA takes at
+/// most 1,000,000 views; a retail game's heap has 1,245,184): a view index, clamped to
+/// [`view_heap_limit`] (then the last dword of the [`SLOT_STRIDES`] table), is not a place in the
+/// host's heap but a key. Dword [`SLOT_STRIDES_COUNT`] + `i` of that table holds the place of
+/// index `i`, and shaders translated while this is set read it there for every view index
+/// (through [`SLOT_STRIDES`] if the shader binds it, else [`SLOT_TABLE_STRIDES`]).
+pub fn set_view_remap(on: bool) {
+    VIEW_REMAP.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_view_remap`].
+pub fn view_remap() -> bool {
+    VIEW_REMAP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Where the host's raw twins of its buffer views start in its view heaps (0: there are none).
@@ -498,7 +517,11 @@ impl Shader {
             let i32t = self.t.i32;
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
             self.m.tag(v, super::bitcode::Tag::Clamp);
-            v
+            if view_remap() {
+                self.view_place(block, v)
+            } else {
+                v
+            }
         } else if sampler {
             // A sampler heap has at most 2,048 samplers on any host: an
             // index past that (a number read from memory the host has not
@@ -529,6 +552,28 @@ impl Shader {
             &[index, s, n],
         );
         self.annotate(block, h, props.0, props.1)
+    }
+
+    /// The place in the host's heap of view index `index` (clamped already): dword
+    /// [`SLOT_STRIDES_COUNT`] + `index` of the host's table ([`set_view_remap`]).
+    fn view_place(&mut self, block: usize, index: V) -> V {
+        let slot = if self.root_srvs.iter().any(|r| r.0 == SLOT_STRIDES) {
+            SLOT_STRIDES
+        } else {
+            SLOT_TABLE_STRIDES
+        };
+        let h = self.root_srv_handle(slot);
+        let two = self.m.i32(2);
+        let byte = self.m.bin(block, Bin::Shl, index, two);
+        let base = self.m.i32(SLOT_STRIDES_COUNT * 4);
+        let byte = self.m.bin(block, Bin::Add, byte, base);
+        let iu = self.m.undef(self.t.i32);
+        let mask = self.m.i8(1);
+        let align = self.m.i32(4);
+        let r = self.op(block, "rawBufferLoad.f32", Attr::ReadOnly, self.t.res_ret, 139, &[h, byte, iu, mask, align]);
+        let f = self.m.extract(block, r, 0);
+        let i32t = self.t.i32;
+        self.m.cast(block, Cast::Bitcast, f, i32t)
     }
 
     /// The finished container.
