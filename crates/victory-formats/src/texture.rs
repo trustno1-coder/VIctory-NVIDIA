@@ -70,7 +70,7 @@ impl Swizzle {
         matches!(self.0, 1 | 5 | 9 | 17 | 21 | 25)
     }
 
-    fn display(self) -> bool {
+    pub(crate) fn display(self) -> bool {
         matches!(self.0, 2 | 6 | 10 | 18 | 22 | 26)
     }
 
@@ -178,10 +178,10 @@ pub struct Layout {
     pub mips: Vec<Mip>,
     /// Byte offsets inside a block for each coordinate, per axis.
     /// Empty for linear and unsupported modes.
-    pattern: &'static SwizzlePattern,
+    pub(crate) pattern: &'static SwizzlePattern,
 }
 
-type SwizzlePattern = [Vec<u32>; 3];
+pub(crate) type SwizzlePattern = [Vec<u32>; 3];
 static EMPTY_PATTERN: SwizzlePattern = [const { Vec::new() }; 3];
 
 /// Micro tile (256 bytes) patterns by log2 of the element size: for each
@@ -274,7 +274,7 @@ const MAX_MIPS: u32 = 16;
 const MAX_EXTENT: u32 = 1 << 14;
 
 /// 256-byte micro tile dimensions by log2 element size, 2D and 3D.
-const BLOCK_256_2D: [[u32; 2]; 5] = [[16, 16], [16, 8], [8, 8], [8, 4], [4, 4]];
+pub(crate) const BLOCK_256_2D: [[u32; 2]; 5] = [[16, 16], [16, 8], [8, 8], [8, 4], [4, 4]];
 const BLOCK_256_3D: [[u32; 3]; 5] = [[8, 4, 8], [4, 4, 8], [4, 4, 4], [4, 2, 4], [2, 2, 4]];
 const BLOCK_1K_3D: [[u32; 3]; 5] = [[16, 8, 8], [8, 8, 8], [8, 8, 4], [8, 4, 4], [4, 4, 4]];
 
@@ -539,7 +539,7 @@ impl Layout {
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
-    fn split(&self, z: u32) -> (u32, u32) {
+    pub(crate) fn split(&self, z: u32) -> (u32, u32) {
         if self.thick {
             (z / self.block[2], z % self.block[2])
         } else {
@@ -575,7 +575,8 @@ impl Layout {
 
     /// The part of an address that depends on the row (and depth in a
     /// thick block).
-    fn row(&self, m: &Mip, y: u32, z: u32) -> u64 {
+    #[inline]
+    pub(crate) fn row(&self, m: &Mip, y: u32, z: u32) -> u64 {
         let [bw, bh, _] = self.block;
         let log2 = self.alignment.trailing_zeros();
         // In the tail the pattern of the shifted position gives the mip's
@@ -586,7 +587,8 @@ impl Layout {
     }
 
     /// The part of an address that depends on the column.
-    fn column(&self, m: &Mip, x: u32) -> u64 {
+    #[inline]
+    pub(crate) fn column(&self, m: &Mip, x: u32) -> u64 {
         let bw = self.block[0];
         let x = x + m.tail.map_or(0, |t| t.x);
         (u64::from(x / bw) << self.alignment.trailing_zeros())
@@ -639,7 +641,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch)
+        crate::detile::detile(self, tiled, mip, slice, linear, row_pitch, depth_pitch)
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -652,10 +654,11 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch)
+        crate::detile::tile(self, tiled, mip, slice, linear, row_pitch, depth_pitch)
     }
 
     /// Copies contiguous runs in one direction between the two layouts.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn walk<const DETILE: bool>(
         &self,
@@ -668,6 +671,9 @@ impl Layout {
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
+        if m.width == 0 || m.height == 0 || depth == 0 {
+            return Err(Error::Invalid);
+        }
         let first = if self.desc.dimension == Dimension::Tex3d {
             if slice != 0 {
                 return Err(Error::Invalid);
@@ -762,6 +768,7 @@ impl Layout {
     }
 }
 
+#[cfg(test)]
 fn copy_run<const DETILE: bool>(
     src: &[u8],
     dst: &mut [u8],
@@ -780,6 +787,7 @@ fn copy_run<const DETILE: bool>(
 /// A row of equal runs is contiguous in linear memory. Treat it as a
 /// slice of arrays so only the tiled chunk needs a bounds check per copy.
 /// Use the byte ranges for irregular runs and the last run of each row.
+#[cfg(test)]
 fn copy_runs<const N: usize, const DETILE: bool>(
     src: &[u8],
     dst: &mut [u8],
@@ -1343,7 +1351,7 @@ mod tests {
             let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
             assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
             assert!(needs[3] * 4 < l.size, "{needs:?}");
-            let tiled: Vec<u8> = (0..l.size).map(|i| (i * 7 >> 3) as u8).collect();
+            let tiled: Vec<u8> = (0..l.size).map(|i| ((i * 7) >> 3) as u8).collect();
             for mip in 1..9 {
                 let m = l.mips[mip as usize];
                 let pitch = m.width as usize * 8;
@@ -1509,5 +1517,757 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+
+    /// Pure element-by-element scalar reference using `Layout::offset`.
+    fn detile_scalar_ref(
+        layout: &Layout,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let m = layout.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let n = layout.desc.element_bytes as usize;
+        let first = if layout.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= layout.slices {
+            return Err(Error::Invalid);
+        }
+        if !layout.addressable() {
+            return Err(Error::Unsupported);
+        }
+        for z in 0..m.depth {
+            for y in 0..m.height {
+                let row_base = z as usize * depth_pitch + y as usize * row_pitch;
+                for x in 0..m.width {
+                    let t = layout.offset(mip, x, y, first + z)? as usize;
+                    let l = row_base + x as usize * n;
+                    linear[l..l + n].copy_from_slice(&tiled[t..t + n]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pure element-by-element scalar reference for tiling.
+    fn tile_scalar_ref(
+        layout: &Layout,
+        tiled: &mut [u8],
+        mip: u32,
+        slice: u32,
+        linear: &[u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let m = layout.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let n = layout.desc.element_bytes as usize;
+        let first = if layout.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= layout.slices {
+            return Err(Error::Invalid);
+        }
+        if !layout.addressable() {
+            return Err(Error::Unsupported);
+        }
+        for z in 0..m.depth {
+            for y in 0..m.height {
+                let row_base = z as usize * depth_pitch + y as usize * row_pitch;
+                for x in 0..m.width {
+                    let t = layout.offset(mip, x, y, first + z)? as usize;
+                    let l = row_base + x as usize * n;
+                    tiled[t..t + n].copy_from_slice(&linear[l..l + n]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pre-optimization `walk` detile helper for BEFORE vs AFTER benchmarking.
+    fn detile_baseline_walk(
+        layout: &Layout,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        layout.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch)
+    }
+
+    /// Deterministic non-repeating pseudo-random byte fill so any swapped byte
+    /// or misaddressed micro-tile is caught immediately.
+    fn fill_pattern(len: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed ^ 0x9e37_79b9_7f4a_7c15;
+        let mut out = vec![0u8; len];
+        for b in &mut out {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *b = (s >> 24) as u8;
+        }
+        out
+    }
+
+    /// Exhaustively compares optimized `detile`/`tile` (and forced portable
+    /// fallback) bit-for-bit against the exact scalar `Layout::offset`
+    /// reference across every addressable swizzle mode, every element size
+    /// (1, 2, 4, 8, 16 bytes -> R8, RG8/R16, RGBA8/R32, BC1..BC7), block
+    /// sizes 1 and 4, NPOT sizes, odd pitches, array slices, 3D textures, and
+    /// partial mip chains (`bytes_from`).
+    #[test]
+    fn optimized_detile_and_tile_match_scalar_reference_exhaustively() {
+        let swizzles = [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ];
+        // Diverse power-of-two and NPOT sizes exercising full micro-tiles,
+        // right-edge remainders, bottom-edge remainders, and mip tails.
+        let dims = [
+            (1u32, 1u32, 1u32),
+            (3, 5, 2),
+            (17, 31, 5),
+            (63, 65, 6),
+            (109, 71, 6),
+            (128, 128, 8),
+            (257, 131, 6),
+        ];
+        for &swizzle in &swizzles {
+            for &bpe in &[1u32, 2, 4, 8, 16] {
+                let blocks: &[u32] = if bpe >= 8 { &[1, 4] } else { &[1] };
+                for &block in blocks {
+                    for &(w, h, mips) in &dims {
+                        let d = Desc {
+                            dimension: Dimension::Tex2d,
+                            width: w * block,
+                            height: h * block,
+                            depth: 1,
+                            mips,
+                            element_bytes: bpe,
+                            block,
+                            samples: 1,
+                            swizzle,
+                        };
+                        let layout = Layout::new(&d).unwrap();
+                        let tiled_src = fill_pattern(
+                            layout.size as usize,
+                            u64::from(swizzle.0) * 97 + u64::from(bpe) * 31 + u64::from(w),
+                        );
+                        for mip in 0..d.mips {
+                            let m = layout.mips[mip as usize];
+                            let active = m.width as usize * bpe as usize;
+                            // Test both tightly packed and odd/unaligned pitches.
+                            for extra_pitch in [0usize, 1, 7, 13] {
+                                let row_pitch = active + extra_pitch;
+                                let plane = row_pitch * m.height as usize + 5;
+                                let partial_len = layout.bytes_from(mip) as usize;
+                                let partial = &tiled_src[..partial_len];
+
+                                let mut ref_lin = vec![0xA5u8; plane];
+                                let mut opt_lin = vec![0xA5u8; plane];
+                                let mut port_lin = vec![0xA5u8; plane];
+
+                                detile_scalar_ref(
+                                    &layout,
+                                    partial,
+                                    mip,
+                                    0,
+                                    &mut ref_lin,
+                                    row_pitch,
+                                    plane,
+                                )
+                                .unwrap();
+                                layout
+                                    .detile(partial, mip, 0, &mut opt_lin, row_pitch, plane)
+                                    .unwrap();
+                                crate::detile::detile_portable(
+                                    &layout,
+                                    partial,
+                                    mip,
+                                    0,
+                                    &mut port_lin,
+                                    row_pitch,
+                                    plane,
+                                )
+                                .unwrap();
+
+                                assert_eq!(
+                                    opt_lin, ref_lin,
+                                    "detile mismatch: {d:?} mip={mip} extra_pitch={extra_pitch}"
+                                );
+                                assert_eq!(
+                                    port_lin, ref_lin,
+                                    "portable detile mismatch: {d:?} mip={mip} extra_pitch={extra_pitch}"
+                                );
+
+                                // Verify tiling matches scalar reference bit-for-bit too.
+                                let full_len = layout.size as usize;
+                                let mut ref_tiled = vec![0x5Au8; full_len];
+                                let mut opt_tiled = vec![0x5Au8; full_len];
+                                let mut port_tiled = vec![0x5Au8; full_len];
+                                tile_scalar_ref(
+                                    &layout,
+                                    &mut ref_tiled,
+                                    mip,
+                                    0,
+                                    &ref_lin,
+                                    row_pitch,
+                                    plane,
+                                )
+                                .unwrap();
+                                layout
+                                    .tile(&mut opt_tiled, mip, 0, &ref_lin, row_pitch, plane)
+                                    .unwrap();
+                                crate::detile::tile_portable(
+                                    &layout,
+                                    &mut port_tiled,
+                                    mip,
+                                    0,
+                                    &ref_lin,
+                                    row_pitch,
+                                    plane,
+                                )
+                                .unwrap();
+
+                                assert_eq!(
+                                    opt_tiled, ref_tiled,
+                                    "tile mismatch: {d:?} mip={mip} extra_pitch={extra_pitch}"
+                                );
+                                assert_eq!(
+                                    port_tiled, ref_tiled,
+                                    "portable tile mismatch: {d:?} mip={mip} extra_pitch={extra_pitch}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Verifies multi-slice arrays, 1D textures, and 3D thick/linear textures
+    /// match scalar reference bit-for-bit.
+    #[test]
+    fn arrays_1d_and_3d_match_scalar_reference() {
+        let cases = [
+            Desc {
+                dimension: Dimension::Tex1d,
+                width: 137,
+                height: 1,
+                depth: 3,
+                mips: 5,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_4KB_D,
+            },
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 193,
+                height: 117,
+                depth: 3,
+                mips: 5,
+                element_bytes: 16,
+                block: 4,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_D,
+            },
+            Desc {
+                dimension: Dimension::Tex3d,
+                width: 45,
+                height: 29,
+                depth: 11,
+                mips: 4,
+                element_bytes: 8,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_4KB_S,
+            },
+            Desc {
+                dimension: Dimension::Tex3d,
+                width: 37,
+                height: 21,
+                depth: 7,
+                mips: 3,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::LINEAR,
+            },
+        ];
+        for d in cases {
+            let layout = Layout::new(&d).unwrap();
+            let tiled_src = fill_pattern(
+                layout.size as usize,
+                u64::from(d.width) * 131 + u64::from(d.swizzle.0),
+            );
+            let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
+            for slice in 0..slices {
+                for mip in 0..d.mips {
+                    let m = layout.mips[mip as usize];
+                    let active = m.width as usize * d.element_bytes as usize;
+                    let row_pitch = active + 19;
+                    let depth_pitch = row_pitch * m.height as usize + 23;
+                    let total = depth_pitch * m.depth as usize;
+
+                    let mut ref_lin = vec![0x3Cu8; total];
+                    let mut opt_lin = vec![0x3Cu8; total];
+                    detile_scalar_ref(
+                        &layout,
+                        &tiled_src,
+                        mip,
+                        slice,
+                        &mut ref_lin,
+                        row_pitch,
+                        depth_pitch,
+                    )
+                    .unwrap();
+                    layout
+                        .detile(&tiled_src, mip, slice, &mut opt_lin, row_pitch, depth_pitch)
+                        .unwrap();
+                    assert_eq!(
+                        opt_lin, ref_lin,
+                        "array/3D detile mismatch: {d:?} mip={mip} slice={slice}"
+                    );
+
+                    let mut ref_tiled = vec![0xC3u8; layout.size as usize];
+                    let mut opt_tiled = vec![0xC3u8; layout.size as usize];
+                    tile_scalar_ref(
+                        &layout,
+                        &mut ref_tiled,
+                        mip,
+                        slice,
+                        &ref_lin,
+                        row_pitch,
+                        depth_pitch,
+                    )
+                    .unwrap();
+                    layout
+                        .tile(&mut opt_tiled, mip, slice, &ref_lin, row_pitch, depth_pitch)
+                        .unwrap();
+                    assert_eq!(
+                        opt_tiled, ref_tiled,
+                        "array/3D tile mismatch: {d:?} mip={mip} slice={slice}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exercises both sub-threshold inline (`1 MiB`), exact-boundary (`2 MiB`),
+    /// and strictly above-threshold parallel worker pool (`> 2 MiB`, e.g. 3 MiB
+    /// NPOT and 4 MiB POT) execution across `SW_64KB_D`, `SW_64KB_S`, and
+    /// `SW_4KB_D`, plus concurrent multi-caller `try_lock` fallback, verifying
+    /// bit-exact parity for both `detile` and `tile`.
+    #[test]
+    fn parallel_threshold_and_concurrent_callers_match_scalar_reference() {
+        let cases = [
+            // 1024x1024 BC7 -> 256x256x16 = 1 MiB inline (SW_64KB_D)
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 1024,
+                height: 1024,
+                depth: 1,
+                mips: 1,
+                element_bytes: 16,
+                block: 4,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_D,
+            },
+            // 1024x1024 BC7 -> 256x256x16 = 1 MiB inline (SW_64KB_S)
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 1024,
+                height: 1024,
+                depth: 1,
+                mips: 1,
+                element_bytes: 16,
+                block: 4,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_S,
+            },
+            // NPOT 1027x515 RGBA8 -> exact 2 MiB full micro-tile body + right/bottom remainders
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 1027,
+                height: 515,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_D,
+            },
+            // 2048x2048 BC7 -> 512x512x16 = 4 MiB (> PARALLEL_MIN_BYTES, SW_64KB_D)
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 2048,
+                height: 2048,
+                depth: 1,
+                mips: 1,
+                element_bytes: 16,
+                block: 4,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_D,
+            },
+            // NPOT 2056x1544 BC7 -> 514x386 blocks (3 MiB full body > PARALLEL_MIN_BYTES + remainders, SW_64KB_S)
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 2056,
+                height: 1544,
+                depth: 1,
+                mips: 1,
+                element_bytes: 16,
+                block: 4,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_S,
+            },
+            // 1024x1024 R8 -> 1 MiB inline (SW_4KB_D)
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 1024,
+                height: 1024,
+                depth: 1,
+                mips: 1,
+                element_bytes: 1,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_4KB_D,
+            },
+        ];
+
+        for d in cases {
+            let layout = Layout::new(&d).unwrap();
+            let tiled_src = fill_pattern(
+                layout.size as usize,
+                u64::from(d.width) * 17 + u64::from(d.element_bytes),
+            );
+            let m = layout.mips[0];
+            let active = m.width as usize * d.element_bytes as usize;
+            let row_pitch = active + 11;
+            let plane = row_pitch * m.height as usize + 7;
+
+            let mut ref_lin = vec![0xEEu8; plane];
+            detile_baseline_walk(&layout, &tiled_src, 0, 0, &mut ref_lin, row_pitch, plane)
+                .unwrap();
+
+            // Run 4 concurrent threads calling detile + tile simultaneously to
+            // exercise both pool dispatch and `try_lock` inline fallback.
+            std::thread::scope(|s| {
+                for tid in 0..4 {
+                    let layout = &layout;
+                    let tiled_src = &tiled_src;
+                    let ref_lin = &ref_lin;
+                    s.spawn(move || {
+                        let mut opt_lin = vec![0xEEu8; plane];
+                        layout
+                            .detile(tiled_src, 0, 0, &mut opt_lin, row_pitch, plane)
+                            .unwrap();
+                        assert_eq!(
+                            opt_lin, *ref_lin,
+                            "parallel detile mismatch tid={tid} {d:?}"
+                        );
+
+                        let mut opt_tiled = vec![0x11u8; layout.size as usize];
+                        let mut ref_tiled = vec![0x11u8; layout.size as usize];
+                        layout
+                            .tile(&mut opt_tiled, 0, 0, &opt_lin, row_pitch, plane)
+                            .unwrap();
+                        tile_scalar_ref(layout, &mut ref_tiled, 0, 0, &opt_lin, row_pitch, plane)
+                            .unwrap();
+                        assert_eq!(
+                            opt_tiled, ref_tiled,
+                            "parallel tile mismatch tid={tid} {d:?}"
+                        );
+                    });
+                }
+            });
+        }
+    }
+
+    /// Release-mode CPU detile throughput benchmark comparing:
+    /// - `scalar`: pure element-by-element `Layout::offset` reference
+    /// - `baseline`: pre-change chunked `walk` run-coalesced loop
+    /// - `optimized`: AVX2/SSE2 micro-tile + LUT + persistent parallel pool
+    ///
+    /// Run with:
+    /// `cargo test --release -p victory-formats --locked -- --ignored --nocapture bench_detile_throughput`
+    #[test]
+    #[ignore]
+    fn bench_detile_throughput() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        struct Case {
+            name: &'static str,
+            desc: Desc,
+            full_chain: bool,
+            iters: usize,
+        }
+
+        let cases = [
+            Case {
+                name: "4K BC7 SW_64KB_D (16 MiB)",
+                desc: Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 4096,
+                    height: 4096,
+                    depth: 1,
+                    mips: 1,
+                    element_bytes: 16,
+                    block: 4,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_D,
+                },
+                full_chain: false,
+                iters: 20,
+            },
+            Case {
+                name: "4K BC7 SW_64KB_S (16 MiB)",
+                desc: Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 4096,
+                    height: 4096,
+                    depth: 1,
+                    mips: 1,
+                    element_bytes: 16,
+                    block: 4,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_S,
+                },
+                full_chain: false,
+                iters: 20,
+            },
+            Case {
+                name: "4K BC1 SW_64KB_D (8 MiB)",
+                desc: Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 4096,
+                    height: 4096,
+                    depth: 1,
+                    mips: 1,
+                    element_bytes: 8,
+                    block: 4,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_D,
+                },
+                full_chain: false,
+                iters: 30,
+            },
+            Case {
+                name: "4K RGBA8 SW_64KB_D (64 MiB)",
+                desc: Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 4096,
+                    height: 4096,
+                    depth: 1,
+                    mips: 1,
+                    element_bytes: 4,
+                    block: 1,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_D,
+                },
+                full_chain: false,
+                iters: 10,
+            },
+            Case {
+                name: "2K BC7 SW_64KB_D (4 MiB)",
+                desc: Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 2048,
+                    height: 2048,
+                    depth: 1,
+                    mips: 1,
+                    element_bytes: 16,
+                    block: 4,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_D,
+                },
+                full_chain: false,
+                iters: 60,
+            },
+            Case {
+                name: "1K BC7 SW_64KB_D (1 MiB)",
+                desc: Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 1024,
+                    height: 1024,
+                    depth: 1,
+                    mips: 1,
+                    element_bytes: 16,
+                    block: 4,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_D,
+                },
+                full_chain: false,
+                iters: 160,
+            },
+            Case {
+                name: "256 BC7 SW_64KB_D (64 KiB, ST)",
+                desc: Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 256,
+                    height: 256,
+                    depth: 1,
+                    mips: 1,
+                    element_bytes: 16,
+                    block: 4,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_D,
+                },
+                full_chain: false,
+                iters: 2000,
+            },
+            Case {
+                name: "4K BC7 MipChain (13 mips, 21.3 MiB)",
+                desc: Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 4096,
+                    height: 4096,
+                    depth: 1,
+                    mips: 13,
+                    element_bytes: 16,
+                    block: 4,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_D,
+                },
+                full_chain: true,
+                iters: 16,
+            },
+        ];
+
+        println!(
+            "\n{:<36} | {:>10} | {:>10} | {:>10} | {:>10} | {:>8} | {:>8}",
+            "Case", "Base ms", "Base MB/s", "Opt ms", "Opt MB/s", "vs Base", "vs Scal"
+        );
+        println!("{}", "-".repeat(108));
+
+        for c in cases {
+            let layout = Layout::new(&c.desc).unwrap();
+            let tiled = fill_pattern(layout.size as usize, 0x1234_5678);
+            let mips: Vec<u32> = if c.full_chain {
+                (0..c.desc.mips).collect()
+            } else {
+                vec![0]
+            };
+            let mut linear_bufs: Vec<(u32, usize, usize, Vec<u8>)> = mips
+                .iter()
+                .map(|&mip| {
+                    let m = layout.mips[mip as usize];
+                    let pitch =
+                        (m.width as usize * c.desc.element_bytes as usize).next_multiple_of(256);
+                    let len = pitch * m.height as usize;
+                    (mip, pitch, len, vec![0u8; len])
+                })
+                .collect();
+            let total_bytes: usize = mips
+                .iter()
+                .map(|&mip| {
+                    let m = layout.mips[mip as usize];
+                    m.width as usize * m.height as usize * c.desc.element_bytes as usize
+                })
+                .sum();
+
+            // Verify bit-exact match before timing.
+            let mut ref_bufs: Vec<Vec<u8>> = linear_bufs.iter().map(|b| vec![0u8; b.2]).collect();
+            for (i, &(mip, pitch, len, _)) in linear_bufs.iter().enumerate() {
+                detile_baseline_walk(&layout, &tiled, mip, 0, &mut ref_bufs[i], pitch, len)
+                    .unwrap();
+            }
+            for (mip, pitch, len, buf) in &mut linear_bufs {
+                layout.detile(&tiled, *mip, 0, buf, *pitch, *len).unwrap();
+            }
+            for (i, (_, _, _, buf)) in linear_bufs.iter().enumerate() {
+                assert_eq!(*buf, ref_bufs[i], "benchmark parity failed for {}", c.name);
+            }
+
+            // Warmup both paths.
+            for (mip, pitch, len, buf) in &mut linear_bufs {
+                detile_baseline_walk(&layout, &tiled, *mip, 0, buf, *pitch, *len).unwrap();
+                layout.detile(&tiled, *mip, 0, buf, *pitch, *len).unwrap();
+            }
+
+            // Time scalar reference (fewer iters for huge textures so bench stays quick).
+            let scalar_iters = (c.iters / 4).max(2);
+            let t0 = Instant::now();
+            for _ in 0..scalar_iters {
+                for (mip, pitch, len, buf) in &mut linear_bufs {
+                    detile_scalar_ref(
+                        &layout,
+                        black_box(&tiled),
+                        *mip,
+                        0,
+                        black_box(buf),
+                        *pitch,
+                        *len,
+                    )
+                    .unwrap();
+                }
+            }
+            let scalar_ms = t0.elapsed().as_secs_f64() * 1000.0 / scalar_iters as f64;
+
+            // Time pre-change baseline (`walk`).
+            let t1 = Instant::now();
+            for _ in 0..c.iters {
+                for (mip, pitch, len, buf) in &mut linear_bufs {
+                    detile_baseline_walk(
+                        &layout,
+                        black_box(&tiled),
+                        *mip,
+                        0,
+                        black_box(buf),
+                        *pitch,
+                        *len,
+                    )
+                    .unwrap();
+                }
+            }
+            let base_ms = t1.elapsed().as_secs_f64() * 1000.0 / c.iters as f64;
+            let base_mbs = (total_bytes as f64 / (1024.0 * 1024.0)) / (base_ms / 1000.0);
+
+            // Time optimized `Layout::detile`.
+            let t2 = Instant::now();
+            for _ in 0..c.iters {
+                for (mip, pitch, len, buf) in &mut linear_bufs {
+                    layout
+                        .detile(black_box(&tiled), *mip, 0, black_box(buf), *pitch, *len)
+                        .unwrap();
+                }
+            }
+            let opt_ms = t2.elapsed().as_secs_f64() * 1000.0 / c.iters as f64;
+            let opt_mbs = (total_bytes as f64 / (1024.0 * 1024.0)) / (opt_ms / 1000.0);
+
+            println!(
+                "{:<36} | {:>10.3} | {:>10.1} | {:>10.3} | {:>10.1} | {:>7.2}x | {:>7.2}x",
+                c.name,
+                base_ms,
+                base_mbs,
+                opt_ms,
+                opt_mbs,
+                base_ms / opt_ms,
+                scalar_ms / opt_ms,
+            );
+        }
     }
 }
