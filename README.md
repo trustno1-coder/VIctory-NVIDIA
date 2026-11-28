@@ -95,6 +95,22 @@
   FSR 3 frame generation (2x) is the supported way on those cards. A
   `winmm.dll` copy of the mod beside `victory.exe` still works too.
 
+**Choosing a GPU on a PC with more than one**
+
+If VIctory picks a different GPU than you intended, open PowerShell in the
+folder containing `victory.exe`. Set `VICTORY_ADAPTER` and launch from the same
+window.
+
+```powershell
+$env:VICTORY_ADAPTER = 'RTX 5070 Ti'
+.\victory.exe
+```
+
+Replace `RTX 5070 Ti` with a distinctive part of your GPU's name. VIctory
+uses the first hardware adapter whose name contains that text, ignoring case.
+If no name matches, it uses its default selection. Check the `adapter` field
+on the `host device on the card` line in the play log to see which GPU it chose.
+
 **In the game**
 
 - **F1** brings up the settings menu (arrow keys pick and change, Enter does
