@@ -302,6 +302,11 @@ enum Command {
     Preload {
         /// The title's folder (default: the configured game folder).
         paths: Vec<PathBuf>,
+        /// Threads and processes for each of its steps, to leave the rest of
+        /// the PC free (default: `VICTORY_PRELOAD_JOBS`, else each step's
+        /// own: every core to translate, two thirds of them to make).
+        #[arg(long)]
+        jobs: Option<usize>,
     },
     /// Play: the title with this fork's settings, as a start with no
     /// command at all does (a double click on the program beside the
@@ -477,11 +482,18 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         #[cfg(windows)]
-        Command::Preload { paths } => {
+        Command::Preload { paths, jobs } => {
+            // The launcher and the F1 menu's restart pass it as a switch.
+            let jobs = jobs
+                .or_else(|| std::env::var("VICTORY_PRELOAD_JOBS").ok()?.trim().parse().ok())
+                .filter(|&n| n > 0);
+            if let Some(n) = jobs {
+                println!("Preloading on {n} threads at a time (VICTORY_PRELOAD_JOBS / --jobs).");
+            }
             play::explain_preload();
-            translate::precompile(paths, None)?;
-            warm::run(None, None, false, false, None)?;
-            warm::into_library(None)
+            translate::precompile(paths, jobs)?;
+            warm::run(jobs, None, false, false, None)?;
+            warm::into_library(jobs)
         }
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),
@@ -608,8 +620,8 @@ mod tests {
         let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap();
         if let Ok(dll) = std::fs::read(system.join("System32").join("D3D12Core.dll")) {
             let v = super::exported_sdk_version(&dll).expect("System32's D3D12Core.dll exports D3D12SDKVersion");
-            assert!(v >= 4, "{v}");
-            assert!((4..=614).contains(&super::os_runtime()));
+            // Older Windows runtimes may export versions below 4.
+            assert_eq!(super::os_runtime(), v.min(614));
         }
         assert_eq!(super::exported_sdk_version(&[0u8; 64]), None);
         assert_eq!(super::exported_sdk_version(b"MZ"), None);

@@ -2770,6 +2770,21 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         // A host group has 32 KiB of LDS (D3D12): the program's LDS with the meetings' and
         // exchanges' dwords past it must fit (`CS_CollectTriangles_Meshlets` uses all 32 KiB).
+        if self.s.lds_dwords > HOST_LDS_DWORDS && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            // (the program's own LDS, then what the translation adds past it)
+            let own = match &self.x.native.io {
+                StageIo::Cs(cs) => cs.lds_bytes() / 4,
+                _ => 0,
+            };
+            eprintln!(
+                "WAVE64-LDS {} dwords of the host's {HOST_LDS_DWORDS}: the program's own {own}, the translation's {} (exchange {:?}, counter {:?}, meetings {:?})",
+                self.s.lds_dwords,
+                self.s.lds_dwords.saturating_sub(own),
+                self.exchange.as_ref().map(|e| e.0),
+                self.halves.or(self.ticket),
+                self.pairs,
+            );
+        }
         if self.pairs.is_some() && self.s.lds_dwords > HOST_LDS_DWORDS {
             return Err(unsupported(0, "LDS for the console waves' meetings past the host's 32 KiB"));
         }
@@ -7123,7 +7138,7 @@ impl<'a> Lower<'a> {
                 }
                 None => self.handle(site, src, false, (11, 0))?,
             };
-            if Self::wide_loads() {
+            if count > 1 && Self::wide_loads() {
                 for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
                     self.write(inst, Reg::S(code + k as u8), x, None);
                 }
@@ -9183,16 +9198,15 @@ impl<'a> Lower<'a> {
                 let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
                 let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
                 let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
-                let make_inf = {
-                    let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                    self.s.m.bin(c, Bin::Or, t, q_nan)
-                };
+                // Resolve zero and infinity operands before a NaN quotient.
+                let make_inf = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
                 let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
                 let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
                 let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
                 let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
                 let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
+                let r = self.s.m.select(c, q_nan, signed_inf, signed_q);
+                let r = self.s.m.select(c, make_zero, sign, r);
                 let r = self.s.m.select(c, make_inf, signed_inf, r);
                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
                 let r = self.s.m.select(c, d_nan, d_qnan, r);

@@ -321,7 +321,7 @@ fn unspill(
     // per instruction the scalar codes it writes.
     let mut stores = [false; 256];
     let mut other: [Option<usize>; 256] = [None; 256]; // the last such use
-    let mut used = [false; 128];
+    let mut used = [false; 256];
     let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
@@ -1919,6 +1919,25 @@ mod tests {
             let (slot, saved) = insts[latest].writes[0];
             assert_eq!(insts[2].name(), "s_mov_b32", "wave64 {wave64}: the read back is a move");
             assert_eq!(insts[2].read(slot), Some(saved), "wave64 {wave64}: it reads write {latest}'s scalar");
+        }
+    }
+
+    /// A scalar destination field of 128 or more (a constant's code, not a
+    /// register) is refused or ignored, never an index past the scalar
+    /// codes the parking search keeps (found by fuzzing the translator).
+    #[test]
+    fn scalar_codes_past_the_registers_do_not_panic() {
+        // v_writelane_b32 v1, s0, 0: a program that parks a scalar, so the
+        // parking search runs.
+        const PARK: [u32; 2] = [0xD761_0001, 0x0001_0000];
+        for (words, wave64) in [
+            ([0xD4C5_A8D7, 0x9342_BFA0], true),
+            ([0xD401_53FF, 0x0509_8D04], false),
+            ([0xD4EC_FE8B, 0x1234_5678], false),
+        ] {
+            let words = [&PARK[..], &words[..], &[S_ENDPGM]].concat();
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let _ = build(&code, wave64, 256);
         }
     }
 

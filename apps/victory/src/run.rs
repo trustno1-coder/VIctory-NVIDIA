@@ -249,6 +249,12 @@ pub fn run(
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
+    // The F1 menu's save sharing, and an import it staged put in place before the title runs.
+    if let Some(data) = storage.parent()
+        && let Some(line) = victory_hle::save_share::start(data, title_dir)
+    {
+        println!("saves          {line}");
+    }
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
@@ -415,7 +421,7 @@ fn watch(base: usize, size: usize) {
     let rvas: Vec<usize> = list
         .split(',')
         .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
+        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
         .collect();
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
