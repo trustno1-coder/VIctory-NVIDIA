@@ -395,8 +395,8 @@ impl Module {
     }
 
     fn int_bits(&self, ty: Ty) -> Option<u32> {
-        match self.types[ty.0 as usize] {
-            TypeDef::Int(bits) => Some(bits),
+        match self.types.get(ty.0 as usize)? {
+            TypeDef::Int(bits) => Some(*bits),
             _ => None,
         }
     }
@@ -404,7 +404,7 @@ impl Module {
     /// An integer constant's width and value (the bits of that width).
     pub(crate) fn int_k(&self, v: V) -> Option<(u32, u64)> {
         let V::Const(i) = v else { return None };
-        let (ty, Const::Int(x)) = &self.consts[i as usize] else {
+        let (ty, Const::Int(x)) = self.consts.get(i as usize)? else {
             return None;
         };
         let bits = self.int_bits(*ty)?;
@@ -415,14 +415,14 @@ impl Module {
     /// cast of an integer constant.
     pub(crate) fn float_k(&self, v: V) -> Option<f32> {
         let (v, cast) = match v {
-            V::Inst(i) => match self.insts[i as usize].op {
+            V::Inst(i) => match self.insts.get(i as usize)?.op {
                 Op::Cast(Cast::Bitcast, x) => (x, true),
                 _ => return None,
             },
             _ => (v, false),
         };
         let V::Const(i) = v else { return None };
-        match &self.consts[i as usize].1 {
+        match &self.consts.get(i as usize)?.1 {
             Const::Float(bits) if !cast => Some(f32::from_bits(*bits)),
             Const::Int(_) if cast => {
                 let (bits, x) = self.int_k(v)?;
@@ -2224,5 +2224,14 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    #[test]
+    fn out_of_range_value_indices_do_not_panic() {
+        let k = kit();
+        assert_eq!(k.m.int_k(V::Const(u32::MAX)), None);
+        assert_eq!(k.m.float_k(V::Const(u32::MAX)), None);
+        assert_eq!(k.m.float_k(V::Inst(u32::MAX)), None);
+        assert_eq!(k.m.int_bits(Ty(u32::MAX)), None);
     }
 }
