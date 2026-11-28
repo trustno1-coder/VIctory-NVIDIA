@@ -1800,24 +1800,53 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    wide_ranges(n, 1, move |range| range.for_each(&work));
+}
+
+/// Claims adjacent jobs together to keep small refreshes from contending
+/// on one atomic for each range. Long or uneven jobs can still claim one.
+pub(crate) fn wide_ranges(n: usize, grain: usize, work: impl Fn(std::ops::Range<usize>) + Send + Sync + 'static) {
+    if n == 0 {
+        return;
+    }
+    let grain = grain.max(1);
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
+    let threads = (wide_threads() + 1).min(n.div_ceil(grain));
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
             Box::new(move || {
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let i = next.fetch_add(grain, Ordering::Relaxed);
                     if i >= n {
                         break;
                     }
-                    work(i);
+                    work(i..i.saturating_add(grain).min(n));
                 }
             }) as Job
         })
         .collect();
     wide(jobs);
+}
+
+#[cfg(test)]
+mod wide_range_tests {
+    use super::*;
+
+    #[test]
+    fn grouped_work_visits_each_index_once() {
+        for n in [0, 1, 7, 8, 9, 63, 64, 255, 513] {
+            let counts = Arc::new((0..n).map(|_| std::sync::atomic::AtomicU8::new(0)).collect::<Vec<_>>());
+            let shared = counts.clone();
+            wide_ranges(n, 8, move |range| {
+                for i in range {
+                    shared[i].fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            assert!(counts.iter().all(|count| count.load(Ordering::Relaxed) == 1), "{n} jobs");
+        }
+    }
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -5220,15 +5249,17 @@ mod land_tests {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    // A pending constructor and the identity of this registration until it publishes.
+    building: Option<Arc<Mutex<()>>>,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
 ///
 /// Read by every view a draw names, on all recording threads at once, and
 /// written when a buffer comes, goes or gets its copy: readers share it.
-static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
+static BUFFERS: std::sync::RwLock<BufferTable> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BufferTable> {
     let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
     // What threads remember of it ([`FOUND`]) is of before.
     BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
@@ -5288,7 +5319,7 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     });
 }
 
-fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BufferTable> {
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -5299,6 +5330,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         Entry {
             end: start + len,
             shadow: None,
+            building: None,
         },
     );
 }
@@ -5400,61 +5432,68 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
 }
 
+/// Select the same registration after locking, before and after a slow allocation.
+type BufferTable = BTreeMap<(u64, usize), Entry>;
+
+fn buffer_key(map: &BufferTable, address: u64, end: u64) -> Option<(u64, usize)> {
+    map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).map(|(k, _)| *k)
+}
+
+fn still_building(entry: &Entry, ticket: &Arc<Mutex<()>>) -> bool {
+    entry.building.as_ref().is_some_and(|id| Arc::ptr_eq(id, ticket))
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    lookup_with(address, len, any, |size| host()?.shared_buffer(size))
+}
+
+fn lookup_with(
+    address: u64,
+    len: u64,
+    any: bool,
+    make: impl Fn(u64) -> Option<(ID3D12Resource, *mut u8)>,
+) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
-    {
-        let map = buffers_read();
-        match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
-            // The copy is made already (nearly always).
-            Some((_, Entry { shadow: Some(shadow), .. })) => {
-                if quick {
-                    // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+    loop {
+        {
+            let map = buffers_read();
+            match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
+                Some((_, Entry { shadow: Some(shadow), .. })) => {
+                    if quick {
+                        remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    }
+                    return Some(shadow.clone());
                 }
-                return Some(shadow.clone());
-            }
-            Some(_) => {}
-            None => {
-                drop(map);
-                return loose(address, end, len <= 1, any);
+                Some(_) => {}
+                None => {
+                    drop(map);
+                    return loose(address, end, len <= 1, any);
+                }
             }
         }
-    }
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
-        drop(map);
-        return loose(address, end, len <= 1, any);
-    };
-    let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
+        let mut map = buffers();
+        let Some(key) = buffer_key(&map, address, end) else {
+            drop(map);
+            return loose(address, end, len <= 1, any);
+        };
+        let entry = map.get_mut(&key)?;
+        if let Some(shadow) = &entry.shadow {
+            return Some(shadow.clone());
+        }
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
-        // In place, if asked for and the memory can be opened
-        // (`crate::inplace::place_for`): the buffer is the title's own
-        // memory. Not the big ones `cards` puts in the card's memory: those
-        // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
-        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
-        // title's 32-bit graphics heap in place, big or not.
-        if let Some(placed) = crate::port::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
-        }
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+        if let Some(placed) = crate::port::place_for(key.0, len, false)
+            .or_else(|| if big { None } else { crate::inplace::place_for(key.0, len, false) })
+        {
+            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+            entry.shadow = Some(shadow.clone());
+            return Some(shadow);
         }
         // Write-combined memory with `VICTORY_WC_BAR`: one buffer in the card's
         // memory that the CPU maps, no CPU's side, nothing sent, and what
@@ -5479,56 +5518,95 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(shadow));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
+        // Keep the original transaction for optional imported/placed memory.
+        // The change below can only manufacture independent, untouched backing.
+        if crate::port::on() || crate::inplace::level() >= 2 {
+            let (buffer, data) = make(size)?;
+            let shadow = copied_buffer(key.0, len, size, buffer, data);
+            entry.shadow = Some(shadow.clone());
+            return Some(shadow);
+        }
+        let ticket = entry.building.get_or_insert_with(Default::default).clone();
+        drop(map);
+        // Never wait for an entry while holding the global table. Other
+        // lookups can proceed; followers of this entry cannot allocate twins.
+        let _only = ticket.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let map = buffers_read();
+            if buffer_key(&map, address, end) != Some(key) || !map.get(&key).is_some_and(|e| still_building(e, &ticket)) {
+                continue;
+            }
+        }
+        let backing = make(size);
+        let mut map = buffers();
+        if buffer_key(&map, address, end) != Some(key) || !map.get(&key).is_some_and(|e| still_building(e, &ticket)) {
+            // Registration was replaced or an overlapping buffer now wins.
+            // Drop an unpublished buffer without blocking table readers.
+            drop(map);
+            drop(backing);
+            continue;
+        }
+        let (buffer, data) = backing?;
+        let entry = map.get_mut(&key)?;
+        let shadow = copied_buffer(key.0, len, size, buffer, data);
+        entry.shadow = Some(shadow.clone());
+        entry.building = None;
+        return Some(shadow);
+    }
+}
+
+/// Publish card bookkeeping before attaching the completed copy to its entry.
+fn copied_buffer(start: u64, len: u64, size: u64, buffer: ID3D12Resource, data: *mut u8) -> Arc<Shadow> {
+    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", start));
+    // A big one, with `cards`: shaders get a buffer in the card's own
+    // memory, and the one just made is the CPU's side.
+    let (buffer, card) = match card_for(size) {
+        Some(on_card) => {
+            crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", start));
+            tracing::info!(
+                start = format_args!("{:#x}", start),
+                len,
+                "a buffer's host copy is in the card's memory"
+            );
+            let card = Card {
+                staging: buffer,
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
-        };
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
-            tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
+                size,
+            };
+            (on_card, Some(card))
         }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.card = card;
-        let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            carded(&shadow);
-        }
-        entry.shadow = Some(shadow);
+        None => (buffer, None),
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{:#x}", start),
+            len,
+            "large buffer copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{:#x}", start),
+            len,
+            "buffer copied to the host"
+        );
     }
-    entry.shadow.clone()
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.card = card;
+    let shadow = Arc::new(shadow);
+    if shadow.card.is_some() {
+        carded(&shadow);
+    }
+    shadow
 }
+
+#[cfg(test)]
+mod title_allocation_tests;
 
 /// Titles also use memory outside any buffer object as GPU memory (
 /// the title's interface vertices, from its own allocator). Such memory

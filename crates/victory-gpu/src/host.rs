@@ -8890,15 +8890,20 @@ impl Batch {
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
-    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+    fn timed_update(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> (u64, u64) {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
+        (us, copied as u64)
+    }
+
+    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let (us, copied) = Self::timed_update(shadow, from, to);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
-        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied, Ordering::Relaxed);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -9134,15 +9139,31 @@ impl Batch {
             let before = PREPARING[0].load(Ordering::Relaxed);
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
-                // A number to a free thread, not a job to each copy.
+                // Most refreshes are unchanged. Claim and count short
+                // stretches of them together.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
+                let check = refreshes.len() > FEW;
+                let grain = if refreshes.len() < 64 { 1 } else { 8 };
+                crate::shadow::wide_ranges(refreshes.len(), grain, move |range| {
+                    let (mut us, mut bytes, mut unchanged) = (0, 0, 0);
+                    for (shadow, from, to) in &refreshes[range] {
+                        if check && shadow.nothing_new(*from, *to - *from) {
+                            unchanged += 1;
+                            continue;
+                        }
+                        let (took, copied) = Self::timed_update(shadow, *from, *to);
+                        us += took;
+                        bytes += copied;
                     }
-                    Self::update(shadow, *from, *to);
+                    if us != 0 {
+                        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                    }
+                    if bytes != 0 {
+                        PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
+                    }
+                    if unchanged != 0 {
+                        FLUSHES[2].fetch_add(unchanged, Ordering::Relaxed);
+                    }
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
