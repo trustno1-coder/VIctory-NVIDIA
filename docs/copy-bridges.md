@@ -1,5 +1,8 @@
 # Copy bridges between title memory and GPU-accessible backing
 
+Status: Phase 1 audit and plan (committed on `phase/copy-bridge-1-audit`), with the Phase 2
+implementation written up in section 12 (`phase/copy-bridge-2-invariants`).
+
 This is the Phase 1 audit of the copy-bridge elimination work, and the plan that follows from it.
 It covers the whole pipeline between the title's memory and whatever the host GPU actually reads
 or writes: the host mirrors of title buffers and windows, their transfer, hash, compare and
@@ -417,3 +420,86 @@ Not establishable here, and explicitly not claimed:
 A hardware validation session should run `VICTORY_INPLACE_PROBE=1` with the census, then the
 direct switch on a title save with `VICTORY_MEMORY_REPORT=1` and the placement ledger read
 against DXGI usage, and finally a GPUView/ETW capture for residency and the PCIe question.
+
+## 12. Phase 2 implemented: backing storage and admission invariants
+
+Every change below is either a pure refactor or measurement; no allocation policy, admission
+threshold, budget, switch default or rendering behaviour changed, and with the direct switches
+off the same buffers are made in the same order as before.
+
+### 12.1 The admission decision split from the allocation
+
+`shadow::card_admission` and `shadow::window_admission` now decide whether a copy is to have a
+device-local side under exactly the old rules (`cards`, `card_limits` sizes and the 1 GiB
+compare limit, `Host::card_ready`, the 80/97% budget line, and the `card_limits` /
+`VICTORY_CARD_WINDOWS_MB` caps), including the old refusal counters and log lines; they allocate
+nothing. `card_allocate`/`window_allocate` then take the cap and make the buffer, and
+`card_side`/`window_side` compose the two with the `VICTORY_CARD_ALL`/`VICTORY_WINDOWS_OWN`
+second-memory side. `lookup` and `loose` ask the admission first, then make the CPU staging
+buffer and the side, so a direct placement (Phase 3/4) can be chosen on exactly the evidence the
+system-memory fallback would be taken on, before any host buffer exists for a copy that will not
+need one. The only observable differences are the order of two internal counters/log lines.
+
+### 12.2 An openability predicate, not an address check
+
+`inplace::openability(start, len)` classifies a title range without opening anything:
+
+- `Openability::Private` - private memory, every page committed read-write in one allocation (the
+  `Address1` part opening);
+- `Openability::View { section, offset }` - title view memory whose bytes are one contiguous run
+  of one section (the opening Phase 3 builds on; the port uses it today for the sub-4-GiB heap);
+- `Openability::Refused(NotOpenable)` - `Unmapped` (reserved, decommitted, guarded, memory of
+  another kind), `Scattered` (views of different places) or `Holes` (pages not mapped).
+
+`inplace::place_for` uses it instead of its own `cover`/`private_whole` pair, so an opt-in
+placement refuses the same ranges as before, with the same counters. A backing is not a virtual
+address: callers are expected to re-ask after mapping changes.
+
+### 12.3 The placed-copy registry, and an exact invalidation
+
+The placed copies are now noted in a weak registry (`shadow::PLACED`) where a
+`Shadow::placed` is made, and `shadow::in_place_let_go` takes its set from that registry instead
+of bounded scans of the copies' tables (the last 256 buffers starting below the range; windows
+starting within 4 MiB below it). A placed title buffer can start far below the changed range and
+many copies can start in between, so the bounded scan could miss a placed copy that covers the
+range and leave the GPU reading pages the title had reused. The registry is exact and short (only
+placed copies are in it); the copies are removed from their tables by the key the ask that made
+them used, or by identity. A test puts a placed copy below 300 other copies and asserts the
+invalidation still finds it, and that the heap releases the title's pages.
+
+### 12.4 Our views: one owner, refcounted, unmapped after the last user
+
+A heap opened on a section view of ours must outlive the title's own views of the same pages but
+must not outlive its last placed buffer. `inplace::SectionView` is that view now: an `Arc` owned
+by every `Placed` made over it (`Placed::keep`) and dropped - unmapping the view - when the last
+placed buffer and its heap are released (release order: buffer, heap, view). The port's regions use
+it instead of a view that was never unmapped, and `inplace::title_memory_section_gone` tells the
+port a section is gone (`port::section_gone`), so a forgotten or closed section leaves no heap or
+view of ours behind. The port's WARP test now actually exercises the claim its comment used to
+make: with the heap standing, the title's own view is made read-only and another is unmapped, the
+placed buffer still reads the section's pages, and it survives the section being closed; only then
+do the placed buffers go and the view is unmapped.
+
+### 12.5 The placement ledger counts direct backing
+
+`residency` now counts directly backed copies (title memory in place, no host copy) while they
+live and since the start, windows and title buffers apart (`direct_add`/`direct_freed`), and the
+asks that wanted direct backing and did not get it, by reason (`NoDirect::NotOpenable`, `Cap`,
+`HostRefused`, `HostUnavailable`). The `memory placement` line prints both; it is now also
+printed while a direct copy lives (not only while a system-memory fallback does), so an opt-in
+direct run has its measurement without forcing `VICTORY_MEMORY_REPORT=1`.
+
+### 12.6 Tests and checks
+
+- Unit tests: `openability_names_private_and_view_memory_and_the_refusals`,
+  `our_section_view_is_unmapped_with_its_last_holder`,
+  `a_covering_placed_copy_is_let_go_without_a_table_scan`,
+  `a_directly_backed_copy_is_counted_while_it_lives_and_after`,
+  `direct_refusals_keep_their_reason_and_bytes`; the port and in-place WARP tests were extended as
+  above.
+- `cargo check --workspace --all-targets --locked`: PASS. `cargo clippy -p victory-gpu
+  --all-targets --locked -- -D warnings`: the only failure is the pre-existing
+  `clippy::manual_is_multiple_of` in `shadow.rs` (now line 1861), the same baseline condition
+  documented in `memory-separation.md` section 8.1; the changed lines add no lint.
+- `cargo test` cannot link on this host (GNU raw-dylib needs a working `dlltool`); the tests run
+  on `windows-latest` (WARP) in CI.

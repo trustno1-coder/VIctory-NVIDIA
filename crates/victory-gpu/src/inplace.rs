@@ -101,6 +101,53 @@ fn most() -> u64 {
     *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096) << 20)
 }
 
+/// What kind of backing `[start, start + len)` has for a direct placement, without opening
+/// anything. The two openings the layer has (see the module comment) decide what a placement can
+/// use: a committed part of one private allocation, or one run of one section through a view of
+/// ours. A backing is not a virtual address: keying a decision by address alone is wrong once the
+/// title remaps pages, so callers re-ask this after every mapping change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Openability {
+    /// Private memory, every page committed read-write in one allocation: [`place_part`] can
+    /// open a part of it.
+    Private,
+    /// Title view memory whose bytes are one run of one section: our own view of that run could
+    /// be opened (the mechanism `crate::port` uses for the sub-4-GiB graphics heap).
+    View { section: usize, offset: u64 },
+    /// Nothing can be opened over it; why.
+    Refused(NotOpenable),
+}
+
+/// Why `[`Openability::Refused`]`: the range is not openable as a heap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NotOpenable {
+    /// No view of title pages there, and not private memory committed read-write (reserved,
+    /// decommitted, guarded, or memory of another kind).
+    Unmapped,
+    /// View memory whose pages are not one contiguous run of one section.
+    Scattered,
+    /// View memory with pages that are not mapped at all.
+    Holes,
+}
+
+/// `[`Openability`]` of title memory `[start, start + len)`, as the view registry and Windows
+/// report it now; no host object is created and the property is not reserved.
+pub(crate) fn openability(start: u64, len: u64) -> Openability {
+    let len = len.max(1);
+    match cover(start as usize, len as usize) {
+        Cover::Run(section, offset) => Openability::View { section, offset },
+        Cover::Scattered => Openability::Refused(NotOpenable::Scattered),
+        Cover::Holes => Openability::Refused(NotOpenable::Holes),
+        Cover::None => {
+            if private_whole(start as usize, len as usize) {
+                Openability::Private
+            } else {
+                Openability::Refused(NotOpenable::Unmapped)
+            }
+        }
+    }
+}
+
 /// In place now: windows and their bytes, title buffers and their bytes;
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
@@ -115,7 +162,51 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// Our own view of the section when the heap was opened on one (not on private memory):
+    /// held for as long as the placed buffer lives, and unmapped after it. The heap is the field
+    /// above, so it is released before the view.
+    pub(crate) keep: Option<std::sync::Arc<SectionView>>,
 }
+
+/// Our own mapping of one run of a title section, kept so that a heap opened on it outlives the
+/// title's own views of the same pages: the title may unmap, remap or reprotect those freely
+/// while our view stands, and our heap reads the section's committed pages through it. The view
+/// is unmapped when the last placed buffer that holds it is dropped, after that buffer's heap.
+pub(crate) struct SectionView {
+    base: usize,
+}
+
+impl SectionView {
+    /// Maps `bytes` of `section` from `offset` at an address of ours. The pages must be
+    /// committed (the caller checks it first); no heap is opened here.
+    pub(crate) fn map(section: usize, offset: u64, bytes: usize) -> Option<std::sync::Arc<SectionView>> {
+        // SAFETY: the handle of a section the runtime made and still has a view of; a view of
+        // our own of a committed range (`crate::port::open_region` asks `committed` first).
+        let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes) }.Value as usize;
+        if base == 0 {
+            tracing::warn!(section = format_args!("{section:#x}"), offset, bytes, error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
+            return None;
+        }
+        Some(std::sync::Arc::new(SectionView { base }))
+    }
+
+    pub(crate) fn base(&self) -> usize {
+        self.base
+    }
+}
+
+impl Drop for SectionView {
+    fn drop(&mut self) {
+        // SAFETY: our own view; every heap opened on it was released before this (the field
+        // order of `Placed` and `Shadow::place` keeps the heap first).
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: self.base as *mut c_void }) };
+    }
+}
+
+// SAFETY: a mapping may be made and unmapped on any thread.
+unsafe impl Send for SectionView {}
+// SAFETY: as above.
+unsafe impl Sync for SectionView {}
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
 /// as a heap of their own and places one buffer over all of them. `Err`
@@ -131,7 +222,7 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, keep: None })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -141,16 +232,43 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
+    // What the backing is, without opening anything. Only private memory is opened by this
+    // stage; view memory is turned down here (a later stage opens a view of a section run) and
+    // costs nothing to classify: the view registry already knows.
+    match openability(start, len) {
+        Openability::Private => {}
+        Openability::View { section, offset } => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            crate::residency::direct_refused(len, crate::residency::NoDirect::NotOpenable);
+            if STATS[4].load(Ordering::Relaxed) <= 8 {
+                tracing::debug!(
+                    start = format_args!("{start:#x}"),
+                    len,
+                    section = format_args!("{section:#x}"),
+                    offset,
+                    "title memory is a view of a section run: not opened by this stage"
+                );
+            }
+            return None;
+        }
+        Openability::Refused(why) => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            crate::residency::direct_refused(len, crate::residency::NoDirect::NotOpenable);
+            if STATS[4].load(Ordering::Relaxed) <= 8 {
+                tracing::debug!(start = format_args!("{start:#x}"), len, ?why, "title memory cannot be opened: a copy instead");
+            }
+            return None;
+        }
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
+        crate::residency::direct_refused(len, crate::residency::NoDirect::Cap);
         return None;
     }
-    let host = crate::host::host()?;
+    let Some(host) = crate::host::host() else {
+        crate::residency::direct_refused(len, crate::residency::NoDirect::HostUnavailable);
+        return None;
+    };
     match place_part(&host.device, start, len) {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
@@ -160,9 +278,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
         Err(None) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            crate::residency::direct_refused(len, crate::residency::NoDirect::NotOpenable);
             None
         }
         Err(Some(e)) => {
+            crate::residency::direct_refused(len, crate::residency::NoDirect::HostRefused);
             if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
                 tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
             }
@@ -326,6 +446,9 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    // Nothing of ours may outlive the section: the port's regions over it are forgotten here
+    // (their views stay mapped only while placed buffers hold them).
+    crate::port::section_gone(section);
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
@@ -1524,6 +1647,96 @@ pub(crate) mod tests {
             assert!(text.contains("census,   view memory, one run of a section (one placed buffer): 1 of"), "{text}");
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// The openability predicate names the two backing kinds a placement can use and the reasons
+    /// the other ranges cannot be opened, without creating anything.
+    #[test]
+    fn openability_names_private_and_view_memory_and_the_refusals() {
+        const K: usize = 64 << 10;
+        // SAFETY: allocations of the test's own.
+        unsafe {
+            let private = mem::VirtualAlloc(std::ptr::null(), 8 * K, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as u64;
+            assert_eq!(openability(private, 4 * K as u64), Openability::Private);
+            let reserved = mem::VirtualAlloc(std::ptr::null(), 8 * K, mem::MEM_RESERVE, mem::PAGE_NOACCESS) as u64;
+            assert_eq!(openability(reserved, K as u64), Openability::Refused(NotOpenable::Unmapped));
+            mem::VirtualFree(private as *mut c_void, 0, mem::MEM_RELEASE);
+            mem::VirtualFree(reserved as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+        // A range only the view registry knows, at one section run; then adjacent views from
+        // elsewhere (scattered) and a gap (holes).
+        let at = 0x7_9000_0000usize;
+        title_memory_view(at, 2 * K, 77, 8 * K as u64);
+        assert_eq!(openability(at as u64, 2 * K as u64), Openability::View { section: 77, offset: 8 * K as u64 });
+        title_memory_view(at + 2 * K, K, 78, 0);
+        assert_eq!(openability(at as u64, 3 * K as u64), Openability::Refused(NotOpenable::Scattered));
+        title_memory_view(at + 4 * K, K, 77, 9 * K as u64);
+        assert_eq!(openability(at as u64, 5 * K as u64), Openability::Refused(NotOpenable::Holes));
+        views_gone(at, 5 * K);
+        assert_eq!(openability(at as u64, K as u64), Openability::Refused(NotOpenable::Unmapped));
+    }
+
+    /// Our own view of a section run is unmapped when the last placed buffer that holds it goes,
+    /// and not before: a heap is opened on it, so it must outlive the heap.
+    #[test]
+    fn our_section_view_is_unmapped_with_its_last_holder() {
+        const K: usize = 64 << 10;
+        // SAFETY (the whole test): the section, placeholder and views made here.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let section = mem::CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE | mem::SEC_RESERVE,
+                0,
+                8 * K as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let hole = mem::VirtualAlloc2(
+                process,
+                std::ptr::null(),
+                8 * K,
+                mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+                mem::PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            )
+            .cast::<u8>();
+            assert!(!hole.is_null());
+            mem::VirtualFree(hole.cast(), 4 * K, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
+            // A title view of the section's first four pages, committed as `xmem` commits them.
+            let view = mem::MapViewOfFile3(
+                section,
+                process,
+                hole.cast(),
+                0,
+                4 * K,
+                mem::MEM_REPLACE_PLACEHOLDER,
+                mem::PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert!(!view.Value.is_null());
+            assert!(!mem::VirtualAlloc(view.Value, 4 * K, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            let state = |at: usize| {
+                let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                let n = mem::VirtualQuery(at as *const c_void, &mut info, std::mem::size_of_val(&info));
+                if n == 0 { 0 } else { info.State }
+            };
+            let ours = super::SectionView::map(section as usize, 0, 2 * K).expect("a view of ours");
+            let base = ours.base();
+            assert_eq!(state(base), mem::MEM_COMMIT, "our view is a mapping");
+            let second = ours.clone();
+            drop(ours);
+            assert_eq!(state(base), mem::MEM_COMMIT, "held by the second reference");
+            drop(second);
+            assert_ne!(state(base), mem::MEM_COMMIT, "unmapped with the last holder");
+            assert_ne!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER), 0);
+            mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
+            mem::VirtualFree(hole.add(4 * K).cast(), 0, mem::MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
 }

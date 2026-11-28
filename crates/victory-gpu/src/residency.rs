@@ -249,8 +249,8 @@ pub(crate) fn placed(resource: &ID3D12Resource, bytes: u64) {
     total.fetch_add(bytes, Ordering::Relaxed);
 }
 
-/// Why a copy has no device-local side (see `shadow::card_for`,
-/// `shadow::window_card_for` and `shadow::by_address`).
+/// Why a copy has no device-local side (see `shadow::card_admission`,
+/// `shadow::window_admission` and `shadow::by_address`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Fallback {
     /// The switch that makes device-local sides is off.
@@ -301,6 +301,86 @@ impl Fallback {
 /// and those made since the start.
 static FALLBACK_LIVE: [[AtomicU64; 2]; FALLBACKS] = [const { [const { AtomicU64::new(0) }; 2] }; FALLBACKS];
 static FALLBACK_TOTAL: [[AtomicU64; 2]; FALLBACKS] = [const { [const { AtomicU64::new(0) }; 2] }; FALLBACKS];
+
+/// Directly backed copies: not copies at all, but buffers placed over the title's own memory
+/// (`crate::inplace`, `crate::port`), so the GPU reads and writes the original backing bytes and
+/// no mirror, refresh, send, compare or copy-back exists for them. Counted while they live and
+/// since the start, windows (0) and title buffers (1).
+const DIRECT: usize = 2;
+static DIRECT_LIVE: [[AtomicU64; 2]; DIRECT] = [const { [const { AtomicU64::new(0) }; 2] }; DIRECT];
+static DIRECT_TOTAL: [[AtomicU64; 2]; DIRECT] = [const { [const { AtomicU64::new(0) }; 2] }; DIRECT];
+
+fn direct_slot(window: bool) -> usize {
+    usize::from(!window)
+}
+
+/// A copy was placed directly over title memory: count it while it lives.
+pub(crate) fn direct_add(window: bool, bytes: u64) {
+    let slot = &DIRECT_LIVE[direct_slot(window)];
+    slot[0].fetch_add(1, Ordering::Relaxed);
+    slot[1].fetch_add(bytes, Ordering::Relaxed);
+    let slot = &DIRECT_TOTAL[direct_slot(window)];
+    slot[0].fetch_add(1, Ordering::Relaxed);
+    slot[1].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// A directly backed copy went.
+pub(crate) fn direct_freed(window: bool, bytes: u64) {
+    let slot = &DIRECT_LIVE[direct_slot(window)];
+    slot[0].fetch_sub(1, Ordering::Relaxed);
+    slot[1].fetch_sub(bytes, Ordering::Relaxed);
+}
+
+/// Bytes of copies alive now that the GPU reaches through the title's own backing.
+pub(crate) fn direct_live_bytes() -> u64 {
+    DIRECT_LIVE.iter().map(|slot| slot[1].load(Ordering::Relaxed)).sum()
+}
+
+/// Why a copy that asked for direct backing did not get it (the copy then went the old way).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NoDirect {
+    /// The title memory is not openable: not private memory committed whole, or view memory
+    /// that is not one contiguous run of one section (scattered, holes, unmapped).
+    NotOpenable,
+    /// The in-place byte cap (`VICTORY_INPLACE_MB`) or a region's own cap refused it.
+    Cap,
+    /// The device or driver refused the opening or the placed resource.
+    HostRefused,
+    /// No host device, or no `ID3D12Device13` for the part-opening call.
+    HostUnavailable,
+}
+
+const NO_DIRECT: usize = 4;
+
+impl NoDirect {
+    fn index(self) -> usize {
+        match self {
+            NoDirect::NotOpenable => 0,
+            NoDirect::Cap => 1,
+            NoDirect::HostRefused => 2,
+            NoDirect::HostUnavailable => 3,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            NoDirect::NotOpenable => "not openable",
+            NoDirect::Cap => "cap",
+            NoDirect::HostRefused => "host refused",
+            NoDirect::HostUnavailable => "host unavailable",
+        }
+    }
+}
+
+/// Direct-backing asks refused since the start, as (count, bytes), by reason.
+static NO_DIRECT_TOTAL: [[AtomicU64; 2]; NO_DIRECT] = [const { [const { AtomicU64::new(0) }; 2] }; NO_DIRECT];
+
+/// A copy asked for direct backing and was refused: count it and its bytes with the reason.
+pub(crate) fn direct_refused(bytes: u64, why: NoDirect) {
+    let slot = &NO_DIRECT_TOTAL[why.index()];
+    slot[0].fetch_add(1, Ordering::Relaxed);
+    slot[1].fetch_add(bytes, Ordering::Relaxed);
+}
 
 /// A copy without a device-local side was made: count it while it lives.
 pub(crate) fn fallback_add(bytes: u64, why: Fallback) {
@@ -371,7 +451,10 @@ pub(crate) fn placement_line(memory: Option<[[u64; 4]; 2]>) {
     }
     let forced = asked.is_some();
     let live_bytes: u64 = ORDER.iter().map(|r| FALLBACK_LIVE[r.index()][1].load(Ordering::Relaxed)).sum();
-    if !forced && live_bytes == 0 {
+    // Also while copies are directly backed: the line is then the measurement of how much of the
+    // copy machinery the direct path replaced (VICTORY_INPLACE / VICTORY_PORT_CONSTANTS runs).
+    let live_direct = direct_live_bytes();
+    if !forced && live_bytes == 0 && live_direct == 0 {
         return;
     }
     let (mut live_count, mut total_count, mut total_bytes) = (0u64, 0u64, 0u64);
@@ -408,12 +491,47 @@ pub(crate) fn placement_line(memory: Option<[[u64; 4]; 2]>) {
     };
     let (live_mb, total_mb) = (fallback_mib(live_bytes), fallback_mib(total_bytes));
     let detail = if reasons.is_empty() { String::new() } else { format!(": {reasons}") };
+    // The copies the GPU reads and writes through the title's own backing: not host buffers at
+    // all, so they are counted apart from the API heap classes above.
+    let direct = |window: bool| {
+        let i = direct_slot(window);
+        (
+            DIRECT_LIVE[i][0].load(Ordering::Relaxed),
+            DIRECT_LIVE[i][1].load(Ordering::Relaxed),
+            DIRECT_TOTAL[i][0].load(Ordering::Relaxed),
+            DIRECT_TOTAL[i][1].load(Ordering::Relaxed),
+        )
+    };
+    let (dw_n, dw_b, dw_tn, dw_tb) = direct(true);
+    let (db_n, db_b, db_tn, db_tb) = direct(false);
+    let (direct_live_count, direct_live) = (dw_n + db_n, live_direct);
+    let (direct_total_count, direct_total_bytes) = (dw_tn + db_tn, dw_tb + db_tb);
+    let mut refused = String::new();
+    for why in [NoDirect::NotOpenable, NoDirect::Cap, NoDirect::HostRefused, NoDirect::HostUnavailable] {
+        let n = NO_DIRECT_TOTAL[why.index()][0].load(Ordering::Relaxed);
+        if n != 0 {
+            let bytes = NO_DIRECT_TOTAL[why.index()][1].load(Ordering::Relaxed);
+            refused.push_str(&format!("{} {} MB, ", why.name(), bytes >> 20));
+        }
+    }
+    if refused.ends_with(", ") {
+        refused.truncate(refused.len() - 2);
+    }
+    let direct_detail = format!(
+        "; directly backed copies (title memory in place, no host copy): alive {direct_live_count} windows {dw_n} {} MB, \
+         title buffers {db_n} {} MB, {} MB in all; {direct_total_count} made since the start, {} MB{}",
+        dw_b >> 20,
+        db_b >> 20,
+        direct_live >> 20,
+        direct_total_bytes >> 20,
+        if refused.is_empty() { String::new() } else { format!("; no direct backing: {refused}") }
+    );
     tracing::info!(
         "memory placement: host buffers the copy and transfer machinery made since the start, as the API reports them: \
          device-local {dl_n} ({dl_mb} MB), CPU-visible {cv_n} ({cv_mb} MB), staging {up_n} ({up_mb} MB), \
          readback {rb_n} ({rb_mb} MB), CPU-mapped VRAM {mv_n} ({mv_mb} MB), other {ot_n} ({ot_mb} MB); copies whose \
          GPU-visible side is system memory, alive {live_count} ({live_mb} MB){detail}, {total_count} ({total_mb} MB) \
-         made since the start; DXGI local {local_used}/{local_budget} MB, shared {shared_used}/{shared_budget} MB"
+         made since the start{direct_detail}; DXGI local {local_used}/{local_budget} MB, shared {shared_used}/{shared_budget} MB"
     );
 }
 
@@ -495,6 +613,31 @@ mod tests {
         fallback_freed(1 << 20, Fallback::Cap);
         assert_eq!(live(), live_before);
         assert_eq!(made(), made_before + (1 << 20), "what was made stays counted");
+    }
+
+    #[test]
+    fn a_directly_backed_copy_is_counted_while_it_lives_and_after() {
+        // The counters are process-wide: other tests may count too, so compare deltas.
+        let live = || (DIRECT_LIVE[direct_slot(false)][0].load(Ordering::Relaxed), DIRECT_LIVE[direct_slot(false)][1].load(Ordering::Relaxed));
+        let made = || (DIRECT_TOTAL[direct_slot(false)][0].load(Ordering::Relaxed), DIRECT_TOTAL[direct_slot(false)][1].load(Ordering::Relaxed));
+        let (live_before, made_before) = (live(), made());
+        direct_add(false, 3 << 20);
+        assert_eq!(live(), (live_before.0 + 1, live_before.1 + (3 << 20)));
+        assert_eq!(made(), (made_before.0 + 1, made_before.1 + (3 << 20)));
+        direct_freed(false, 3 << 20);
+        assert_eq!(live(), live_before);
+        assert_eq!(made(), (made_before.0 + 1, made_before.1 + (3 << 20)), "what was made stays counted");
+    }
+
+    #[test]
+    fn direct_refusals_keep_their_reason_and_bytes() {
+        let slot = |why: NoDirect| NO_DIRECT_TOTAL[why.index()][1].load(Ordering::Relaxed);
+        let before = (slot(NoDirect::NotOpenable), slot(NoDirect::Cap), slot(NoDirect::HostUnavailable));
+        direct_refused(2 << 20, NoDirect::NotOpenable);
+        direct_refused(5 << 20, NoDirect::HostUnavailable);
+        assert_eq!(slot(NoDirect::NotOpenable), before.0 + (2 << 20));
+        assert_eq!(slot(NoDirect::Cap), before.1);
+        assert_eq!(slot(NoDirect::HostUnavailable), before.2 + (5 << 20));
     }
 
     #[test]

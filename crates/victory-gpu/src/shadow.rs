@@ -105,6 +105,11 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// When `place` was opened on a view of one of the title's sections (`crate::inplace`):
+    /// the view that heap is on. Kept alive as long as the heap is (the field order here is the
+    /// release order: the heap first, then the view), so the title's own views of the same pages
+    /// stay free to change while this copy is in place.
+    place_keep: Option<std::sync::Arc<crate::inplace::SectionView>>,
     /// Bytes of this copy whose GPU-visible side is system memory because no
     /// device-local side was made, and why ([crate::residency::Fallback]);
     /// counted in [crate::residency] while the copy lives. The number is the
@@ -307,7 +312,7 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 ///
 /// The copies are made in one burst when the world loads (run 189: 94 of
 /// its 95 within two seconds, right before the first world frame), and
-/// [`card_for`] makes one only while the card is under eight tenths of its
+/// [`card_admission`] admits one only while the card is under eight tenths of its
 /// budget. That held as long as the textures picked by index filled the
 /// card after the burst. Since the texture queue keeps packed neighbours
 /// (52b8060) it fills the card while the world loads: 85% and more at the
@@ -428,34 +433,37 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 16
 }
 
-/// The side shaders see for a title buffer's copy of `size` bytes, if it is to
-/// have one: [`cards`] is on, the size is within [`card_limits`] and below
-/// 1 GiB (the compare counts in 32 bits), and the host has what it takes
-/// (`Host::card_ready`). `Err` is why not: the copy then stays single-sided in
-/// system memory, counted in [`crate::residency`] by the caller.
-fn card_for(size: u64) -> Result<CardSide, crate::residency::Fallback> {
-    match card_room_for(size) {
-        Ok(buffer) => Ok(CardSide::Vram(buffer)),
-        Err(why) => {
-            if !card_all() || size >= 1 << 30 || !cards() {
-                return Err(why);
-            }
-            // Two sides all the same, the card's in the PC's memory.
-            let Some(host) = host() else {
-                return Err(crate::residency::Fallback::HostUnavailable);
-            };
-            if !host.card_ready() {
-                return Err(crate::residency::Fallback::HostUnavailable);
-            }
-            let Some((buffer, _)) = host.shared_buffer(size) else {
-                // The copy stays single-sided staging, as before: the reason it
-                // has no card side is still the refusal, not this failure.
-                return Err(why);
-            };
-            CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
-            Ok(CardSide::Ram(buffer, why))
-        }
+/// The side shaders see for a copy of `size` bytes that `card_admission` decided on: the
+/// device-local buffer, or the second system-memory side (`VICTORY_CARD_ALL`), with the reason
+/// the card side was refused. Split from the admission so that a direct placement
+/// (`crate::inplace`) replaces exactly the copies the policy would have kept in system memory:
+/// the decision is the same evidence the fallback is taken on.
+fn card_side(size: u64, admission: Result<(), crate::residency::Fallback>) -> Result<CardSide, crate::residency::Fallback> {
+    use crate::residency::Fallback;
+    let why = match admission {
+        Ok(()) => match card_allocate(size) {
+            Ok(buffer) => return Ok(CardSide::Vram(buffer)),
+            Err(why) => why,
+        },
+        Err(why) => why,
+    };
+    if !card_all() || size >= 1 << 30 || !cards() {
+        return Err(why);
     }
+    // Two sides all the same, the card's in the PC's memory.
+    let Some(host) = host() else {
+        return Err(Fallback::HostUnavailable);
+    };
+    if !host.card_ready() {
+        return Err(Fallback::HostUnavailable);
+    }
+    let Some((buffer, _)) = host.shared_buffer(size) else {
+        // The copy stays single-sided staging, as before: the reason it
+        // has no card side is still the refusal, not this failure.
+        return Err(why);
+    };
+    CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+    Ok(CardSide::Ram(buffer, why))
 }
 
 /// Whether every title buffer's copy has two sides, however small
@@ -472,8 +480,16 @@ fn card_all() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"))
 }
 
-/// [`card_for`] in the card's own memory.
-fn card_room_for(size: u64) -> Result<ID3D12Resource, crate::residency::Fallback> {
+/// Whether a title buffer's copy of `size` bytes is to have a device-local side, before one
+/// is allocated ([`card_allocate`]): [`cards`] is on, the size is within [`card_limits`] and
+/// below 1 GiB (the compare counts in 32 bits), the host has what it takes
+/// (`Host::card_ready`) and the card has room. `Err` is why not: the copy then stays
+/// single-sided in system memory, counted in [`crate::residency`].
+///
+/// Split from the allocation so that a direct placement decides on the same evidence the
+/// system-memory fallback would be taken on, and so that no host buffer is made before the
+/// decision. The cap is checked but not taken here; [`card_allocate`] takes it.
+fn card_admission(size: u64) -> Result<(), crate::residency::Fallback> {
     use crate::residency::Fallback;
     if !cards() {
         return Err(Fallback::SwitchOff);
@@ -523,6 +539,23 @@ fn card_room_for(size: u64) -> Result<ID3D12Resource, crate::residency::Fallback
         }
         return Err(Fallback::Budget);
     }
+    if CARD_BYTES[0].load(Ordering::Relaxed) + size > most {
+        return Err(Fallback::Cap);
+    }
+    Ok(())
+}
+
+/// The device-local side for a copy [`card_admission`] admitted: takes the bytes of
+/// [`card_limits`]' second number and allocates the buffer.
+fn card_allocate(size: u64) -> Result<ID3D12Resource, crate::residency::Fallback> {
+    use crate::residency::Fallback;
+    let Some(host) = host() else {
+        return Err(Fallback::HostUnavailable);
+    };
+    if !cards() || !host.card_ready() {
+        return Err(Fallback::HostUnavailable);
+    }
+    let most = card_limits().1;
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return Err(Fallback::Cap);
@@ -553,7 +586,7 @@ fn card_room_for(size: u64) -> Result<ID3D12Resource, crate::residency::Fallback
 ///
 /// A window goes to the card while there is room under this number and
 /// while a fifth of the card's budget is free, as title buffers do
-/// (`card_for`): textures keep their room, and once they have filled the
+/// (`card_admission`): textures keep their room, and once they have filled the
 /// card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
@@ -600,32 +633,35 @@ fn window_refused(size: u64) {
     WINDOW_REFUSED[1].fetch_add(size, Ordering::Relaxed);
 }
 
-/// The side shaders see for a window of `size` bytes, if it is to have one
-/// ([`window_card_most`]); `Err` is why not.
-fn window_card_for(size: u64) -> Result<CardSide, crate::residency::Fallback> {
-    match window_room_for(size) {
-        Ok(buffer) => Ok(CardSide::Vram(buffer)),
-        Err(why) => {
-            if !windows_own() || !cards() {
-                return Err(why);
-            }
-            // Two sides all the same, the card's in the PC's memory.
-            let Some(host) = host() else {
-                return Err(crate::residency::Fallback::HostUnavailable);
-            };
-            if !host.card_ready() {
-                return Err(crate::residency::Fallback::HostUnavailable);
-            }
-            let Some((buffer, _)) = host.shared_buffer(size) else {
-                // As in `card_for`: the work is single-sided staging either way,
-                // and the reason no card side was made is the refusal.
-                return Err(why);
-            };
-            // The second side is system memory: it is counted in the placement
-            // ledger, not against the windows' device-local budget.
-            Ok(CardSide::Ram(buffer, why))
-        }
+/// The side shaders see for a window of `size` bytes that `window_admission` decided on; as
+/// [`card_side`] for title buffers.
+fn window_side(size: u64, admission: Result<(), crate::residency::Fallback>) -> Result<CardSide, crate::residency::Fallback> {
+    use crate::residency::Fallback;
+    let why = match admission {
+        Ok(()) => match window_allocate(size) {
+            Ok(buffer) => return Ok(CardSide::Vram(buffer)),
+            Err(why) => why,
+        },
+        Err(why) => why,
+    };
+    if !windows_own() || !cards() {
+        return Err(why);
     }
+    // Two sides all the same, the card's in the PC's memory.
+    let Some(host) = host() else {
+        return Err(Fallback::HostUnavailable);
+    };
+    if !host.card_ready() {
+        return Err(Fallback::HostUnavailable);
+    }
+    let Some((buffer, _)) = host.shared_buffer(size) else {
+        // As in `card_side`: the work is single-sided staging either way,
+        // and the reason no card side was made is the refusal.
+        return Err(why);
+    };
+    // The second side is system memory: it is counted in the placement
+    // ledger, not against the windows' device-local budget.
+    Ok(CardSide::Ram(buffer, why))
 }
 
 /// The most bytes of windows outside buffers that lie in the card's memory
@@ -638,7 +674,7 @@ fn window_card_for(size: u64) -> Result<CardSide, crate::residency::Fallback> {
 /// instead of 36; filling them costs the CPU what it did.
 ///
 /// Windows go there while a fifth of the card's budget is free, as with
-/// [`window_room_for`], which this comes before.
+/// [`window_admission`], which this comes before.
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
@@ -683,8 +719,9 @@ fn windows_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_OWN").is_some_and(|v| v == "1"))
 }
 
-/// [`window_card_for`] in the card's own memory.
-fn window_room_for(size: u64) -> Result<ID3D12Resource, crate::residency::Fallback> {
+/// Whether a window of `size` bytes is to have a device-local side, before one is allocated
+/// ([`window_allocate`]); as [`card_admission`] for title buffers.
+fn window_admission(size: u64) -> Result<(), crate::residency::Fallback> {
     use crate::residency::Fallback;
     let most = window_card_most();
     if most == 0 || !cards() {
@@ -701,6 +738,23 @@ fn window_room_for(size: u64) -> Result<ID3D12Resource, crate::residency::Fallba
     {
         window_refused(size);
         return Err(Fallback::Budget);
+    }
+    if WINDOW_CARD_BYTES.load(Ordering::Relaxed) + size > most {
+        window_refused(size);
+        return Err(Fallback::Cap);
+    }
+    Ok(())
+}
+
+/// The device-local side for a window [`window_admission`] admitted.
+fn window_allocate(size: u64) -> Result<ID3D12Resource, crate::residency::Fallback> {
+    use crate::residency::Fallback;
+    let most = window_card_most();
+    let Some(host) = host() else {
+        return Err(Fallback::HostUnavailable);
+    };
+    if most == 0 || !cards() || !host.card_ready() {
+        return Err(Fallback::HostUnavailable);
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
@@ -3021,8 +3075,9 @@ fn reserve_cap(used: &AtomicU64, len: u64, most: u64) -> bool {
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
-            // Never counted with the copies (`Shadow::placed`).
+            // Never counted with the copies (`Shadow::placed`); counted as directly backed.
             crate::inplace::gone(self.window, self.len);
+            crate::residency::direct_freed(self.window, self.len);
             return;
         }
         if self.fallback.0 != 0 {
@@ -3493,6 +3548,8 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        shadow.place_keep = placed.keep;
+        crate::residency::direct_add(window, len);
         shadow
     }
 
@@ -3544,6 +3601,7 @@ impl Shadow {
             wc: AtomicU8::new(0),
             mapped: false,
             place: None,
+            place_keep: None,
             fallback: (0, crate::residency::Fallback::ViewCopy),
             address_card: 0,
             window_card: 0,
@@ -5442,6 +5500,22 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
         .map(|(k, e)| (k.0, e.end - k.0))
 }
 
+/// The copies that are not copies but title memory in place (`crate::inplace`), weakest:
+/// the registry does not keep one alive. A mapping change must let go of every placed copy over
+/// the range, and the copies' own tables cannot be searched reliably for it: they are keyed by
+/// the ask that made the copy, a placed copy can start far below the range (a big title buffer),
+/// and any one scan is bounded. This list is short and exact: only placed copies are here.
+static PLACED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// Notes a placed copy for [`in_place_let_go`]; called where a `Shadow::placed` is made.
+fn remember_placed(shadow: &Arc<Shadow>) {
+    let mut placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    if placed.len() >= 64 {
+        placed.retain(|weak| weak.strong_count() > 0);
+    }
+    placed.push(Arc::downgrade(shadow));
+}
+
 /// Title memory `[at, at + len)` is about to show something else or be
 /// given up: what is in place there (`crate::inplace`) is taken out of the
 /// tables, so that the next ask makes a copy or opens the memory anew, and
@@ -5450,20 +5524,51 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
+        let mut placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut i = 0;
+        while i < placed.len() {
+            match placed[i].upgrade() {
+                Some(shadow) if shadow.start < end && shadow.start.saturating_add(shadow.len) > at => {
+                    placed.swap_remove(i);
+                    gone.push(shadow);
+                }
+                Some(_) => i += 1,
+                None => {
+                    placed.swap_remove(i);
+                }
+            }
+        }
+    }
+    if gone.is_empty() {
+        return 0;
+    }
+    // Out of the tables, by the key the ask that made each copy used; a copy the tables hold
+    // under another key is removed by identity.
+    {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-        let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
-            .map(|(key, _)| *key)
-            .collect();
-        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        for shadow in &gone {
+            let key = (shadow.start, shadow.len);
+            if map.get(&key).is_some_and(|s| Arc::ptr_eq(s, shadow)) {
+                map.remove(&key);
+            } else {
+                map.retain(|_, s| !Arc::ptr_eq(s, shadow));
+            }
+        }
     }
     {
-        // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
-                gone.extend(entry.shadow.take());
+        for shadow in &gone {
+            let key = (shadow.start, shadow.len as usize);
+            if map.get(&key).is_some_and(|e| e.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, shadow))) {
+                if let Some(entry) = map.get_mut(&key) {
+                    entry.shadow = None;
+                }
+            } else {
+                for entry in map.values_mut() {
+                    if entry.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, shadow)) {
+                        entry.shadow = None;
+                    }
+                }
             }
         }
     }
@@ -5571,12 +5676,16 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
         if let Some(placed) = crate::port::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+            remember_placed(&shadow);
+            entry.shadow = Some(shadow.clone());
+            return Some(shadow);
         }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+            remember_placed(&shadow);
+            entry.shadow = Some(shadow.clone());
+            return Some(shadow);
         }
         // Write-combined memory with `VICTORY_WC_BAR`: one buffer in the card's
         // memory that the CPU maps, no CPU's side, nothing sent, and what
@@ -5601,12 +5710,16 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(shadow));
             return entry.shadow.clone();
         }
+        // The device-local side is decided first, on the same evidence the system-memory
+        // fallback would be taken on, so that a direct placement (`crate::inplace`) can replace
+        // exactly the copies the policy would have kept in system memory.
+        let admission = card_admission(size);
         let (staging, data) = host()?.shared_buffer(size)?;
         crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side. Refused, the copy
         // stays single-sided in system memory: counted in `crate::residency`.
-        let (buffer, card, fallback) = match card_for(size) {
+        let (buffer, card, fallback) = match card_side(size, admission) {
             Ok(CardSide::Vram(on_card)) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
@@ -5923,6 +6036,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        remember_placed(&shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
@@ -5940,12 +6054,15 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    // The device-local side is decided first, as `lookup` does for a title buffer: a direct
+    // placement tries after this decision and only when it refused.
+    let admission = window_admission(len);
     let (staging, data) = host()?.shared_buffer(len)?;
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side. Refused, the window
     // stays single-sided in system memory: counted in `crate::residency`.
-    let (buffer, card, fallback, window_card) = match window_card_for(len) {
+    let (buffer, card, fallback, window_card) = match window_side(len, admission) {
         Ok(CardSide::Vram(on_card)) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             (
@@ -6345,4 +6462,54 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+
+    /// A placed copy is let go by a mapping change even when a bounded scan of the copies' table
+    /// would stop before its key: the placed-copy registry is exact, and a placed copy can start
+    /// far below the range (a big title buffer) with many copies starting between.
+    #[test]
+    fn a_covering_placed_copy_is_let_go_without_a_table_scan() {
+        use windows_sys::Win32::System::Memory as mem;
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = crate::inplace::tests::warp() else { return; };
+        const K: usize = 64 << 10;
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 8 * K, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            let start = base as u64;
+            let len = 2 * K as u64;
+            let placed = crate::inplace::place_part(&device, start, len).expect("a placed buffer");
+            let shadow = Arc::new(Shadow::placed(placed, start, len, false));
+            remember_placed(&shadow);
+            let at = start + 0x100;
+            {
+                let mut map = buffers();
+                map.clear();
+                // The placed copy, under the key of the ask that made it.
+                map.insert((start, len as usize), Entry { end: start + len, shadow: Some(shadow.clone()) });
+                // More copies starting above it than a bounded scan looks at, none covering.
+                for i in 1..=300u64 {
+                    let s = start + i * 0x40;
+                    map.insert((s, 0x10), Entry { end: s + 0x10, shadow: None });
+                }
+            }
+            assert_eq!(in_place_let_go(at, 0x10), 1, "the placed copy is let go");
+            assert!(buffers_read().get(&(start, len as usize)).is_some_and(|e| e.shadow.is_none()), "out of the table");
+            buffers().clear();
+            // The heap is gone with the last reference; the title's pages are free again.
+            let freed = (0..500).any(|_| {
+                let done = mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE) != 0;
+                if !done {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                done
+            });
+            assert!(freed, "the placed heap let go of the pages");
+        }
+    }
 }
