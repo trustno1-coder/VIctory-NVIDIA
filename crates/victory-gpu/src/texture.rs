@@ -17,7 +17,8 @@
 
 pub(crate) mod ahead;
 
-use std::collections::HashMap;
+/// Tables by our own addresses: hashed by [`crate::host::AddressHash`].
+type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::host::AddressHash>>;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -190,7 +191,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     let Some(host) = host() else { return false };
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
-        let map = map.get_or_insert_with(HashMap::new);
+        let map = map.get_or_insert_with(HashMap::default);
         match map.get(&(placed as usize)) {
             Some(through) => through.clone(),
             None => {
@@ -568,7 +569,7 @@ pub(crate) fn let_go_idle() {
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize, std::hash::BuildHasherDefault<crate::host::AddressHash>>>> = Mutex::new(None);
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
@@ -703,6 +704,115 @@ fn once() -> bool {
 /// cryptographic one, which took 0.27 ms a megabyte, four times the detiling
 /// it was to spare; nobody makes up textures to collide.)
 pub(crate) fn digest(bytes: &[u8]) -> Digest {
+    digest_aes(bytes).map_or_else(|| digest_plain(bytes), Digest)
+}
+
+/// Round keys of the AES digest (any fixed values do).
+const AES_KEYS: [u64; 4] = [0xbe4b_a423_396c_feb8, 0x1cad_21f7_2c81_017c, 0xdb97_9083_e96d_d4de, 0x1f67_b3b7_a4a4_4072];
+
+/// [`digest`] with AES rounds: eight 16-byte lanes, each taking 16 bytes of
+/// every 128 through one round (`aesenc` of the lane and the bytes), then
+/// folded with the length. Some four times the speed of the multiplications
+/// it replaces where the bytes are in the cache (a copy just made). Two of
+/// the lanes a VAES instruction when the processor has it, else one an
+/// AES-NI instruction each: the same digest either way.
+fn digest_aes(bytes: &[u8]) -> Option<u128> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("vaes") && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the features are there.
+            return Some(unsafe { digest_vaes(bytes) });
+        }
+        if std::arch::is_x86_feature_detected!("aes") {
+            // SAFETY: the feature is there.
+            return Some(unsafe { digest_aesni(bytes) });
+        }
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,vaes,aes")]
+// The VAES intrinsics are stable from Rust 1.89; the toolchain is pinned to a
+// later one (`rust-toolchain.toml`).
+#[allow(clippy::incompatible_msrv)]
+unsafe fn digest_vaes(bytes: &[u8]) -> u128 {
+    use std::arch::x86_64::*;
+    // SAFETY: loads of 32 bytes inside `bytes` or a local block.
+    unsafe {
+        let k = _mm256_loadu_si256(AES_KEYS.as_ptr().cast());
+        let lane = |i: i64| _mm256_xor_si256(k, _mm256_set_epi64x(0, 2 * i + 1, 0, 2 * i));
+        let mut h = [lane(0), lane(1), lane(2), lane(3)];
+        let blocks = bytes.chunks_exact(128);
+        let rest = blocks.remainder();
+        for block in blocks {
+            let p = block.as_ptr();
+            for (i, h) in h.iter_mut().enumerate() {
+                *h = _mm256_aesenc_epi128(_mm256_xor_si256(*h, _mm256_loadu_si256(p.add(32 * i).cast())), k);
+            }
+        }
+        let mut last = [0u8; 128];
+        last[..rest.len()].copy_from_slice(rest);
+        for (i, h) in h.iter_mut().enumerate() {
+            *h = _mm256_aesenc_epi128(_mm256_xor_si256(*h, _mm256_loadu_si256(last.as_ptr().add(32 * i).cast())), k);
+        }
+        let mut out = [[0u8; 16]; 8];
+        for (i, h) in h.iter().enumerate() {
+            _mm_storeu_si128(out[2 * i].as_mut_ptr().cast(), _mm256_castsi256_si128(*h));
+            _mm_storeu_si128(out[2 * i + 1].as_mut_ptr().cast(), _mm256_extracti128_si256::<1>(*h));
+        }
+        aes_finish(&out, bytes.len())
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "aes,sse2")]
+unsafe fn digest_aesni(bytes: &[u8]) -> u128 {
+    use std::arch::x86_64::*;
+    // SAFETY: loads of 16 bytes inside `bytes` or a local block.
+    unsafe {
+        let keys: [__m128i; 2] = [_mm_loadu_si128(AES_KEYS.as_ptr().cast()), _mm_loadu_si128(AES_KEYS.as_ptr().add(2).cast())];
+        let mut h: [__m128i; 8] = std::array::from_fn(|i| _mm_xor_si128(keys[i % 2], _mm_set_epi64x(0, i as i64)));
+        let blocks = bytes.chunks_exact(128);
+        let rest = blocks.remainder();
+        for block in blocks {
+            let p = block.as_ptr();
+            for (i, h) in h.iter_mut().enumerate() {
+                *h = _mm_aesenc_si128(_mm_xor_si128(*h, _mm_loadu_si128(p.add(16 * i).cast())), keys[i % 2]);
+            }
+        }
+        let mut last = [0u8; 128];
+        last[..rest.len()].copy_from_slice(rest);
+        for (i, h) in h.iter_mut().enumerate() {
+            *h = _mm_aesenc_si128(_mm_xor_si128(*h, _mm_loadu_si128(last.as_ptr().add(16 * i).cast())), keys[i % 2]);
+        }
+        let mut out = [[0u8; 16]; 8];
+        for (i, h) in h.iter().enumerate() {
+            _mm_storeu_si128(out[i].as_mut_ptr().cast(), *h);
+        }
+        aes_finish(&out, bytes.len())
+    }
+}
+
+/// The eight lanes and the length, folded to 128 bits (folded products, as
+/// [`digest`] ends).
+fn aes_finish(lanes: &[[u8; 16]; 8], len: usize) -> u128 {
+    let fold = |a: u64, b: u64| {
+        let p = u128::from(a) * u128::from(b);
+        p as u64 ^ (p >> 64) as u64
+    };
+    let w: Vec<u64> = lanes.iter().flat_map(|l| [u64::from_le_bytes(l[..8].try_into().unwrap_or_default()), u64::from_le_bytes(l[8..].try_into().unwrap_or_default())]).collect();
+    let len = len as u64;
+    let (mut lo, mut hi) = (0x9e37_79b9_7f4a_7c15u64 ^ len, 0xc2b2_ae3d_27d4_eb4fu64 ^ len.rotate_left(29));
+    for pair in w.chunks_exact(2) {
+        lo = fold(lo ^ pair[0], pair[1] ^ 0xa076_1d64_78bd_642f).wrapping_add(lo.rotate_left(23));
+        hi = fold(hi ^ pair[1], pair[0] ^ 0xe703_7ed1_a0b4_28db).wrapping_add(hi.rotate_left(41));
+    }
+    u128::from(lo) << 64 | u128::from(hi)
+}
+
+/// [`digest`] without AES instructions.
+fn digest_plain(bytes: &[u8]) -> Digest {
     const K: [u64; 8] = [
         0xa076_1d64_78bd_642f,
         0xe703_7ed1_a0b4_28db,
@@ -2122,7 +2232,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
+    let map = map.get_or_insert_with(HashMap::default);
     if let Some(s) = map.get(&(resource as usize))
         && s.first <= first.max(copy.base)
         && s.serial == copy.serial
@@ -2558,6 +2668,18 @@ mod allocation_costs {
 
     /// The digest tells every length and every changed byte apart, zeros
     /// among them.
+    #[test]
+    fn the_aes_digest_is_the_same_on_both_paths() {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("vaes") && std::arch::is_x86_feature_detected!("aes") {
+            let bytes: Vec<u8> = (0..70_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+            for n in (0..300).chain([4096, 65_536, 65_537, 70_000]) {
+                // SAFETY: the features are there.
+                assert_eq!(unsafe { super::digest_vaes(&bytes[..n]) }, unsafe { super::digest_aesni(&bytes[..n]) }, "{n} bytes");
+            }
+        }
+    }
+
     #[test]
     fn a_digest_tells_bytes_apart() {
         use super::digest;

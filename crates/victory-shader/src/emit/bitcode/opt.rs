@@ -30,7 +30,7 @@
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
 
-use std::collections::HashMap;
+use crate::fxmap::HashMap;
 
 use super::{
     Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
@@ -798,23 +798,41 @@ impl Module {
         }
         // The values every path to the block being walked has computed
         // (those of the blocks above it in the tree, and its own so far).
-        let mut known: HashMap<Key, V> = HashMap::new();
+        // Each value with the block that computed it: it stands for a later
+        // one only where that block dominates (its span of the tree's
+        // preorder holds the later block's). Entries of blocks left behind
+        // are written over, not taken out one by one when the walk leaves.
+        let mut known: HashMap<Key, (V, usize)> = HashMap::default();
+        let (mut tin, mut tout) = (vec![0usize; self.blocks.len()], vec![0usize; self.blocks.len()]);
+        {
+            let (mut clock, mut st) = (0usize, vec![(0usize, false)]);
+            while let Some((b, done)) = st.pop() {
+                if done {
+                    tout[b] = clock;
+                    continue;
+                }
+                tin[b] = clock;
+                clock += 1;
+                st.push((b, true));
+                for &c in tree.children[b].iter().rev() {
+                    st.push((c, false));
+                }
+            }
+        }
+        let dominates = |a: usize, b: usize| tin[a] <= tin[b] && tout[b] <= tout[a];
         // The reads of the block being walked since its last store.
-        let mut read: HashMap<Key, V> = HashMap::new();
+        let mut read: HashMap<Key, V> = HashMap::default();
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
             Enter(usize),
-            Leave(Vec<Key>, Learned),
+            Leave(Learned),
         }
         let mut steps = vec![Step::Enter(0)];
         while let Some(step) = steps.pop() {
             let b = match step {
                 Step::Enter(b) => b,
-                Step::Leave(keys, learned) => {
-                    for k in keys {
-                        known.remove(&k);
-                    }
+                Step::Leave(learned) => {
                     for v in learned.bits {
                         facts.bits.remove(&v);
                     }
@@ -824,7 +842,6 @@ impl Module {
                     continue;
                 }
             };
-            let mut added = Vec::new();
             // Reached from one block alone, by one side of its branch: the
             // condition is that side's, here and in every block below.
             let mut learned = Learned::default();
@@ -843,7 +860,7 @@ impl Module {
             read.clear();
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
-                let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
+                let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::default();
                 for &p in &self.blocks[b].phis {
                     if repl[p as usize].is_some() {
                         continue;
@@ -899,13 +916,20 @@ impl Module {
                     && class == Effect::Pure
                     && let Some(key) = self.key(i)
                 {
-                    if let Some(&first) = known.get(&key) {
-                        repl[i as usize] = Some(first);
-                        changed = true;
-                        continue;
+                    match known.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let &(first, at) = e.get();
+                            if dominates(at, b) {
+                                repl[i as usize] = Some(first);
+                                changed = true;
+                                continue;
+                            }
+                            e.insert((V::Inst(i), b));
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert((V::Inst(i), b));
+                        }
                     }
-                    known.insert(key.clone(), V::Inst(i));
-                    added.push(key);
                 }
                 // Reads of memory, and wave operations (the same lanes run
                 // the whole block): the block's own earlier one.
@@ -930,7 +954,7 @@ impl Module {
                 let c = known_bit(&facts, resolve(&repl, c));
                 self.blocks[b].term = Some(Term::CondBr(c, t, f));
             }
-            steps.push(Step::Leave(added, learned));
+            steps.push(Step::Leave(learned));
             for &c in tree.children[b].iter().rev() {
                 steps.push(Step::Enter(c));
             }

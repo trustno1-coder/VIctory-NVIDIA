@@ -163,7 +163,7 @@ pub(crate) struct HostHeap {
     /// The slots made from a texture whose memory was found away, with what
     /// they were made from and when that was
     /// ([`HostHeap::texture_slot_gone`]).
-    away: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
+    away: Mutex<std::collections::HashMap<u32, (u64, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -365,7 +365,7 @@ pub(crate) fn show_new_later() -> bool {
 
 /// Slots [`show_new_later`] holds back now: heap, slot, record. (A slot
 /// held back is held once, not again at each draw that reads it.)
-static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(usize, u32, u64)>>> =
+static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(usize, u32, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Slots held back by [`show_new_later`] since the start.
@@ -651,10 +651,10 @@ pub(crate) struct Spans {
     /// When a newer view makes an older one stale.
     rule: Rule,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
-    by_slot: std::collections::HashMap<u32, u64>,
+    by_slot: std::collections::HashMap<u32, u64, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The level each slot's view starts at, and where what it is read from
     /// ends ([`Spans::shows`]).
-    first: std::collections::HashMap<u32, (u32, u64)>,
+    first: std::collections::HashMap<u32, (u32, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).

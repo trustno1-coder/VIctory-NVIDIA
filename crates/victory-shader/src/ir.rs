@@ -16,7 +16,7 @@
 //! operand's whole possible range: from the encoded register up to the
 //! program's VGPR count, all read (and all written, for a destination).
 
-use std::collections::{HashMap, HashSet};
+use crate::fxmap::{HashMap, HashSet};
 
 use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
@@ -436,7 +436,7 @@ fn unspill(
             }
             let at = |offset: usize| list.partition_point(|i| i.offset < offset);
             for save in (0..list.len()).filter(|&i| parks[i].is_some_and(|p| p.0)) {
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 let mut work = vec![save + 1];
                 while let Some(from) = work.pop() {
                     for i in from..list.len() {
@@ -470,7 +470,7 @@ fn unspill(
                 first[i] = root(&mut first, i);
             }
         } else {
-            let mut of: HashMap<(u8, u32), usize> = HashMap::new();
+            let mut of: HashMap<(u8, u32), usize> = HashMap::default();
             for i in 0..list.len() {
                 if let Some(s) = slot(i) {
                     first[i] = *of.entry(s).or_insert(i);
@@ -785,12 +785,12 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     };
     // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
     // comes back by such a move, `unspill`) are the value they copy.
-    let mut copy: std::collections::HashMap<Value, Value> = Default::default();
+    let mut copy: crate::fxmap::HashMap<Value, Value> = Default::default();
     // Values something reads, directly or through joins. A scalar operation none of whose
     // results is read reads nothing either (the compiler restores EXEC from a saved mask
     // and overwrites it at once where two branches end together).
-    let mut live: std::collections::HashSet<Value> = Default::default();
-    let idle = |inst: &Inst, live: &std::collections::HashSet<Value>| {
+    let mut live: crate::fxmap::HashSet<Value> = Default::default();
+    let idle = |inst: &Inst, live: &crate::fxmap::HashSet<Value>| {
         let name = inst.name();
         matches!(inst.fields, crate::gfx10::Fields::Sop { .. })
             && !(name.starts_with("s_setpc")
@@ -958,7 +958,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 Exit::End | Exit::Indirect => (false, Vec::new()),
             }
         };
-        let mut seen: HashSet<State> = HashSet::new();
+        let mut seen: HashSet<State> = HashSet::default();
         let mut work = vec![(first, b, facts)];
         // (states followed in all; past that the region is taken not to stall, as before)
         let mut budget = 20_000u32;

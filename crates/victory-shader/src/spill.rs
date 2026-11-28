@@ -134,7 +134,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
     }
 
     // Values some instruction or phi reads.
-    let mut read_somewhere = std::collections::HashSet::new();
+    let mut read_somewhere = crate::fxmap::HashSet::default();
     for block in &p.blocks {
         read_somewhere.extend(block.phis.iter().flat_map(|phi| phi.args.iter().copied()));
         read_somewhere.extend(block.insts.iter().flat_map(|i| i.reads.iter().map(|r| r.1)));
@@ -154,7 +154,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
         .unwrap_or(0);
 
     // Each load through the pointer: its dwords become entry values.
-    let mut replaced: std::collections::HashMap<Value, Value> = Default::default();
+    let mut replaced: crate::fxmap::HashMap<Value, Value> = Default::default();
     let mut gone: Vec<(usize, usize)> = Vec::new();
     let mut inputs = p.inputs.clone();
     for (b, block) in p.blocks.iter().enumerate() {
@@ -240,7 +240,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
     let mut drop = gone.clone();
     loop {
         let read_somewhere = {
-            let mut used = std::collections::HashSet::new();
+            let mut used = crate::fxmap::HashSet::default();
             for (b, block) in p.blocks.iter().enumerate() {
                 used.extend(block.phis.iter().flat_map(|phi| phi.args.iter().copied()));
                 for (i, inst) in block.insts.iter().enumerate() {
@@ -270,7 +270,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
         });
     }
     // The pointer's registers are no inputs once nothing reads them.
-    let mut read = std::collections::HashSet::new();
+    let mut read = crate::fxmap::HashSet::default();
     for block in &p.blocks {
         read.extend(block.phis.iter().flat_map(|phi| phi.args.iter().copied()));
         read.extend(block.insts.iter().flat_map(|i| i.reads.iter().map(|r| r.1)));

@@ -140,7 +140,7 @@ pub struct RootIndexedView {
 pub struct Resources {
     /// Scalar values saved to a constant VGPR lane and restored within one
     /// block, even if that VGPR is also used in ordinary vector operations.
-    pub(crate) restored_lanes: std::collections::HashMap<Site, Moved>,
+    pub(crate) restored_lanes: crate::fxmap::HashMap<Site, Moved>,
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,

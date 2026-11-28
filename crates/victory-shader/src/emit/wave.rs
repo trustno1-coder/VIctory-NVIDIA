@@ -11,7 +11,7 @@
 //! sequence is matched; any step the simulation does not model leaves the
 //! values it writes unknown.
 
-use std::collections::HashMap;
+use crate::fxmap::HashMap;
 
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
@@ -153,7 +153,7 @@ pub(crate) struct Section {
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     let mut i = 0;
     while i < insts.len() {
         let inst = &insts[i];
@@ -185,7 +185,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             break;
         };
         let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
-        let mut reads = HashMap::new();
+        let mut reads = HashMap::default();
         for later in insts[end + 1..].iter().filter(|i| i.name() == "v_readlane_b32") {
             if let Fields::Valu(v) = &later.fields
                 && let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, lane]) =
@@ -308,8 +308,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
         u64::from(u32::MAX)
     };
     let mut exec = all;
-    let mut vec: HashMap<Value, Vec<Sym>> = HashMap::new();
-    let mut uni: HashMap<Value, Sym> = HashMap::new();
+    let mut vec: HashMap<Value, Vec<Sym>> = HashMap::default();
+    let mut uni: HashMap<Value, Sym> = HashMap::default();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
     for inst in insts {
@@ -748,7 +748,7 @@ fn shapes(
     wave: u32,
 ) -> HashMap<Value, Shape> {
     let all = u64::MAX >> (64 - wave);
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for (v, s) in uni {
         if let Some(sh) = single(s, wave) {
             out.insert(v, sh);

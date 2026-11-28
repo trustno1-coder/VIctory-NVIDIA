@@ -36,3 +36,30 @@ pub enum ShaderError {
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
 }
+
+/// Fast non-cryptographic hashing for the translator's maps (keys are small
+/// integers, registers, offsets): SipHash's DoS resistance buys nothing here.
+pub(crate) mod fxmap {
+    #[derive(Default, Clone, Copy)]
+    pub struct Fx(u64);
+    const K: u64 = 0xf135_7aea_2e62_a9c5;
+    impl std::hash::Hasher for Fx {
+        #[inline]
+        fn finish(&self) -> u64 { self.0.rotate_left(26) }
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            let mut c = bytes.chunks_exact(8);
+            for w in &mut c { self.write_u64(u64::from_le_bytes(w.try_into().unwrap())); }
+            let r = c.remainder();
+            if !r.is_empty() { let mut w = [0u8; 8]; w[..r.len()].copy_from_slice(r); self.write_u64(u64::from_le_bytes(w)); }
+        }
+        #[inline] fn write_u8(&mut self, i: u8) { self.write_u64(i as u64) }
+        #[inline] fn write_u16(&mut self, i: u16) { self.write_u64(i as u64) }
+        #[inline] fn write_u32(&mut self, i: u32) { self.write_u64(i as u64) }
+        #[inline] fn write_u64(&mut self, i: u64) { self.0 = self.0.wrapping_add(i).wrapping_mul(K); }
+        #[inline] fn write_usize(&mut self, i: usize) { self.write_u64(i as u64) }
+    }
+    pub type B = std::hash::BuildHasherDefault<Fx>;
+    pub type HashMap<K, V> = std::collections::HashMap<K, V, B>;
+    pub type HashSet<K> = std::collections::HashSet<K, B>;
+}
