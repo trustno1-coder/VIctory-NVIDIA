@@ -700,3 +700,210 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+/// Multi-wave compute programs that write title memory only through `Fields::Flat`
+/// (`global_store_dword` / `global_atomic_add`) and synchronize across waves of the CTA with
+/// `s_barrier`: `dx.op.barrier` must include `UAV_FENCE_GLOBAL` (bit 2, mode 11), validate with
+/// `dxil.dll`, and make cross-wave global stores and atomics visible after `s_barrier` on both
+/// hardware and WARP.
+#[test]
+fn flat_global_stores_and_atomics_fence_uavs_at_group_barriers_across_waves() {
+    let build_flat_cs = |words: &[u32]| -> HostShader {
+        let mut code_words = words.to_vec();
+        code_words.push(0xBF81_0000); // s_endpgm
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1, // s0, s1: 64-bit base address
+                threads: [128, 1, 1],
+            }),
+            code: code_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        }
+    };
+
+    // Control 1: `global_load_dword` + `s_barrier` alone has no UAV write -> mode 9 (`1 | 8`).
+    let load_only = build_flat_cs(&[
+        0x7E04_0200, // v_mov_b32 v2, s0
+        0x7E06_0201, // v_mov_b32 v3, s1
+        0xDC30_8000,
+        0x047D_0002, // global_load_dword v4, v[2:3], off
+        0xBF8A_0000, // s_barrier
+    ]);
+    assert_eq!(
+        super::bitcode::census::barrier_modes(&load_only.dxil),
+        Some(vec![9])
+    );
+
+    // Control 2: `global_store_dword` alone + `s_barrier` -> mode 11 (`1 | 2 | 8`).
+    let store_only = build_flat_cs(&[
+        0x7E04_0200, // v_mov_b32 v2, s0
+        0x7E06_0201, // v_mov_b32 v3, s1
+        0xDC70_8000,
+        0x007D_0002, // global_store_dword v[2:3], v0, off
+        0xBF8A_0000, // s_barrier
+    ]);
+    assert_eq!(
+        super::bitcode::census::barrier_modes(&store_only.dxil),
+        Some(vec![11])
+    );
+
+    // Control 3: `global_atomic_add` alone + `s_barrier` -> mode 11 (`1 | 2 | 8`).
+    let atomic_only = build_flat_cs(&[
+        0x7E04_0200, // v_mov_b32 v2, s0
+        0x7E06_0201, // v_mov_b32 v3, s1
+        0x7E08_0281, // v_mov_b32 v4, 1
+        0xDCC8_8000,
+        0x007D_0402, // global_atomic_add v[2:3], v4, off
+        0xBF8A_0000, // s_barrier
+    ]);
+    assert_eq!(
+        super::bitcode::census::barrier_modes(&atomic_only.dxil),
+        Some(vec![11])
+    );
+
+    // End-to-end 128-thread (4 Wave32 waves) cross-wave global_store_dword + global_atomic_add
+    // -> s_barrier -> cross-wave global_load_dword -> global_store_dword.
+    let cross_wave = build_flat_cs(&[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0: 4 * t
+        0x4A04_0200, // v_add_nc_u32 v2, s0, v1
+        0x7E06_0201, // v_mov_b32 v3, s1
+        0x4A08_0283, // v_add_nc_u32 v4, 3, v1
+        0x4A08_08FF,
+        0xA500_0000, // v_add_nc_u32 v4, 0xA500_0000, v4
+        0xDC70_8000,
+        0x007D_0402, // global_store_dword v[2:3], v4, off (slot t)
+        0x7E0A_02FF,
+        512,         // v_mov_b32 v5, 512
+        0x4A0A_0A00, // v_add_nc_u32 v5, s0, v5
+        0x7E0C_0201, // v_mov_b32 v6, s1
+        0x7E0E_0281, // v_mov_b32 v7, 1
+        0xDCC8_8000,
+        0x007D_0705, // global_atomic_add v[5:6], v7, off (slot 128)
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x3A10_00FF,
+        127,         // v_xor_b32 v8, 127, v0: partner lane in wave 3 - (t / 32)
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8
+        0x4A10_1000, // v_add_nc_u32 v8, s0, v8
+        0x7E12_0201, // v_mov_b32 v9, s1
+        0xDC30_8000,
+        0x0A7D_0008, // global_load_dword v10, v[8:9], off
+        0xDC30_8000,
+        0x0B7D_0005, // global_load_dword v11, v[5:6], off
+        0xBF8C_0F70, // s_waitcnt vmcnt(0)
+        0x4A14_170A, // v_add_nc_u32 v10, v10, v11
+        0x7E18_02FF,
+        1024,        // v_mov_b32 v12, 1024
+        0x4A18_030C, // v_add_nc_u32 v12, v12, v1
+        0x4A18_1800, // v_add_nc_u32 v12, s0, v12
+        0x7E1A_0201, // v_mov_b32 v13, s1
+        0xDC70_8000,
+        0x007D_0A0C, // global_store_dword v[12:13], v10, off (slot 256 + t)
+    ]);
+    assert_eq!(
+        super::bitcode::census::barrier_modes(&cross_wave.dxil),
+        Some(vec![11])
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for s in [&load_only, &store_only, &atomic_only, &cross_wave] {
+            let mut copy = s.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+
+    // Map title page 0x10 (64 KiB at 0x10_0000) to copy 1 in the descriptor heap (view index 1,
+    // after the null sink at view index 0). Root parameters: 0 constants, 1 u253 (SLOT_FAULTS,
+    // never reached since page 0x10 has copy 1), 2 t254 (SLOT_MEMORY directory).
+    let base = 0x0010_0000u64;
+    let page = (base >> 16) as usize;
+    let mut directory = vec![0u32; 2 * (page + 2)];
+    directory[2 * page] = 1;
+    directory[2 * page + 1] = 0;
+
+    let mut ud = vec![0u32; cross_wave.user_data_dwords().max(1) as usize];
+    for u in &cross_wave.user_data {
+        match (u.root, u.slot, u.dword) {
+            (RootType::Constants, 0, 0) => ud[u.index as usize] = base as u32,
+            (RootType::Constants, 0, 1) => ud[u.index as usize] = (base >> 32) as u32,
+            (RootType::Other(super::USER_MEMORY_BASE), _, _) => ud[u.index as usize] = 0,
+            _ => {}
+        }
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&cross_wave)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud.clone())),
+                        (2, Root::View { srv: true, data: directory.clone() }),
+                    ],
+                    views: &[View::RawUav(1), View::RawUav(512)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let mem = &out[1];
+        assert_eq!(mem[128], 128, "{label}: atomic counter across 4 waves");
+        for t in 0..128usize {
+            let partner = t ^ 127;
+            let want = (0xA500_0000u32 + 4 * partner as u32 + 3).wrapping_add(128);
+            assert_eq!(mem[256 + t], want, "{label}: thread {t} reading partner {partner}");
+        }
+        eprintln!("ran flat global_store/atomic + s_barrier cross-wave test on {label}");
+        ran += 1;
+    }
+    assert_eq!(ran, 2, "expected both hardware and WARP SM 6.6 devices");
+}

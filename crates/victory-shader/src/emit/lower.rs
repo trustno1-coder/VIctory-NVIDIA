@@ -482,11 +482,9 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
 }
 
 /// [`lane_regions`]; with `group`, the wave-wide branches too ([`all_lane_blocks_of`]).
-/// With console waves meeting on their own ([`with_pair_meetings`]), a branch that closes a
-/// loop (the code leads back to it) is in its own region: a lane that left the loop does not
-/// run it again. (Not yet for the other programs: their translations stay as they were.)
+/// A branch that closes a loop (the code leads back to it) is in its own region: a lane
+/// that left the loop does not run it again.
 fn lane_regions_of(st: &Structured, group: bool) -> Option<Vec<(usize, Vec<bool>)>> {
-    let loops = PAIR_MEETINGS.get();
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -537,7 +535,7 @@ fn lane_regions_of(st: &Structured, group: bool) -> Option<Vec<(usize, Vec<bool>
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 && !(loops && b == d) {
+            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 && b != d {
                 continue;
             }
             seen[b] = true;
@@ -1732,9 +1730,14 @@ impl<'a> Lower<'a> {
             s.flags |= flags::EARLY_DEPTH_STENCIL;
         }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
-        let writes_uavs = insts().any(|i| {
-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
-                && (i.name().contains("store") || i.name().contains("atomic"))
+        let writes_uavs = insts().any(|i| match i.fields {
+            Fields::Image { .. } | Fields::Buffer { .. } => {
+                i.name().contains("store") || i.name().contains("atomic")
+            }
+            Fields::Flat { .. } => {
+                i.name().starts_with("global_") && !i.name().starts_with("global_load_")
+            }
+            _ => false,
         });
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
@@ -1761,6 +1764,8 @@ impl<'a> Lower<'a> {
                 LdsOrder { looped, ..LdsOrder::default() }
             }
         };
+        let lds_no_meeting: HashSet<(usize, usize)> =
+            lds_order.unordered.union(&lds_order.looped).copied().collect();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1815,7 +1820,7 @@ impl<'a> Lower<'a> {
                     let lds = |b: usize, k: usize, i: &Inst| {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
-                            && !lds_order.unordered.contains(&(b, k))
+                            && !lds_no_meeting.contains(&(b, k))
                     };
                     if let Some(all) = all_lane_blocks(x.st) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
@@ -1824,7 +1829,7 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, &lds_order.unordered) {
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, &lds_no_meeting) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -1880,7 +1885,7 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all, &lds_order.unordered).is_none() => {
+                            Some(all) if lds_meetings(p, x.st, &all, &lds_no_meeting).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
                             }
                             Some(_) => {}
@@ -6139,14 +6144,13 @@ impl<'a> Lower<'a> {
         if self.split_lds
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
-            && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
             && !self.lds_unordered.contains(&(b, i))
         {
             if self.lds_looped.contains(&(b, i)) {
                 // (in a loop the host waves take each on its own: a fence, no wait)
                 let (fence, void) = (self.s.m.i32(8), self.s.t.void);
                 self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
-            } else {
+            } else if self.lds_meet.as_ref().is_none_or(|(all, _)| all[b]) {
                 // the two host waves of a console wave meet before each LDS access: what the
                 // other half wrote is visible, and what it still reads is not overwritten
                 self.meet();
