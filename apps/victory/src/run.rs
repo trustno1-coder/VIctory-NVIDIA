@@ -305,6 +305,10 @@ pub fn run(
     // VICTORY_SKIP_BINK asks for it (bound as before otherwise); beneath
     // the FidelityFX interposer, which only looks at its own DLL.
     let with_dlls = victory_hle::modules::bink::SkipMovies { inner: &with_dlls };
+    // The builder's two methods get wrappers when compacted sizes are
+    // answered; every other import binds as before.
+    #[cfg(windows)]
+    let with_dlls = BuilderWatch(&with_dlls);
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -511,6 +515,33 @@ fn poke(base: usize, size: usize) {
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+}
+
+/// Binds imports of the title's acceleration-structure builder to the
+/// wrappers that answer its compacted-size queries, when they are on.
+#[cfg(windows)]
+struct BuilderWatch<'a>(&'a dyn victory_loader::ImportResolver);
+
+#[cfg(windows)]
+impl victory_loader::ImportResolver for BuilderWatch<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        use victory_loader::{Provenance, Resolution};
+        let found = self.0.resolve(dll, symbol);
+        if let Resolution::Found {
+            address,
+            provenance: Provenance::Title,
+        } = found
+            && dll.eq_ignore_ascii_case("XboxBvhBuilder.dll")
+            && let victory_pe::ImportSymbol::Name { name, .. } = symbol
+            && let Some(wrapper) = victory_hle::dxr::hook(name, address)
+        {
+            return Resolution::Found {
+                address: wrapper,
+                provenance: Provenance::Title,
+            };
+        }
+        found
+    }
 }
 
 /// The DLLs among `imported` (the main image's static imports) that must
