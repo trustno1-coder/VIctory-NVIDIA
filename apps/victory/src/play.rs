@@ -331,10 +331,11 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     // AMD FSR 3 frame generation, made ready as DLSS frame generation is: auto, the layer uses
     // it only where DLSS frame generation does not run; fsr, DLSS frame generation is not asked.
     // The layer checks the files and the card and says at the start what runs and why not.
-    // Only with DLSS on: it never runs without DLSS's upscaling, and made ready without it (the
+    // Only with DLSS upscaling on (not DLAA, which runs at native resolution): it never runs
+    // without DLSS's upscaling, and made ready without it (the
     // title's FidelityFX then left with AMD's files) the title stopped during the boot screens
     // (0x80000003 at +0x2219650, or exit code 3; #331, #459: --no-framegen-ready avoided it).
-    if dlss_on && fg_type != "dlss" && (framegen || o.framegen_ready && !o.no_framegen_ready) {
+    if dlss_on && dlss != "dlaa" && fg_type != "dlss" && (framegen || o.framegen_ready && !o.no_framegen_ready) {
         set("VICTORY_FSR_FRAMEGEN", "1");
         if fg_type == "fsr" {
             s.remove("VICTORY_FRAMEGEN");
@@ -1077,6 +1078,23 @@ mod tests {
         o.fg_type = "dlss".to_owned();
         let (s, _) = settings(&o, &[], Some(Path::new("x")));
         assert_eq!((s.get("VICTORY_FRAMEGEN").map(String::as_str), s.get("VICTORY_FSR_FRAMEGEN")), (Some("1"), None));
+    }
+
+    #[test]
+    fn dlaa_does_not_enable_fsr_frame_generation() {
+        // DLAA runs at native resolution (scale 1.0), not upscaling; FSR 3 frame generation
+        // crashes without DLSS upscaling (0x80000003 at +0x2219650, #663).
+        let mut o = options();
+        o.dlss = "dlaa".to_owned();
+        o.framegen = Some(3);
+        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        let get = |k: &str| s.get(k).map(String::as_str);
+        assert_eq!(get("VICTORY_DLSS"), Some("1"));
+        assert_eq!(get("VICTORY_DLSS_MODE"), Some("dlaa"));
+        // FSR 3 must not be set: DLAA is not upscaling
+        assert!(!s.contains_key("VICTORY_FSR_FRAMEGEN"));
+        // DLSS frame generation itself is fine with DLAA
+        assert_eq!(get("VICTORY_FRAMEGEN"), Some("1"));
     }
 
     #[test]
