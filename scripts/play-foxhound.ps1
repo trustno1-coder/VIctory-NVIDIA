@@ -47,6 +47,9 @@ $repo = Split-Path $PSScriptRoot -Parent
 # The F1 menu's "PRELOAD SHADERS" restarts this with -Preload (and VICTORY_PRELOAD=1, read here before the
 # switches below are cleared).
 $preload = $Preload -or $env:VICTORY_PRELOAD -eq '1'
+# Its "CLEAR SHADER CACHE" restarts this with VICTORY_CLEAR_SHADERS=1 (read here too): the shaders and pipelines
+# made so far are deleted before the game starts (`victory clear-shaders`).
+$clearShaders = $env:VICTORY_CLEAR_SHADERS -eq '1'
 # What the F1 menu saved: its own choices (VICTORY_MENU_...) stand in for this script's options, and its
 # switches go over the settings below. An empty value unsets a switch.
 $menuFile = Join-Path $repo 'victory-settings.txt'
@@ -175,6 +178,9 @@ $writer.WriteLine("# console=$console build=$Build preload=$preload switches: " 
 Write-Host "Log: $log"
 Push-Location $repo   # victory.toml is read from here
 try {
+    if ($clearShaders) {
+        & $victory clear-shaders 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine("# clear-shaders: $line"); $line }
+    }
     if ($preload) {
         # With this start's switches (the translations depend on them); its lines go to the log too.
         Write-Host 'Preloading shaders before the game starts. This takes a while (see the lines below).'

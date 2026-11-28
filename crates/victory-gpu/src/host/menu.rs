@@ -1,9 +1,12 @@
 //! The F1 settings menu. F1 shows and hides it while our window has the
 //! focus; Up/Down pick a setting, Left/Right change it, Enter runs the line
-//! picked (save, save and restart, preload shaders, reset, close), Esc
-//! closes. Preloading saves, ends this run and has the launcher make every
-//! shader before the title starts again (`VICTORY_PRELOAD=1`, `victory
-//! preload`); it asks for a second Enter first. While it is
+//! picked (save, save and restart, preload shaders, clear the shader cache,
+//! reset, close), Esc closes. Preloading saves, ends this run and has the
+//! launcher make every shader before the title starts again
+//! (`VICTORY_PRELOAD=1`, `victory preload`); clearing does the same but has it
+//! delete the shaders and pipelines made so far instead
+//! (`VICTORY_CLEAR_SHADERS=1`, `victory clear-shaders`). Both ask for a second
+//! Enter first. While it is
 //! shown the title sees no keyboard (`crate::SETTINGS_MENU_OPEN`, read by the
 //! input module); a pad still works.
 //!
@@ -50,10 +53,22 @@ const ABOUT_PRELOAD: [&str; 3] = [
     "TAKES A WHILE: MAYBE A LONG TIME, DEPENDING ON HARDWARE.",
     "A LATER UPDATE OF THIS BUILD MAY NEED A NEW PRELOAD.",
 ];
+/// The action that deletes the shaders and pipelines made so far (`VICTORY_CLEAR_SHADERS=1` at
+/// the start it asks for, `victory clear-shaders`), and what is said of it while it is picked.
+const CLEAR: usize = 3;
+const ABOUT_CLEAR: [&str; 3] = [
+    "DELETES THE SHADERS AND PIPELINES MADE SO FAR, THEN",
+    "STARTS THE GAME AGAIN. THEY ARE MADE AGAIN AS YOU PLAY",
+    "OR WITH PRELOAD SHADERS. SETTINGS AND SAVES ARE KEPT.",
+];
+/// The note after the first Enter on it: the second one does it.
+const CONFIRM_CLEAR: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND CLEAR SHADERS";
+/// The line that sets every setting back to the play defaults.
+const RESET: usize = 4;
 /// The actions that export and import the game's save (`crate::save_share`), and what is said
 /// of them while they are picked.
-const EXPORT: usize = 4;
-const IMPORT: usize = 5;
+const EXPORT: usize = 5;
+const IMPORT: usize = 6;
 const ABOUT_EXPORT: [&str; 3] = [
     "MAKES A ZIP OF YOUR SAVE IN SAVES, IN THE FOLDER OF",
     "GAME_SCARLETT_MASTER.EXE. SEND THAT ZIP TO SHARE IT.",
@@ -161,15 +176,39 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
-const ACTIONS: [&str; 7] = [
+const ACTIONS: [&str; 8] = [
     "SAVE AND RESTART NOW",
     "SAVE FOR NEXT START",
     "PRELOAD SHADERS (RESTARTS THE GAME)",
+    "CLEAR SHADER CACHE (RESTARTS THE GAME)",
     "RESET ALL TO PLAY DEFAULTS",
     "EXPORT SAVE (TO SAVES IN THE GAME FOLDER)",
     "IMPORT SAVE (PICK FROM SAVES)",
     "CLOSE",
 ];
+
+/// What the start a restart asks for does before the game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Then {
+    /// Nothing: the game at once.
+    Play,
+    /// Makes every shader first (`VICTORY_PRELOAD=1`, for that start alone).
+    Preload,
+    /// Deletes the shaders and pipelines made so far first (`VICTORY_CLEAR_SHADERS=1`, for that
+    /// start alone).
+    ClearShaders,
+}
+
+impl Then {
+    /// The PowerShell that sets the start's variable, before the launcher's command.
+    fn switch(self) -> &'static str {
+        match self {
+            Then::Play => "",
+            Then::Preload => "$env:VICTORY_PRELOAD='1'; ",
+            Then::ClearShaders => "$env:VICTORY_CLEAR_SHADERS='1'; ",
+        }
+    }
+}
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
@@ -486,6 +525,8 @@ impl Menu {
         out.push(String::new());
         let about = if self.at == ITEMS.len() + PRELOAD {
             ABOUT_PRELOAD
+        } else if self.at == ITEMS.len() + CLEAR {
+            ABOUT_CLEAR
         } else if self.at == ITEMS.len() + EXPORT {
             ABOUT_EXPORT
         } else if self.at == ITEMS.len() + IMPORT {
@@ -613,26 +654,26 @@ impl Menu {
         }
     }
 
-    /// Starts the launcher again in a new console, a few seconds on, and ends this run.
-    /// `preload`: the launcher makes every shader first (`VICTORY_PRELOAD=1`, for that start alone).
-    fn restart(&mut self, preload: bool) {
+    /// Starts the launcher again in a new console, a few seconds on, and ends this run; `then`
+    /// says what that start does before the game ([`Then::switch`]).
+    fn restart(&mut self, then: Then) {
         let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
             self.note = "SAVED. START THE LAUNCHER AGAIN YOURSELF".to_owned();
             return;
         };
         let play = play.to_string_lossy().replace('\'', "''");
         let args = get("VICTORY_MENU_ARGS");
-        // The preload is asked by VICTORY_PRELOAD=1, which both launchers read (victory.exe's is
-        // `--preload`, the script's `-Preload`: the script's flag given to victory.exe was refused,
-        // and the window closed before it could be read, 2026-11-27). A launcher that fails keeps
-        // its window until Enter.
+        // What that start does first is asked by a variable both launchers read (victory.exe's
+        // preload is `--preload`, the script's `-Preload`: the script's flag given to victory.exe
+        // was refused, and the window closed before it could be read, 2026-11-27). A launcher that
+        // fails keeps its window until Enter.
         let command = format!(
             "Start-Sleep 3; {}& '{play}' {args}; if ($LASTEXITCODE) {{ Read-Host 'The start failed (see above). Press Enter to close this window' }}",
-            if preload { "$env:VICTORY_PRELOAD='1'; " } else { "" }
+            then.switch()
         );
         match new_console(&format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{}\"", command.replace('"', "\\\""))) {
             Ok(()) => {
-                tracing::info!(command, preload, "settings menu: restarting");
+                tracing::info!(command, ?then, "settings menu: restarting");
                 // Ended at once: std::process::exit runs the DLLs' unloading, which with
                 // Streamline loaded did not come back (a windowless leftover process).
                 // SAFETY: this process, with nothing of its own left to save.
@@ -681,7 +722,7 @@ impl Menu {
             let _ = std::fs::write(&mark, "this victory.exe was warmed up (its first start, then a restart)\r\n");
         }
         tracing::info!(seconds, mark = %mark.display(), "first start of this victory.exe: warmed up; the game starts again");
-        self.restart(false);
+        self.restart(Then::Play);
     }
 
     /// Reads which saves `Saves` holds, keeping the one picked if it is still there.
@@ -738,7 +779,7 @@ impl Menu {
         }
         tracing::info!(name, "settings menu: save import staged; put in place at the next start");
         if std::env::var_os("VICTORY_MENU_PLAY").is_some() {
-            self.restart(false);
+            self.restart(Then::Play);
         } else {
             self.note = "IMPORTED: CLOSE THE GAME AND START IT AGAIN".to_owned();
         }
@@ -791,8 +832,9 @@ impl Menu {
             if !open {
                 continue;
             }
-            // Only an Enter right after the first one starts a preload or an import.
-            let confirmed = self.note == CONFIRM_PRELOAD || self.note == CONFIRM_IMPORT;
+            // Only an Enter right after the first one starts a preload, a clearing or an import
+            // (any other key clears the note, so the line picked is the one the note is about).
+            let confirmed = [CONFIRM_PRELOAD, CONFIRM_CLEAR, CONFIRM_IMPORT].contains(&self.note.as_str());
             if confirmed {
                 self.note.clear();
             }
@@ -818,7 +860,7 @@ impl Menu {
                 VK_RETURN => match self.at - ITEMS.len() {
                     0 => {
                         if self.save() {
-                            self.restart(false);
+                            self.restart(Then::Play);
                         }
                     }
                     1 => {
@@ -827,10 +869,16 @@ impl Menu {
                     PRELOAD if !confirmed => self.note = CONFIRM_PRELOAD.to_owned(),
                     PRELOAD => {
                         if self.save() {
-                            self.restart(true);
+                            self.restart(Then::Preload);
                         }
                     }
-                    3 => self.reset(),
+                    CLEAR if !confirmed => self.note = CONFIRM_CLEAR.to_owned(),
+                    CLEAR => {
+                        if self.save() {
+                            self.restart(Then::ClearShaders);
+                        }
+                    }
+                    RESET => self.reset(),
                     EXPORT => self.export_save(),
                     IMPORT => {
                         self.read_imports();
@@ -974,6 +1022,8 @@ mod tests {
                 let about = &lines[n - 5..n - 2];
                 if at == ITEMS.len() + PRELOAD {
                     assert_eq!(about, ABOUT_PRELOAD);
+                } else if at == ITEMS.len() + CLEAR {
+                    assert_eq!(about, ABOUT_CLEAR);
                 } else if at == ITEMS.len() + EXPORT {
                     assert_eq!(about, ABOUT_EXPORT);
                 } else if at == ITEMS.len() + IMPORT {
@@ -987,10 +1037,12 @@ mod tests {
         }
         assert_eq!(ACTIONS[PRELOAD], "PRELOAD SHADERS (RESTARTS THE GAME)");
         assert!(CONFIRM_PRELOAD.len() <= COLUMNS as usize);
+        assert_eq!(ACTIONS[CLEAR], "CLEAR SHADER CACHE (RESTARTS THE GAME)");
+        assert_eq!(ACTIONS[RESET], "RESET ALL TO PLAY DEFAULTS");
         assert_eq!(ACTIONS[EXPORT], "EXPORT SAVE (TO SAVES IN THE GAME FOLDER)");
         assert_eq!(ACTIONS[IMPORT], "IMPORT SAVE (PICK FROM SAVES)");
         let pick = [PICK_TITLE, PICK_HELP, PICK_NONE, PICK_BACK, CONFIRM_IMPORT, "IMPORT FAILED: THAT ZIP IS DAMAGED OR NOT A SAVE"];
-        for line in ABOUT_EXPORT.iter().chain(&ABOUT_IMPORT).chain(&ABOUT_PICK).chain(&pick) {
+        for line in ABOUT_EXPORT.iter().chain(&ABOUT_IMPORT).chain(&ABOUT_PICK).chain(&ABOUT_CLEAR).chain(&pick).chain(&[CONFIRM_CLEAR]) {
             assert!(line.len() <= COLUMNS as usize, "{line}");
             assert!(line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
         }
@@ -1059,5 +1111,12 @@ mod tests {
         let lines = check(&menu);
         assert!(lines.iter().any(|l| l == PICK_NONE));
         assert!(lines.iter().any(|l| l == &format!("> {PICK_BACK}")));
+    }
+
+    #[test]
+    fn a_restart_asks_its_start_for_what_it_was_picked_for() {
+        assert_eq!(Then::Play.switch(), "");
+        assert_eq!(Then::Preload.switch(), "$env:VICTORY_PRELOAD='1'; ");
+        assert_eq!(Then::ClearShaders.switch(), "$env:VICTORY_CLEAR_SHADERS='1'; ");
     }
 }

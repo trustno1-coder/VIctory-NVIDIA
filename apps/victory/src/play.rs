@@ -180,6 +180,54 @@ pub(crate) fn explain_preload() {
     println!();
 }
 
+/// The cache's folders `clear_shaders` deletes: the translated shaders, and the
+/// pipelines made of them with what was written down of them (the pipeline
+/// book, the library, the warm-up's progress). The translated title (`images`)
+/// is left: it is not made of shaders, and making it again takes a while.
+const SHADER_FOLDERS: [&str; 2] = ["shaders", "pipelines"];
+
+/// The F1 menu's "CLEAR SHADER CACHE" (`VICTORY_CLEAR_SHADERS=1` at the start
+/// it asks for, #496) and `victory clear-shaders`: deletes what the title's
+/// shaders were made into so far, so the next start makes them again (as the
+/// game goes, or all at once with a preload). Settings, saves and logs are not
+/// in the cache and stay; the graphics driver's own copies are in its shader
+/// cache, which Windows' Disk Cleanup (DirectX Shader Cache) clears.
+pub(crate) fn clear_shaders() -> Result<()> {
+    let cfg = victory_core::Config::load()?;
+    println!("Clearing the shader cache in {} ...", cfg.cache_dir.display());
+    let freed = clear_shaders_in(&cfg.cache_dir)
+        .with_context(|| format!("clearing the shader cache in {} (is the game still running?)", cfg.cache_dir.display()))?;
+    println!("Shader cache cleared: {:.0} MB freed. Shaders are made again as you play, or all at once with a preload.", freed as f64 / 1e6);
+    Ok(())
+}
+
+/// Deletes `SHADER_FOLDERS` in `cache` and returns how many bytes their files
+/// held. A folder that is not there is not an error.
+fn clear_shaders_in(cache: &Path) -> std::io::Result<u64> {
+    fn size(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+        entries
+            .flatten()
+            .map(|e| match e.file_type() {
+                Ok(t) if t.is_dir() => size(&e.path()),
+                Ok(t) if t.is_file() => e.metadata().map_or(0, |m| m.len()),
+                _ => 0,
+            })
+            .sum()
+    }
+    let mut freed = 0;
+    for folder in SHADER_FOLDERS {
+        let dir = cache.join(folder);
+        if !dir.is_dir() {
+            continue;
+        }
+        let held = size(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        freed += held;
+    }
+    Ok(freed)
+}
+
 /// Runs `victory preload` over the title's folder with this start's settings
 /// (the translations depend on them), then lets the start go on, whatever came of it.
 pub(crate) fn preload(exe: &Path) {
@@ -938,6 +986,24 @@ pub(crate) fn hold_window() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_the_shader_cache_leaves_the_translated_title() {
+        let cache = std::env::temp_dir().join(format!("victory-clear-shaders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        for (file, bytes) in [("shaders/00/a.bin", 3), ("shaders/01/b.bin", 4), ("pipelines/known-pipelines.bin", 5), ("images/title.dll", 7)] {
+            let path = cache.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![0u8; bytes]).unwrap();
+        }
+        assert_eq!(clear_shaders_in(&cache).unwrap(), 12);
+        assert!(!cache.join("shaders").exists());
+        assert!(!cache.join("pipelines").exists());
+        assert!(cache.join("images/title.dll").is_file());
+        // Again, with nothing left to clear.
+        assert_eq!(clear_shaders_in(&cache).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
 
     fn options() -> Play {
         Play {
