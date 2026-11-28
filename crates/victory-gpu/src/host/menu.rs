@@ -160,6 +160,9 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_FULLSCREEN", label: "FULLSCREEN (NO BORDER)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
     Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
+    // PlayStation pads over HID, and prompts built from the user's copy at the next start (docs\playstation-prompts.md).
+    Item { var: "VICTORY_DUALSENSE", label: "PLAYSTATION PAD", values: &[("", "AUTO"), ("1", "WITH XBOX PADS"), ("0", "OFF")], live: false },
+    Item { var: "VICTORY_PS_PROMPTS", label: "PLAYSTATION BUTTON ICONS", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
     Item { var: X_RES, label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
     // In place of SERIES X PICTURE when CONSOLE is Series S.

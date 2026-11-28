@@ -1,8 +1,11 @@
 //! Everything specific to the title: its container formats, build
-//! identities, and the hooks we place in its code (located by per-build
-//! offsets or byte-pattern signatures). What may and may not be stored here
-//! is defined in docs/asset-policy.md.
+//! identities, the hooks we place in its code (located by per-build offsets
+//! or byte-pattern signatures), and the pictures we build from the user's
+//! own copy to serve in place of the title's (PlayStation button prompts).
+//! What may and may not be stored here is defined in docs/asset-policy.md.
 
+pub mod prompt_glyphs;
+pub mod settings_diagram;
 pub mod sgd5;
 
 /// A specific build of the title executable we know how to run.

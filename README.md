@@ -101,6 +101,13 @@
   it): DLSS, frame generation, frame rate cap and more.
 - **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
   memory numbers).
+- **PlayStation pads are read directly**: a DualShock 4 or a DualSense (USB or
+  Bluetooth) needs no DS4Windows or Steam Input; the F1 row PLAYSTATION PAD
+  turns them off or reads them beside Xbox pads as well. The game asks for
+  Xbox buttons until **F1, PLAYSTATION BUTTON ICONS** is ON: the next start
+  then builds PlayStation prompts (cross, circle, square, triangle, L1 to R2)
+  from your own copy, without changing any game file. Details are in
+  [docs/playstation-prompts.md](docs/playstation-prompts.md).
 
 **Building it yourself instead**
 
@@ -204,8 +211,9 @@ speed, in the picture and in simply being able to play it:
 **Playing it**
 
 - **The F1 settings menu**, in every build: DLSS, frame generation, frame rate
-  cap, console profile, picture size, the light estimates and the main speed
-  switches, saved to `victory-settings.txt` and applied at the next start
+  cap, console profile, picture size, PlayStation pads and prompts, the light
+  estimates and the main speed switches, saved to `victory-settings.txt` and
+  applied at the next start
   ("SAVE AND RESTART NOW" does that for you; lines marked LIVE change at once).
 - **The F3 stats panel**, in every build: frame rate and frame time, frames
   shown with frame generation, draws, how busy the GPU and the submitting
@@ -354,6 +362,8 @@ to check memory on systems with 32 GB of RAM or GPUs with 8 GB of VRAM.
 - [docs/architecture.md](docs/architecture.md): the layer's parts.
 - [docs/findings.md](docs/findings.md): measurements behind the choices.
 - [docs/dlss.md](docs/dlss.md): DLSS and Frame Generation.
+- [docs/playstation-prompts.md](docs/playstation-prompts.md): PlayStation pads
+  and button prompts, and mods through `VICTORY_FILE_PATCH`.
 - [docs/linux-proton.md](docs/linux-proton.md): building on Linux and first
   runs under Proton (experimental).
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): the title's ray tracing

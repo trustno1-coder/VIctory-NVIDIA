@@ -1,11 +1,15 @@
 [package]
 name = "victory-formats"
-description = "Platform-level data formats: texture layouts, compressed textures, audio codecs."
+description = "Platform-level data formats: texture layouts, compressed textures, audio codecs, movies, exact-length zlib streams."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+zlib-rs.workspace = true
+zopfli.workspace = true
 
 [lints]
 workspace = true

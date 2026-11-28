@@ -125,6 +125,11 @@ const SETTINGS: &[(&str, &str)] = &[
 /// card the host device is made on. Cleared, the caches and saves went to
 /// `%LOCALAPPDATA%` with `VICTORY_HOME` set (#472), and a named card was
 /// passed over for the one with the most memory.
+///
+/// `VICTORY_FILE_PATCH` and `VICTORY_PS_PICTURE` name files of the user's
+/// that `run` reads after the clearing: the list of patches the title's
+/// files are served with, and the Settings controller picture the
+/// PlayStation prompts are built from.
 const KEPT: &[&str] = &[
     "VICTORY_HOME",
     "VICTORY_ADAPTER",
@@ -134,6 +139,8 @@ const KEPT: &[&str] = &[
     "VICTORY_DATA_DIR",
     "VICTORY_STREAMLINE_DIR",
     "VICTORY_FIDELITYFX_DIR",
+    "VICTORY_FILE_PATCH",
+    "VICTORY_PS_PICTURE",
     "VICTORY_LOG",
 ];
 
@@ -226,8 +233,9 @@ pub(crate) fn preload(exe: &Path) {
     }
 }
 
-/// `%LOCALAPPDATA%\victory`, or the folder `VICTORY_HOME` names.
-fn home() -> Result<PathBuf> {
+/// `%LOCALAPPDATA%\victory`, or the folder `VICTORY_HOME` names. (`run`
+/// looks there for the Settings controller picture a start takes by default.)
+pub(crate) fn home() -> Result<PathBuf> {
     if let Some(home) = victory_core::config::home_override() {
         return Ok(home);
     }
@@ -1191,7 +1199,14 @@ mod tests {
     /// Settings read again after `prepare` clears the others survive it.
     #[test]
     fn paths_and_the_named_card_are_kept() {
-        for k in ["VICTORY_HOME", "VICTORY_ADAPTER", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"] {
+        for k in [
+            "VICTORY_HOME",
+            "VICTORY_ADAPTER",
+            "VICTORY_CACHE_DIR",
+            "VICTORY_DATA_DIR",
+            "VICTORY_FILE_PATCH",
+            "VICTORY_PS_PICTURE",
+        ] {
             assert!(KEPT.contains(&k), "{k}");
         }
     }

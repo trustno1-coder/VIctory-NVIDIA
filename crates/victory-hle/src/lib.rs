@@ -35,6 +35,10 @@ pub use victory_gpu::replay;
 
 #[cfg(windows)]
 pub use victory_gpu::pipeline::known as known_pipelines;
+/// Byte ranges of the title's files served from other files as they are
+/// read: the list of patches to use, in place of `VICTORY_FILE_PATCH`.
+#[cfg(windows)]
+pub use modules::dstorage::file_patch::use_file_patches;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

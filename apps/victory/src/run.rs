@@ -161,6 +161,17 @@ pub fn run(
         None => println!("build          unknown ({hash})"),
     }
 
+    // PlayStation button prompts (`VICTORY_PS_PROMPTS=1`): the patches are
+    // built from this copy of the game before the title runs, and served
+    // over its reads of the archive. A list of the user's own
+    // (`VICTORY_FILE_PATCH`) is left to them.
+    if execute
+        && std::env::var_os("VICTORY_PS_PROMPTS").is_some_and(|v| v == "1")
+        && std::env::var_os("VICTORY_FILE_PATCH").is_none_or(|v| v.is_empty())
+    {
+        playstation_prompts(&cfg, exe.parent().unwrap_or(Path::new(".")));
+    }
+
     // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
     // patched image goes to a folder of its own, beside the stock one.
     let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
@@ -380,6 +391,55 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+/// The file, in VIctory's home folder, a start takes the Settings
+/// controller picture from when `VICTORY_PS_PICTURE` names none.
+#[cfg(windows)]
+const PS_PICTURE: &str = "ps5-controller.png";
+
+/// PlayStation button prompts (`VICTORY_PS_PROMPTS=1`) for the game in
+/// `game`: the patches are built there from the user's copy of it, kept in
+/// the cache, and their list given to the DirectStorage hook, which serves
+/// them over the title's reads (`glyphs`). The Settings controller picture
+/// is the PNG `VICTORY_PS_PICTURE` names, else `ps5-controller.png` in
+/// VIctory's home folder where there is one, else the DualSense render that
+/// ships with VIctory. Nothing here stops the start: without the patches
+/// the title shows its Xbox prompts.
+#[cfg(windows)]
+fn playstation_prompts(cfg: &victory_core::Config, game: &Path) {
+    use crate::glyphs;
+
+    let own = std::env::var_os("VICTORY_PS_PICTURE")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::play::home().ok().map(|home| home.join(PS_PICTURE)).filter(|p| p.is_file()));
+    let began = std::time::Instant::now();
+    let list = cfg.cache_subdir("file-patches/playstation").and_then(|out| -> Result<std::path::PathBuf> {
+        let picture = match own {
+            Some(own) => own,
+            None => glyphs::bundled_picture(&out)?,
+        };
+        // The list is reused rather than built again at every start:
+        // building it reads the whole archive, and the hook checks each
+        // patch's hash of the bytes it replaces, so a list made for another
+        // version of the game is not applied. (After an update of the game,
+        // delete the folder: the list is not built again while it is there.)
+        let list = out.join(glyphs::LIST);
+        if !glyphs::stale(&out, Some(&picture)) {
+            tracing::info!(list = %list.display(), "playstation prompts: the list made earlier is used as it is");
+            return Ok(std::path::absolute(list)?);
+        }
+        tracing::info!(game = %game.display(), "playstation prompts: building the patches from this copy of the game, once (they are kept in the cache)");
+        let list = glyphs::build(game, Some(&picture), &out)?;
+        tracing::info!(list = %list.display(), "playstation prompts: the patches are built, in {:.1} s", began.elapsed().as_secs_f64());
+        // Absolute: the title may change the working directory before it opens its files.
+        Ok(std::path::absolute(list)?)
+    });
+    match list {
+        Ok(list) => victory_hle::use_file_patches(list),
+        Err(error) => tracing::warn!("playstation prompts: not built ({error:#}); the title's Xbox prompts are shown"),
+    }
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
