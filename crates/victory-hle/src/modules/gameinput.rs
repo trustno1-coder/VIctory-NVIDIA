@@ -1247,6 +1247,39 @@ mod host {
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
 
+    type GetState = unsafe extern "system" fn(u32, *mut XINPUT_STATE) -> u32;
+    type SetState = unsafe extern "system" fn(u32, *const XINPUT_VIBRATION) -> u32;
+
+    fn gameinput_shim() -> Option<(GetState, SetState)> {
+        use windows_sys::Win32::Foundation::FreeLibrary;
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        static API: std::sync::OnceLock<Option<(GetState, SetState)>> = std::sync::OnceLock::new();
+        *API.get_or_init(|| {
+            if !std::env::var_os("VICTORY_GAMEPAD_SHIM").is_some_and(|v| v == "1") {
+                return None;
+            }
+            // Load only the installed GameInput DLL. Keep it loaded for the
+            // lifetime of the cached, ABI-compatible XInput function pointers.
+            unsafe {
+                let module = LoadLibraryW(windows_sys::w!(r"C:\Program Files\Microsoft GameInput\x64\XInput1_3.dll"));
+                if module.is_null() {
+                    return None;
+                }
+                match (GetProcAddress(module, c"XInputGetState".as_ptr().cast()),
+                       GetProcAddress(module, c"XInputSetState".as_ptr().cast())) {
+                    (Some(get), Some(set)) => Some((
+                        std::mem::transmute::<unsafe extern "system" fn() -> isize, GetState>(get),
+                        std::mem::transmute::<unsafe extern "system" fn() -> isize, SetState>(set),
+                    )),
+                    _ => {
+                        FreeLibrary(module);
+                        None
+                    }
+                }
+            }
+        })
+    }
+
     const BUTTONS: [(u16, u32); 14] = [
         (XINPUT_GAMEPAD_START, MENU),
         (XINPUT_GAMEPAD_BACK, VIEW),
@@ -1284,6 +1317,7 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        shim_slots: [bool; PADS],
         mouse: MouseState,
         /// The input snapshot for this poll and the HID connection owning each slot.
         pads: [Option<PadState>; PADS],
@@ -1297,7 +1331,38 @@ mod host {
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
+            let through_shim = gameinput_shim()
+                .is_some_and(|(get, _)| unsafe { get(slot as u32, &mut state) } == 0);
+            self.shim_slots[slot] = through_shim;
+            // `VICTORY_GAMEPAD_LOG=1`: say which path answered each slot, once per slot, so a pad
+            // that does not work can be told apart from a pad that is not there. GameInput's own
+            // XInput says 1167 for every slot when the system one does not see the pad at all.
+            if std::env::var_os("VICTORY_GAMEPAD_LOG").is_some_and(|v| v == "1") {
+                use std::sync::atomic::{AtomicU8, Ordering};
+                static SAID: AtomicU8 = AtomicU8::new(0);
+                if SAID.load(Ordering::Relaxed) & (1 << slot) == 0 {
+                    let system = unsafe { XInputGetState(slot as u32, &mut state) };
+                    SAID.fetch_or(1 << slot, Ordering::Relaxed);
+                    if through_shim || system == 0 {
+                        tracing::info!(
+                            slot,
+                            through = if through_shim { "Microsoft GameInput's XInput" } else { "the system XInput" },
+                            buttons = format_args!("{:#x}", state.Gamepad.wButtons),
+                            left_x = state.Gamepad.sThumbLX,
+                            right_x = state.Gamepad.sThumbRX,
+                            "VICTORY_GAMEPAD_LOG: a pad answered this slot"
+                        );
+                    } else {
+                        tracing::info!(
+                            slot,
+                            system = system,
+                            gameinput = "no pad in this slot either",
+                            "VICTORY_GAMEPAD_LOG: no pad answered this slot"
+                        );
+                    }
+                }
+            }
+            if !self.shim_slots[slot] && unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
                 return None;
             }
@@ -1392,7 +1457,13 @@ mod host {
                 wRightMotorSpeed: high,
             };
             // SAFETY: a valid vibration; an empty slot just fails.
-            unsafe { XInputSetState(slot as u32, &speeds) };
+            unsafe {
+                if self.shim_slots[slot] && let Some((_, set)) = gameinput_shim() {
+                    set(slot as u32, &speeds);
+                } else {
+                    XInputSetState(slot as u32, &speeds);
+                }
+            }
         }
     }
 
