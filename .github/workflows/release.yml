@@ -1,0 +1,53 @@
+name: Release build
+
+# Builds victory.exe with scripts/build-release.ps1 on GitHub's own runner and
+# signs a build provenance attestation for it: anyone can then check that a
+# downloaded victory.exe was built here, from which commit and by this
+# workflow, with
+#   gh attestation verify victory.exe --repo trustno1-coder/VIctory-NVIDIA
+# (and, as the build is reproducible, by building that commit again).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - name: Build (reproducible recipe)
+        shell: pwsh
+        run: ./scripts/build-release.ps1 -Out dist
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/victory.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory
+          path: dist/
+      - name: Attach to the tag's release (a draft is made if there is none)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TAG --draft --title $env:TAG --notes "Built by the Release build workflow; see its attestation."
+          }
+          gh release upload $env:TAG dist/victory.exe dist/victory.exe.sha256 --clobber
