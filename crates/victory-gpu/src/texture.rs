@@ -1072,7 +1072,7 @@ fn record_upload(
     const COPY_DEST: u32 = 0x400;
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
-    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
+    if !staging.uploaded.load(Relaxed) && crate::pool::is_pooled(texture) {
         let aliasing = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

@@ -7406,7 +7406,7 @@ impl HostList {
             // A texture cut from a block may lie where another did: what the
             // card holds of that one is done with before the first upload
             // into this one.
-            if crate::pool::on() && *first_upload {
+            if *first_upload && crate::pool::is_pooled(&copy.texture) {
                 aliasing.push(D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
