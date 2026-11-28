@@ -497,6 +497,16 @@ struct Call {
     identity: usize,
     done: Mutex<bool>,
     finished: Condvar,
+    cleanup: Mutex<Cleanup>,
+}
+
+/// The provider's cleanup waits for its cancels to return: a cancel may
+/// still use what cleanup frees, and the call may end while one runs.
+#[derive(Default)]
+struct Cleanup {
+    cancels: usize,
+    due: bool,
+    done: bool,
 }
 
 impl Call {
@@ -514,6 +524,15 @@ impl Call {
             context: self.context as *mut c_void,
         };
         (self.provider)(op, &data)
+    }
+
+    /// Whether cleanup runs now; if a cancel is running, the last one to
+    /// return cleans up instead.
+    fn clean_up_now(&self) -> bool {
+        let mut cleanup = lock(&self.cleanup);
+        cleanup.due = cleanup.cancels > 0;
+        cleanup.done = !cleanup.due;
+        cleanup.done
     }
 }
 
@@ -554,7 +573,9 @@ fn zeroed(block: *mut AsyncBlock) -> bool {
 fn release(block: *mut AsyncBlock) {
     // Unlocked before the provider runs: it may call back into us.
     let removed = lock(&CALLS).remove(&(block as usize));
-    if let Some(call) = removed {
+    if let Some(call) = removed
+        && call.clean_up_now()
+    {
         call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
 }
@@ -595,6 +616,7 @@ pub fn XAsyncBegin(
         identity: identity as usize,
         done: Mutex::new(false),
         finished: Condvar::new(),
+        cleanup: Mutex::default(),
     });
     lock(&CALLS).insert(block as usize, call.clone());
     // A failed begin fails the call, so the completion routine still runs.
@@ -620,6 +642,10 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
             return;
         }
         let hr = if canceled {
+            // The queue was terminated. The provider is asked to cancel, as
+            // the library does; no more of its work will run, so if it does
+            // not end the call, the call ends here.
+            cancel(&call, block);
             E_ABORT
         } else {
             call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut())
@@ -721,15 +747,40 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     hr
 }
 
-/// Asks the provider to cancel; the call fails with `E_ABORT` unless the
-/// provider completed it first. A completed call is left alone.
+/// Asks the provider to cancel. Completing the call (with `E_ABORT`) is the
+/// provider's to do, now, later or not at all: its own work may still be
+/// running, so the call is not ended under it. A completed call is left
+/// alone.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
-        if *lock(&call.done) {
+        cancel(&call, block);
+    }
+}
+
+/// The provider's cancel for `call`, with its cleanup held back until the
+/// cancel returns.
+fn cancel(call: &Call, block: *mut AsyncBlock) {
+    if *lock(&call.done) {
+        return;
+    }
+    {
+        let mut cleanup = lock(&call.cleanup);
+        if cleanup.done {
             return;
         }
-        call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
-        complete_call(&call, block, E_ABORT, 0);
+        cleanup.cancels += 1;
+    }
+    call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
+    let clean_up = {
+        let mut cleanup = lock(&call.cleanup);
+        cleanup.cancels -= 1;
+        let last = cleanup.cancels == 0 && cleanup.due;
+        cleanup.due &= !last;
+        cleanup.done |= last;
+        last
+    };
+    if clean_up {
+        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
 }
 
@@ -840,7 +891,9 @@ pub fn pending_with(
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 ) -> HRESULT {
-    type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
+    type Body = Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>;
+    /// The work until it starts, its result, and the call it is for.
+    type Data = Mutex<(Option<Body>, Vec<u8>, Option<Arc<Call>>)>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
         // shared state until cleanup releases it.
@@ -860,7 +913,11 @@ pub fn pending_with(
                     Arc::increment_strong_count(state);
                     Arc::from_raw(state)
                 };
-                let work = state.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let work = {
+                    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.2 = Some(call.clone());
+                    state.0.take()
+                };
                 let block = data.block as usize;
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
@@ -878,6 +935,16 @@ pub fn pending_with(
                     complete_call(&call, block as *mut AsyncBlock, hr, len);
                 });
             }
+            // Canceled: the call ends now, and the work's result, when it
+            // comes, is dropped. Ended through the call begun, not the block:
+            // it may have completed meanwhile and the block hold another.
+            OP_CANCEL => {
+                // SAFETY: as above; cleanup waits for the cancel to return.
+                let call = unsafe { (*state).lock().unwrap_or_else(|e| e.into_inner()).2.clone() };
+                if let Some(call) = call {
+                    complete_call(&call, data.block, E_ABORT, 0);
+                }
+            }
             // SAFETY: as above; the runtime checked the buffer's size.
             OP_GET_RESULT => unsafe {
                 let state = (*state).lock().unwrap_or_else(|e| e.into_inner());
@@ -889,7 +956,7 @@ pub fn pending_with(
         }
         S_OK
     }
-    let state: Arc<Data> = Arc::new(Mutex::new((Some(Box::new(work)), Vec::new())));
+    let state: Arc<Data> = Arc::new(Mutex::new((Some(Box::new(work)), Vec::new(), None)));
     let context = Arc::into_raw(state);
     let hr = XAsyncBegin(
         block,
@@ -926,7 +993,9 @@ pub fn bytes<T: Copy>(value: T) -> Vec<u8> {
 type Work = extern "system" fn(*mut AsyncBlock) -> HRESULT;
 
 /// Runs `work` on the block's work port as an async call of its own; its
-/// return value is the call's result.
+/// return value is the call's result. A cancel is ignored, as in the
+/// library: the work runs all the same, unless its queue is terminated
+/// first, which ends the call with `E_ABORT`.
 pub fn XAsyncRun(block: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data.
@@ -1325,15 +1394,20 @@ mod tests {
         }
     }
 
-    /// The next call's provider: it never ends on its own, and notes being
-    /// asked to work.
+    /// The next call's provider: it never ends on its own, only on cancel,
+    /// and notes being asked to work.
     extern "system" fn next_call(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; its context is
         // the test's `Reuse`.
         let reuse = unsafe { &*(*data).context.cast::<Reuse>() };
-        if op == OP_DO_WORK {
-            reuse.next_worked.store(true, Ordering::SeqCst);
-            return E_PENDING;
+        match op {
+            OP_DO_WORK => {
+                reuse.next_worked.store(true, Ordering::SeqCst);
+                return E_PENDING;
+            }
+            // SAFETY: as above.
+            OP_CANCEL => XAsyncComplete(unsafe { (*data).block }, E_ABORT, 0),
+            _ => {}
         }
         S_OK
     }
@@ -1605,6 +1679,181 @@ mod tests {
             S_OK
         );
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+    }
+
+    /// A block on `queue` without a completion routine.
+    fn plain_block(queue: *const Queue) -> AsyncBlock {
+        AsyncBlock {
+            queue,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }
+    }
+
+    /// A provider whose cancel only asks its work to stop: the call ends
+    /// when that work next runs. Until then it is pending, and nothing of
+    /// it may be cleaned up.
+    #[test]
+    fn cancel_leaves_ending_the_call_to_the_provider() {
+        static CANCELED: AtomicBool = AtomicBool::new(false);
+        static ENDED: AtomicBool = AtomicBool::new(false);
+        static CLEANUPS: AtomicU32 = AtomicU32::new(0);
+        static CLEANED_BEFORE_THE_END: AtomicBool = AtomicBool::new(false);
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid provider data.
+            let block = unsafe { (*data).block };
+            match op {
+                OP_CANCEL => {
+                    CANCELED.store(true, Ordering::SeqCst);
+                    return XAsyncSchedule(block, 0);
+                }
+                OP_DO_WORK if CANCELED.load(Ordering::SeqCst) => {
+                    ENDED.store(true, Ordering::SeqCst);
+                    XAsyncComplete(block, E_ABORT, 0);
+                }
+                OP_CLEANUP => {
+                    CLEANUPS.fetch_add(1, Ordering::SeqCst);
+                    if !ENDED.load(Ordering::SeqCst) {
+                        CLEANED_BEFORE_THE_END.store(true, Ordering::SeqCst);
+                    }
+                }
+                _ => {}
+            }
+            S_OK
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let mut block = plain_block(q);
+        assert_eq!(begin(&mut block, std::ptr::null_mut(), provider), S_OK);
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 0, "still the provider's");
+
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 1);
+        assert!(!CLEANED_BEFORE_THE_END.load(Ordering::SeqCst));
+        assert!(call(&raw mut block).is_none());
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// A provider that ends the call inside its cancel is cleaned up once,
+    /// after the cancel returns, not while it still runs.
+    #[test]
+    fn a_call_ended_inside_its_cancel_is_cleaned_up_after_the_cancel() {
+        static IN_CANCEL: AtomicBool = AtomicBool::new(false);
+        static CLEANUPS: AtomicU32 = AtomicU32::new(0);
+        static CLEANED_IN_CANCEL: AtomicBool = AtomicBool::new(false);
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid provider data.
+            let block = unsafe { (*data).block };
+            match op {
+                OP_CANCEL => {
+                    IN_CANCEL.store(true, Ordering::SeqCst);
+                    XAsyncComplete(block, E_ABORT, 0);
+                    IN_CANCEL.store(false, Ordering::SeqCst);
+                }
+                OP_CLEANUP => {
+                    CLEANUPS.fetch_add(1, Ordering::SeqCst);
+                    if IN_CANCEL.load(Ordering::SeqCst) {
+                        CLEANED_IN_CANCEL.store(true, Ordering::SeqCst);
+                    }
+                }
+                _ => {}
+            }
+            S_OK
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let mut block = plain_block(q);
+        assert_eq!(begin(&mut block, std::ptr::null_mut(), provider), S_OK);
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 1);
+        assert!(!CLEANED_IN_CANCEL.load(Ordering::SeqCst));
+        // A second cancel finds the call over.
+        XAsyncCancel(&mut block);
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 1);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// The text-entry kind of call ends on cancel at once, though its work
+    /// is still running, and is cleaned up once.
+    #[test]
+    fn a_canceled_pending_call_ends_with_abort_while_its_work_runs() {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (ended, work_ended) = std::sync::mpsc::channel::<()>();
+        let mut block = plain_block(std::ptr::null());
+        let identity = 0x94 as *const c_void;
+        let work = move || {
+            let _ = gate.recv();
+            let _ = ended.send(());
+            Ok(vec![3])
+        };
+        assert_eq!(pending_with(&mut block, identity, work), S_OK);
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        assert!(call(&raw mut block).is_none(), "over and cleaned up");
+        assert!(release.send(()).is_ok());
+        assert!(work_ended.recv_timeout(Duration::from_secs(5)).is_ok());
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+    }
+
+    /// `XAsyncRun` ignores a cancel, as the library's does: its work runs
+    /// and gives the result.
+    #[test]
+    fn a_canceled_run_still_runs_its_work() {
+        static RUNS: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            S_OK
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let mut block = plain_block(q);
+        assert_eq!(XAsyncRun(&mut block, Some(work)), S_OK);
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1);
+        assert_eq!(XAsyncGetStatus(&mut block, false), S_OK);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// Work not yet run when its queue is terminated: the provider is asked
+    /// to cancel, and a call it leaves running ends with `E_ABORT`.
+    #[test]
+    fn terminating_a_queue_aborts_calls_whose_work_has_not_run() {
+        static RUNS: AtomicU32 = AtomicU32::new(0);
+        static CANCELS: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            S_OK
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            match op {
+                // SAFETY: the runtime passes valid provider data.
+                OP_BEGIN => return XAsyncSchedule(unsafe { (*data).block }, 0),
+                OP_CANCEL => drop(CANCELS.fetch_add(1, Ordering::SeqCst)),
+                OP_DO_WORK => drop(RUNS.fetch_add(1, Ordering::SeqCst)),
+                _ => {}
+            }
+            S_OK
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let mut run = plain_block(q);
+        let mut scheduled = plain_block(q);
+        assert_eq!(XAsyncRun(&mut run, Some(work)), S_OK);
+        assert_eq!(begin(&mut scheduled, std::ptr::null_mut(), provider), S_OK);
+        let none = std::ptr::null_mut();
+        assert_eq!(XTaskQueueTerminate(q, true, none, None), S_OK);
+        assert_eq!(XAsyncGetStatus(&mut run, false), E_ABORT);
+        assert_eq!(XAsyncGetStatus(&mut scheduled, false), E_ABORT);
+        assert_eq!(CANCELS.load(Ordering::SeqCst), 1);
+        assert_eq!(RUNS.load(Ordering::SeqCst), 0);
+        XTaskQueueCloseHandle(q);
     }
 
     #[test]
