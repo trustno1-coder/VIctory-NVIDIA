@@ -2322,13 +2322,13 @@ pub(crate) fn line(frames: f64) {
                 ms(T_COPY)
             );
         }
-        // Every tenth line (about ten seconds): the colour without the
+        // Every second line (about ten seconds; the lines are 5 seconds apart): the colour without the
         // interface, where the title draws the interface into the frame.
         static LINES: AtomicU32 = AtomicU32::new(0);
-        if hudless_wanted() && LINES.fetch_add(1, Relaxed) % 10 == 9 {
+        if hudless_wanted() && LINES.fetch_add(1, Relaxed) % 2 == 1 {
             let [copies, tagged, missing, composites, again, others] = [0, 1, 2, 3, 4, 5].map(|i| HUD_COUNTS[i].swap(0, Relaxed));
             tracing::info!(
-                "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
+                "DLSS Frame Generation, colour without the interface, last two lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
             );
         }
     }

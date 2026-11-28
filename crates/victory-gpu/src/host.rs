@@ -9712,11 +9712,15 @@ struct Meter {
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
+    /// When the lines were last said, and the frames presented and the
+    /// draws counted then ([`Meter::frame`]).
     logged: std::time::Instant,
     /// The last present counted, and the intervals between presents since
     /// the last frame-rate line, in ms: what the average hides (stutter).
     last: std::time::Instant,
     intervals: Vec<f32>,
+    logged_frames: u32,
+    logged_drawn: u64,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -9733,13 +9737,17 @@ impl Meter {
             logged: now,
             last: now,
             intervals: Vec::with_capacity(512),
+            logged_frames: 0,
+            logged_drawn: crate::draw::drawn(),
             caption: None,
         }
     }
 
-    /// Whether the next frame counted makes the frame-rate line.
+    /// Whether the next frame counted makes the lines, which take the
+    /// counters (`panel` reads them right before).
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
+            && self.logged.elapsed() >= std::time::Duration::from_secs(5)
     }
 
     /// Counts a presented frame.
@@ -9749,6 +9757,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.logged_frames += 1;
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -9760,14 +9769,31 @@ impl Meter {
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
-        frame_times_line(&mut self.intervals);
+        // The frame rate in the caption and at the top of the picture, every
+        // second.
         let drawn = crate::draw::drawn();
-        let frames = f64::from(self.frames);
+        {
+            let frames = f64::from(self.frames);
+            let fps = frames / elapsed.as_secs_f64();
+            let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+            METER_FPS_TENTHS.store((fps * 10.0).round() as u32, Ordering::Relaxed);
+            let draws = (drawn - self.drawn) as f64 / frames;
+            (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+            self.show_rate(hwnd, fps, ms, draws);
+        }
+        // The lines, every 5 seconds over the frames since the last (said
+        // every second, the "per frame" ones were some 2,000 lines and 700 KB
+        // a minute, two thirds of a play log in steady play).
+        let elapsed = self.logged.elapsed();
+        if elapsed < std::time::Duration::from_secs(5) {
+            return;
+        }
+        frame_times_line(&mut self.intervals);
+        let frames = f64::from(self.logged_frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
-        METER_FPS_TENTHS.store((fps * 10.0).round() as u32, Ordering::Relaxed);
-        let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        let draws = (drawn - self.logged_drawn) as f64 / frames;
+        (self.logged, self.logged_frames, self.logged_drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -9873,8 +9899,7 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
-            self.logged = std::time::Instant::now();
+        {
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -10174,6 +10199,11 @@ impl Meter {
                 }
             }
         }
+    }
+
+    /// Shows the frame rate of the last second (`fps`, `ms` a frame, `draws`
+    /// a frame) in the window's caption.
+    fn show_rate(&mut self, hwnd: HWND, fps: f64, ms: f64, draws: f64) {
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];

@@ -844,9 +844,9 @@ fn surface_format(format: DXGI_FORMAT) -> u32 {
 /// since the last one, and prepare dispatches that failed; `None` if it is
 /// not in use.
 pub(crate) fn line_counts() -> Option<(u64, u64, u64, u64)> {
-    // (Every tenth frame-rate line: about every ten seconds.)
+    // (Every second frame-rate line, 5 seconds apart: about every ten seconds.)
     static LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let due = LINES.fetch_add(1, Relaxed) % 10 == 9;
+    let due = LINES.fetch_add(1, Relaxed) % 2 == 1;
     (SWAP_CHAIN.load(Relaxed) && due).then(|| {
         (PRESENTS_ON.swap(0, Relaxed), PRESENTS_OFF.swap(0, Relaxed), FAILED.swap(0, Relaxed), HUDLESS_GIVEN.swap(0, Relaxed))
     })
