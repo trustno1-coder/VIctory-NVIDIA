@@ -272,6 +272,52 @@ Before it, once: `victory upscaler-check --present` (below, line 1).
    0x887a0005. With `VICTORY_STREAMLINE_LOG=<folder>` Streamline's own log has
    the plugin's last words.
 
+## RTX 20 and 30 cards: DLSS Enabler (a mod, not ours)
+
+[DLSS Enabler](https://www.nexusmods.com/site/mods/757) answers for the card in
+NVIDIA's place: Streamline then reports DLSS Frame Generation as supported, and
+the mod makes the frames itself (FSR 3.1 based), so the F1 menu's 2X to 6X run
+on an RTX 20 or 30. NVIDIA does not support this. Tried: DLSS Enabler 4.9.0 on
+an RTX 2080 8 GB, driver 621.40, Windows 11, with the script launcher
+(`PLAY_FRAMEGEN.cmd`, `scripts\play-nvidia.ps1`).
+
+1. Its `version.dll` goes beside `target\release\victory.exe` as `winmm.dll`:
+   victory.exe imports `winmm.dll`, not `version.dll`, so a `version.dll` there
+   is never loaded. The mod writes its settings and logs beside it.
+2. F1, FRAME GEN TYPE, DLSS (AUTO loads AMD's FSR 3 files into the process as
+   well).
+3. In `OptiScaler.ini`, written beside victory.exe at the first start:
+   - `Dx12Upscaler=dlss` and
+     `NvngxDlssPath=<repository>\nvidia-sdk\Streamline\bin\x64\nvngx_dlss.dll`.
+     Without them it does not find NVIDIA's DLSS and puts another upscaler in
+     its place (XeSS, else its own FSR).
+   - `DisableFlipMetering=true`. With NVIDIA's flip metering on, the PC froze
+     twice within three minutes of frame generation (6x, then 3x); the driver
+     did not recover and the PC had to be restarted. Off: 7.5 minutes over two
+     runs at 2x to 6x without a freeze.
+4. `nvidia-sdk\Streamline\bin\x64\nvngx_dlssg.dll` renamed out of the way. With
+   it there and NVIDIA's DLSS upscaling on, the mod stopped every start during
+   the device hand-over (0xC0000409, 0xC0000374). These cards do not run that
+   file anyway; `Get-NVIDIA-DLSS.cmd` puts it back.
+
+The mod stays off in a process with a console window or console output, so the
+launcher starts the layer without a window and reads its output through a pipe
+(closing the launcher's window no longer ends the game). victory.exe started
+on its own (`victory.exe play`, a double click) has a console window, and the
+mod does not run there.
+
+By Streamline's own count, frames shown for each one rendered: 2.00, 3.00,
+4.00, 5.00 and 6.00, status 0 throughout. Series S, DLSS balanced, 4x: 11.4
+frames a second rendered, 45.6 shown (306 s). Series X at 1080p upscaled: 9 to
+10 rendered, 45 to 61 shown at 5x and 6x.
+
+Known: the process crashes when it ends (0xC0000005, after Streamline has shut
+down); one start in nine stopped during the device hand-over (an access
+violation in victory.exe) and the next one ran. The runs without a freeze also
+had `VICTORY_TEXTURE_ROOM_PERCENT=65`, which was not tested apart from flip
+metering. As with NVIDIA's, frames are generated only while the window has the
+focus.
+
 ## Limits
 
 - Motion vectors: blocks of wrong motion inside character silhouettes (likely
