@@ -38,6 +38,8 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    // A draw only needs waking when its own pipeline finishes.
+    finished: (Mutex<()>, Condvar),
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -63,16 +65,17 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 /// `CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0), translatable for
 /// 32-lane hosts through host waves that meet by spinning, took 11.85 ms of
 /// the card a frame in the first gameplay area (timing run, 2026-11-26).
-fn leave_out() -> &'static [String] {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+pub(super) fn excluded_shader(hash: &[u8; 32]) -> bool {
+    static HASHES: OnceLock<Vec<[u8; 8]>> = OnceLock::new();
     HASHES.get_or_init(|| {
         std::env::var("VICTORY_LEAVE_OUT")
             .unwrap_or_default()
             .split(',')
-            .map(|h| h.trim().to_ascii_lowercase())
+            .map(str::trim)
             .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .filter_map(|h| u64::from_str_radix(h, 16).ok().map(u64::to_be_bytes))
             .collect()
-    })
+    }).iter().any(|prefix| hash.starts_with(prefix))
 }
 
 /// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
@@ -96,7 +99,7 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
+    if shaders.iter().any(|s| excluded_shader(&s.full_hash)) {
         return Some("named in VICTORY_LEAVE_OUT, left out");
     }
     if water_light_left_out(shaders) {
@@ -174,6 +177,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            finished: (Mutex::new(()), Condvar::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -190,6 +194,7 @@ impl Pending {
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
+<<<<<<< Updated upstream
     }
 
     fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
@@ -205,6 +210,9 @@ impl Pending {
             }
         });
         let (lock, done) = &DONE;
+=======
+        let (lock, done) = &self.finished;
+>>>>>>> Stashed changes
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
@@ -244,9 +252,6 @@ pub(crate) fn hashes(p: &Pending) -> String {
     let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
     hashes.join("+")
 }
-
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -297,6 +302,11 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.left_out.is_some() {
+        if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed)
+            && p.shaders.iter().any(|s| excluded_shader(&s.full_hash))
+        {
+            tracing::info!(shaders = ?p.shaders, "skipped configured shader on first use");
+        }
         LEFT_OUT.fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -375,7 +385,7 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let started = Instant::now();
-    let (lock, done) = &DONE;
+    let (lock, done) = &p.finished;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());

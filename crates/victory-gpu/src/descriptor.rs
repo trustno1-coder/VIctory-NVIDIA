@@ -1751,6 +1751,68 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Copy only the fields of a placed resource description. Padding can differ
+/// between two views of the same texture and the caller may leave it unwritten.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    let mut fields = [0; 14];
+    // SAFETY: the caller supplies a 56-byte ResourceDesc, possibly unaligned.
+    // Dimension occupies word 0. Alignment through Flags occupy words 2..13.
+    unsafe {
+        fields[0] = src.read_unaligned();
+        fields[2..13].copy_from_slice(&src.add(2).cast::<[u32; 11]>().read_unaligned());
+    }
+    Some(fields)
+}
+
+/// The words of a placed view's description with those its kind does not
+/// use set to zero. The first ten words are the PC's view description: for a
+/// shader resource view, the format, the dimension, the component mapping,
+/// a word of padding (the union that follows starts on 8 bytes) and the
+/// union's six words; for an unordered access view, the format, the
+/// dimension and the union's eight words. Each dimension uses only the head
+/// of the union, and the title leaves the rest unwritten: run vt-shapes saw
+/// 131,392 values in word 3 and 36,413 in word 9 of a million shapes, each
+/// a new shape for the same view. Words 10 and on (the address and the
+/// console's own fields) are kept; an unknown dimension keeps all.
+fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    // SAFETY: the view description contains 16 possibly unaligned words.
+    let dimension = unsafe { src.add(1).read_unaligned() } as usize;
+    // Words of the union each dimension uses (D3D12_BUFFER_SRV and the like).
+    let (start, used) = if unordered {
+        // D3D12_UAV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D.
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        (2, USED.get(dimension).copied())
+    } else {
+        // D3D12_SRV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D, cube, cube array, acceleration structure.
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        (4, USED.get(dimension).copied())
+    };
+    let Some(used) = used.filter(|_| dimension != 0) else {
+        return words(desc);
+    };
+    let mut d = [0; 16];
+    // Only read the fields this dimension defines. The padding in the
+    // caller's description can be uninitialised. The final six words are
+    // the title's address and console-specific fields.
+    for range in [0..if unordered { 2 } else { 3 }, start..start + used, 10..16] {
+        for i in range {
+            // SAFETY: all three field ranges fit the 16-word description.
+            d[i] = unsafe { src.add(i).read_unaligned() };
+        }
+    }
+    Some(d)
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -1760,8 +1822,12 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
+<<<<<<< Updated upstream
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         let (resource, desc) = normal_placed(false, resource, desc);
+=======
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, false)) {
+>>>>>>> Stashed changes
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1772,8 +1838,12 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
+<<<<<<< Updated upstream
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         let (resource, desc) = normal_placed(true, resource, desc);
+=======
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
+>>>>>>> Stashed changes
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -2210,9 +2280,13 @@ mod tests {
         ] {
             create(null, &resource, &desc, handle);
             let first = slot;
+<<<<<<< Updated upstream
             // Kept as `normal_placed` makes it (a buffer view's first element folded into its address).
             let (r, d) = normal_placed(unordered, resource, desc);
             assert_eq!(view(handle), Some(View::Placed(unordered, r, d)));
+=======
+            assert_eq!(view(handle), Some(View::Placed(unordered, resource, desc)));
+>>>>>>> Stashed changes
             let mut noisy = desc;
             for w in unused {
                 noisy[w] = 0xdead_beef;

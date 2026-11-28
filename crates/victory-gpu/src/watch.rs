@@ -319,30 +319,52 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
+/// Preserve exactly the queries covered by a single successful kernel call.
+/// Increasing starts and ends let thousands of refreshes search the same list.
+fn index_queries(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_unstable();
+    let mut farthest = 0;
+    ranges.retain(|&(_, end)| {
+        if end <= farthest {
+            return false;
+        }
+        farthest = end;
+        true
+    });
+}
+
+fn query_covers(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let past = ranges.partition_point(|&(start, _)| start <= first);
+    past != 0 && last <= ranges[past - 1].1
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+pub(crate) fn ask_ahead(ranges: impl IntoIterator<Item = (usize, usize)>) {
+    // While the submission's query stands, its flushes use that answer.
+    // Avoid walking every buffer's published pages again on each flush.
+    if journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
+        .into_iter()
         // Not view memory known by its bits: the kernel would refuse the
         // asking (and, asked together with others, theirs).
         .filter(|r| r.0 < r.1 && !published(r.0, r.1))
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .map(|(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
+    let _all = Asking::hold_all();
     if journal().kept {
         return;
     }
-    let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
@@ -359,6 +381,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         ask_run(&pieces[i..k], &mut asked, &mut written);
         i = k;
     }
+    index_queries(&mut asked);
     note_hot(&written);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
@@ -545,7 +568,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
-    ask_ahead(ranges);
+    ask_ahead(ranges.iter().copied());
     ask_rest(ranges);
 }
 
@@ -562,18 +585,25 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
+    // ask_ahead already indexed this prefix. Only successful single-range
+    // queries appended by this loop need a linear search.
+    let indexed = ahead.len();
     let mut written = Vec::new();
     for &(start, end) in ranges {
         if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if !query_covers(&ahead[..indexed], first, last)
+            && !ahead[indexed..].iter().any(|&(a, b)| a <= first && last <= b)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
             ahead.push((first, last));
         }
+    }
+    if ahead.len() != indexed {
+        index_queries(&mut ahead);
     }
     note_hot(&written);
     let mut j = journal_mut();
@@ -660,9 +690,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    query_covers(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -672,6 +700,21 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    query_writes(start, end, guarded, |pages| pages.map(|(&p, &w)| (p, w)).collect())
+}
+
+/// A texture has one watermark for its whole extent. Compare it while the
+/// journal is locked so a refresh needs no temporary list of page numbers.
+pub(crate) fn written_since(start: usize, end: usize, guarded: bool, since: u64) -> Option<(u64, bool)> {
+    query_writes(start, end, guarded, |mut pages| pages.any(|(_, &w)| w > since))
+}
+
+fn query_writes<T>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    inspect: impl Fn(std::collections::btree_map::Range<'_, usize, u64>) -> T,
+) -> Option<(u64, T)> {
     // Guarding asks Windows about the pages and protects them: a lazy view
     // is none to it yet. (Not so a view in the books alone, which is
     // guarded there: [`use_soft_views`].)
@@ -679,9 +722,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         materialize(start, end.saturating_sub(start));
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+    let of = |j: &Journal| inspect(j.written.range(first..last));
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| query_covers(&j.ahead, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -765,7 +808,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !query_covers(&j.ahead, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -3274,6 +3317,23 @@ mod parts_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_queries_preserve_individual_kernel_ranges() {
+        let original = [(12, 19), (0, 4), (6, 10), (4, 6), (12, 14), (3, 7), (13, 15), (22, 24), (3, 7)];
+        let mut indexed = original.to_vec();
+        index_queries(&mut indexed);
+        for first in 0..26 {
+            for last in first..=26 {
+                assert_eq!(
+                    query_covers(&indexed, first, last),
+                    original.iter().any(|&(a, b)| a <= first && last <= b),
+                    "{first}..{last}"
+                );
+            }
+        }
+        assert!(!query_covers(&[], 0, 1));
+    }
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
@@ -3656,7 +3716,7 @@ mod tests {
         assert_ne!(p, 0);
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
-        ask_ahead(&ranges);
+        ask_ahead(ranges.iter().copied());
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };

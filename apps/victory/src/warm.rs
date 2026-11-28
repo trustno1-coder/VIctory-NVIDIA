@@ -26,7 +26,23 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+/// A standalone preparation and a launcher's quick preparation share the
+/// pipeline library and its progress files. Windows releases this lock on exit.
+pub fn preparation_lock() -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(victory_core::Config::load()?.cache_subdir("pipelines")?.join("preparation.lock"))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            println!("Waiting for the other preparation using this cache to finish.");
+            file.lock()?;
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+    }
+    Ok(file)
+}
+
+pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, extra: usize, these: Option<String>) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
@@ -52,7 +68,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let (fingerprint, card) = fingerprint;
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
-    let keys = known::keys(&dir);
+    let (keys, excluded) = known::warm_keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
     for line in listed.lines() {
@@ -66,14 +82,26 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
-    // Those earlier runs drew with first, the others in no order (by key).
+    let drawn: HashSet<usize> = keys.iter().enumerate().filter_map(|(n, k)| early.contains(k.as_str()).then_some(n)).collect();
+    let related = if used && extra > 0 && !drawn.is_empty() {
+        known::related_variants(&dir, &drawn)
+    } else {
+        HashSet::new()
+    };
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
-            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
+            !excluded.contains(&n) && (again || !done.contains(key)) && !bad.contains(key)
         })
         .collect();
-    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+    if used {
+        // Stable within each group so brand new scenes still progress in book order.
+        let actual = all.iter().filter(|n| drawn.contains(n)).count();
+        all.sort_by_key(|n| (!drawn.contains(n), !related.contains(n)));
+        all.truncate(actual.saturating_add(extra));
+    } else {
+        all.sort_by_key(|&n| (!drawn.contains(&n), &keys[n]));
+    }
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
@@ -135,6 +163,9 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         }
     });
     let (mut times, refused, crashed) = state.into_inner().unwrap_or_else(|e| e.into_inner());
+    anyhow::ensure!(times.len() + crashed == all.len(),
+        "pipeline preparation stopped after {} of {} attempts; rerun to continue from the recorded results",
+        times.len() + crashed, all.len());
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
     println!(
@@ -161,7 +192,7 @@ pub fn into_library(jobs: Option<usize>) -> Result<()> {
     let dir = folder()?;
     let cfg = victory_core::Config::load()?;
     known::use_library(cfg.cache_subdir("shaders")?);
-    let keys = known::keys(&dir);
+    let (keys, excluded) = known::warm_keys(&dir);
     let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap_or_default();
     let (bad, early, slow) = (read("warm-bad.txt"), read("early-pipelines.txt"), read("slow-pipelines.txt"));
     let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
@@ -170,11 +201,11 @@ pub fn into_library(jobs: Option<usize>) -> Result<()> {
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
-            !bad.contains(key) && (early.contains(key) || slow.contains(key))
+            !excluded.contains(&n) && !bad.contains(key) && (early.contains(key) || slow.contains(key))
         })
         .collect();
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
-    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()) * 2 / 3).max(1);
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()) * 2 / 3).max(1).min(all.len());
     println!("into the pipeline library: {} pipelines (loading and slow ones), {threads} threads", all.len());
     let began = Instant::now();
     let (count, made) = (AtomicUsize::new(0), AtomicUsize::new(0));

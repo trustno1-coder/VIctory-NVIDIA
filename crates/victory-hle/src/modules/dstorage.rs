@@ -35,6 +35,8 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
+pub mod assets;
+
 /// The factory interface the title asks for.
 const FACTORY: Guid = Guid::new(
     0x6295_9d11,
@@ -149,7 +151,8 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let files = Files::new(file, Io::chosen());
+    let mut files = Files::new(file, Io::chosen());
+    files.asset_reads = assets::track(&name, &files.first);
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
@@ -319,6 +322,7 @@ struct Files {
     first: std::fs::File,
     others: Box<[OnceLock<Option<std::fs::File>>]>,
     io: Io,
+    asset_reads: Option<assets::ReadMap>,
 }
 
 impl Files {
@@ -329,7 +333,7 @@ impl Files {
             Io::Overlapped => 1,
             Io::Handles | Io::Direct => workers,
         };
-        Files { first, others: (0..others).map(|_| OnceLock::new()).collect(), io }
+        Files { first, others: (0..others).map(|_| OnceLock::new()).collect(), io, asset_reads: None }
     }
 
     #[cfg(test)]
@@ -1606,6 +1610,9 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         victory_gpu::kernel_will_write(out.as_ptr() as usize + done, out.len() - done);
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if result.is_ok() && let Some(map) = &files.asset_reads {
+        map.note(request.offset, out.len());
+    }
     result
 }
 

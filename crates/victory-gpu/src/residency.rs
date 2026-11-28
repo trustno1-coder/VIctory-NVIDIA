@@ -62,11 +62,10 @@ fn has_upload_reserve(commit: u64, bake: bool) -> bool {
     commit >= if bake { 256 * MIB } else { 512 * MIB }
 }
 
-fn has_growth_reserve(commit: u64, bake: bool) -> bool {
-    // Growing a fresh 64 MiB upload block for speculative bindless prefetch
-    // requires more headroom than reusing slices already committed inside the
-    // staging pool.
-    commit >= if bake { 256 * MIB } else { 1024 * MIB }
+fn has_growth_reserve(commit: u64, bytes: u64) -> bool {
+    // Leave a GiB for the title and driver after the speculative allocation.
+    // A dedicated upload can be much larger than a pooled block.
+    commit.saturating_sub(bytes) >= GIB
 }
 
 /// Leave commit for game allocations and submissions already in flight while
@@ -82,12 +81,12 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
 /// Whether the staging allocator may commit a brand-new OS upload buffer
 /// (reusing existing free ranges in already-committed pool blocks stays open
 /// whenever `admit_texture_pass` is true).
-pub(crate) fn allow_staging_growth(bake: bool) -> bool {
+pub(crate) fn allow_staging_growth(bytes: u64) -> bool {
     let now = crate::host::coarse_ms();
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    has_growth_reserve(sample_commit(now), bytes)
 }
 
 pub(crate) fn limited_host_ram() -> bool {
@@ -173,8 +172,16 @@ mod tests {
         ] {
             assert_eq!(has_upload_reserve(commit, true), bake);
             assert_eq!(has_upload_reserve(commit, false), lookahead);
-            assert_eq!(has_growth_reserve(commit, false), growth);
+            assert_eq!(has_growth_reserve(commit, 0), growth);
         }
+    }
+
+    #[test]
+    fn speculative_growth_preserves_the_floor_after_the_request() {
+        assert!(has_growth_reserve(GIB + 64 * MIB, 64 * MIB));
+        assert!(!has_growth_reserve(GIB + 64 * MIB - 1, 64 * MIB));
+        assert!(!has_growth_reserve(2 * GIB, GIB + 1));
+        assert!(!has_growth_reserve(2 * GIB, u64::MAX));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+mod display_watch;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Context;
@@ -798,6 +799,16 @@ fn private_bytes() -> u64 {
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
 static ON_FAILURE: OnceLock<fn(&str) -> !> = OnceLock::new();
+static ON_WINDOW_CLOSE: OnceLock<fn()> = OnceLock::new();
+static DISPLAY_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn on_window_close(close: fn()) {
+    let _ = ON_WINDOW_CLOSE.set(close);
+}
+
+pub fn is_display_window(hwnd: usize) -> bool {
+    hwnd != 0 && DISPLAY_WINDOW.load(Ordering::Acquire) == hwnd
+}
 
 /// Sets what a host GPU failure does (the runtime's crash report).
 pub fn on_failure(report: fn(&str) -> !) {
@@ -1104,6 +1115,45 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "opens real windows and requires a D3D12 adapter"]
+    fn resumes_presenting_after_the_display_window_is_destroyed() {
+        use super::*;
+        let host = host().expect("D3D12 device");
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 96, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut texture = None;
+        // SAFETY: the description and initial state are for a local test texture.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+        }
+        let texture = texture.unwrap();
+        assert!(host.present(&texture, 0, 1).is_some());
+        let old = host.presenter.lock().unwrap().as_ref().unwrap().hwnd;
+        // This standalone test has no title close handler. WM_CLOSE destroys the fallback HWND.
+        unsafe { PostMessageW(Some(old), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while unsafe { IsWindow(Some(old)) }.as_bool() {
+            assert!(std::time::Instant::now() < deadline, "first window did not close");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(host.present(&texture, 0, 2).is_some());
+        let new = host.presenter.lock().unwrap().as_ref().unwrap().hwnd;
+        assert!(is_display_window(new.0 as usize));
+        assert!(unsafe { IsWindowVisible(new) }.as_bool());
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        host.drop_presenter();
+        unsafe { PostMessageW(Some(new), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -8544,10 +8594,9 @@ struct Batch {
     /// copy (by address) is in it.
     spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     spans_at: ByCopy<usize>,
-    /// Room for the submission's one asking's ranges, and for
-    /// [`Batch::refresh_front`]'s walk over the steps.
+    /// Room for the submission's one asking's ranges.
     ranges: Vec<(usize, usize)>,
-    touches: Vec<Touch>,
+    front_spans: FrontSpans,
 }
 
 thread_local! {
@@ -8588,52 +8637,74 @@ fn refresh_front() -> bool {
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
 }
 
-/// Per copy what is refreshed in front of a submission's steps, as
-/// [`written_spans`]'s but of all copies, up to the copy's first write by
-/// shaders in each part of the submission (`Touch::Part`: another begins).
-/// What a part refreshes of a copy it has given to its shaders stays where it
-/// stands: around what they write. What a later part refreshes is the
-/// title's bytes of before either.
-fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
-    // (Copy, from, to), in the order they come, and the part that gave it to
-    // shaders last.
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-    let mut given: Vec<u32> = Vec::new();
-    let (mut part, mut last) = (1, usize::MAX);
-    for step in steps {
-        match step {
-            Touch::Refresh(copy, from, to) => {
-                // (Most come several times on end.)
-                let i = if spans.get(last).is_some_and(|s| s.0 == copy) {
-                    last
-                } else {
-                    *at.entry(copy).or_insert_with(|| {
-                        spans.push((copy, usize::MAX, 0));
-                        given.push(0);
-                        spans.len() - 1
-                    })
-                };
-                last = i;
-                if given[i] != part {
-                    let span = &mut spans[i];
-                    (span.1, span.2) = (span.1.min(from), span.2.max(to));
-                }
+/// Ranges that can be refreshed before a submission's first shader writes.
+#[derive(Default)]
+struct FrontSpans {
+    // Indexed by Batch::spans_at, which already covers every refreshed copy.
+    ranges: Vec<Option<FrontRange>>,
+    order: Vec<usize>,
+    last: Option<(usize, usize)>,
+    part: usize,
+}
+
+#[derive(Copy, Clone)]
+struct FrontRange {
+    from: usize,
+    to: usize,
+    written_in: usize,
+}
+
+impl FrontSpans {
+    fn reset(&mut self, copies: usize) {
+        self.ranges.clear();
+        self.ranges.resize(copies, None);
+        self.order.clear();
+        self.last = None;
+        self.part = 1;
+    }
+
+    fn note(&mut self, step: Touch, indices: &ByCopy<usize>) {
+        let key = match step {
+            Touch::Refresh(key, ..) | Touch::Write(key) => key,
+            Touch::Part => {
+                self.part += 1;
+                return;
             }
-            Touch::Write(copy) => {
-                let i = *at.entry(copy).or_insert_with(|| {
-                    spans.push((copy, usize::MAX, 0));
-                    given.push(0);
-                    spans.len() - 1
-                });
-                given[i] = part;
+            Touch::Title | Touch::Nothing => return,
+        };
+        let index = match self.last {
+            Some((last, index)) if last == key => index,
+            _ => {
+                // A write to a copy never refreshed needs no front range.
+                let Some(&index) = indices.get(&key) else { return };
+                self.last = Some((key, index));
+                index
             }
-            Touch::Part => part += 1,
-            Touch::Title | Touch::Nothing => {}
+        };
+        let range = self.ranges[index].get_or_insert_with(|| {
+            self.order.push(index);
+            FrontRange {
+                from: usize::MAX,
+                to: 0,
+                written_in: 0,
+            }
+        });
+        if let Touch::Refresh(_, from, to) = step {
+            if range.written_in != self.part {
+                range.from = range.from.min(from);
+                range.to = range.to.max(to);
+            }
+        } else {
+            range.written_in = self.part;
         }
     }
-    spans.retain(|s| s.1 < s.2);
-    spans
+
+    fn spans(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        self.order.iter().filter_map(|&i| {
+            let range = self.ranges[i]?;
+            (range.from < range.to).then_some((i, range.from, range.to))
+        })
+    }
 }
 
 /// What a step is to the copies' refreshes, for [`written_spans`].
@@ -8679,33 +8750,43 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
 
 #[cfg(test)]
 mod written_spans_tests {
-    use super::{Touch, front_spans, split, written_spans};
+    use super::{ByCopy, FrontSpans, Touch, split, written_spans};
 
     #[test]
     fn everything_is_refreshed_in_front_but_what_a_part_gave_its_shaders() {
         use Touch::{Nothing, Part, Refresh, Title, Write};
-        let found = front_spans(
-            [
-                Refresh(1, 10, 20),
-                Refresh(1, 12, 25),
-                Refresh(2, 0, 5),
-                Nothing,
-                Write(1),
-                // (Around what the part's own shaders write.)
-                Refresh(1, 0, 100),
-                Write(3),
-                Refresh(3, 1, 2),
-                Title,
-                Refresh(4, 7, 9),
-                Part,
-                // The next part's bytes under the first one's writes.
-                Refresh(1, 30, 40),
-                Write(4),
-                Refresh(4, 0, 9),
-            ]
-            .into_iter(),
-        );
-        assert_eq!(found, [(1, 10, 40), (2, 0, 5), (4, 7, 9)]);
+        let indices: ByCopy<_> = [(1, 0), (2, 1), (3, 2), (4, 3)].into_iter().collect();
+        let mut front = FrontSpans::default();
+        front.reset(indices.len());
+        for step in [
+            Refresh(1, 10, 20),
+            Refresh(1, 12, 25),
+            Refresh(2, 0, 5),
+            Nothing,
+            Write(1),
+            // (Around what the part's own shaders write.)
+            Refresh(1, 0, 100),
+            Write(3),
+            Refresh(3, 1, 2),
+            Title,
+            Refresh(4, 7, 9),
+            Part,
+            // The next part's bytes under the first one's writes.
+            Refresh(1, 30, 40),
+            Write(4),
+            Refresh(4, 0, 9),
+        ] {
+            front.note(step, &indices);
+        }
+        assert_eq!(front.spans().collect::<Vec<_>>(), [(0, 10, 40), (1, 0, 5), (3, 7, 9)]);
+
+        // Reuse the same index for a different submission. A first write
+        // still sets the order if the copy is refreshed in a later part.
+        front.reset(indices.len());
+        for step in [Write(9), Write(4), Refresh(1, 4, 8), Part, Refresh(4, 0, 4)] {
+            front.note(step, &indices);
+        }
+        assert_eq!(front.spans().collect::<Vec<_>>(), [(3, 0, 4), (0, 4, 8)]);
     }
 
     #[test]
@@ -8797,7 +8878,6 @@ impl Batch {
         self.spans.clear();
         self.spans_at.clear();
         self.ranges.clear();
-        self.touches.clear();
         SPARE_BATCH.set(Some(self));
     }
 
@@ -8924,17 +9004,20 @@ impl Batch {
             self.copy_spans(runs);
         }
         let mut due = Vec::new();
-        self.touches.clear();
+        self.front_spans.reset(self.spans.len());
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
-                self.touches.push(Touch::Part);
+                self.front_spans.note(Touch::Part, &self.spans_at);
             }
             for step in &list.deferred().copies {
                 match step {
                     Step::Refresh(shadow, at, len) => {
-                        self.touches.push(Touch::Refresh(std::sync::Arc::as_ptr(shadow) as usize, *at, *at + *len));
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        self.front_spans.note(Touch::Refresh(key, *at, *at + *len), &self.spans_at);
                     }
-                    Step::GpuWrite(shadow, ..) => self.touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
+                    Step::GpuWrite(shadow, ..) => {
+                        self.front_spans.note(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize), &self.spans_at);
+                    }
                     Step::Texture(staging) if wide_textures() => {
                         if self.texture_due(staging) {
                             due.push(staging.clone());
@@ -8944,10 +9027,8 @@ impl Batch {
                 }
             }
         }
-        let found = front_spans(self.touches.drain(..));
-        let spans: Vec<_> = found
-            .into_iter()
-            .filter_map(|(key, from, to)| Some((self.spans.get(*self.spans_at.get(&key)?)?.0.clone(), from, to)))
+        let spans: Vec<_> = self.front_spans.spans()
+            .map(|(index, from, to)| (self.spans[index].0.clone(), from, to))
             .collect();
         self.front = true;
         for (shadow, from, to) in &spans {
@@ -8970,8 +9051,7 @@ impl Batch {
         }
         let ahead = spans.len() > 1;
         if ahead {
-            let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
-            crate::watch::ask_ahead(&ranges);
+            crate::watch::ask_ahead(spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)));
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
@@ -9117,13 +9197,12 @@ impl Batch {
         let ahead = self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
+            let ranges = self
                 .refreshes
                 .iter()
                 .filter(|r| r.0.asked_ahead())
-                .map(|r| (r.1, r.2))
-                .collect();
-            crate::watch::ask_ahead(&ranges);
+                .map(|r| (r.1, r.2));
+            crate::watch::ask_ahead(ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
@@ -9618,8 +9697,11 @@ pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 }
 
 const BUFFERS: u32 = 2;
+// The mode DXGI accepted when the current presenter was created.
+static EXCLUSIVE_FALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct Presenter {
+    exclusive: bool,
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
@@ -9630,8 +9712,10 @@ struct Presenter {
     /// again once that one has finished).
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
+    last_status: windows::core::HRESULT,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    fxaa_input: Option<ID3D12Resource>,
     /// The numbers panel (F3), in every build.
     panel: panel::Panel,
     /// What the card does for frame generation, for the first seconds.
@@ -9673,6 +9757,15 @@ fn tearing(factory: &IDXGIFactory2) -> bool {
 /// The swap chain's flags for [`tearing`].
 fn chain_flags(tearing: bool) -> DXGI_SWAP_CHAIN_FLAG {
     if tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING } else { DXGI_SWAP_CHAIN_FLAG(0) }
+}
+
+impl Drop for Presenter {
+    fn drop(&mut self) {
+        if self.exclusive {
+            // DXGI requires returning to windowed mode before releasing the chain.
+            unsafe { let _ = self.swap_chain.SetFullscreenState(false, None); }
+        }
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9909,7 +10002,7 @@ impl Meter {
                 {
                     let weighed = used.saturating_sub(blocks) + buffers + targets;
                     tracing::info!(
-                        "the texture queue's room: {used} MB in use - {blocks} MB free in texture blocks + {buffers} MB kept for \
+                        "the texture queue's room: {used} MB in use - {blocks} MB credited from reusable texture blocks + {buffers} MB kept for \
                          card copies of title buffers + {targets} MB kept for render targets = {weighed} MB against a line of \
                          {line} MB ({:.1} % of a budget of {budget} MB): {}",
                         line as f64 * 100.0 / budget.max(1) as f64,
@@ -10223,6 +10316,18 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        let fxaa = menu::fxaa_on().load(Ordering::Relaxed);
+        self.present_filtered(texture, state, overlay, frame, fxaa)
+    }
+
+    fn present_filtered(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+        fxaa: bool,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {
@@ -10244,12 +10349,36 @@ impl Host {
             };
             format
         };
+        // Match the transfer function of the normal direct copy, even with an
+        // sRGB view or an input that prohibits shader-resource views.
+        let filter_single = fxaa && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && desc.DepthOrArraySize == 1 && desc.MipLevels == 1 && desc.SampleDesc.Count == 1;
+        let copy_input = filter_single && planes.is_none() && crate::compose::view(&desc) != Some(format);
+        let layers = planes.map(|(over, state, base_fmt, over_fmt)| {
+            (base_fmt, Some((over, state, over_fmt)))
+        }).or_else(|| filter_single.then_some((format, None)));
+        if fxaa && layers.is_none() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| tracing::warn!(format = desc.Format.0, "FXAA unavailable for this display surface; using the original image"));
+        }
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        // The title can replace its window while audio and rendering continue.
+        if let Some(p) = presenter.as_ref()
+            && !unsafe { IsWindow(Some(p.hwnd)) }.as_bool()
+            && !crate::streamline::fsr::live_swap_chain()
+        {
+            tracing::warn!(frame, "display window was destroyed; attaching a new swap chain");
+            settle_now(WHY_SYNC);
+            crate::streamline::resizing();
+            *presenter = None;
+            DISPLAY_WINDOW.store(0, Ordering::Release);
+        }
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
                 Ok(p) => Some(p),
                 Err(e) => {
+                    self.check_display_device("create swap chain", e.code(), frame);
                     tracing::warn!(error = %e, "no swap chain");
                     return None;
                 }
@@ -10257,16 +10386,6 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
-        if planes.is_some() && p.composer.is_none() {
-            match crate::compose::Composer::new(self, format) {
-                Ok(c) => p.composer = Some(c),
-                Err(e) => {
-                    tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
-                    drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
-                }
-            }
-        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
@@ -10282,6 +10401,7 @@ impl Host {
                     if p.format != format {
                         p.composer = None;
                     }
+                    p.fxaa_input = None;
                     (p.width, p.height, p.format) = (width, height, format);
                     tracing::info!(
                         width,
@@ -10293,18 +10413,30 @@ impl Host {
                     self.log_video_memory("right after the swap chain's buffers were made again");
                 }
                 Err(e) => {
+                    self.check_display_device("resize swap chain", e.code(), frame);
                     tracing::warn!(error = %e, width, height, "swap chain not resized");
                     return None;
                 }
             }
         }
-        if planes.is_some() && p.composer.is_none() {
+        if copy_input && p.fxaa_input.is_none() {
+            match crate::compose::sample_copy(self, width, height, format) {
+                Ok(input) => p.fxaa_input = Some(input),
+                Err(e) => {
+                    tracing::warn!(error = %e, "FXAA input unavailable; using the original image");
+                    menu::fxaa_on().store(false, Ordering::Relaxed);
+                    drop(presenter);
+                    return self.present_filtered(texture, state_u32, None, frame, false);
+                }
+            }
+        }
+        if layers.is_some() && p.composer.is_none() {
             match crate::compose::Composer::new(self, format) {
                 Ok(c) => p.composer = Some(c),
                 Err(e) => {
-                    tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");
+                    tracing::warn!(error = %e, "display compositor unavailable; showing original image");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_filtered(texture, state_u32, None, frame, false);
                 }
             }
         }
@@ -10312,8 +10444,16 @@ impl Host {
         // SAFETY: our swap chain, list and live source texture(s).
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
-            let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
-                return None;
+            let back = match p.swap_chain.GetBuffer::<ID3D12Resource>(index) {
+                Ok(back) => back,
+                Err(e) => {
+                    self.check_display_device("get back buffer", e.code(), frame);
+                    if p.last_status != e.code() {
+                        tracing::warn!(frame, index, error = %e, "could not acquire the display buffer");
+                        p.last_status = e.code();
+                    }
+                    return None;
+                }
             };
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
@@ -10340,14 +10480,27 @@ impl Host {
             copy.reset();
             copy.keep(texture);
             let list = &copy.list;
-            let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
-                copy.keep(over);
+            let composed = if let Some((base_fmt, over_plane)) = layers {
+                if let Some((over, _, _)) = over_plane { copy.keep(over); }
                 if let Some(composer) = p.composer.as_mut() {
                     let mut pre = Vec::with_capacity(3);
-                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
-                        pre.push(transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+                    let (base, base_state) = if copy_input {
+                        let input = p.fxaa_input.as_ref().expect("allocated FXAA input");
+                        if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                            list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        }
+                        list.CopyResource(input, texture);
+                        if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                            pre.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+                        }
+                        (input, D3D12_RESOURCE_STATE_COPY_DEST)
+                    } else {
+                        (texture, state)
+                    };
+                    if base_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                        pre.push(transition(base, base_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     }
-                    if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    if let Some((over, over_state, _)) = over_plane && over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         pre.push(transition(over, over_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     }
                     pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
@@ -10357,7 +10510,9 @@ impl Host {
                         self,
                         compose_slot,
                         list,
-                        [(texture, base_fmt), (over, over_fmt)],
+                        (base, base_fmt),
+                        over_plane.map(|(r, _, f)| (r, f)),
+                        fxaa,
                         &back,
                         (width, height),
                     ) {
@@ -10365,7 +10520,7 @@ impl Host {
                         drop(back);
                         drop(presenter);
                         tracing::warn!(%err, "could not record display composite; presenting the base plane");
-                        return self.present_planes(texture, state_u32, None, frame);
+                        return self.present_filtered(texture, state_u32, None, frame, false);
                     }
                     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !ONCE.swap(true, Ordering::Relaxed) {
@@ -10374,15 +10529,16 @@ impl Host {
                             width,
                             height,
                             base_format = base_fmt.0,
-                            overlay_format = over_fmt.0,
-                            "display output: compositing two planes (overlay active)"
+                            overlay = over_plane.is_some(),
+                            fxaa,
+                            "display compositor active"
                         );
                     }
                     let mut post = Vec::with_capacity(3);
-                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
-                        post.push(transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state));
+                    if base_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                        post.push(transition(base, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, base_state));
                     }
-                    if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    if let Some((over, over_state, _)) = over_plane && over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         post.push(transition(over, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, over_state));
                     }
                     post.push(transition(
@@ -10476,7 +10632,7 @@ impl Host {
                 [width, height],
                 format,
                 (texture, state_u32),
-                composed && overlay.is_some(),
+                composed && planes.is_some(),
             );
             copy.close();
             let flown = match slot {
@@ -10508,11 +10664,12 @@ impl Host {
                 frame,
                 crate::streamline::Planes {
                     base: (texture, state_u32),
-                    overlay: overlay.filter(|_| composed),
+                    overlay: overlay.filter(|_| composed && planes.is_some()),
                     size: [width, height],
                 },
             );
             let called = crate::streamline::present_called(&presenting);
+<<<<<<< Updated upstream
             let shown = p.swap_chain.Present(0, if p.presents_tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) });
             if shown.is_err() && p.presents_tearing {
                 // A white window on an RTX 5070 at 1440p (2026-11-28): presents that may tear
@@ -10524,8 +10681,24 @@ impl Host {
                 p.present_refused = true;
                 tracing::warn!(code = %shown, frame, "a present was refused (logged once)");
             }
+=======
+            display_watch::begin_present();
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            display_watch::end_present(status == windows::Win32::Foundation::S_OK);
+>>>>>>> Stashed changes
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
+            if status != p.last_status {
+                tracing::info!(frame, status = format_args!("{:#010X}", status.0), "display presentation status changed");
+                p.last_status = status;
+            }
+            if status.is_err() {
+                self.check_display_device("present frame", status, frame);
+                return None;
+            }
+            if status == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED {
+                return None;
+            }
             showing.next("the frame meter");
             p.panel.frame(p.meter.line_due());
             p.menu.frame();
@@ -10538,12 +10711,22 @@ impl Host {
         }
     }
 
+    fn check_display_device(&self, operation: &str, status: windows::core::HRESULT, frame: u64) {
+        // The first operation to notice removal can be a swap-chain call.
+        if matches!(status, DXGI_ERROR_DEVICE_HUNG | DXGI_ERROR_DEVICE_REMOVED | DXGI_ERROR_DEVICE_RESET | DXGI_ERROR_DRIVER_INTERNAL_ERROR)
+            || unsafe { self.device.GetDeviceRemovedReason() }.is_err()
+        {
+            fail(format_args!("{operation} at frame {frame} failed with {status:?}"));
+        }
+    }
+
     /// Lets the swap chain and what presents with it go, once everything
     /// sent has run (`victory upscaler-check`: before Streamline is shut
     /// down; nothing presents afterwards).
     pub(crate) fn drop_presenter(&self) {
         settle_now(WHY_SYNC);
         *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        DISPLAY_WINDOW.store(0, Ordering::Release);
     }
 
     fn presenter(
@@ -10586,32 +10769,67 @@ impl Host {
                     .CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None)
                     .and_then(|s| s.cast::<IDXGISwapChain3>())
             });
-            let swap_chain = if let Some(swap_chain) = fsr { swap_chain } else { match proxied {
-                Some(Ok(swap_chain)) => {
-                    crate::streamline::swap_chain_made(true, None);
-                    // Frame generation must be off across a change between
-                    // windowed and full screen (Streamline's guide, 12.0):
-                    // the system's own Alt+Enter is not taken for this window.
-                    if let Ok(parent) = swap_chain.GetParent::<IDXGIFactory1>() {
-                        let _ = parent.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+            let (swap_chain, native_chain) = if let Some(chain) = fsr {
+                (chain, false)
+            } else {
+                match proxied {
+                    Some(Ok(chain)) => {
+                        crate::streamline::swap_chain_made(true, None);
+                        // Frame generation must be off across a fullscreen transition.
+                        if let Ok(parent) = chain.GetParent::<IDXGIFactory1>() {
+                            let _ = parent.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                        }
+                        (chain, false)
                     }
-                    swap_chain
+                    Some(Err(e)) => {
+                        crate::streamline::swap_chain_made(false, Some(&e));
+                        let chain = factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?;
+                        (chain, true)
+                    }
+                    None => {
+                        let chain = factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?;
+                        let native = chain.as_raw();
+                        let chain = crate::streamline::present_hooked(chain);
+                        let is_native = chain.as_raw() == native;
+                        (chain, is_native)
+                    }
                 }
-                Some(Err(e)) => {
-                    crate::streamline::swap_chain_made(false, Some(&e));
-                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?
-                }
-                // (`VICTORY_STREAMLINE_PRESENT=1`, DLSS without frame
-                // generation: Streamline's proxy of it, for its present hook.)
-                None => crate::streamline::present_hooked(
-                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
-                ),
-            } };
+            };
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            let mut exclusive = false;
+            let requested_exclusive = std::env::var("VICTORY_FULLSCREEN").as_deref() == Ok("exclusive");
+            if requested_exclusive {
+                let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                if native_chain {
+                    match swap_chain.SetFullscreenState(true, None) {
+                        Ok(()) => {
+                            // Flip-model chains must resize before presenting in the new mode.
+                            let mut active = windows::core::BOOL::default();
+                            let resized = swap_chain.ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                                .and_then(|()| swap_chain.GetFullscreenState(Some(&mut active), None));
+                            if resized.is_ok() && active.as_bool() {
+                                exclusive = true;
+                                tracing::info!("exclusive fullscreen enabled");
+                            } else {
+                                swap_chain.SetFullscreenState(false, None)?;
+                                swap_chain.ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))?;
+                                tracing::warn!(result = ?resized, "exclusive mode was not confirmed; using borderless");
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "exclusive fullscreen unavailable; using borderless"),
+                    }
+                } else {
+                    tracing::warn!("exclusive fullscreen unavailable with the presentation proxy; using borderless");
+                }
+            }
+            EXCLUSIVE_FALLBACK.store(requested_exclusive && !exclusive, Ordering::Relaxed);
+            DISPLAY_WINDOW.store(hwnd.0 as usize, Ordering::Release);
+            display_watch::start();
+            tracing::info!(width, height, format = format.0, hwnd = hwnd.0 as usize, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
+                exclusive,
                 swap_chain,
                 width,
                 height,
@@ -10619,8 +10837,10 @@ impl Host {
                 copy,
                 ahead: Vec::new(),
                 hwnd,
+                last_status: windows::Win32::Foundation::S_OK,
                 meter: Meter::new(),
                 composer: None,
+                fxaa_input: None,
                 panel: panel::Panel::new(),
                 notice: panel::Notice::new(),
                 menu: menu::Menu::new(),
@@ -11238,6 +11458,14 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_CLOSE && let Some(close) = ON_WINDOW_CLOSE.get() {
+        close();
+        return LRESULT(0);
+    }
+    if message == WM_DESTROY {
+        // This thread owns only the fallback display.
+        unsafe { PostQuitMessage(0) };
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
@@ -11262,14 +11490,22 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             right: width as i32,
             bottom: height as i32,
         };
-        AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        let fullscreen = matches!(std::env::var("VICTORY_FULLSCREEN").as_deref(), Ok("1" | "exclusive"));
+        let (style, x, y) = if fullscreen {
+            rect.right = GetSystemMetrics(SM_CXSCREEN);
+            rect.bottom = GetSystemMetrics(SM_CYSCREEN);
+            (WS_POPUP, 0, 0)
+        } else {
+            AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+            (WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT)
+        };
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            style | WS_VISIBLE,
+            x,
+            y,
             rect.right - rect.left,
             rect.bottom - rect.top,
             None,

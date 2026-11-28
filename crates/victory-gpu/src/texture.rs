@@ -1449,8 +1449,10 @@ impl Staging {
         if alone && !exact && last.hash.is_some() {
             return 0;
         }
-        if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+        if !alone
+            && let Some((now, changed)) = waited(1, || crate::watch::written_since(start, start + size, false, last.asked))
+        {
+            if !exact && last.asked != 0 && !changed {
                 return 0;
             }
             last.asked = now;
@@ -1479,10 +1481,10 @@ impl Staging {
         let mut blind = false;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, changed)) = waited(1, || crate::watch::written_since(start, start + size, true, last.asked))
         {
             const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let unwritten = last.asked != 0 && !changed;
             last.asked = now;
             let frame = crate::frame::current();
             let turn = frame
@@ -2175,7 +2177,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         None => {
             let speculative = PICKING.get().is_some() && !BAKING.get();
             if crate::residency::upload_refused()
-                || (speculative && !crate::residency::allow_staging_growth(false))
+                || (speculative && !crate::residency::allow_staging_growth(total))
             {
                 crate::residency::note_staging_deferred();
                 return None;

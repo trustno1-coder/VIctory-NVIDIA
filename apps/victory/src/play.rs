@@ -139,7 +139,7 @@ const KEPT: &[&str] = &[
 
 const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
 
-const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
+const RESOLUTIONS: [&str; 5] = ["1440", "1080", "1080stockui", "1080to1440", "4k"];
 const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
 /// The Series S scene heights the F1 menu offers and the DLSS mode of each: the picture
 /// is 1920x1080, the scene that mode's share of it (720: the game's own size, and what
@@ -155,8 +155,9 @@ pub(crate) struct Play {
     /// The Series S profile (1280x720 inside: faster, softer).
     #[arg(long)]
     series_s: bool,
-    /// 1440: output and scene 2560x1440; 1080to1440: scene 1920x1080
-    /// upscaled by the title; 4k: the stock 3840x2160 output.
+    /// 1080 and 1440 select native output and scene sizes. 1080to1440: scene 1920x1080
+    /// upscaled by the title; 4k: the stock 3840x2160 output. 1080stockui fits the stock UI
+    /// to a 1080p window with a 1080p scene (an external upscaler uses its own scene size).
     #[arg(long, default_value = "1440", value_parser = RESOLUTIONS)]
     res: String,
     /// DLSS in place of the title's upscaling (needs NVIDIA's files).
@@ -323,6 +324,11 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     if !series_s {
         match res {
+            "1080" => set("VICTORY_NATIVE_1080P", "1"),
+            "1080stockui" => {
+                set("VICTORY_1080P_STOCK_UI", "1");
+                set("VICTORY_WINDOW_MAX", "1920x1080");
+            }
             "1440" => set("VICTORY_NATIVE_1440P", "1"),
             "1080to1440" => set("VICTORY_RENDER_1080P", "1"),
             _ => {}
@@ -1124,6 +1130,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< Updated upstream
     fn the_series_s_picture_sets_the_scene() {
         let get = |s: &BTreeMap<String, String>, k: &str| s.get(k).cloned();
         let s_menu = |more: &str| parse_menu(&format!("VICTORY_MENU_CONSOLE=series-s\r\n{more}"));
@@ -1152,6 +1159,28 @@ mod tests {
         let (s, series_s) = settings(&options(), &parse_menu("VICTORY_MENU_S_RES=540\r\n"), Some(Path::new("x")));
         assert!(!series_s);
         assert_eq!((get(&s, "VICTORY_DLSS_MODE").as_deref(), get(&s, "VICTORY_FSR_PATH")), (Some("quality"), None));
+=======
+    fn native_1080p_selects_only_its_own_display_switch() {
+        let mut o = options();
+        o.res = "1080".to_owned();
+        let (s, _) = settings(&o, &[], None);
+        assert_eq!(s.get("VICTORY_NATIVE_1080P").map(String::as_str), Some("1"));
+        assert!(!s.contains_key("VICTORY_RENDER_1080P") && !s.contains_key("VICTORY_NATIVE_1440P"));
+        o.series_s = true;
+        assert!(!settings(&o, &[], None).0.contains_key("VICTORY_NATIVE_1080P"));
+    }
+
+    #[test]
+    fn stock_ui_uses_a_1080p_window_and_stock_console_modes() {
+        let mut o = options();
+        o.res = "1080stockui".into();
+        let (s, _) = settings(&o, &[], None);
+        assert_eq!(s["VICTORY_1080P_STOCK_UI"], "1");
+        assert_eq!(s["VICTORY_WINDOW_MAX"], "1920x1080");
+        assert!(!s.contains_key("VICTORY_NATIVE_1080P") && !s.contains_key("VICTORY_NATIVE_1440P"));
+        o.series_s = true;
+        assert!(!settings(&o, &[], None).0.contains_key("VICTORY_1080P_STOCK_UI"));
+>>>>>>> Stashed changes
     }
 
     #[test]

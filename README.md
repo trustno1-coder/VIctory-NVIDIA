@@ -1,5 +1,83 @@
 # VIctory on NVIDIA
 
+## Radeon at 1080p
+
+Double-click `Play-Radeon-1080p.cmd` when the game folder and this checkout
+are next to each other. You can also pass the game folder as its first
+argument. The launcher uses a release build and builds it on first use if
+Cargo is installed. The Series X profile renders the 3D scene at 1920×1080.
+The game composes the menus at its original 3840×2160 and the complete picture
+fits a window up to 1920×1080. This keeps the Medium UI and controller preview
+aligned. In F1, open Victory Settings with Tab and choose Series X Picture to
+select the lower-cost native 1920x1080 scanout.
+The cap is 60 rendered FPS. Ray-tracing structure
+building and frame generation are off. The existing ambient-light
+approximation supplies indirect light.
+
+The launcher preloads the shader pack and embedded programs from the game's
+executable and DLLs before play. Once a scene has been played,
+the next preload warms pipelines requested by earlier runs and up to 4,096
+untried variants, prioritising ones that share the same shader stages. The dedicated
+`Victory-cache-1080p` folder sits beside the checkout. Setting
+`VICTORY_CACHE_DIR` selects another location. F1 saves changes to
+`victory-settings.radeon1080.txt`. F3 shows the frame rate while playing.
+The 60 FPS target corresponds to 16.7 ms per rendered frame.
+
+### Comparing graphics settings
+
+Use **F1** on the Radeon launcher to open **Game Graphics**. Up and Down pick a
+setting. Left and Right change it. **Tab** opens the existing Victory settings.
+The game graphics page appears once this title has created its settings file.
+
+- **Temporal upscale source (p)** sets the Series X 3D scene to 720p, 900p,
+  1080p (the Radeon default), 1440p, or 2160p. The 2160p option renders at the
+  full size of the game's UI canvas. The window still fits your display.
+  **Map anti-aliasing (MSAA)** controls the map separately.
+- Press **Tab** for **Post anti-aliasing**. Select **Game + FXAA** to smooth
+  edges immediately, or **Game only** to remove the extra pass. On a single
+  display plane FXAA also filters game text. Series S composites its separate
+  UI plane after FXAA. **Console / Upscaler** lets you compare the Series X
+  temporal path with the Series S FidelityFX path when DLSS is off. Switching
+  console also changes the game's quality profile.
+- **Display mode** offers windowed, borderless and exclusive fullscreen after
+  restart. If Windows declines exclusive mode or a frame-generation proxy owns
+  presentation, Victory starts borderless and reports the fallback in F1.
+- **Texture streaming budget** changes live. Try 8 ms against the original 16 ms
+  and check how quickly trees and road textures reach full detail.
+- **Grass detail**, **World draw distance**, vehicle detail, texture upgrades,
+  tree tessellation, particle shadows, water reflections and motion blur use
+  the game's own settings. Choose **Save for next start** to keep playing.
+  **Save and restart** asks for a second Enter and reuses the prepared cache.
+  Save your game progress before restarting.
+- **Measure 20 seconds of gameplay** closes F1 and starts a countdown. Play the
+  same route for each run. Open F1 after the countdown to see the last two
+  results, including average rendered FPS and the 95th-percentile frame time.
+  Opening F1 during the countdown cancels that sample. The full history and
+  settings are in `7952987A\victory-graphics-samples.tsv` under your data folder.
+- **Select original graphics**, then **Save for next start**, restores the values
+  this profile had before you changed them through F1.
+
+Double-click `Prepare-Radeon-Cache.cmd` for a full offline pass before playing.
+It translates supported shaders from the shader pack, executable and DLLs, then
+attempts every eligible pipeline Victory has recorded for this driver and build.
+Completed pipeline attempts are remembered between runs. New areas can introduce
+pipelines the game has never described. Running the tool again includes them.
+
+The last step warms archive headers, previously streamed regions and common
+assets in the Windows file cache. Radeon play sessions record the regions they
+read in small maps under `Victory-cache-1080p\asset-reads`. The warm-up reads
+up to 2 GiB or one quarter of available RAM, whichever is smaller. Shader and
+pipeline caches persist on disk. Windows can reclaim warmed asset pages, so run
+the tool shortly before playing for that part to help. At the end press **P**
+to play immediately with the prepared cache, or **X** to exit. You can also
+start `Play-Radeon-1080p.cmd` later as usual.
+
+On a Ryzen 7 9700X and RX 9070 XT with 32 GB RAM, the prison prologue
+rendered in colour at native 1080p. Five consecutive release-build samples
+there measured 21–27 FPS. The opening night shots still appeared almost
+black with visible subtitles, and entering the world caused compilation
+stalls. The play log records the player's exit code when it returns.
+
 > **Reporting a problem?** Please attach **both** logs from the run that went
 > wrong. Without them we can only guess. Paste `%LOCALAPPDATA%` into the address
 > bar of File Explorer to get there.
@@ -278,9 +356,11 @@ foxhound's own measurements, on an RTX 4070 SUPER, are in its README.
 
 What is known to be wrong:
 
-- **No ray tracing.** The title's own is off (`VICTORY_BVH_BUILDER=1`, or the
-  menu's RAY TRACING, turns it on: slow and with a broken picture on this
-  base). An estimate stands in for indirect light and reflections.
+- **Experimental ray tracing.** The BVH builder is off by default (`VICTORY_BVH_BUILDER=1`, or the
+  menu's **Ray tracing BVH builder**, enables it). The builder prepares scene
+  structures, but ray traversal is incomplete and enabling it can break
+  lighting or reduce frame rate. Victory uses estimates for indirect light and
+  reflections by default.
 - **Frame generation needs room in the card's memory.** The layer fills the
   card with textures up to its budget; with frame generation on from the start
   the launcher holds a fifth of the budget back (a little less while it is only

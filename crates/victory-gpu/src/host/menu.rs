@@ -21,6 +21,8 @@
 //! that panel is: white text on a black box, copied onto the swap chain's
 //! buffer, in the middle of the picture.
 
+mod graphics;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -28,7 +30,7 @@ use std::time::Duration;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -95,6 +97,7 @@ const ABOUT_MFG: [&str; 3] = [
     "ON: DOWNLOADED FROM ITS GITHUB AT THE NEXT START, THEN RUN.",
     "NVIDIA DOES NOT SUPPORT IT. IF THE GAME FAILS, TURN IT OFF.",
 ];
+<<<<<<< Updated upstream
 /// The DLSS setting, and what is said while it is picked on in a start without NVIDIA's files.
 const DLSS: &str = "VICTORY_MENU_DLSS";
 const ABOUT_NO_DLSS: [&str; 3] = [
@@ -124,12 +127,45 @@ const ABOUT_S_RES: [&str; 3] = [
     "OTHER THAN 720 NEEDS DLSS: THIS SETS ITS MODE (1080 IS",
     "DLAA, 720 QUALITY, 626 BALANCED, 540 PERFORMANCE).",
 ];
+=======
+const ABOUT_RT: [&str; 3] = [
+    "BUILDS THE SCENE STRUCTURES USED BY RAY TRACING.",
+    "RAY TRAVERSAL IS INCOMPLETE IN THIS BUILD.",
+    "ENABLING IT CAN SLOW THE GAME OR BREAK LIGHTING.",
+];
+const ABOUT_CONSOLE: [&str; 3] = [
+    "WITH DLSS OFF, SERIES X USES TEMPORAL UPSCALING.",
+    "SERIES S USES FIDELITYFX FROM 720P TO 1080P.",
+    "CHANGING CONSOLE ALSO CHANGES GAME QUALITY SETTINGS.",
+];
+const ABOUT_DISPLAY: [&str; 3] = [
+    "EXCLUSIVE REQUESTS CONTROL OF THE DISPLAY.",
+    "IF UNAVAILABLE OR USING A FRAME GENERATION PROXY,",
+    "VICTORY USES BORDERLESS. APPLIES ON RESTART.",
+];
+fn item_help(var: &str) -> [&'static str; 3] {
+    match var {
+        MFG => ABOUT_MFG,
+        "VICTORY_BVH_BUILDER" => ABOUT_RT,
+        "VICTORY_MENU_CONSOLE" => ABOUT_CONSOLE,
+        "VICTORY_FULLSCREEN" if super::EXCLUSIVE_FALLBACK.load(Ordering::Relaxed) => [
+            "THIS RUN STARTED BORDERLESS. EXCLUSIVE WAS UNAVAILABLE.",
+            "THE PLAYER LOG RECORDS THE REASON.",
+            "CHANGES TO DISPLAY MODE APPLY ON RESTART.",
+        ],
+        "VICTORY_FULLSCREEN" => ABOUT_DISPLAY,
+        _ => [""; 3],
+    }
+}
+>>>>>>> Stashed changes
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
 /// The last line of the box: where this build comes from.
 const REPO: &str = "GITHUB.COM/TRUSTNO1-CODER/VICTORY-NVIDIA";
 const RIM: u32 = 4;
 const UPLOADS: usize = 4;
+
+enum Restart { Normal, Preload, UsePreparedCache }
 
 /// A setting: the variable, its name in the menu, the values it takes
 /// (`""`: not set, the build's own default), and whether a change applies at once.
@@ -147,6 +183,10 @@ const STAGES: &[(&str, &str)] = &[("2", "2"), ("1", "1"), ("0", "0 OFF")];
 /// The first value of each is what the launcher starts with.
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
+    Item { var: "VICTORY_FULLSCREEN", label: "DISPLAY MODE", values: &[("", "WINDOWED"), ("1", "BORDERLESS"), ("exclusive", "EXCLUSIVE FULLSCREEN")], live: false },
+    Item { var: "VICTORY_POST_AA", label: "POST ANTI-ALIASING", values: &[("", "GAME ONLY"), ("fxaa", "GAME + FXAA")], live: true },
+    Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING BVH BUILDER", values: &[("", "OFF"), ("1", "EXPERIMENTAL")], live: false },
+    Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE / UPSCALER", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
     // The launcher's own choices.
     Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
     Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
@@ -157,22 +197,29 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
     Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
-    Item { var: "VICTORY_FULLSCREEN", label: "FULLSCREEN (NO BORDER)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
     Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
+<<<<<<< Updated upstream
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
     Item { var: X_RES, label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
     // In place of SERIES X PICTURE when CONSOLE is Series S.
     Item { var: S_RES, label: "SERIES S PICTURE", values: &[("1080", "1920X1080 (DLAA)"), ("720", "1280X720 (THE GAME)"), ("626", "1113X626"), ("540", "960X540 (FASTEST)")], live: false },
+=======
+    Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080", "1920X1080"), ("1080stockui", "1080P (STOCK UI)"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
+>>>>>>> Stashed changes
     // The layer's switches.
     Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
     Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
     Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },
+<<<<<<< Updated upstream
     Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
     // On unless "0": a file saved by an earlier version holds an empty value (its OFF) or "1",
     // and both start it on, so nobody keeps it off from before by accident (2026-11-27).
     Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "ON"), ("0", "OFF")], live: false },
+=======
+    Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "OFF (NO DARK BLOCKS)"), ("1", "ON (GREEN, DARK BLOCKS)")], live: false },
+>>>>>>> Stashed changes
     Item { var: "VICTORY_LEAVE_OUT", label: "HEAT HAZE AND DECAL DEFRAG", values: &[("02384a60fda6f2d0,731a39171b568298", "LEFT OUT"), ("", "RUN (SLOWER, SMEARS)")], live: false },
     Item { var: "VICTORY_EARLY_DEPTH", label: "EARLY DEPTH TEST", values: ON_UNSET, live: false },
     Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: ON_UNSET, live: false },
@@ -299,6 +346,11 @@ fn live(item: &Item) -> bool {
     item.live || (item.var == "VICTORY_MENU_FRAMEGEN" && crate::streamline::framegen_live())
 }
 
+pub(super) fn fxaa_on() -> &'static AtomicBool {
+    static ON: OnceLock<AtomicBool> = OnceLock::new();
+    ON.get_or_init(|| AtomicBool::new(get("VICTORY_POST_AA") == "fxaa"))
+}
+
 /// Whether the frame-rate line is shown at the top while the menu is closed
 /// (`VICTORY_FPS_LINE=0`: not; the menu changes it).
 fn fps_line_on() -> &'static AtomicBool {
@@ -320,8 +372,8 @@ fn fps_line() -> Option<String> {
         return None;
     }
     Some(match crate::streamline::shown_per_frame() {
-        1 => format!("FPS: {fps:.1}"),
-        per => format!("FPS: {fps:.1}  FG: {:.1}", fps * f64::from(per)),
+        1 => format!("FPS: {fps:.1}  {:.1} MS", 1000.0 / fps),
+        per => format!("FPS: {fps:.1}  {:.1} MS  FG: {:.1}", 1000.0 / fps, fps * f64::from(per)),
     })
 }
 
@@ -348,7 +400,7 @@ fn keys() -> &'static Mutex<Vec<u16>> {
     static KEYS: OnceLock<Mutex<Vec<u16>>> = OnceLock::new();
     KEYS.get_or_init(|| {
         let _ = std::thread::Builder::new().name("settings menu keys".into()).spawn(|| {
-            const WATCHED: [u16; 7] = [VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE];
+            const WATCHED: [u16; 8] = [VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE, VK_TAB];
             let mut was = [false; WATCHED.len()];
             loop {
                 std::thread::sleep(Duration::from_millis(10));
@@ -463,6 +515,8 @@ impl Buffers {
 
 /// The menu of a presenter.
 pub(super) struct Menu {
+    graphics: Option<graphics::Graphics>,
+    graphics_page: bool,
     /// The values chosen, by item (as at start until changed).
     values: Vec<String>,
     /// The values at start.
@@ -491,7 +545,12 @@ impl Menu {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
+<<<<<<< Updated upstream
         Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false }
+=======
+        let graphics = graphics::Graphics::load();
+        Menu { graphics_page: graphics.is_some(), graphics, started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
+>>>>>>> Stashed changes
     }
 
     fn open() -> bool {
@@ -525,6 +584,7 @@ impl Menu {
     }
 
     fn lines(&self) -> Vec<String> {
+<<<<<<< Updated upstream
         if self.picking {
             return self.pick_lines();
         }
@@ -532,8 +592,15 @@ impl Menu {
         let total = rows.len();
         let at = rows.iter().position(|r| *r == self.at).unwrap_or(0);
         let first = at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
+=======
+        if self.graphics_page && let Some(graphics) = &self.graphics {
+            return graphics.lines(&self.note);
+        }
+        let total = ITEMS.len() + ACTIONS.len();
+        let first = self.at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
+>>>>>>> Stashed changes
         let mut out = vec![
-            "SETTINGS                       F1 OR ESC CLOSES".to_owned(),
+            if self.graphics.is_some() { "VICTORY SETTINGS               TAB: GAME GRAPHICS" } else { "SETTINGS                       F1 OR ESC CLOSES" }.to_owned(),
             "UP/DOWN PICK  LEFT/RIGHT CHANGE  ENTER DOES IT".to_owned(),
             String::new(),
         ];
@@ -555,6 +622,7 @@ impl Menu {
         out.push(String::new());
         let about = if self.at == ITEMS.len() + PRELOAD {
             ABOUT_PRELOAD
+<<<<<<< Updated upstream
         } else if self.at == ITEMS.len() + EXPORT {
             ABOUT_EXPORT
         } else if self.at == ITEMS.len() + IMPORT {
@@ -572,8 +640,10 @@ impl Menu {
             && !matches!(self.values[self.at].as_str(), "" | "0")
         {
             ABOUT_FRAMEGEN_RESTART
+=======
+>>>>>>> Stashed changes
         } else {
-            [""; 3]
+            ITEMS.get(self.at).map_or([""; 3], |i| item_help(i.var))
         };
         out.extend(about.iter().map(|l| (*l).to_owned()));
         out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
@@ -659,6 +729,7 @@ impl Menu {
         match var {
             // Off (0) or the frames shown for each one rendered, from the next present on.
             "VICTORY_MENU_FRAMEGEN" => crate::streamline::set_framegen(value.parse().unwrap_or(0)),
+            "VICTORY_POST_AA" => fxaa_on().store(value == "fxaa", Ordering::Relaxed),
             "VICTORY_FPS_LINE" => fps_line_on().store(value != "0", Ordering::Relaxed),
             "VICTORY_PANEL" => super::panel::shown().store(value == "1", Ordering::Relaxed),
             _ => {}
@@ -671,11 +742,27 @@ impl Menu {
             self.note = "NO FOLDER FOR THE SETTINGS FILE".to_owned();
             return false;
         };
+<<<<<<< Updated upstream
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut kept: Vec<(String, String)> = std::fs::read_to_string(&path)
             .unwrap_or_default()
+=======
+        self.save_to(std::path::Path::new(&path))
+    }
+
+    fn save_to(&mut self, path: &std::path::Path) -> bool {
+        let previous = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => {
+                self.note = "COULD NOT READ THE SETTINGS FILE".into();
+                return false;
+            }
+        };
+        let mut kept: Vec<(String, String)> = previous
+>>>>>>> Stashed changes
             .lines()
             .filter_map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())))
             .filter(|(k, _)| k.starts_with("VICTORY_"))
@@ -687,14 +774,22 @@ impl Menu {
             kept.retain(|(k, _)| k != item.var);
             kept.push((item.var.to_owned(), self.values[i].clone()));
         }
+        if let Some(graphics) = &self.graphics {
+            for (key, value) in graphics.edits() {
+                kept.retain(|(k, _)| k != key);
+                if !value.is_empty() { kept.push((key.into(), value.into())); }
+            }
+        }
         let mut text = String::from("# Saved by the F1 menu; applied over the play settings at every start (an empty value: unset).\r\n");
         for (k, v) in &kept {
             text.push_str(&format!("{k}={v}\r\n"));
         }
-        match std::fs::write(&path, text) {
+        let temporary = path.with_extension(format!("settings-{}.tmp", std::process::id()));
+        match std::fs::write(&temporary, text).and_then(|()| std::fs::rename(&temporary, path)) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "settings menu: saved");
                 self.started = self.values.clone();
+<<<<<<< Updated upstream
                 self.note = if std::env::var_os("VICTORY_MENU_FILE").is_some() {
                     "SAVED. APPLIES AT THE NEXT START"
                 } else {
@@ -703,9 +798,14 @@ impl Menu {
                     "SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME"
                 }
                 .to_owned();
+=======
+                if let Some(graphics) = &mut self.graphics { graphics.mark_saved(); }
+                self.note = "SAVED. APPLIES AT THE NEXT START".to_owned();
+>>>>>>> Stashed changes
                 true
             }
             Err(e) => {
+                let _ = std::fs::remove_file(&temporary);
                 tracing::warn!(error = %e, "settings menu: not saved");
                 self.note = "COULD NOT SAVE THE SETTINGS FILE".to_owned();
                 false
@@ -715,7 +815,7 @@ impl Menu {
 
     /// Starts the launcher again in a new console, a few seconds on, and ends this run.
     /// `preload`: the launcher makes every shader first (`VICTORY_PRELOAD=1`, for that start alone).
-    fn restart(&mut self, preload: bool) {
+    fn restart(&mut self, mode: Restart) {
         let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
             self.note = "SAVED. START THE LAUNCHER AGAIN YOURSELF".to_owned();
             return;
@@ -726,9 +826,15 @@ impl Menu {
         // `--preload`, the script's `-Preload`: the script's flag given to victory.exe was refused,
         // and the window closed before it could be read, 2026-11-27). A launcher that fails keeps
         // its window until Enter.
+        let preload = matches!(mode, Restart::Preload);
+        let setup = match mode {
+            Restart::Preload => "$env:VICTORY_PRELOAD='1'; ",
+            Restart::UsePreparedCache => "$env:VICTORY_PLAY_PREPARED='1'; $env:VICTORY_PRELOAD=$null; ",
+            Restart::Normal => "",
+        };
         let command = format!(
             "Start-Sleep 3; {}& '{play}' {args}; if ($LASTEXITCODE) {{ Read-Host 'The start failed (see above). Press Enter to close this window' }}",
-            if preload { "$env:VICTORY_PRELOAD='1'; " } else { "" }
+            setup
         );
         match new_console(&format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{}\"", command.replace('"', "\\\""))) {
             Ok(()) => {
@@ -845,6 +951,11 @@ impl Menu {
         } else {
             self.note = "IMPORTED: CLOSE THE GAME AND START IT AGAIN".to_owned();
         }
+<<<<<<< Updated upstream
+=======
+        tracing::info!(seconds, mark = %mark.display(), "first start of this victory.exe: warmed up; the game starts again");
+        self.restart(Restart::Normal);
+>>>>>>> Stashed changes
     }
 
     /// Removes the settings file: the launcher's own settings at the next start.
@@ -867,6 +978,7 @@ impl Menu {
     /// A frame was presented: the keys pressed since the last one.
     pub(super) fn frame(&mut self) {
         self.warmup();
+        if let Some(graphics) = &mut self.graphics { graphics.frame(); }
         let pressed = std::mem::take(&mut *keys().lock().unwrap_or_else(|e| e.into_inner()));
         if pressed.is_empty() {
             return;
@@ -883,9 +995,14 @@ impl Menu {
             if vk == VK_F1 || (open && vk == VK_ESCAPE) {
                 crate::SETTINGS_MENU_OPEN.store(!open && vk == VK_F1, Ordering::Relaxed);
                 self.note.clear();
+<<<<<<< Updated upstream
                 self.picking = false;
                 if !open {
                     self.read_imports();
+=======
+                if !open && self.graphics.as_mut().is_some_and(|g| g.cancel_sample()) {
+                    self.note = "SAMPLE CANCELLED WHEN F1 OPENED".into();
+>>>>>>> Stashed changes
                 }
                 self.changed = true;
                 continue;
@@ -893,8 +1010,29 @@ impl Menu {
             if !open {
                 continue;
             }
+<<<<<<< Updated upstream
             // Only an Enter right after the first one starts a preload or an import.
             let confirmed = self.note == CONFIRM_PRELOAD || self.note == CONFIRM_IMPORT;
+=======
+            if vk == VK_TAB && self.graphics.is_some() {
+                self.graphics_page = !self.graphics_page;
+                self.note.clear();
+                self.changed = true;
+                continue;
+            }
+            if self.graphics_page && let Some(graphics) = &mut self.graphics {
+                match graphics.key(vk, &mut self.note) {
+                    graphics::Action::Save => { self.save(); }
+                    graphics::Action::Restart => { if self.save() { self.restart(Restart::UsePreparedCache); } }
+                    graphics::Action::Close => crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed),
+                    graphics::Action::None => {}
+                }
+                self.changed = true;
+                continue;
+            }
+            // Only an Enter right after the first one starts a preload.
+            let confirmed = self.note == CONFIRM_PRELOAD;
+>>>>>>> Stashed changes
             if confirmed {
                 self.note.clear();
             }
@@ -920,7 +1058,7 @@ impl Menu {
                 VK_RETURN => match self.at - ITEMS.len() {
                     0 => {
                         if self.save() {
-                            self.restart(false);
+                            self.restart(Restart::Normal);
                         }
                     }
                     1 => {
@@ -929,7 +1067,7 @@ impl Menu {
                     PRELOAD if !confirmed => self.note = CONFIRM_PRELOAD.to_owned(),
                     PRELOAD => {
                         if self.save() {
-                            self.restart(true);
+                            self.restart(Restart::Preload);
                         }
                     }
                     3 => self.reset(),
@@ -954,7 +1092,13 @@ impl Menu {
         }
         // Closed: the frame-rate line in the top left corner, if it is wanted and there is a rate.
         let open = Self::open();
-        let line = if open { None } else { fps_line() };
+        let line = if open {
+            None
+        } else if let Some(seconds) = self.graphics.as_ref().and_then(|g| g.seconds_left()) {
+            Some(format!("TEST {seconds}S  {}", fps_line().unwrap_or_default()))
+        } else {
+            fps_line()
+        };
         if !open && line.is_none() {
             return;
         }
@@ -1059,7 +1203,11 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
+<<<<<<< Updated upstream
         let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+=======
+        let mut menu = Menu { graphics: None, graphics_page: false, values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+>>>>>>> Stashed changes
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;
@@ -1074,7 +1222,11 @@ mod tests {
 
     #[test]
     fn the_link_is_always_right_under_the_note() {
+<<<<<<< Updated upstream
         let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+=======
+        let mut menu = Menu { graphics: None, graphics_page: false, values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+>>>>>>> Stashed changes
         menu.started = menu.values.clone();
         for note in ["", "SAVED"] {
             menu.note = note.to_owned();
@@ -1089,6 +1241,7 @@ mod tests {
                 let about = &lines[n - 5..n - 2];
                 if at == ITEMS.len() + PRELOAD {
                     assert_eq!(about, ABOUT_PRELOAD);
+<<<<<<< Updated upstream
                 } else if at == ITEMS.len() + EXPORT {
                     assert_eq!(about, ABOUT_EXPORT);
                 } else if at == ITEMS.len() + IMPORT {
@@ -1097,6 +1250,10 @@ mod tests {
                     assert_eq!(about, ABOUT_MFG);
                 } else if at < ITEMS.len() && ITEMS[at].var == S_RES {
                     assert_eq!(about, ABOUT_S_RES);
+=======
+                } else if let Some(item) = ITEMS.get(at) {
+                    assert_eq!(about, item_help(item.var));
+>>>>>>> Stashed changes
                 } else {
                     assert!(about.iter().all(String::is_empty), "{about:?}");
                 }
@@ -1190,7 +1347,11 @@ mod tests {
 
     #[test]
     fn values_cycle_both_ways() {
+<<<<<<< Updated upstream
         let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+=======
+        let mut menu = Menu { graphics: None, graphics_page: false, values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+>>>>>>> Stashed changes
         menu.started = menu.values.clone();
         let n = ITEMS[0].values.len();
         for _ in 0..n {
@@ -1202,6 +1363,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< Updated upstream
     fn a_shared_save_name_is_shown_in_letters_the_menu_has() {
         let names = vec!["save 2026-11-27 23-45-10.zip".to_owned(), "Jason's boat ~ 100% [\u{e9}] and a very long name that goes on and on.zip".to_owned()];
         let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true };
@@ -1237,5 +1399,34 @@ mod tests {
         let lines = check(&menu);
         assert!(lines.iter().any(|l| l == PICK_NONE));
         assert!(lines.iter().any(|l| l == &format!("> {PICK_BACK}")));
+=======
+    fn graphics_edits_round_trip_without_overwriting_renderer_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.txt");
+        std::fs::write(&path, "VICTORY_PANEL=1\r\n").unwrap();
+        let graphics = graphics::Graphics::from_spec(
+            "VICTORY_GAME_GRASSLOD|Grass detail|0.875000|0.50,0.75,1.00",
+            "16", |_| String::new(),
+        );
+        let values: Vec<_> = ITEMS.iter().map(|_| String::new()).collect();
+        let mut menu = Menu { graphics, graphics_page: true, started: values.clone(), values,
+            at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false };
+        menu.graphics.as_mut().unwrap().key(VK_RIGHT, &mut menu.note);
+        assert!(menu.save_to(&path));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("VICTORY_GAME_GRASSLOD=0.50\r\n"));
+        assert!(saved.contains("VICTORY_PANEL=1\r\n"));
+        menu.graphics.as_mut().unwrap().key(VK_LEFT, &mut menu.note);
+        assert!(menu.save_to(&path));
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(!saved.contains("VICTORY_GAME_GRASSLOD"));
+        assert!(saved.contains("VICTORY_PANEL=1\r\n"));
+        let lines = menu.lines();
+        assert!(lines.len() <= LINES as usize);
+        for line in lines {
+            assert!(line.len() <= COLUMNS as usize);
+            for c in line.bytes() { assert_ne!(glyph(c.to_ascii_uppercase()), glyph(b'#')); }
+        }
+>>>>>>> Stashed changes
     }
 }

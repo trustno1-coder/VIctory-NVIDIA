@@ -11,9 +11,10 @@ use windows::core::{PCSTR, s};
 use crate::host::Host;
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=1, b0, visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
+cbuffer DisplayOptions : register(b0) { uint flags; };
 SamplerState smooth_ : register(s0);
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
 [RootSignature(RS)]
@@ -23,9 +24,33 @@ V vs(uint id : SV_VertexID) {
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
+float luminance(float3 rgb) { return dot(rgb, float3(0.299, 0.587, 0.114)); }
+float3 color(float2 uv) { return scene.SampleLevel(smooth_, uv, 0).rgb; }
+float3 fxaa(float2 uv, float3 center) {
+    uint w, h;
+    scene.GetDimensions(w, h);
+    float2 px = 1.0 / float2(w, h);
+    float nw = luminance(color(uv + px * float2(-1, -1)));
+    float ne = luminance(color(uv + px * float2( 1, -1)));
+    float sw = luminance(color(uv + px * float2(-1,  1)));
+    float se = luminance(color(uv + px * float2( 1,  1)));
+    float mid = luminance(center);
+    float lo = min(mid, min(min(nw, ne), min(sw, se)));
+    float hi = max(mid, max(max(nw, ne), max(sw, se)));
+    if (hi - lo < max(0.0312, hi * 0.125)) return center;
+    float2 dir = float2((sw + se) - (nw + ne), (nw + sw) - (ne + se));
+    float reduce = max((nw + ne + sw + se) / 32.0, 1.0 / 128.0);
+    dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), -8.0, 8.0) * px;
+    float3 inner = (color(uv - dir / 6.0) + color(uv + dir / 6.0)) * 0.5;
+    float3 outer = inner * 0.5 + (color(uv - dir * 0.5) + color(uv + dir * 0.5)) * 0.25;
+    float l = luminance(outer);
+    return (l < lo || l > hi) ? inner : outer;
+}
 [RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
+    if (flags & 1) s.rgb = fxaa(v.uv, s.rgb);
+    if (!(flags & 2)) return s;
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
     return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
 }
@@ -121,7 +146,9 @@ impl Composer {
         host: &Host,
         slot: usize,
         list: &ID3D12GraphicsCommandList,
-        planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
+        base: (&ID3D12Resource, DXGI_FORMAT),
+        overlay: Option<(&ID3D12Resource, DXGI_FORMAT)>,
+        fxaa: bool,
         back: &ID3D12Resource,
         (width, height): (u32, u32),
     ) -> windows::core::Result<()> {
@@ -145,12 +172,12 @@ impl Composer {
                 views.GetCPUDescriptorHandleForHeapStart(),
                 views.GetGPUDescriptorHandleForHeapStart(),
             );
-            for (i, plane) in planes.iter().enumerate() {
+            for (i, plane) in [Some(base), overlay].into_iter().enumerate() {
                 let at = D3D12_CPU_DESCRIPTOR_HANDLE {
                     ptr: cpu.ptr + (i * self.step as usize),
                 };
                 let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: plane.1,
+                    Format: plane.map_or(base.1, |p| p.1),
                     ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
                     Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                     Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -161,7 +188,7 @@ impl Composer {
                     },
                 };
                 host.device
-                    .CreateShaderResourceView(Some(plane.0), Some(&desc), at);
+                    .CreateShaderResourceView(plane.map(|p| p.0), Some(&desc), at);
             }
             let rtv = host.rtv(Some(back), None);
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -169,6 +196,7 @@ impl Composer {
             list.SetGraphicsRootSignature(&self.root);
             list.SetPipelineState(&self.pso);
             list.SetGraphicsRootDescriptorTable(0, gpu);
+            list.SetGraphicsRoot32BitConstant(1, u32::from(fxaa) | (u32::from(overlay.is_some()) << 1), 0);
             list.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
@@ -188,6 +216,25 @@ impl Composer {
         }
         Ok(())
     }
+}
+
+/// Some display surfaces forbid SRVs or have an sRGB view that would change
+/// the direct copy's transfer function. Keep a sampleable copy in swap format.
+pub(crate) fn sample_copy(host: &Host, width: u32, height: u32, format: DXGI_FORMAT) -> windows::core::Result<ID3D12Resource> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: u64::from(width), Height: height, DepthOrArraySize: 1, MipLevels: 1,
+        Format: format, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    let mut resource = None;
+    unsafe {
+        host.device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut resource,
+        )?;
+    }
+    resource.ok_or_else(windows::core::Error::empty)
 }
 
 /// Select a legal float-sampled view of a display plane, preserving a typed
@@ -210,9 +257,89 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn display_shaders_compile() {
+    compile(s!("vs"), s!("vs_5_1")).unwrap();
+    compile(s!("ps"), s!("ps_5_1")).unwrap();
+}
+
 #[cfg(all(test, feature = "diagnostics"))]
 mod tests {
     use super::*;
+
+    fn texture(host: &Host, width: u64, height: u32) -> ID3D12Resource {
+        let mut resource = None;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: width,
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut resource,
+                )
+                .unwrap()
+        };
+        resource.unwrap()
+    }
+
+    #[test]
+    fn single_plane_fxaa_smooths_diagonal_and_preserves_flat_pixels() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping FXAA readback: no D3D12 device");
+            return;
+        };
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let mut composer = Composer::new(host, format).unwrap();
+        let input = texture(host, 16, 16);
+        let output = texture(host, 16, 16);
+        let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        let list = host.new_list().unwrap();
+        let cmds = &list.list;
+        unsafe {
+            let rtv = host.rtv(Some(&input), None);
+            cmds.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], None);
+            for y in 0..16 {
+                let row = windows::Win32::Foundation::RECT { left: y, top: y, right: 16, bottom: y + 1 };
+                cmds.ClearRenderTargetView(rtv, &[1.0; 4], Some(&[row]));
+            }
+            cmds.ResourceBarrier(&[crate::host::transition(&input, target, read)]);
+            composer.record(host, 0, cmds, (&input, format), None, true, &output, (16, 16)).unwrap();
+            cmds.ResourceBarrier(&[crate::host::transition(&output, target, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let (buffer, footprint) = crate::capture::read_back(&host.device, cmds, &output).unwrap();
+            list.close();
+            host.execute(&[&list]);
+            host.device.GetDeviceRemovedReason().unwrap();
+            let mut mapped = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut mapped)).unwrap();
+            let row = mapped.cast::<u8>().add(footprint.Offset as usize + footprint.Footprint.RowPitch as usize * 8);
+            let levels: Vec<_> = (0..16).map(|x| *row.add(4 * x)).collect();
+            buffer.Unmap(0, None);
+            assert_eq!((levels[1], levels[14]), (0, 255));
+            assert!(levels[6..11].iter().any(|v| (1..255).contains(v)), "{levels:?}");
+            eprintln!("FXAA diagonal readback: {levels:?}");
+        }
+    }
 
     #[test]
     fn composes_scaled_premultiplied_plane_on_gpu() {
@@ -223,44 +350,11 @@ mod tests {
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
         let mut compositor = Composer::new(host, format).unwrap();
         let list = host.new_list().unwrap();
-        let texture = |width: u64| -> ID3D12Resource {
-            let mut resource = None;
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                Width: width,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                Format: format,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                ..Default::default()
-            };
-            unsafe {
-                host.device
-                    .CreateCommittedResource(
-                        &D3D12_HEAP_PROPERTIES {
-                            Type: D3D12_HEAP_TYPE_DEFAULT,
-                            ..Default::default()
-                        },
-                        D3D12_HEAP_FLAG_NONE,
-                        &desc,
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        None,
-                        &mut resource,
-                    )
-                    .unwrap()
-            };
-            resource.unwrap()
-        };
         // A half-red base at one resolution. The overlay at output resolution
         // contains transparent, half-opaque green and fully opaque blue pixels.
-        let base = texture(1);
-        let overlay = texture(3);
-        let output = texture(3);
+        let base = texture(host, 1, 1);
+        let overlay = texture(host, 3, 1);
+        let output = texture(host, 3, 1);
         let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
         let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let cmds = &list.list;
@@ -290,7 +384,9 @@ mod tests {
                     host,
                     0,
                     cmds,
-                    [(&base, format), (&overlay, format)],
+                    (&base, format),
+                    Some((&overlay, format)),
+                    false,
                     &output,
                     (3, 1),
                 )

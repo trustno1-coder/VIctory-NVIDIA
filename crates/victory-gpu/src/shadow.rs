@@ -1666,6 +1666,7 @@ fn spin(there: impl Fn() -> bool) {
 /// streams in 38.9 ms a frame in place of 41.6 (runs v5q, v6q; gameplay not measured, the
 /// title's own threads want processors there, hence 6 of 16).
 fn wide_threads() -> usize {
+<<<<<<< Updated upstream
     static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let asked = *ASKED.get_or_init(|| {
         let n = std::env::var("VICTORY_WIDE_THREADS").ok()?.trim().parse::<usize>().ok()?.clamp(1, 32);
@@ -1673,6 +1674,10 @@ fn wide_threads() -> usize {
         Some(n)
     });
     asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() * 3 / 8).clamp(2, 8))
+=======
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+>>>>>>> Stashed changes
 }
 
 fn workers() -> &'static Workers {
@@ -1800,6 +1805,12 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    if n < 2 {
+        if n == 1 {
+            work(0);
+        }
+        return;
+    }
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
     let threads = (wide_threads() + 1).min(n);

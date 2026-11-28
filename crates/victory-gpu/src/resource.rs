@@ -121,7 +121,11 @@ pub(crate) struct AllocationInfo {
 
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
+<<<<<<< Updated upstream
 // normal_placed (descriptor.rs) clears the padding words on either side of these spans.
+=======
+// placed_resource_words copies the two field spans on either side of the padding.
+>>>>>>> Stashed changes
 const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
 const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
@@ -1886,8 +1890,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < room_line(budget)
+            let line = room_line(budget);
+            used.saturating_sub(pool_credit(crate::pool::texture_room(), budget, line))
+                + crate::shadow::card_room_kept() + targets_room_kept() < line
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1993,7 +1998,7 @@ pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
         [
             budget,
             used,
-            crate::pool::texture_room(),
+            pool_credit(crate::pool::texture_room(), budget, room_line(budget)),
             crate::shadow::card_room_kept(),
             targets_room_kept(),
             room_line(budget),
@@ -2051,6 +2056,14 @@ pub(crate) fn room_line(budget: u64) -> u64 {
     } else {
         line_for(budget)
     }
+}
+
+/// A new allocation may not fit the free ranges in existing heaps. Count
+/// reusable space up to half the reserve, so a fragmented pool cannot
+/// permit new textures while actual usage already exceeds the DXGI budget.
+#[cfg(windows)]
+fn pool_credit(available: u64, budget: u64, line: u64) -> u64 {
+    available.min(budget.saturating_sub(line) / 2)
 }
 
 /// The budget less what is left free for the host's own needs that are
@@ -2330,10 +2343,11 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
+            let line = room_line(budget);
+            let used = used.saturating_sub(pool_credit(crate::pool::texture_room(), budget, line))
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep_below(budget, used, room_line(budget))
+            crate::host::vram_keep_below(budget, used, line)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -2399,11 +2413,14 @@ pub(crate) fn let_go_idle() {
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
                 r.host.wanted.store(u32::MAX, Relaxed);
+<<<<<<< Updated upstream
                 // Not used since: the looks pass it by (`used == 0`) until
                 // a use makes its copy again. Kept, it stayed idle and every
                 // look over the line sorted and locked it, finding nothing
                 // to let go: a look cost 3 ms after a minute and 14 ms after
                 // 30 (issue #12). The next use stamps it under this lock.
+=======
+>>>>>>> Stashed changes
                 r.host.used.store(0, Relaxed);
                 made.take()
             } else {
@@ -5210,6 +5227,12 @@ float4 lit() : SV_Target { return 1.0; }
         // 6 GB: 90 % (768 MiB would be more than a tenth).
         assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
         assert_eq!(line_for(0), 0);
+        // Late-world sample on the Radeon: heaps had free ranges while
+        // actual usage was already 751 MiB over the process budget.
+        let (budget, used, available) = (12_126 * MIB, 12_877 * MIB, 1_567 * MIB);
+        let line = line_for(budget);
+        assert!(used - pool_credit(available, budget, line) >= line);
+        assert_eq!(pool_credit(64 * MIB, budget, line), 64 * MIB);
     }
 
     /// The room kept for render targets goes once the world's targets are

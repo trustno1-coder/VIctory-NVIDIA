@@ -210,6 +210,8 @@ fn a_piece_lands_what_the_card_wrote_in_its_parts() {
         let (_, written) = crate::watch::writes(title.at, title.at + BLOCK, true).expect("a view");
         let told = written.iter().any(|&(page, at)| page == title.at / BLOCK && at > asked);
         assert!(told || put == 0, "round {round}: {put} bytes, {written:?} after {asked}");
+        let (_, changed) = crate::watch::written_since(title.at, title.at + BLOCK, true, asked).expect("a view");
+        assert_eq!(changed, told, "round {round}: texture and page queries must agree");
     }
 }
 

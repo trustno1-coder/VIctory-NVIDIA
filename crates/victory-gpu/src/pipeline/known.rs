@@ -103,7 +103,7 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     let mut entry = id.to_vec();
     entry.push(shaders.len() as u8);
     for s in shaders {
-        let hash = *blake3::hash(&s.container).as_bytes();
+        let hash = s.full_hash;
         let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u8;
         entry.push(stage);
         entry.extend(hash);
@@ -192,19 +192,56 @@ pub fn count(dir: &Path) -> usize {
 
 /// The key of each pipeline known in `dir`, as the early list has it.
 pub fn keys(dir: &Path) -> Vec<String> {
+    warm_keys(dir).0
+}
+
+/// Preserve book indices while omitting explicitly disabled shaders from warm jobs.
+pub fn warm_keys(dir: &Path) -> (Vec<String>, HashSet<usize>) {
     let mut all = Vec::new();
-    walk_pipelines(dir, |_, e| {
+    let mut excluded = HashSet::new();
+    walk_pipelines(dir, |n, e| {
+        if excluded_entry(e) {
+            excluded.insert(n);
+        }
         all.push(e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect());
     });
-    all
+    (all, excluded)
+}
+
+fn excluded_entry(entry: &[u8]) -> bool {
+    let Some(&count) = entry.get(16) else { return false };
+    let Some(stages) = entry.get(17..17 + usize::from(count) * 33) else { return false };
+    stages.chunks_exact(33).any(|stage| {
+        stage[1..].first_chunk::<32>().is_some_and(super::make::excluded_shader)
+    })
+}
+
+/// Find alternate graphics states using the exact stage types and shaders of a
+/// previously drawn pipeline. The book can contain each variant in any order.
+pub fn related_variants(dir: &Path, drawn: &HashSet<usize>) -> HashSet<usize> {
+    let mut families = Vec::new();
+    let mut used = HashSet::new();
+    walk_pipelines(dir, |n, entry| {
+        let Some(&count) = entry.get(16) else { return };
+        let Some(stages) = entry.get(17..17 + usize::from(count) * 33) else { return };
+        if stages.is_empty() { return }
+        let family = blake3::hash(stages);
+        if drawn.contains(&n) {
+            used.insert(family);
+        }
+        families.push((n, family));
+    });
+    families.into_iter().filter_map(|(n, family)| used.contains(&family).then_some(n)).collect()
 }
 
 /// What a driver's cached pipelines depend on besides the title's: the
 /// translator with its settings, and the driver.
 pub fn fingerprint() -> String {
+    // Device creation selects the wave size and shader features included in the key.
+    let host = crate::host::host();
     let mut h = blake3::Hasher::new();
     h.update(&crate::shader_cache::translation());
-    if let Some(host) = crate::host::host() {
+    if let Some(host) = host {
         h.update(&host.driver().to_le_bytes());
     }
     h.update(&super::samplers::order());
@@ -247,18 +284,26 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
             entries.insert(n, bytes.to_vec());
         }
     });
-    let mut read = |hash: &[u8; 32]| {
+    let mut read = |stage: &'static str, hash: &[u8; 32]| {
+        // Graphics pipelines often share stages. A shader interned by its full
+        // digest has already been read and verified in this process.
+        if let Some(shader) = super::SHADERS.lock().unwrap_or_else(|e| e.into_inner())
+            .as_ref().and_then(|shaders| shaders.get(hash)).cloned()
+        {
+            return Some(shader);
+        }
         let &(_, at, len) = places.get(hash)?;
         let mut bytes = vec![0; len as usize];
         file.seek(SeekFrom::Start(at)).ok()?;
         file.read_exact(&mut bytes).ok()?;
-        Some(bytes)
+        let shader = super::shader(stage, &bytes);
+        (shader.full_hash == *hash).then_some(shader)
     };
     for n in which {
         let Some(entry) = entries.get(n) else { continue };
         each(*n, None);
         let began = std::time::Instant::now();
-        let made = parse(entry, &mut read)
+        let made = !excluded_entry(entry) && parse(entry, &mut read)
             .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
             .is_some();
         each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
@@ -268,7 +313,7 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
 #[allow(clippy::type_complexity)]
 fn parse(
     entry: &[u8],
-    read: &mut impl FnMut(&[u8; 32]) -> Option<Vec<u8>>,
+    read: &mut impl FnMut(&'static str, &[u8; 32]) -> Option<Arc<Shader>>,
 ) -> Option<(Vec<Arc<Shader>>, Option<Box<GraphicsState>>)> {
     let mut rest = entry.get(16..)?;
     let (&count, after) = rest.split_first()?;
@@ -279,7 +324,7 @@ fn parse(
         rest = after;
         let mut hash = [0; 32];
         hash.copy_from_slice(&head[1..]);
-        shaders.push(super::shader(STAGES.get(usize::from(head[0]))?, &read(&hash)?));
+        shaders.push(read(STAGES.get(usize::from(head[0]))?, &hash)?);
     }
     let (&graphics, rest) = rest.split_first()?;
     let g = match graphics {
@@ -436,6 +481,22 @@ impl GraphicsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_variants_match_every_shader_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut book = Vec::new();
+        for (n, (stage, hash)) in [(0, 1), (0, 2), (1, 1), (0, 1)].into_iter().enumerate() {
+            let mut entry = vec![n as u8; 16];
+            entry.extend([1, stage]);
+            entry.extend([hash; 32]);
+            entry.push(n as u8); // A different serialized render state.
+            book.extend((entry.len() as u32).to_le_bytes());
+            book.extend(entry);
+        }
+        std::fs::write(dir.path().join(PIPELINES), book).unwrap();
+        assert_eq!(related_variants(dir.path(), &HashSet::from([3])), HashSet::from([0, 3]));
+    }
 
     #[test]
     fn a_state_comes_back_as_it_was() {

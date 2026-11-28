@@ -20,7 +20,7 @@ param(
     [switch]$SeriesS,
     # 1440: output and scene 2560x1440 (Series X, the image is patched); 1080to1440: scene 1920x1080 upscaled by
     # the title; 4k: the stock Series X output (3840x2160).
-    [ValidateSet('1440', '1080to1440', '4k')][string]$Res = '1440',
+    [ValidateSet('1440', '1080', '1080stockui', '1080to1440', '4k')][string]$Res = '1440',
     # DLSS Super Resolution in place of the title's upscaling; needs NVIDIA Streamline (README).
     [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance')][string]$Dlss = 'quality',
     # DLSS Frame Generation (RTX 40 or later, hardware-accelerated GPU scheduling on); needs DLSS.
@@ -44,15 +44,29 @@ param(
     # Every shader and the loading pipelines made first (`victory preload`), then the game; the F1 menu's
     # PRELOAD SHADERS starts this again with it.
     [switch]$Preload,
+    # Finish after preparing the caches. FullPreload covers all recorded pipelines.
+    [switch]$PrepareOnly,
+    [switch]$FullPreload,
+    # 1080p scene and window, stock UI, 60 rendered FPS target and preloading for a Radeon PC.
+    [switch]$Radeon1080p,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
+if ($Radeon1080p) {
+    if (-not $PSBoundParameters.ContainsKey('Res')) { $Res = '1080stockui' }
+    if (-not $PSBoundParameters.ContainsKey('Fps')) { $Fps = 60 }
+    if (-not $PSBoundParameters.ContainsKey('Dlss')) { $Dlss = 'off' }
+    if (-not $PSBoundParameters.ContainsKey('NoFrameGenReady')) { $NoFrameGenReady = $true }
+    if (-not $PSBoundParameters.ContainsKey('Preload')) { $Preload = $env:VICTORY_PLAY_PREPARED -ne '1' }
+    if (-not $env:VICTORY_CACHE_DIR) { $env:VICTORY_CACHE_DIR = Join-Path (Split-Path $repo -Parent) 'Victory-cache-1080p' }
+}
 # The F1 menu's "PRELOAD SHADERS" restarts this with -Preload (and VICTORY_PRELOAD=1, read here before the
 # switches below are cleared).
-$preload = $Preload -or $env:VICTORY_PRELOAD -eq '1'
+$preload = $PrepareOnly -or $Preload -or $env:VICTORY_PRELOAD -eq '1'
 # What the F1 menu saved: its own choices (VICTORY_MENU_...) stand in for this script's options, and its
 # switches go over the settings below. An empty value unsets a switch.
 $menuFile = Join-Path $repo 'victory-settings.txt'
+if ($Radeon1080p) { $menuFile = Join-Path $repo 'victory-settings.radeon1080.txt' }
 $menu = [ordered]@{}
 if (Test-Path -LiteralPath $menuFile) {
     foreach ($line in Get-Content -LiteralPath $menuFile) {
@@ -61,7 +75,7 @@ if (Test-Path -LiteralPath $menuFile) {
 }
 $fpsWanted = $Fps
 if ($menu.Contains('VICTORY_MENU_CONSOLE')) { $SeriesS = $menu['VICTORY_MENU_CONSOLE'] -eq 'series-s' }
-if ($menu['VICTORY_MENU_RES'] -in '1440', '1080to1440', '4k') { $Res = $menu['VICTORY_MENU_RES'] }
+if ($menu['VICTORY_MENU_RES'] -in '1440', '1080', '1080stockui', '1080to1440', '4k') { $Res = $menu['VICTORY_MENU_RES'] }
 if ($menu['VICTORY_MENU_DLSS'] -in 'off', 'dlaa', 'quality', 'balanced', 'performance') { $Dlss = $menu['VICTORY_MENU_DLSS'] }
 $timesWanted = $FrameGenX
 if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
@@ -102,8 +116,23 @@ $settings = @{
     VICTORY_ALLOCATOR_TRIM = '1'
     VICTORY_BUDGET_PACK = '1'
 }
+if ($Radeon1080p) {
+    # Each line also passes through PowerShell and is flushed to disk.
+    # Keep frame timings and warnings, and avoid logging every shader and view.
+    $settings.VICTORY_LOG = if ($env:VICTORY_LOG) { $env:VICTORY_LOG } else { 'warn,victory_gpu::host=info' }
+    $settings.VICTORY_DISPLAY_WATCH = '1'
+    $settings.VICTORY_RECORD_ASSET_READS = '1'
+    # RX 9070 XT: the driver faulted compiling this tree-animation velocity variant
+    # during prologue streaming. Other skinning and velocity shaders stay enabled.
+    $settings.VICTORY_LEAVE_OUT += ',f16876929fa64f9f'
+}
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
+    elseif ($Res -eq '1080') { $settings.VICTORY_NATIVE_1080P = '1' }
+    elseif ($Res -eq '1080stockui') {
+        $settings.VICTORY_1080P_STOCK_UI = '1'
+        $settings.VICTORY_WINDOW_MAX = '1920x1080'
+    }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
 }
 if ($Dlss -ne 'off') {
@@ -155,21 +184,43 @@ $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
+<<<<<<< Updated upstream
 $settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
+=======
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Radeon1080p) { ' -Radeon1080p' })"
+>>>>>>> Stashed changes
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
+# A release built during play can be staged beside the running executable.
+# Install it at the usual path so the next launch can use the warmed driver cache.
+$staged = "$victory.pending"
+if (Test-Path -LiteralPath $staged) {
+    try {
+        if (-not [IO.File]::Exists($victory)) {
+            [IO.File]::Move($staged, $victory)
+        } elseif ([IO.File]::GetLastWriteTimeUtc($staged) -ge [IO.File]::GetLastWriteTimeUtc($victory)) {
+            [IO.File]::Replace($staged, $victory, [System.Management.Automation.Language.NullString]::Value)
+        }
+        if (-not [IO.File]::Exists($staged) -and [IO.File]::Exists("$staged.pdb")) {
+            Move-Item -LiteralPath "$staged.pdb" -Destination ([IO.Path]::ChangeExtension($victory, 'pdb')) -Force -ErrorAction Stop
+        }
+    } catch {
+        if (Test-Path -LiteralPath $staged) { Write-Warning "Player update is pending. $($_.Exception.GetBaseException().Message)" }
+        elseif (Test-Path -LiteralPath "$staged.pdb") { Write-Warning "Could not install player debug symbols. $($_.Exception.GetBaseException().Message)" }
+    }
+}
 if (-not (Test-Path $victory)) {
     # Not built yet: built here, once.
-    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { Write-Host "No $victory, and no cargo to build it with: install Rust (README), then start this again."; return }
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { Write-Host "No $victory, and no cargo to build it with: install Rust (README), then start this again."; exit 1 }
     Write-Host 'Building the layer (a few minutes the first time) ...'
     Push-Location $repo
     try {
         if ($Build -eq 'diag') { cargo build --locked --profile diag -p victory --features diagnostics }
         else { cargo build --release --locked -p victory }
     } finally { Pop-Location }
-    if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
+    if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; exit 1 }
 }
-if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
+if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; exit 1 }
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
@@ -184,16 +235,69 @@ Push-Location $repo   # victory.toml is read from here
 try {
     if ($preload) {
         # With this start's switches (the translations depend on them); its lines go to the log too.
-        Write-Host 'Preloading shaders before the game starts. This takes a while (see the lines below).'
+        Write-Host 'Preparing the shader and pipeline caches. Progress follows.'
         $began = Get-Date
         # (Split-Path -LiteralPath with -Parent: no such parameter set in Windows PowerShell 5.1.)
-        & $victory preload ([IO.Path]::GetDirectoryName($Exe)) 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine("# preload: $line"); $line }
-        $how = if ($LASTEXITCODE -eq 0) { 'done' } else { "ended with code $LASTEXITCODE" }
-        $said = 'Preload {0} after {1:N1} min. Starting the game.' -f $how, ((Get-Date) - $began).TotalMinutes
+        $gameFolder = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Exe))
+        $preloadArgs = @($gameFolder)
+        if ($Radeon1080p) {
+            # This retail build stores its shader pack and embedded programs here.
+            # Scanning audio, movies and level archives adds tens of GB of reads.
+            $preloadArgs = @($Exe)
+            if (!$FullPreload) { $preloadArgs = @('--used', '--extra', '4096') + $preloadArgs }
+            $preloadArgs += @(Get-ChildItem -LiteralPath $gameFolder -File | Where-Object {
+                $_.Extension -eq '.dll' -or $_.Name -eq 'shaders.rpf'
+            } | ForEach-Object { $_.FullName })
+        }
+        if ($PrepareOnly) { $preloadArgs = @('--asset-dir', $gameFolder) + @($preloadArgs) }
+        & $victory preload @preloadArgs 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine("# preload: $line"); $line }
+        $preloadExit = $LASTEXITCODE
+        $how = if ($preloadExit -eq 0) { 'done' } else { "ended with code $preloadExit" }
+        $said = 'Preload {0} after {1:N1} min.' -f $how, ((Get-Date) - $began).TotalMinutes
+        if (!$PrepareOnly) { $said += ' Starting the game.' }
         $writer.WriteLine("# $said"); Write-Host $said
+        if ($PrepareOnly) { $writer.Dispose(); exit $preloadExit }
     }
 }
 finally { Pop-Location }
 Push-Location $repo
-try { & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line } }
+try {
+    $stockCanvas = $settings.VICTORY_1080P_STOCK_UI -eq '1'
+    if ($Radeon1080p) {
+        $customConfig = $env:VICTORY_CONFIG -or (Test-Path -LiteralPath 'victory.toml')
+        $dataDir = $env:VICTORY_DATA_DIR
+        if (!$dataDir -and $customConfig) {
+            # Let Victory resolve [paths].data_dir and its normal defaults.
+            $config = @(& $victory config)
+            if ($LASTEXITCODE -eq 0) {
+                foreach ($line in $config) { if ($line -match '^data_dir\s*:\s*(.+)$') { $dataDir = $Matches[1]; break } }
+            }
+        } elseif (!$dataDir) { $dataDir = Join-Path $env:LOCALAPPDATA 'victory\data' }
+        $videoFile = if ($dataDir) { Join-Path $dataDir '7952987A\storage\settings\settings.xml' }
+        if ($videoFile -and (Test-Path -LiteralPath $videoFile)) {
+            if (($stockCanvas -or $settings.VICTORY_NATIVE_1080P -eq '1') -and !$customConfig) {
+                try {
+                    & (Join-Path $PSScriptRoot 'set-radeon-ui-resolution.ps1') -SettingsFile $videoFile -StockCanvas:$stockCanvas
+                } catch { Write-Warning "Could not update the UI canvas. $($_.Exception.Message)" }
+            }
+            try {
+                $fields = & (Join-Path $PSScriptRoot 'game-graphics.ps1') -SettingsFile $videoFile -Menu $menu
+                if ($fields) {
+                    $env:VICTORY_MENU_GAME_FIELDS = $fields
+                    $env:VICTORY_MENU_SAMPLE_FILE = Join-Path $dataDir '7952987A\victory-graphics-samples.tsv'
+                }
+            } catch {
+                $message = "Could not apply game graphics. $($_.Exception.GetBaseException().Message)"
+                $writer.WriteLine("# $message")
+                Write-Warning $message
+            }
+        }
+    }
+    & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line }
+    $runExit = $LASTEXITCODE
+    $ended = 'Player exited with code {0} (0x{0:X8}).' -f $runExit
+    $writer.WriteLine("# $ended")
+    if ($runExit -ne 0) { Write-Host "$ended Log: $log" }
+}
 finally { Pop-Location; $writer.Dispose() }
+exit $runExit

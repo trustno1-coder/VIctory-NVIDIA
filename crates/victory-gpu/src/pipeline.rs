@@ -60,6 +60,10 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg(windows)]
+    full_hash: [u8; 32],
+    #[cfg(windows)]
+    builder: OnceLock<bool>,
     container: Vec<u8>,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
@@ -113,6 +117,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                #[cfg(windows)]
+                full_hash: *full.as_bytes(),
+                #[cfg(windows)]
+                builder: OnceLock::new(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
@@ -285,12 +293,11 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     if shader.stage != "compute" {
         return false;
     }
-    let Ok(c) = Container::parse(&shader.container) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    *shader.builder.get_or_init(|| {
+        Container::parse(&shader.container).ok()
+            .and_then(|c| c.part(FourCC::DXIL).and_then(|part| victory_shader::native_programs(part.data).ok()))
+            .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    })
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store

@@ -446,13 +446,15 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
+        // Warm workers may translate a non-mesh pipeline before any other GPU call.
+        // Select this adapter's shader features before caching those translations.
+        let host = host()?;
+        if mesh.is_some() && !host.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
             s.translated()?;
         }
-        let host = host()?;
 
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
         // SAFETY: the feature query writes the structure of the given size.

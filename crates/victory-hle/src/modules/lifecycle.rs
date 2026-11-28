@@ -105,20 +105,32 @@ pub(super) fn enabled(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| v == "1")
 }
 
+fn fullscreen_requested() -> bool {
+    matches!(std::env::var("VICTORY_FULLSCREEN").as_deref(), Ok("1" | "exclusive"))
+}
+
 fn fullscreen(hwnd: HWND) {
-    if !enabled("VICTORY_FULLSCREEN") {
+    if !fullscreen_requested() {
         return;
     }
     // SAFETY: this thread owns the newly created top-level window.
     unsafe {
+        use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let bounds = if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info) != 0 {
+            info.rcMonitor
+        } else {
+            RECT { left: 0, top: 0, right: wm::GetSystemMetrics(wm::SM_CXSCREEN), bottom: wm::GetSystemMetrics(wm::SM_CYSCREEN) }
+        };
         let (width, height) = std::env::var("VICTORY_FULLSCREEN_RES")
             .ok().as_deref().and_then(parse_window_limit)
-            .unwrap_or_else(|| (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)));
+            .unwrap_or((bounds.right - bounds.left, bounds.bottom - bounds.top));
         let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32;
         let ex = wm::GetWindowLongW(hwnd, wm::GWL_EXSTYLE) as u32;
         wm::SetWindowLongW(hwnd, wm::GWL_STYLE, ((style & !wm::WS_OVERLAPPEDWINDOW) | wm::WS_POPUP) as i32);
         wm::SetWindowLongW(hwnd, wm::GWL_EXSTYLE, (ex & !(wm::WS_EX_CLIENTEDGE | wm::WS_EX_WINDOWEDGE | wm::WS_EX_DLGMODALFRAME | wm::WS_EX_STATICEDGE)) as i32);
-        wm::SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, width, height,
+        wm::SetWindowPos(hwnd, std::ptr::null_mut(), bounds.left, bounds.top, width, height,
             wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE);
     }
 }
@@ -374,8 +386,10 @@ extern "system" fn window_proc(
     }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
-    if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
-        end_title("window closed", Box::new(|| {}));
+    if (message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize)
+        || (message == wm::WM_CLOSE && victory_gpu::is_display_window(hwnd as usize))
+    {
+        close_display();
         return 0;
     }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
@@ -396,6 +410,10 @@ extern "system" fn window_proc(
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
     }
+}
+
+pub(super) fn close_display() {
+    end_title("window closed", Box::new(|| {}));
 }
 
 /// Suspends the title as the console does when it ends it, runs `then`
@@ -428,6 +446,8 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     // thread and wait for it inside the routine.
     std::thread::spawn(move || {
         constrain_then_suspend(&constrain, &suspend);
+        // Saving can wait for the renderer. Keep it outside the deadline's lock.
+        victory_gpu::pipeline::save_pipeline_cache();
         finish("title suspended");
     });
     std::thread::spawn(move || {
@@ -503,11 +523,14 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+<<<<<<< Updated upstream
     // A pad left rumbling would run on until it is switched off.
     crate::modules::gameinput::stop_rumble();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+=======
+>>>>>>> Stashed changes
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
@@ -693,7 +716,7 @@ mod tests {
         let mut text = [0u16; 16];
         // SAFETY: our window; the buffer holds 16 characters.
         unsafe {
-            assert_eq!(wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32 & wm::WS_POPUP != 0, enabled("VICTORY_FULLSCREEN"));
+            assert_eq!(wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32 & wm::WS_POPUP != 0, fullscreen_requested());
             wm::SetWindowTextW(hwnd, w!("after"));
             let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 16);
             assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "after");

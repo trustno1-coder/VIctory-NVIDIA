@@ -302,11 +302,23 @@ enum Command {
     Preload {
         /// The title's folder (default: the configured game folder).
         paths: Vec<PathBuf>,
+<<<<<<< Updated upstream
         /// Threads and processes for each of its steps, to leave the rest of
         /// the PC free (default: `VICTORY_PRELOAD_JOBS`, else each step's
         /// own: every core to translate, two thirds of them to make).
         #[arg(long)]
         jobs: Option<usize>,
+=======
+        /// Warm the pipelines requested in play. Shader translation still covers every input.
+        #[arg(long)]
+        used: bool,
+        /// Also warm up to this many untried pipelines beyond those already drawn.
+        #[arg(long, requires = "used")]
+        extra: Option<usize>,
+        /// Warm recorded and common asset ranges into the Windows file cache after compiling.
+        #[arg(long)]
+        asset_dir: Option<PathBuf>,
+>>>>>>> Stashed changes
     },
     /// Play: the title with this fork's settings, as a start with no
     /// command at all does (a double click on the program beside the
@@ -480,8 +492,12 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, these } => {
+            let _preparation = if these.is_none() { Some(warm::preparation_lock()?) } else { None };
+            warm::run(jobs, limit, again, used, 0, these)
+        }
         #[cfg(windows)]
+<<<<<<< Updated upstream
         Command::Preload { paths, jobs } => {
             // The launcher and the F1 menu's restart pass it as a switch.
             let jobs = jobs
@@ -494,6 +510,19 @@ fn main() -> Result<()> {
             translate::precompile(paths, jobs)?;
             warm::run(jobs, None, false, false, None)?;
             warm::into_library(jobs)
+=======
+        Command::Preload { paths, used, extra, asset_dir } => {
+            let _preparation = warm::preparation_lock()?;
+            play::explain_preload();
+            translate::precompile(paths, None)?;
+            warm::run(None, None, false, used, extra.unwrap_or(0), None)?;
+            warm::into_library(None)?;
+            if let Some(root) = asset_dir {
+                let cache = victory_core::Config::load()?.cache_subdir("asset-reads")?;
+                victory_hle::modules::dstorage::assets::warm(&root, &cache)?;
+            }
+            Ok(())
+>>>>>>> Stashed changes
         }
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),

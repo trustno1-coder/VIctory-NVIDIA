@@ -60,6 +60,20 @@ impl Slots {
         }
     }
 
+    /// Return the selected stripe of live slots plus every change, including
+    /// removals. A concurrent write after we take a word stays set for the
+    /// next frame. Combining the bits visits each candidate just once.
+    fn sweep(&self, changed: &Slots, mask: u64) -> Vec<u32> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        debug_assert_eq!(self.0.len(), changed.0.len());
+        let mut out = Vec::new();
+        for (n, (live, changed)) in self.0.iter().zip(&changed.0).enumerate() {
+            let edits = if changed.load(Acquire) == 0 { 0 } else { changed.swap(0, AcqRel) };
+            Self::of(n, edits | (live.load(Acquire) & mask), &mut out, &|_| true);
+        }
+        out
+    }
+
     /// Those that `which` says, in order.
     fn all(&self, which: impl Fn(u32) -> bool) -> Vec<u32> {
         let mut out = Vec::new();
@@ -3350,10 +3364,9 @@ impl HostHeap {
         self.buffers.all(|_| true)
     }
 
-    /// Of [`HostHeap::buffer_slots`], those of one of `parts` parts: every
-    /// slot is in the same part each time.
-    pub(crate) fn buffer_slots_of(&self, part: u32, parts: u32) -> Vec<u32> {
-        self.buffers.all(|slot| slot % parts == part)
+    /// One of the 16 periodic sweep stripes, together with recent changes.
+    pub(crate) fn changed_and_periodic_buffers(&self, mask: u64) -> Vec<u32> {
+        self.buffers.sweep(&self.changed, mask)
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -6610,6 +6623,23 @@ mod tests {
         assert!(set.remove(64) && !set.remove(64) && !set.remove(5));
         assert_eq!(set.take(), [0, 63, 130, 199]);
         assert!(set.take().is_empty());
+    }
+
+    #[test]
+    fn periodic_sweep_visits_changed_slots_and_removals_once() {
+        let (live, changed) = (Slots::new(135), Slots::new(135));
+        for slot in [3, 4, 19, 62, 67, 131, 134] {
+            live.put(slot);
+        }
+        for slot in [3, 4, 65, 131, 134] {
+            changed.put(slot);
+        }
+        let mask = 0x0008_0008_0008_0008;
+        assert_eq!(live.sweep(&changed, mask), [3, 4, 19, 65, 67, 131, 134]);
+        assert_eq!(live.sweep(&changed, mask), [3, 19, 67, 131]);
+        live.remove(67);
+        changed.put(67);
+        assert_eq!(live.sweep(&changed, 0), [67]);
     }
 
     /// A slot a draw read through a table leaves the queue; the title's

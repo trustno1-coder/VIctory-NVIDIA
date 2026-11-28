@@ -37,6 +37,7 @@ const SPARE_KEPT: usize = 64;
 const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
+static STAGING_SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
@@ -45,6 +46,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
+    let staging_limit = if crate::residency::critical_commit() { 0 } else if pressure { 1 } else { limit.min(STAGING_KEPT) };
+    STAGING_SPARES.store(staging_limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
@@ -52,13 +55,6 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
-            0
-        } else if pressure {
-            1
-        } else {
-            limit
-        };
         pool.reclaim(tick, staging_limit, true);
     }
     if stats_on() {
@@ -201,15 +197,18 @@ struct Pool<B> {
     blocks: Vec<Option<Block<B>>>,
     /// Pieces given back, and when each may be used again.
     resting: VecDeque<(u64, Piece)>,
+    /// Ranges available to take now. Pieces still resting are excluded.
+    available_bytes: u64,
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    limit: &'static AtomicUsize,
     retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
-    const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+    const fn new(most: usize, limit: &'static AtomicUsize) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), available_bytes: 0, spare: 0, most, limit, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -276,6 +275,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         let block = self.blocks[i].as_mut()?;
+        self.available_bytes -= len;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
@@ -301,6 +301,7 @@ impl<B: Clone> Pool<B> {
             }
         };
         self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.available_bytes += BLOCK;
         i
     }
 
@@ -311,7 +312,7 @@ impl<B: Clone> Pool<B> {
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        self.reclaim(now, self.limit.load(Ordering::Relaxed), false);
     }
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
@@ -322,6 +323,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
+                self.available_bytes += piece.len;
                 any |= block.free.whole(BLOCK);
             }
         }
@@ -335,12 +337,14 @@ impl<B: Clone> Pool<B> {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        self.available_bytes -= BLOCK;
                     }
                 }
             }
         }
     }
 
+    #[cfg(any(test, feature = "diagnostics"))]
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
@@ -391,20 +395,16 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT, &SPARES));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT, &STAGING_SPARES));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bytes of the pieces textures hold now.
-static HELD: AtomicU64 = AtomicU64::new(0);
-
-/// Bytes of the texture blocks no texture holds: the card's memory in use
-/// by us that new textures take first.
+/// Bytes already allocated on the card and available for another texture.
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    lock(&TEXTURES).available_bytes
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
@@ -532,7 +532,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
-        if speculative && !crate::residency::allow_staging_growth(false) {
+        if speculative && !crate::residency::allow_staging_growth(BLOCK) {
             return None;
         }
         let (buffer, data) = host.upload_buffer(BLOCK)?;
@@ -596,8 +596,11 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
+<<<<<<< Updated upstream
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             counted(gone.piece, gone.small, false);
+=======
+>>>>>>> Stashed changes
             lock(&TEXTURES).give(gone.piece, now());
         }
         left
@@ -850,9 +853,13 @@ pub(crate) unsafe fn texture(
     let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
     match (result, made) {
         (Ok(()), Some(made)) => {
+<<<<<<< Updated upstream
             HELD.fetch_add(piece.len, Ordering::Relaxed);
             counted(piece, small, true);
             give_back_with(&made, piece, small);
+=======
+            give_back_with(&made, piece);
+>>>>>>> Stashed changes
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -935,7 +942,7 @@ mod tests {
 
     #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
-        let mut pool: Pool<u32> = Pool::new(2);
+        let mut pool: Pool<u32> = Pool::new(2, &SPARES);
         let calls = std::cell::Cell::new(0);
         let refuse = || { calls.set(calls.get() + 1); None };
         for size in [704008, 179720, 179720, 24080, 48648, 524288, 89616, 351760] {
@@ -947,10 +954,12 @@ mod tests {
 
     #[test]
     fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces() {
-        let mut pool = Pool::new(STAGING_KEPT);
+        static LIMIT: AtomicUsize = AtomicUsize::new(0);
+        let mut pool = Pool::new(STAGING_KEPT, &LIMIT);
         let (held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
         let (resting, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(2)).unwrap();
         pool.give(resting, 0);
+        assert_eq!(pool.available_bytes, 0);
         for i in 0..12 {
             pool.add(i, 0);
         }
@@ -958,18 +967,22 @@ mod tests {
         assert_eq!(pool.blocks(), STAGING_KEPT + 1);
         pool.reclaim(REST - 1, SPARE, true);
         assert_eq!(pool.blocks(), SPARE + 1);
+        assert_eq!(pool.available_bytes, SPARE as u64 * BLOCK);
         assert_eq!(pool.resting.len(), 1);
         pool.reclaim(REST, 0, true);
         assert_eq!(pool.blocks(), 1);
+        assert_eq!(pool.available_bytes, BLOCK / 2);
         assert!(pool.resting.is_empty());
         pool.give(held, REST);
-        pool.reclaim(2 * REST, 0, true);
+        // A normal allocation also observes this pool's limit when the last piece has rested.
+        pool.rested(2 * REST);
         assert_eq!(pool.blocks(), 0);
+        assert_eq!(pool.available_bytes, 0);
     }
 
     #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
-        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let mut pool: Pool<u32> = Pool::new(SPARE, &SPARES);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);
@@ -999,13 +1012,13 @@ mod tests {
         assert_eq!(pool.blocks(), blocks.min(SPARE));
         // Too big for a block, and a block that cannot be made.
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
-        let mut none: Pool<u32> = Pool::new(SPARE);
+        let mut none: Pool<u32> = Pool::new(SPARE, &SPARES);
         assert!(none.take(65536, 65536, 0, || None).is_none());
     }
 
     #[test]
     fn pieces_come_from_blocks_older_than_the_lists_that_run() {
-        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
+        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT, &SPARES);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);

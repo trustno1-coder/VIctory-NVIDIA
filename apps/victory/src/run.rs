@@ -161,9 +161,11 @@ pub fn run(
         None => println!("build          unknown ({hash})"),
     }
 
-    // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
-    // patched image goes to a folder of its own, beside the stock one.
+    // Each display profile needs its own copy of the prepared image.
+    use native_1440p::Output;
+    let stock_ui = std::env::var("VICTORY_1080P_STOCK_UI").as_deref() == Ok("1");
     let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
+<<<<<<< Updated upstream
     let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
     let images = if native_1440p {
         anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
@@ -172,29 +174,50 @@ pub fn run(
         }
         let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())
             .map_err(|e| if victory_game::identify(&hash).is_some() { e } else { e.context(changed_copy(exe)) })?;
+=======
+    let output = if std::env::var("VICTORY_NATIVE_1080P").as_deref() == Ok("1") {
+        Some(Output::Hd1080)
+    } else if render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1") {
+        Some(Output::Qhd1440)
+    } else {
+        None
+    };
+    if stock_ui {
+        anyhow::ensure!(matches!(console, Console::SeriesX) && output.is_none(), "1080p with stock UI requires the stock Series X output");
+        // The console's complete UI is composed before the window scales it.
+        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
+    }
+    let images = if let Some(output) = output {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "custom SDR output needs the Series X profile");
+        let [width, height] = output.size();
+        let scene = if render_1080p && upscaler.is_none() { Output::Hd1080 } else { output };
+        native_1440p::prepare(&mut prepared, output, scene)?;
+>>>>>>> Stashed changes
         // SAFETY: nothing else runs yet; the title and the display mode list
         // read these later.
         unsafe {
-            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
-            std::env::set_var("VICTORY_NATIVE_1440P", "1");
+            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{width}x{height}"));
         }
         match upscaler.map(|mode| (mode, native_1440p::prepare_upscaler(&mut prepared, mode))) {
             Some((mode, Ok(()))) => {
-                let [rw, rh] = mode.render_size([native_1440p::WIDTH, native_1440p::HEIGHT]);
+                let [rw, rh] = mode.render_size(output.size());
                 println!(
-                    "display        {}x{} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
-                    native_1440p::WIDTH,
-                    native_1440p::HEIGHT,
+                    "display        {width}x{height} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
                     mode.name()
                 );
-                cfg.cache_subdir(&format!("images/native-1440p-upscaler-{}-sdr", mode.name()))?
+                cfg.cache_subdir(&format!("images/native-{height}p-upscaler-{}-sdr", mode.name()))?
             }
             other => {
                 if let Some((_, Err(e))) = other {
                     println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
                 }
-                println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
-                cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+                let [w, h] = scene.size();
+                println!("display        {width}x{height} SDR, scene {w}x{h}");
+                if h == height {
+                    cfg.cache_subdir(&format!("images/native-{height}p-sdr"))?
+                } else {
+                    cfg.cache_subdir("images/1080p-to-1440p-sdr")?
+                }
             }
         }
     } else if let Some(mode) = upscaler {
@@ -208,10 +231,34 @@ pub fn run(
                 cfg.cache_subdir("images")?
             }
         }
+    } else if stock_ui {
+        let height = match std::env::var("VICTORY_GAME_SCENE_HEIGHT").as_deref() {
+            Ok("720") => 720,
+            Ok("900") => 900,
+            Ok("1440") => 1440,
+            Ok("2160") => 2160,
+            _ => 1080,
+        };
+        native_1440p::prepare_stock_ui_1080p(&mut prepared, height)?;
+        // Resolve this host-only control after device capability checks. For
+        // example, unsupported frame generation can fall back to this path.
+        if let Ok(mut fields) = std::env::var("VICTORY_MENU_GAME_FIELDS") {
+            fields.push_str("\nVICTORY_GAME_SCENE_HEIGHT|Temporal upscale source (p)|1080|720,900,1080,1440,2160");
+            unsafe { std::env::set_var("VICTORY_MENU_GAME_FIELDS", fields) };
+        }
+        println!("display        {}x{height} temporal scene, stock 3840x2160 UI and scanout", height * 16 / 9);
+        if height == 1080 {
+            cfg.cache_subdir("images/1080p-stock-ui")?
+        } else {
+            cfg.cache_subdir(&format!("images/{height}p-stock-ui"))?
+        }
     } else {
         cfg.cache_subdir("images")?
     };
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    if std::env::var("VICTORY_RECORD_ASSET_READS").as_deref() == Ok("1") {
+        victory_hle::modules::dstorage::assets::record_in(cfg.cache_subdir("asset-reads")?);
+    }
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the

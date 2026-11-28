@@ -132,6 +132,25 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
+/// The retail frontend composite uses float3 position, RGBA8 colour and float2 UV.
+/// Check which canvas the composite vertices describe, including fullscreen
+/// triangles that extend past the screen and vertically flipped texture coordinates.
+fn covers_ui_canvas(vertices: &[[u8; 24]; 3], width: f32, height: f32) -> bool {
+    let mut points = [[0.0_f32; 4]; 3];
+    for (point, vertex) in points.iter_mut().zip(vertices) {
+        let words = vertex.as_chunks::<4>().0;
+        *point = [0, 1, 4, 5].map(|i| f32::from_le_bytes(words[i]));
+    }
+    let covers_axis = |pos: usize, uv: usize, extent: f32| {
+        let near = |a: f32, b: f32| (a - b).abs() <= 1.0;
+        points.iter().any(|p| p[pos] <= 1.0)
+            && points.iter().any(|p| p[pos] >= extent - 1.0)
+            && (points.iter().all(|p| near(p[pos], p[uv] * extent))
+                || points.iter().all(|p| near(p[pos], (1.0 - p[uv]) * extent)))
+    };
+    covers_axis(0, 2, width) && covers_axis(1, 3, height)
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct IndexView {
@@ -700,6 +719,8 @@ pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Passes after which every buffer slot of the heap was looked at again.
 const HEAP_ROUND: u64 = 16;
+const _: () = assert!(HEAP_ROUND > 0 && HEAP_ROUND < 64 && 64 % HEAP_ROUND == 0);
+const HEAP_STRIPE: u64 = u64::MAX / ((1 << HEAP_ROUND) - 1);
 
 /// Whether the slots looked at again for no write are a part of them at
 /// every pass, each slot at every sixteenth (`VICTORY_HEAP_SPREAD=0`: all of
@@ -746,7 +767,7 @@ impl<T> HeapRanges<T> {
     }
 
     /// Forgets the slots of one of `parts` parts
-    /// (`HostHeap::buffer_slots_of`).
+    /// (`HostHeap::changed_and_periodic_buffers`).
     fn forget_part(&mut self, part: u32, parts: u32) {
         self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
     }
@@ -909,6 +930,16 @@ pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new
 /// In nanoseconds: in microseconds each call lost what it took below the
 /// next whole one, and a slot asks five or six such short questions.
 pub(crate) static HEAP_TEXTURE_NANOS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+pub(crate) fn texture_stage_ms() -> &'static AtomicU64 {
+    static MS: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    MS.get_or_init(|| {
+        let selected = std::env::var("VICTORY_GAME_STREAM_MS").ok()
+            .and_then(|v| v.parse::<u64>().ok()).filter(|v| matches!(v, 4 | 8 | 12 | 16 | 24));
+        let original = std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok());
+        AtomicU64::new(selected.or(original).unwrap_or(250))
+    })
+}
 
 /// `f`'s result, its time added to [`HEAP_TEXTURE_NANOS`]' place `slot`.
 fn timed<T>(slot: usize, f: impl FnOnce() -> T) -> T {
@@ -1171,20 +1202,18 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
     let BufferSweep { passes, ranges, unwatched } = &mut *kept;
-    let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
+        drop(host.buffer_changes());
         ranges.0.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part(part, parts);
-        let mut slots = host.buffer_slots_of(part, parts);
-        slots.extend(changed);
-        slots
+        host.changed_and_periodic_buffers(HEAP_STRIPE << part)
     } else {
-        changed
+        host.buffer_changes()
     };
     *passes += 1;
     // Whether the device was there before the pass: a view that removes
@@ -3174,10 +3203,7 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
+        let span = std::time::Duration::from_millis(texture_stage_ms().load(Ordering::Relaxed));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
@@ -4845,7 +4871,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
-            let frontend = if count == 3 && instances == 1 { self.native_frontend_viewport() } else { None };
+            let frontend = if count == 3 && instances == 1 { self.native_frontend_viewport(from) } else { None };
             if let Some(viewport) = frontend {
                 viewports(list, &[viewport]);
             }
@@ -4896,24 +4922,31 @@ impl State {
         crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
     }
 
-    /// With a 1440p output (`VICTORY_NATIVE_1440P=1`, set by the runner when
-    /// it patches the image for it): the frontend's last triangle is drawn
+    /// With a reduced Series X output the frontend's last triangle is drawn
     /// in output pixels, but some screens project it against the legacy
     /// 3840x2160 canvas; for that draw the viewport is the canvas, so that
-    /// the projection lands on the 2560x1440 target. The scissor and target
-    /// stay 1440p. From DexNom's fork (`State::native_frontend_viewport`,
+    /// the projection lands on the smaller target. The scissor and target
+    /// keep their actual size. From DexNom's fork (`State::native_frontend_viewport`,
     /// GPL-3.0-or-later).
-    fn native_frontend_viewport(&self) -> Option<D3D12_VIEWPORT> {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1"))
-            || self.depth != 0
-        {
+    fn native_frontend_viewport(&self, first: u32) -> Option<D3D12_VIEWPORT> {
+        if self.depth != 0 {
             return None;
         }
+        static SIZE: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+        let (width, height) = (*SIZE.get_or_init(|| {
+            let enabled = |name| std::env::var(name).as_deref() == Ok("1");
+            if enabled("VICTORY_NATIVE_1080P") {
+                Some((1920.0, 1080.0))
+            } else if enabled("VICTORY_NATIVE_1440P") || enabled("VICTORY_RENDER_1080P") {
+                Some((2560.0, 1440.0))
+            } else {
+                None
+            }
+        }))?;
         let [viewport] = self.viewports.as_slice() else {
             return None;
         };
-        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, 2560.0, 1440.0) {
+        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, width, height) {
             return None;
         }
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
@@ -4943,8 +4976,23 @@ impl State {
         {
             return None;
         }
+        // A legacy projection alone does not imply that the viewport needs
+        // enlarging. For native 1080p compensate only if the vertices actually
+        // cover a 1080p canvas. With 4K or unknown geometry the title's viewport
+        // already maps the projection to the target.
+        if width == 1920.0 {
+            let vertex = self.vertex[0];
+            let offset = u64::from(first) * 24;
+            let mut vertices = [[0u8; 24]; 3];
+            if vertex.stride != 24 || vertex.address == 0 || offset + 72 > u64::from(vertex.size)
+                || !crate::host::read_into(vertex.address.checked_add(offset)? as *const u8, vertices.as_flattened_mut())
+                || !covers_ui_canvas(&vertices, width, height)
+            {
+                return None;
+            }
+        }
         static FIRST: std::sync::Once = std::sync::Once::new();
-        FIRST.call_once(|| tracing::info!("the frontend's legacy 4K projection drawn on the 1440p target"));
+        FIRST.call_once(|| tracing::info!(width, height, "the frontend's legacy 4K projection drawn on the SDR target"));
         Some(D3D12_VIEWPORT { Width: 3840.0, Height: 2160.0, ..*viewport })
     }
 
@@ -5974,6 +6022,7 @@ mod tests {
     use super::staging_budget_per_frame;
 
     #[test]
+<<<<<<< Updated upstream
     fn a_frames_pass_runs_share_the_texspk_cap() {
         use super::pass_span_left;
         use std::time::Duration;
@@ -5985,6 +6034,27 @@ mod tests {
         assert_eq!(pass_span_left(ms(16), 8, 5_000_000), ms(3));
         // Spent: nothing (the run stops at its first slot).
         assert_eq!(pass_span_left(ms(16), 8, 9_000_000), Duration::ZERO);
+=======
+    fn legacy_ui_composite_uses_the_pixel_extent_per_uv() {
+        fn triangle(width: f32, height: f32, uv_span: f32, flipped: bool) -> [[u8; 24]; 3] {
+            [(0., 0.), (uv_span, 0.), (0., uv_span)].map(|(u, v)| {
+                let mut vertex = [0; 24];
+                for (offset, value) in [(0, width * u), (4, height * v), (16, u), (20, if flipped { 1. - v } else { v })] {
+                    vertex[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                vertex
+            })
+        }
+        use super::covers_ui_canvas;
+        for flipped in [false, true] {
+            for span in [1., 2.] {
+                assert!(!covers_ui_canvas(&triangle(3840., 2160., span, flipped), 1920., 1080.));
+                assert!(covers_ui_canvas(&triangle(1920., 1080., span, flipped), 1920., 1080.));
+            }
+        }
+        assert!(!covers_ui_canvas(&triangle(1920., 1080., 0.5, false), 1920., 1080.));
+        assert!(!covers_ui_canvas(&triangle(1920., f32::NAN, 1., false), 1920., 1080.));
+>>>>>>> Stashed changes
     }
 
     #[test]
