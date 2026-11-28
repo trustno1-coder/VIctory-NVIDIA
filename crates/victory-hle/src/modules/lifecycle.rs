@@ -152,8 +152,13 @@ struct MouseCapture {
 static MOUSE_CAPTURE: std::sync::LazyLock<Mutex<MouseCapture>> =
     std::sync::LazyLock::new(|| Mutex::new(MouseCapture::default()));
 
+/// Whether the mouse is captured while the window has the focus: the setting
+/// at the start, then turned over by each tap of Alt alone (`window_proc`).
+static CAPTURE_ON: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| enabled("VICTORY_MOUSE_CAPTURE").into());
+
 fn capture_mouse(hwnd: HWND, active: bool) {
-    if !enabled("VICTORY_MOUSE_CAPTURE") { return; }
+    let active = active && CAPTURE_ON.load(std::sync::atomic::Ordering::Relaxed);
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: runs on the window thread; local geometry, balanced cursor count.
     unsafe {
@@ -186,7 +191,6 @@ fn capture_mouse(hwnd: HWND, active: bool) {
 }
 
 pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
-    if !enabled("VICTORY_MOUSE_CAPTURE") { return None; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: sampling and warping serialize with capture/focus messages.
     unsafe {
@@ -194,7 +198,9 @@ pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
         let mut point = POINT::default();
         if wm::GetCursorPos(&mut point) == 0 { state.reference = None; return None; }
         let point = (point.x, point.y);
-        let warp = std::env::var_os("VICTORY_MOUSE_WARP").is_some_and(|v| v == "1");
+        // Back to the middle after each sample (the cursor is hidden), or the motion ends
+        // at the window's edge; `VICTORY_MOUSE_WARP=0` leaves the pointer alone.
+        let warp = std::env::var_os("VICTORY_MOUSE_WARP").is_none_or(|v| v != "0");
         let warped = (warp && wm::SetCursorPos(state.center.0, state.center.1) != 0)
             .then_some(state.center);
         Some(mouse_motion(&mut state.reference, point, warped))
@@ -385,6 +391,12 @@ extern "system" fn window_proc(
     // the title aborts itself about half a minute later. A console has no window
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
+        // Alt tapped alone (no letter with it; F10 asks the same): the mouse
+        // capture is turned over, so the cursor can leave the game and come back.
+        if lparam == 0 {
+            let on = !CAPTURE_ON.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+            capture_mouse(hwnd, on);
+        }
         return 0;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
