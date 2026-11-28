@@ -260,18 +260,21 @@ type File = *mut c_void;
 
 // kernel32 and its file API sets.
 
-/// `VICTORY_FILE_BUFFERED` (on by default, `=0` off): a read-only open of a
-/// title file loses `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_RANDOM_ACCESS`,
-/// so the host's file cache and read-ahead serve it. The title opens its
-/// archives unbuffered and reads them at loading in some 80,000 small
-/// synchronous calls, each of which then waits for the drive. The bytes are
-/// the same either way; opens for writing keep their flags.
+/// `VICTORY_FILE_BUFFERED` (on by default, `=0` off): a read-only,
+/// synchronous open of a title file loses `FILE_FLAG_NO_BUFFERING` and
+/// `FILE_FLAG_RANDOM_ACCESS`, so the host's file cache and read-ahead serve
+/// it. The title opens its archives unbuffered and reads them at loading in
+/// some 80,000 small synchronous calls, each of which then waits for the
+/// drive. The bytes are the same either way. Opens for writing keep their
+/// flags, and so do overlapped ones (`ReadFileScatter` needs no buffering).
+/// The same change as Marvisak/VIctory#2427's for packs.
 mod title_io {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
     const NO_BUFFERING: u32 = 0x2000_0000;
     const RANDOM_ACCESS: u32 = 0x1000_0000;
+    const OVERLAPPED: u32 = 0x4000_0000;
     /// GENERIC_WRITE, GENERIC_ALL, FILE_WRITE_DATA, FILE_APPEND_DATA.
     const WRITES: u32 = 0x4000_0000 | 0x1000_0000 | 0x0000_0002 | 0x0000_0004;
 
@@ -286,7 +289,7 @@ mod title_io {
 
     /// The flags a read-only open goes to the host with when `on`.
     pub(super) fn sent(access: u32, flags: u32, on: bool) -> u32 {
-        if on && access & WRITES == 0 {
+        if on && access & WRITES == 0 && flags & OVERLAPPED == 0 {
             flags & !(NO_BUFFERING | RANDOM_ACCESS)
         } else {
             flags
@@ -357,7 +360,11 @@ mod title_io {
         const READ: u32 = 0x8000_0000;
         assert_eq!(sent(READ, NO_BUFFERING, true), 0);
         assert_eq!(sent(READ, NO_BUFFERING | RANDOM_ACCESS | 0x80, true), 0x80);
-        assert_eq!(sent(READ, 0x4000_0000, true), 0x4000_0000); // FILE_FLAG_OVERLAPPED stays
+        // An overlapped open keeps its flags (`ReadFileScatter` needs no buffering).
+        assert_eq!(
+            sent(READ, OVERLAPPED | NO_BUFFERING, true),
+            OVERLAPPED | NO_BUFFERING
+        );
         assert_eq!(sent(READ, NO_BUFFERING, false), NO_BUFFERING);
         // An open that may write keeps its flags.
         assert_eq!(sent(READ | 0x4000_0000, NO_BUFFERING, true), NO_BUFFERING);
