@@ -3766,7 +3766,9 @@ fn fence_reached(completed: u64, target: u64) -> bool {
 /// What [`wait_host_fence`] says when `target` was not reached. A lost
 /// device is named as such: its fences all read `u64::MAX`, and printed as
 /// a value (`fence 18446744073709551615 did not reach 312701`) it read as
-/// an underflow of ours (#972).
+/// an underflow of ours (#972). Why it was lost, hung or reset, is not asked
+/// here: [`fail`] adds the device's removal reason to the same line
+/// (`; device removed: ... (0x887A0006)`).
 fn fence_short(context: &str, completed: u64, target: u64) -> String {
     if completed == u64::MAX {
         format!("{context}: the device was lost before fence value {target} was reached (once it is, every fence reads u64::MAX)")
