@@ -173,11 +173,16 @@ fn process_memory() -> (u64, u64) {
     (c.WorkingSetSize as u64, c.PagefileUsage as u64)
 }
 
-/// The frame generation line: `per` frames shown for each one rendered.
-fn generated(fps: f64, per: u32) -> String {
-    match per {
-        0 | 1 => "FRAME GEN OFF".to_owned(),
-        per => format!("FRAME GEN {per}X  SHOWN {:.1} FPS", fps * f64::from(per)),
+/// Show the applied mode and, when the backend reports it, the last present count.
+fn generated(fps: f64, reading: crate::streamline::FramegenReading) -> String {
+    use crate::streamline::FramegenReading;
+    match reading {
+        FramegenReading::Off => "FRAME GEN OFF".to_owned(),
+        FramegenReading::Dlss(None) => "FRAME GEN ON  WAITING FOR PRESENT".to_owned(),
+        FramegenReading::Dlss(Some(per)) => {
+            format!("FRAME GEN ON {per}X  SHOWN {:.1} FPS", fps * f64::from(per))
+        }
+        FramegenReading::Fsr => "FSR 3 FRAME GEN ON  TARGET 2X".to_owned(),
     }
 }
 
@@ -191,7 +196,7 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
     let fps = 1e3 / ms.max(0.001);
     vec![
         format!("FPS {fps:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}"),
-        generated(fps, crate::streamline::shown_per_frame()),
+        generated(fps, crate::streamline::framegen_reading()),
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
@@ -488,9 +493,14 @@ mod tests {
     /// The frame generation line fits the box and says what is shown.
     #[test]
     fn generated_frames_are_told() {
-        assert_eq!(generated(27.5, 1), "FRAME GEN OFF");
-        assert_eq!(generated(27.5, 6), "FRAME GEN 6X  SHOWN 165.0 FPS");
-        assert!(generated(999.9, 6).len() <= COLUMNS as usize);
+        use crate::streamline::FramegenReading::*;
+        assert_eq!(generated(27.5, Off), "FRAME GEN OFF");
+        assert_eq!(generated(27.5, Dlss(None)), "FRAME GEN ON  WAITING FOR PRESENT");
+        assert_eq!(generated(27.5, Dlss(Some(0))), "FRAME GEN ON 0X  SHOWN 0.0 FPS");
+        assert_eq!(generated(27.5, Dlss(Some(1))), "FRAME GEN ON 1X  SHOWN 27.5 FPS");
+        assert_eq!(generated(27.5, Dlss(Some(2))), "FRAME GEN ON 2X  SHOWN 55.0 FPS");
+        assert_eq!(generated(27.5, Fsr), "FSR 3 FRAME GEN ON  TARGET 2X");
+        assert!(generated(999.9, Dlss(Some(6))).len() <= COLUMNS as usize);
     }
 
     #[test]
