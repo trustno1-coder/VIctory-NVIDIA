@@ -239,6 +239,17 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// Why a draw or dispatch did not run (diagnostics): [`missing`]'s reason,
+/// or, for a pipeline that has a host pipeline, a binding or buffer the
+/// host could not give it (`State::prepare`, `State::bind`). Those drops
+/// were counted in the frame line but named in no per-reason line.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dropped_why(missing: Option<String>, hashes: &str) -> String {
+    missing.unwrap_or_else(|| {
+        format!("has a host pipeline; a binding or buffer could not be given: {hashes}")
+    })
+}
+
 /// The hashes of the shaders `p` is made of.
 pub(crate) fn hashes(p: &Pending) -> String {
     let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
@@ -702,6 +713,21 @@ mod tests {
         assert_eq!(
             missing(&p).as_deref(),
             Some("left out on purpose: shades ray-tracing hits without BVH, left out")
+        );
+    }
+
+    /// Every drop gets a reason: one with a host pipeline (a failed binding
+    /// or a buffer without a host copy) is named, not left out of the split.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn every_dropped_draw_has_a_reason() {
+        assert_eq!(
+            dropped_why(Some("being made".into()), "aa+bb"),
+            "being made"
+        );
+        assert_eq!(
+            dropped_why(None, "aa+bb"),
+            "has a host pipeline; a binding or buffer could not be given: aa+bb"
         );
     }
 
