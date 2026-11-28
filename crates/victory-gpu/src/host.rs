@@ -2297,16 +2297,45 @@ impl<T> Spare<T> {
         out
     }
 
-    /// Keeps `thing` (`size` bytes) unless that takes the kept bytes past
-    /// `most`: then it comes back.
-    fn give(&mut self, thing: T, size: u64, most: u64) -> Option<T> {
-        if self.bytes + size > most {
-            return Some(thing);
+    /// Keeps `thing` (`size` bytes). Where that takes the kept bytes past
+    /// `most`, the things kept longest go first to make room ([`spare_evict`],
+    /// #930): they were given back before everything else kept and not asked
+    /// for since, while what was just given back is of a size in use. Gives
+    /// what is not kept, to be freed: those evicted, or `thing` itself when
+    /// it is larger than `most` alone, or (`evict` off) when it does not fit,
+    /// as before.
+    fn give(&mut self, thing: T, size: u64, most: u64, evict: bool) -> Vec<(T, u64)> {
+        if size > most || (!evict && self.bytes + size > most) {
+            return vec![(thing, size)];
         }
+        let mut out = Vec::new();
+        // `kept` is in the order things were given back: the front is the
+        // oldest (a take removes, a give appends).
+        let over = (self.bytes + size).saturating_sub(most);
+        if over > 0 {
+            let (mut freed, mut n) = (0, 0);
+            while freed < over {
+                freed += self.kept[n].1;
+                n += 1;
+            }
+            out.extend(self.kept.drain(..n));
+            self.bytes -= freed;
+        }
+        // What was kept all along the trim window is now at most what is left
+        // without `thing`: it was not there before.
+        self.low = self.low.min(self.bytes);
         self.bytes += size;
         self.kept.push((thing, size));
-        None
+        out
     }
+}
+
+/// `VICTORY_SPARE_EVICT=0`: a scratch chunk given back to a full pool is
+/// freed, and the chunks kept stay, as before (#930). On by default: the
+/// oldest kept chunks are freed to keep it.
+fn spare_evict() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPARE_EVICT").is_none_or(|v| v != "0"))
 }
 
 /// Scratch chunks no list holds.
@@ -2343,26 +2372,28 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
-            let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() {
-                    SPARE_KEPT
-                } else {
-                    SPARE_MOST
-                };
-                spare.give(chunk, size, limit)
+            if !scratch_pool() {
+                ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+                ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+                freed.push(chunk);
+                continue;
+            }
+            let limit = if keep_freed() && !crate::residency::limited_host_ram() {
+                SPARE_KEPT
             } else {
-                Some(chunk)
+                SPARE_MOST
             };
-            match back {
-                None => {
-                    ALIVE[3].fetch_add(1, Ordering::Relaxed);
-                    ALIVE[4].fetch_add(size, Ordering::Relaxed);
-                }
-                Some(chunk) => {
-                    ALIVE[1].fetch_sub(1, Ordering::Relaxed);
-                    ALIVE[2].fetch_sub(size, Ordering::Relaxed);
-                    freed.push(chunk);
-                }
+            // Counted as kept first: what comes back is either this chunk or
+            // chunks kept before it, and both are counted out the same way.
+            ALIVE[3].fetch_add(1, Ordering::Relaxed);
+            ALIVE[4].fetch_add(size, Ordering::Relaxed);
+            for (chunk, size) in spare.give(chunk, size, limit, spare_evict()) {
+                ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+                ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+                ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+                ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+                SPARE_EVICTED.fetch_add(size, Ordering::Relaxed);
+                freed.push(chunk);
             }
         }
     }
@@ -2388,6 +2419,11 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     // Freed outside the lock.
     drop(freed);
 }
+
+/// Bytes of scratch chunks freed when given back to a full pool (the
+/// oldest kept ones, or the chunk itself with `VICTORY_SPARE_EVICT=0`) since
+/// the start.
+pub(crate) static SPARE_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Bytes of spare scratch chunks freed by the trim ([`allocator_trim`])
 /// since the start.
@@ -11313,18 +11349,23 @@ mod trail {
 mod spare {
     use super::Spare;
 
+    /// What [`Spare::give`] did not keep, by thing.
+    fn things(out: Vec<(u32, u64)>) -> Vec<u32> {
+        out.into_iter().map(|(t, _)| t).collect()
+    }
+
     /// Kept things come back by size, the last given first, and nothing is
-    /// kept past the limit.
+    /// kept past the limit (`VICTORY_SPARE_EVICT=0`: the one given back).
     #[test]
     fn kept_things_come_back_by_size_within_the_limit() {
         let mut spare: Spare<u32> = Spare::new();
         assert_eq!(spare.take(4), None);
-        assert_eq!(spare.give(1, 4, 10), None);
-        assert_eq!(spare.give(2, 1, 10), None);
-        assert_eq!(spare.give(3, 4, 10), None);
+        assert!(spare.give(1, 4, 10, false).is_empty());
+        assert!(spare.give(2, 1, 10, false).is_empty());
+        assert!(spare.give(3, 4, 10, false).is_empty());
         assert_eq!(spare.bytes, 9);
         // Past the limit: handed back, nothing changes.
-        assert_eq!(spare.give(4, 4, 10), Some(4));
+        assert_eq!(things(spare.give(4, 4, 10, false)), vec![4]);
         assert_eq!(spare.bytes, 9);
         assert_eq!(spare.take(2), None, "no thing of that size");
         assert_eq!(spare.take(4), Some(3));
@@ -11335,6 +11376,84 @@ mod spare {
         assert!(spare.kept.is_empty());
     }
 
+    /// A full pool keeps what was just given back and frees the things kept
+    /// longest to make room (#930), and only as many as needed.
+    #[test]
+    fn a_full_pool_frees_its_oldest_to_keep_the_one_given_back() {
+        let mut spare: Spare<u32> = Spare::new();
+        for thing in 1..=5 {
+            assert!(spare.give(thing, 2, 10, true).is_empty());
+        }
+        assert_eq!(spare.bytes, 10);
+        // 3 bytes over: the two oldest (4 bytes) go.
+        assert_eq!(things(spare.give(6, 3, 10, true)), vec![1, 2]);
+        assert_eq!(spare.bytes, 9);
+        assert_eq!(spare.take(3), Some(6), "the one given back is kept");
+        // A thing taken and given back is the newest again.
+        assert_eq!(spare.take(2), Some(5));
+        assert!(spare.give(5, 2, 10, true).is_empty());
+        assert_eq!(spare.kept.iter().map(|k| k.0).collect::<Vec<_>>(), vec![3, 4, 5]);
+        // 1 byte over a lower limit: only the oldest goes.
+        assert_eq!(things(spare.give(7, 2, 7, true)), vec![3]);
+        assert_eq!(spare.kept.iter().map(|k| k.0).collect::<Vec<_>>(), vec![4, 5, 7]);
+        // Larger than the limit alone: not kept, and nothing else goes.
+        assert_eq!(things(spare.give(8, 11, 10, true)), vec![8]);
+        assert_eq!(spare.bytes, 6);
+    }
+
+    /// The case from #930: a 128 MiB pool full of 256 KiB chunks, then 4 MiB
+    /// ones taken and given back. As before, none of the big ones is ever
+    /// kept; with eviction every take after the first finds one.
+    #[test]
+    fn chunks_of_a_new_size_are_reused_at_capacity() {
+        const KIB: u64 = 1 << 10;
+        let (most, small, big) = (128 << 20, 256 * KIB, 4 << 20);
+        for evict in [false, true] {
+            let mut spare: Spare<u32> = Spare::new();
+            for thing in 0..512 {
+                assert!(spare.give(thing, small, most, evict).is_empty());
+            }
+            assert!(spare.trim().is_empty());
+            let (mut hits, mut made) = (0, 1000);
+            for _ in 0..64 {
+                let chunk = match spare.take(big) {
+                    Some(chunk) => {
+                        hits += 1;
+                        chunk
+                    }
+                    None => {
+                        made += 1;
+                        made
+                    }
+                };
+                drop(spare.give(chunk, big, most, evict));
+            }
+            assert_eq!(hits, if evict { 63 } else { 0 }, "evict={evict}");
+            assert!(spare.bytes <= most);
+        }
+    }
+
+    /// One 4 MiB chunk into a full pool of 512 chunks of 256 KiB: the 16
+    /// oldest go, 128 MiB stay kept, and the next trim frees the other 496
+    /// (they were kept all the window) and leaves the new one to take (#930).
+    #[test]
+    fn one_big_chunk_into_a_full_pool_and_the_trim_after_it() {
+        const KIB: u64 = 1 << 10;
+        let (most, small, big) = (128 << 20, 256 * KIB, 4 << 20);
+        let mut spare: Spare<u32> = Spare::new();
+        for thing in 0..512 {
+            assert!(spare.give(thing, small, most, true).is_empty());
+        }
+        assert!(spare.trim().is_empty());
+        assert_eq!(things(spare.give(9999, big, most, true)), (0..16).collect::<Vec<_>>());
+        assert_eq!(spare.bytes, most);
+        let gone = spare.trim();
+        assert_eq!(gone.len(), 496);
+        assert_eq!(gone.iter().map(|g| g.1).sum::<u64>(), 124 << 20);
+        assert_eq!(spare.take(big), Some(9999));
+        assert_eq!(spare.bytes, 0);
+    }
+
     /// A trim frees only what stayed kept through the whole window since the
     /// last one (memory stack by skornuta, skornuta/victory-memory-stack
     /// 57fb136, GPL-3.0).
@@ -11342,14 +11461,14 @@ mod spare {
     fn a_trim_frees_only_what_was_never_asked_for_since_the_last() {
         let mut spare: Spare<u32> = Spare::new();
         for (thing, size) in [(1, 4), (2, 4), (3, 4)] {
-            assert_eq!(spare.give(thing, size, 100), None);
+            assert!(spare.give(thing, size, 100, true).is_empty());
         }
         // The first trim knows no window yet: nothing goes.
         assert!(spare.trim().is_empty());
         assert_eq!(spare.bytes, 12);
         // One taken and given back: 8 bytes stayed kept all the while.
         assert_eq!(spare.take(4), Some(3));
-        assert_eq!(spare.give(3, 4, 100), None);
+        assert!(spare.give(3, 4, 100, true).is_empty());
         let gone = spare.trim();
         assert_eq!(gone.iter().map(|g| g.1).sum::<u64>(), 8);
         assert_eq!(gone.iter().map(|g| g.0).collect::<Vec<_>>(), vec![1, 2], "the oldest go");
