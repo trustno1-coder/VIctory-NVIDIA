@@ -672,8 +672,10 @@ pub fn device_shader_model(device: &ID3D12Device) -> Option<(u32, u32)> {
     .or(Some((5, 1)))
 }
 
-/// The highest shader model of the default adapter (the one the title's device is
-/// on), from a device made for the question; `None` without one. Windows 10's own
+/// The highest shader model of the card the title's device is made on
+/// (`hardware_adapter`; else the first adapter), from a device made for the
+/// question; `None` without one. Windows' first adapter can be an integrated GPU
+/// (foxhound issue #14), whose answer is not the card's. Windows 10's own
 /// Direct3D 12 stops at 6.5; Microsoft's newer runtime (`D3D12\D3D12Core.dll`
 /// beside the program, which victory.exe asks for) runs 6.6. Made in a process of
 /// its own (`victory shader-model`), since a process keeps the first runtime it loads.
@@ -681,13 +683,50 @@ pub fn highest_shader_model() -> Option<(u32, u32)> {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     // SAFETY: plain DXGI and D3D12 calls with owned results.
     let device = unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let adapter = factory.EnumAdapters1(0).ok()?;
+        let adapter = match victory_shader::emit::host::hardware_adapter() {
+            Some((adapter, ..)) => adapter,
+            None => CreateDXGIFactory1::<IDXGIFactory1>().ok()?.EnumAdapters1(0).ok()?,
+        };
         let mut device: Option<ID3D12Device> = None;
         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
         device?
     };
     device_shader_model(&device)
+}
+
+/// The PC's RAM in bytes and its page files as Windows keeps them (`PagingFiles`
+/// under Memory Management, one "path min max" a file, in MB), for the check
+/// before a start; `None` where either cannot be read.
+pub fn ram_and_page_files() -> Option<(u64, Vec<String>)> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_MULTI_SZ, RegGetValueW};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let key = wide(Path::new(r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"));
+    let name = wide(Path::new("PagingFiles"));
+    // SAFETY: a structure of the size given, filled by the call; NUL-terminated
+    // names, and the value read into a buffer of the size the first call gives.
+    unsafe {
+        let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+        status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut status) == 0 {
+            return None;
+        }
+        let read = |buf: *mut u16, size: &mut u32| {
+            RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), name.as_ptr(), RRF_RT_REG_MULTI_SZ, std::ptr::null_mut(), buf.cast(), size)
+        };
+        let mut size = 0u32;
+        if read(std::ptr::null_mut(), &mut size) != ERROR_SUCCESS {
+            return None;
+        }
+        let mut value = vec![0u16; size as usize / 2 + 1];
+        size = (value.len() * 2) as u32;
+        if read(value.as_mut_ptr(), &mut size) != ERROR_SUCCESS {
+            return None;
+        }
+        value.truncate(size as usize / 2);
+        let files = String::from_utf16_lossy(&value).split('\0').map(str::trim).filter(|f| !f.is_empty()).map(str::to_owned).collect();
+        Some((status.ullTotalPhys, files))
+    }
 }
 
 /// The file of the Direct3D 12 runtime this process loaded (`D3D12Core.dll`:

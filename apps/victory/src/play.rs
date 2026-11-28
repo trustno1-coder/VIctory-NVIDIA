@@ -619,7 +619,7 @@ fn d3d12_dir() -> Result<PathBuf> {
     Ok(program.parent().map(Path::to_path_buf).unwrap_or_default().join("D3D12"))
 }
 
-/// The highest shader model the default GPU runs, asked by a process of our
+/// The highest shader model the card the game runs on runs, asked by a process of our
 /// own (`victory shader-model`: a process keeps the first Direct3D 12 runtime
 /// it loads, and this one is yet to choose). `None`: no answer.
 fn shader_model() -> Option<(u32, u32)> {
@@ -752,6 +752,57 @@ fn mod_dlls(here: &Path) -> Vec<String> {
     NAMES.iter().filter(|n| here.join(n).is_file()).map(|n| (*n).to_owned()).collect()
 }
 
+/// RAM and page file together, in GB, that the game needs at least: while it runs
+/// foxhound's test PC commits about 48 GB in all (31 GB of RAM, the rest in its page
+/// file), and past Windows' limit allocations fail and the title stops ("Failed to
+/// allocate ...").
+const MEMORY_NEEDED_GB: u64 = 52;
+
+/// The most the page files may grow to, in MB, from `PagingFiles` ("path min max"
+/// a file, in MB): `None` where Windows manages a size (it grows as needed:
+/// `?:\pagefile.sys`, a path alone, or `0 0`) or an entry cannot be read; 0 with no
+/// page file.
+fn page_files_most_mb(files: &[String]) -> Option<u64> {
+    let mut most = 0;
+    for file in files {
+        if file.starts_with('?') {
+            return None;
+        }
+        // From the end: a path may hold spaces.
+        let mut words = file.split_whitespace().rev();
+        let (Some(max), Some(min), Some(_path)) = (words.next(), words.next(), words.next()) else { return None };
+        let (Ok(min), Ok(max)) = (min.parse::<u64>(), max.parse::<u64>()) else { return None };
+        if min == 0 && max == 0 {
+            return None;
+        }
+        most += max;
+    }
+    Some(most)
+}
+
+/// The warning before a start where Windows can give programs less memory than
+/// [`MEMORY_NEEDED_GB`] (`ram` bytes, the page files as [`page_files_most_mb`]
+/// reads them); `None` where there is enough or Windows manages the page file's size.
+/// (foxhound 0.2.0-pre.4's launcher asks before Play; this one says so and starts,
+/// since its restarts open a console of their own where a question would wait.)
+fn memory_warning(ram: u64, files: &[String]) -> Option<String> {
+    let most_mb = page_files_most_mb(files)?;
+    let ram_gb = ram as f64 / (1u64 << 30) as f64;
+    let total_gb = ram_gb + most_mb as f64 / 1024.0;
+    if total_gb >= MEMORY_NEEDED_GB as f64 {
+        return None;
+    }
+    let file = if most_mb == 0 { "no page file".to_owned() } else { format!("a page file of at most {:.0} GB", most_mb as f64 / 1024.0) };
+    let needed_mb = (MEMORY_NEEDED_GB as f64 - ram_gb).ceil() * 1024.0;
+    Some(format!(
+        "Windows can give programs at most {total_gb:.0} GB of memory on this PC: {ram_gb:.0} GB of RAM and {file}.\n\
+         While the game runs it can take about 48 GB; when Windows runs out, the game stops, often with \"Failed to allocate\".\n\
+         Fix: Start, type \"View advanced system settings\", then Performance: Settings, Advanced, Virtual memory: Change.\n\
+         Tick \"Automatically manage paging file size for all drives\" (or set a maximum of at least {needed_mb:.0} MB),\n\
+         then restart Windows."
+    ))
+}
+
 /// How long the first start of a new victory.exe plays before it restarts.
 const WARMUP_SECONDS: u32 = 30;
 
@@ -791,6 +842,11 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     let exe = PathBuf::from(exe.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
 
     check_shader_model()?;
+    if let Some((ram, files)) = victory_hle::streamline::ram_and_page_files()
+        && let Some(warning) = memory_warning(ram, &files)
+    {
+        println!("{warning}");
+    }
 
     let home = home()?;
     std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
@@ -1022,5 +1078,35 @@ mod tests {
         assert_eq!(stamp(0), "19700101-000000");
         assert_eq!(stamp(1_795_753_200), "20261127-042000");
         assert_eq!(stamp(951_782_400), "20000229-000000");
+    }
+
+    /// The page files' most, as Windows keeps them; a size Windows manages is none.
+    #[test]
+    fn page_files_as_windows_keeps_them() {
+        let files = |f: &[&str]| f.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(page_files_most_mb(&[]), Some(0), "no page file");
+        assert_eq!(page_files_most_mb(&files(&[r"C:\pagefile.sys 16384 32768"])), Some(32768));
+        assert_eq!(page_files_most_mb(&files(&[r"C:\pagefile.sys 1024 2048", r"D:\page files\pagefile.sys 4096 8192"])), Some(10240));
+        // Managed by Windows: on every drive, for a drive, or "System managed size".
+        assert_eq!(page_files_most_mb(&files(&[r"?:\pagefile.sys"])), None);
+        assert_eq!(page_files_most_mb(&files(&[r"C:\pagefile.sys"])), None);
+        assert_eq!(page_files_most_mb(&files(&[r"C:\pagefile.sys 0 0"])), None);
+        assert_eq!(page_files_most_mb(&files(&[r"C:\pagefile.sys 1024 2048", r"D:\pagefile.sys 0 0"])), None);
+        // Not read: no warning.
+        assert_eq!(page_files_most_mb(&files(&[r"C:\pagefile.sys some 2048"])), None);
+    }
+
+    /// The warning before a start: RAM and page file under 52 GB, a size Windows manages never.
+    #[test]
+    fn memory_warned_under_52_gb() {
+        const GB: u64 = 1 << 30;
+        let files = |f: &[&str]| f.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let warning = memory_warning(32 * GB, &files(&[r"C:\pagefile.sys 4096 8192"])).expect("40 GB in all");
+        assert!(warning.contains("at most 40 GB") && warning.contains("32 GB of RAM and a page file of at most 8 GB"), "{warning}");
+        assert!(warning.contains("at least 20480 MB"), "{warning}");
+        assert!(memory_warning(16 * GB, &[]).expect("16 GB in all").contains("no page file"));
+        assert_eq!(memory_warning(32 * GB, &files(&[r"C:\pagefile.sys 16384 20480"])), None, "52 GB");
+        assert_eq!(memory_warning(64 * GB, &[]), None);
+        assert_eq!(memory_warning(16 * GB, &files(&[r"?:\pagefile.sys"])), None);
     }
 }
