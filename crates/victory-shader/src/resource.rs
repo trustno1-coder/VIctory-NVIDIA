@@ -40,10 +40,10 @@ pub const CODE: usize = usize::MAX;
 
 /// [`Address::param`] of title memory at an address no root parameter
 /// gives: one the code computes from root constants, reads out of a
-/// descriptor or loads from other memory (compute programs only: the
-/// ray-tracing structure builder and the programs that walk its
-/// structures). Offset and computed term are not used: lowering takes the
-/// 64-bit address from the instruction's operands.
+/// descriptor or loads from other memory (compute programs, and geometry
+/// shaders whose user data is not a root parameter). Offset and computed
+/// term are not used: lowering takes the 64-bit address from the
+/// instruction's operands.
 pub const MEMORY: usize = usize::MAX - 1;
 
 /// The reasons an address traces to no root parameter for which the
@@ -880,9 +880,9 @@ impl<'a> Tracer<'a> {
 
     /// The address of an access that traces to no root parameter (`why`
     /// says how it failed): title memory at the address as it stands, in a
-    /// compute program.
+    /// compute program or a geometry shader.
     fn by_address(&self, why: &'static str) -> Result<Address, &'static str> {
-        if self.stage == HwStage::Cs && RAW.contains(&why) {
+        if matches!(self.stage, HwStage::Cs | HwStage::Gs) && RAW.contains(&why) {
             Ok(Address {
                 param: MEMORY,
                 offset: 0,
@@ -2514,6 +2514,95 @@ pub(crate) mod tests {
             offset,
             dynamic: None,
         }
+    }
+
+    #[test]
+    fn a_merged_geometry_shaders_table_pointer_is_at_s16() {
+        // The same table in a merged ES-GS: user data starts at s16, after
+        // eight system SGPRs.
+        let r = track_words(
+            &[
+                0xBE91_0380, // s_mov_b32 s17, 0
+                0xF408_0208,
+                0xFA00_0920, // s_load_dwordx4 s[8:11], s[16:17], 0x920
+                S_ENDPGM,
+            ],
+            &[RootParam {
+                table_offset_dwords: 584,
+                base_register: 202,
+                ..param(Table, 8, 1)
+            }],
+            HwStage::Gs,
+        );
+        assert_eq!(r.scalar, [((0, 1), at(0, 0x920))]);
+    }
+
+    #[test]
+    fn a_merged_geometry_shader_keeps_a_raw_address_and_its_table() {
+        // GS_VoxelizeGeneric: the load at 0xb8 goes through s8, which in a
+        // merged ES-GS is user data 0 and not a root parameter: it is a raw
+        // address. The table the program uses is at 0x920, through s16
+        // (user data 8). The two must not be confused.
+        let r = track_words(
+            &[
+                0x8701_FF09,
+                0x0000_00FF, // s_and_b32 s1, s9, 0xff
+                0xBE80_0308, // s_mov_b32 s0, s8
+                0xF400_0000,
+                0xFA00_00B8, // s_load_dword s0, s[0:1], 0xb8
+                0xBE91_0380, // s_mov_b32 s17, 0
+                0xF408_0208,
+                0xFA00_0920, // s_load_dwordx4 s[8:11], s[16:17], 0x920
+                S_ENDPGM,
+            ],
+            &[RootParam {
+                table_offset_dwords: 584,
+                base_register: 202,
+                ..param(Table, 8, 1)
+            }],
+            HwStage::Gs,
+        );
+        assert_eq!(
+            r.scalar
+                .iter()
+                .map(|(_, a)| (a.param, a.offset))
+                .collect::<Vec<_>>(),
+            [(MEMORY, 0), (0, 0x920)]
+        );
+    }
+
+    #[test]
+    fn a_merged_geometry_shaders_root_descriptor_high_half_is_at_s17() {
+        // A merged ES-GS's user data starts at s16: a root descriptor at
+        // user data 8 has its low half at s16 and its high half at s17. The
+        // tracker must follow the merged placement, not the standalone s9.
+        let r = track_words(
+            &[
+                0x8801_FF11,
+                0x0010_0000, // s_or_b32 s1, s17, 0x100000
+                0xBE80_0310, // s_mov_b32 s0, s16
+                0xBE82_03C1, // s_mov_b32 s2, -1
+                0xBE83_03FF,
+                0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+                0xF430_0000,
+                0xFA00_0000, // s_buffer_load_dwordx16 s[0:15], s[0:3], null
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 8, 2)],
+            HwStage::Gs,
+        );
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(0, 0),
+                bits: 0x10_0000,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+        assert_eq!(
+            r.params.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(),
+            [(0, 0), (0, 1)]
+        );
     }
 
     #[test]
