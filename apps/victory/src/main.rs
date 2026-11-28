@@ -328,8 +328,8 @@ enum Command {
     /// it by itself then.
     #[cfg(windows)]
     GetMfg,
-    /// Print the highest shader model the default GPU runs here (`play`
-    /// asks it in a process of its own).
+    /// Print the highest shader model the card the game runs on runs here
+    /// (`play` asks it in a process of its own).
     #[cfg(windows)]
     #[command(hide = true)]
     ShaderModel,

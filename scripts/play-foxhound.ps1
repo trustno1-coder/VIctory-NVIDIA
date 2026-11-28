@@ -86,6 +86,9 @@ $settings = @{
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'
+    # A frame's texture passes within 8 ms together; helpers woken at each submission's start (foxhound 0.2.0-pre.4,
+    # from its PR #13); the layer's threads a frame waits for above normal priority (foxhound 0.2.0-pre.3). As `victory play`.
+    VICTORY_TEXSPK_PASS_MS = '8'; VICTORY_PASSES_HOT = '1'; VICTORY_HELPER_PRIORITY = '1'
     # Light without the title's ray tracing: an estimate of indirect light and of reflections
     VICTORY_AMBIENT = '0.8'; VICTORY_AMBIENT_AIR = '1.5'; VICTORY_AMBIENT_SPECULAR = '1'
     # Pixel programs keep the console's early depth test
