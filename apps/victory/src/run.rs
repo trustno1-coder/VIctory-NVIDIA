@@ -127,13 +127,25 @@ pub fn run(
     let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
     asked.series_s = matches!(console, Console::SeriesS);
     let available = victory_hle::streamline::init(&asked);
+    let pc_fsr = execute
+        && !available.dlss
+        && std::env::var("VICTORY_PC_FSR").as_deref() == Ok("1")
+        && victory_hle::modules::fidelityfx::init_pc(&asked.fidelityfx_dir);
+    let pc_fg4 = pc_fsr && asked.fsr_framegen
+        && victory_hle::streamline::enable_host_fsr4(&asked.fidelityfx_dir);
     // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
     // scale with its own FidelityFX upscaling (no Streamline): DLSS's
     // comparison, and on Series X what that path alone looks like.
     let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
     // (FSR 3 frame generation reads the upscaling's inputs as DLSS Frame
     // Generation does: the title renders through its FidelityFX path too.)
-    let upscaler = (available.dlss || available.framegen || available.fsr_framegen || fsr_path).then_some(asked.mode);
+    // Series S keeps its established title dimensions. Series X uses the
+    // existing startup scale patch only when the host upscaler passed preflight.
+    let pc_mode = pc_fsr && matches!(console, Console::SeriesX);
+    let upscaler = (available.dlss || available.framegen || available.fsr_framegen || pc_mode || fsr_path).then_some(asked.mode);
+    if pc_fsr {
+        println!("upscaling      PC FidelityFX; experimental FSR 4 frame generation {}", if pc_fg4 { "requested" } else { "off" });
+    }
     // What this card does for frame generation (also on the picture for the first seconds).
     for (i, line) in victory_hle::streamline::notice_at_start().iter().enumerate() {
         println!("{}{line}", if i == 0 { "frame gen      " } else { "               " });

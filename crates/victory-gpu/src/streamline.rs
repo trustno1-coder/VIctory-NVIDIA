@@ -160,6 +160,7 @@ pub struct Upscale {
     pub camera: plan::Camera,
     pub pre_exposure: f32,
     pub frame_ms: f32,
+    pub view_space_to_meters: f32,
 }
 
 // SAFETY: pointers to title objects that live until the list has run (the
@@ -389,13 +390,13 @@ pub fn init(asked: &Asked) -> Available {
     // Series S, with its own FidelityFX upscaler running beside our frame generation, the title
     // stopped on a check (0x80000003 at +0x2219650) seconds into the start (2026-11-27: muted
     // runs here, issues #272, #308 and #331; with DLSS on, both consoles ran).
-    let fsr_needs_dlss = asked.fsr_framegen && !available.dlss;
+    let fsr_needs_dlss = asked.fsr_framegen && !available.dlss && !fsr::ml_requested();
     if fsr_needs_dlss {
         tracing::warn!(
             "FSR 3 frame generation stays off: it needs DLSS for the upscaling, which is off, or this card or these files do not give; without it the title stops at the start"
         );
     }
-    let fsr_framegen = asked.fsr_framegen && !fsr_needs_dlss && fsr::init(&asked.fidelityfx_dir);
+    let fsr_framegen = asked.fsr_framegen && available.dlss && fsr::init(&asked.fidelityfx_dir);
     let _ = FACTS.set(Facts {
         adapter: default_adapter().map(|a| a.0).unwrap_or_default(),
         no_dlss,
@@ -450,7 +451,7 @@ pub fn notice() -> Vec<String> {
 /// (DLSS Frame Generation where it is supported, else FSR 3 if loaded).
 pub fn notice_at_start() -> Vec<String> {
     let Some(f) = FACTS.get() else { return Vec::new() };
-    notice_of(f, f.dlss_fg_supported, f.fsr_loaded && !f.dlss_fg_supported)
+    notice_of(f, f.dlss_fg_supported, fsr::loaded() && !f.dlss_fg_supported)
 }
 
 fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
@@ -484,6 +485,14 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
     } else if dlss_live {
         lines.push("FRAME GEN: DLSS, SUPPORTED HERE (F1 MENU: 2X-6X)".into());
         lines.push("MORE THAN 2X NEEDS AN RTX 50 CARD".into());
+    } else if f.fsr_asked && fsr::ml_requested() {
+        lines.push(if fsr::ml_active() {
+            "FRAME GEN: FSR 4 PROXY VERIFIED (EXPERIMENTAL)"
+        } else if fsr_live {
+            "FRAME GEN: FSR 4 REQUESTED (EXPERIMENTAL)"
+        } else {
+            "FRAME GEN: FSR 4 UNAVAILABLE (SEE THE LOG)"
+        }.into());
     } else if fsr_live {
         lines.push(if no_dlss_fg {
             "USING AMD FSR 3 FRAME GEN INSTEAD: 2X AT MOST".into()
@@ -785,7 +794,7 @@ pub fn load_mod(what: &str, path: &Path) -> Result<(), u32> {
 
 /// The Authenticode signature of `path` (NVIDIA signs its DLLs), checked
 /// without going online.
-fn verify_signature(path: &Path) -> Result<(), String> {
+pub fn verify_signature(path: &Path) -> Result<(), String> {
     use windows_sys::Win32::Security::WinTrust::*;
     let file = wide(path);
     let mut info = WINTRUST_FILE_INFO {
@@ -863,6 +872,16 @@ fn load(path: &Path) -> Result<Sl, String> {
 
 /// Whether the title's FidelityFX calls are to be served (DLSS or frame
 /// generation is on): `victory_hle` then puts its own in front of them.
+pub fn fsr4_requested() -> bool {
+    fsr::ml_requested()
+}
+
+/// Prepares the AMD presentation path after the host FidelityFX upscaler
+/// has been validated on the selected device.
+pub fn enable_host_fsr4(dir: &Path) -> bool {
+    fsr::ml_requested() && fsr::init(dir)
+}
+
 pub fn serving() -> bool {
     PLAN.get().is_some_and(|p| p.dlss || p.framegen) || fsr::noting()
 }
@@ -1133,6 +1152,59 @@ pub fn forwarded() {
     FORWARDED.fetch_add(1, Relaxed);
 }
 
+/// The selected host device, shared with the title-facing PC upscaler.
+pub fn host_upscale_device() -> Option<ID3D12Device> {
+    crate::host::host().map(|host| host.device.clone())
+}
+
+/// Records a PC FidelityFX dispatch on the host list in the title's order.
+pub fn record_host_upscale(
+    up: Upscale,
+    record: impl FnOnce(&ID3D12GraphicsCommandList, [Option<ID3D12Resource>; 7]) -> bool + Send + 'static,
+) -> bool {
+    if up.resources[OUTPUT].0.is_null()
+        || up.resources.iter().any(|&(resource, state)| {
+            !resource.is_null()
+                && (!crate::resource::is_resource(resource) || plan::host_state(state).is_none())
+        })
+    {
+        return false;
+    }
+    let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
+    crate::list::external(up.list, Box::new(move |host| {
+        let mut textures = std::array::from_fn(|_| None);
+        for (i, (resource, state)) in up.resources.into_iter().enumerate() {
+            if resource.is_null() {
+                continue;
+            }
+            if i != OUTPUT && crate::external::prepare_input(host, resource).is_none() {
+                return false;
+            }
+            let Some(wanted) = plan::host_state(state) else { return false };
+            let Some((texture, actual)) = crate::external::host_texture(host, resource, wanted) else {
+                return false;
+            };
+            if actual != wanted {
+                return false;
+            }
+            textures[i] = Some(texture);
+        }
+        if record(&host.list, textures) {
+            crate::external::output_written(up.resources[OUTPUT].0);
+            if fsr::noting() {
+                note(host, &up, id);
+            }
+        }
+        // The SDK may have changed bindings before reporting a dispatch error.
+        true
+    }))
+}
+
+/// Waits for submitted host-upscaler work before destroying its context.
+pub fn finish_host_upscale() {
+    crate::external::finish_submitted();
+}
+
 /// What an upscaling's textures must be for DLSS, checked on the title's
 /// thread (the title's own runs if not): host textures, in states they can
 /// be in.
@@ -1165,11 +1237,21 @@ fn note(host: &crate::host::HostList, up: &Upscale, id: u64) {
     let (Some(depth), Some(motion)) =
         (crate::resource::host_copy(up.resources[DEPTH].0), crate::resource::host_copy(up.resources[MOTION].0))
     else {
+        if fsr::ml_active() {
+            once!(warn, "FSR 4: upscale depth or motion has no host copy");
+        }
         return;
     };
+    if fsr::ml_active() {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(id, render = ?up.camera.render, jitter = ?up.camera.jitter,
+                view_space_to_meters = up.view_space_to_meters, "FSR 4: recorded upscale inputs");
+        });
+    }
     let mut pending = pending();
     pending.retain(|n| id.saturating_sub(n.id) < 16);
-    pending.push(Noted { id, depth: Source::Host(depth), motion: Source::Host(motion), camera: up.camera, frame_ms: up.frame_ms });
+    pending.push(Noted { id, depth: Source::Host(depth), motion: Source::Host(motion), camera: up.camera, frame_ms: up.frame_ms, view_space_to_meters: up.view_space_to_meters, pose: None });
     drop(pending);
     host.mark_upscale(id);
 }
@@ -1181,6 +1263,8 @@ struct Noted {
     motion: Source,
     camera: plan::Camera,
     frame_ms: f32,
+    view_space_to_meters: f32,
+    pose: Option<fsr::camera::Pose>,
 }
 
 /// What FSR 3 frame generation reads at a present ([`fresh_inputs`]): depth
@@ -1190,6 +1274,8 @@ pub(crate) struct Inputs {
     pub(crate) motion: (ID3D12Resource, u32),
     pub(crate) camera: plan::Camera,
     pub(crate) frame_ms: f32,
+    pub(crate) view_space_to_meters: f32,
+    pub(crate) pose: Option<fsr::camera::Pose>,
 }
 
 impl Source {
@@ -1207,7 +1293,7 @@ pub(crate) fn fresh_inputs() -> Option<Inputs> {
     let latest = SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
     let n = latest.as_ref().filter(|n| n.id > PRESENTED_ID.load(Relaxed))?;
     PRESENTED_ID.store(n.id, Relaxed);
-    Some(Inputs { depth: n.depth.current(), motion: n.motion.current(), camera: n.camera, frame_ms: n.frame_ms })
+    Some(Inputs { depth: n.depth.current(), motion: n.motion.current(), camera: n.camera, frame_ms: n.frame_ms, view_space_to_meters: n.view_space_to_meters, pose: n.pose })
 }
 
 /// A texture frame generation reads at the present, and the state it is in
@@ -1242,12 +1328,23 @@ fn pending() -> std::sync::MutexGuard<'static, Vec<Noted>> {
 
 /// A host list that recorded upscaling `id` is submitted (in submission
 /// order, before the present that follows it).
-pub(crate) fn submitted(id: u64) {
-    let noted = {
+pub(crate) fn submitted(id: u64, camera: Option<fsr::camera::Recording>) {
+    let mut noted = if id == 0 { None } else {
         let mut pending = pending();
         let at = pending.iter().position(|n| n.id == id);
         at.map(|i| pending.swap_remove(i))
     };
+    if let Some(camera) = camera {
+        let expected = noted.as_ref().map(|n| (n.camera.render, n.camera.jitter));
+        let pose = camera.submitted(expected);
+        if let Some(noted) = noted.as_mut() {
+            noted.pose = pose;
+            once!(info, id, pose = pose.is_some(), "FSR 4: first submitted upscale inputs");
+            if pose.is_some() {
+                once!(info, id, "FSR 4: matched the velocity camera to the submitted upscale");
+            }
+        }
+    }
     if let Some(noted) = noted {
         let mut latest = SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
         if latest.as_ref().is_none_or(|l| l.id < noted.id) {
@@ -1919,7 +2016,7 @@ unsafe extern "C" fn present_error(error: *const i32) {
 
 /// Frames shown for each one rendered with frame generation on, as asked at the start:
 /// `VICTORY_FRAMEGEN_X=2..6` (2 unless set); 0: ready but off until the settings menu asks.
-fn framegen_times() -> u32 {
+pub(crate) fn framegen_times() -> u32 {
     static TIMES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *TIMES.get_or_init(|| {
         std::env::var("VICTORY_FRAMEGEN_X").ok().and_then(|v| v.trim().parse::<u32>().ok()).map_or(2, |n| if n == 0 { 0 } else { n.clamp(2, 6) })
@@ -1948,12 +2045,12 @@ pub(crate) fn framegen_live() -> bool {
     FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire) || fsr::live_swap_chain()
 }
 
-/// Which frame generation the presents have: DLSS's, AMD's FSR 3, or none.
+/// Which frame generation provider is ready at the presenter.
 pub(crate) fn framegen_kind() -> Option<&'static str> {
     if FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire) {
         Some("DLSS")
     } else if fsr::live_swap_chain() {
-        Some("FSR 3")
+        Some(if fsr::ml_active() { "FSR 4" } else { "FSR 3" })
     } else {
         None
     }
@@ -2221,6 +2318,8 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
                 motion: Source::Fixed(motion.clone(), SHADER_READ),
                 camera,
                 frame_ms: 16.7,
+                view_space_to_meters: 1.0,
+                pose: None,
             });
             if let Some(copy) = &copy {
                 lock(&HUD_SUBMITTED).push(Copied { id: frame, target: base.as_raw() as usize, texture: copy.clone() });
@@ -2283,8 +2382,9 @@ fn texture(
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
     if let Some((on, off, failed, hudless)) = fsr::line_counts() {
+        let version = if fsr::ml_active() { "FSR 4" } else { "FSR 3" };
         tracing::info!(
-            "FSR 3 frame generation: {on} presents with it on ({hudless} with the colour without the interface), {off} off, {failed} prepare dispatches failed"
+            "{version} frame generation: {on} presents with it on ({hudless} with the colour without the interface), {off} off, {failed} prepare dispatches failed"
         );
     }
     let Some(plan) = PLAN.get() else { return };

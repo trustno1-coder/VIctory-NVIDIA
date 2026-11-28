@@ -2684,6 +2684,7 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    framegen_camera: crate::streamline::fsr::camera::Recording,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -6012,8 +6013,11 @@ impl Host {
         // present tags the latest (frame generation).
         for run in runs {
             let id = run.take_upscale();
-            if id != 0 {
-                crate::streamline::submitted(id);
+            if crate::streamline::fsr::ml_active() {
+                let camera = std::mem::take(&mut run.deferred().framegen_camera);
+                crate::streamline::submitted(id, Some(camera));
+            } else if id != 0 {
+                crate::streamline::submitted(id, None);
             }
             let id = run.take_hudless();
             if id != 0 {
@@ -8003,8 +8007,19 @@ impl HostList {
         self.deferred().textures.contains(&key)
     }
 
+    /// Record the velocity-pass camera in this list's command order.
+    pub(crate) fn record_framegen_camera(
+        &self,
+        record: impl FnOnce(&mut crate::streamline::fsr::camera::Recording),
+    ) {
+        record(&mut self.deferred().framegen_camera);
+    }
+
     /// The list recorded upscaling `id` (`crate::streamline`).
     pub(crate) fn mark_upscale(&self, id: u64) {
+        if crate::streamline::fsr::ml_active() {
+            self.record_framegen_camera(|camera| camera.mark_upscale());
+        }
         self.upscale.store(id, Ordering::Relaxed);
     }
 
@@ -10526,6 +10541,7 @@ impl Host {
             }
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
+            crate::streamline::fsr::presented(&p.swap_chain, frame);
             showing.next("the frame meter");
             p.panel.frame(p.meter.line_due());
             p.menu.frame();
@@ -10578,7 +10594,7 @@ impl Host {
             };
             // FSR 3 frame generation (where DLSS Frame Generation does not
             // run): FidelityFX's frame interpolation swap chain.
-            let fsr = crate::streamline::fsr::swap_chain(&factory, &self.queue, hwnd, &desc);
+            let fsr = crate::streamline::fsr::swap_chain(&factory, &self.device, &self.queue, hwnd, &desc);
             // With frame generation, through Streamline's factory proxy and
             // on its queue proxy: the swap chain is its proxy.
             let proxied = if fsr.is_some() { None } else { crate::streamline::swap_chain_factory(&factory) }.map(|(proxy, queue)| {
