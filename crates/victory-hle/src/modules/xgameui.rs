@@ -62,9 +62,13 @@ extern "system" fn text_entry_async(
 ) -> HRESULT {
     let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
     let max_length = max_length_for(scope, max_length);
-    tracing::info!(title, description, max_length, "text entry");
+    // The console hides what is typed in a password entry (GDK:
+    // XGameUiTextEntryInputScope::Password = 31, "the textbox hides characters
+    // as the user types"), so the dialog is told to.
+    let password = scope == PASSWORD;
+    tracing::info!(title, description, max_length, password, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
-        match ask(&title, &description, &default, max_length) {
+        match ask(&title, &description, &default, max_length, password) {
             Some(typed) => {
                 tracing::info!(length = typed.chars().count(), "text entry: done");
                 let mut bytes = limit(&typed, max_length).into_bytes();
@@ -125,15 +129,19 @@ fn limit(typed: &str, max: u32) -> String {
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
 #[cfg(not(test))]
-fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
-    dialog::ask(title, description, default, max)
+fn ask(title: &str, description: &str, default: &str, max: u32, password: bool) -> Option<String> {
+    dialog::ask(title, description, default, max, password)
 }
 
 /// Tests answer for the user: "typed" for a title starting with "Type",
-/// cancelled otherwise.
+/// cancelled otherwise. A "*" marks a dialog that was asked to hide its text,
+/// so the password-scope test can see the decision in the call's result.
 #[cfg(test)]
-fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
-    title.starts_with("Type").then(|| format!("{default}typed"))
+fn ask(title: &str, _: &str, default: &str, _: u32, password: bool) -> Option<String> {
+    let hidden = if password { "*" } else { "" };
+    title
+        .starts_with("Type")
+        .then(|| format!("{default}typed{hidden}"))
 }
 
 mod dialog {
@@ -155,9 +163,16 @@ mod dialog {
 
     /// The description, an edit box with the default text, OK and Cancel,
     /// from an in-memory template (dialog units, the system font); Enter
-    /// accepts, Esc cancels.
+    /// accepts, Esc cancels. A password entry's text box hides what is typed,
+    /// as the console's Password input scope does.
     #[allow(dead_code)] // unused in test builds
-    pub(super) fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
+    pub(super) fn ask(
+        title: &str,
+        description: &str,
+        default: &str,
+        max: u32,
+        password: bool,
+    ) -> Option<String> {
         let mut t: Vec<u16> = Vec::new();
         fn dword(t: &mut Vec<u16>, v: u32) {
             t.extend([v as u16, (v >> 16) as u16]);
@@ -186,7 +201,10 @@ mod dialog {
         let (button, edit, label) = (0x80, 0x81, 0x82);
         let tab = wm::WS_TABSTOP;
         item(0, [7, 7, 226, 10], 0xffff, label, description);
-        let edit_style = wm::WS_BORDER | tab | wm::ES_AUTOHSCROLL as u32;
+        let mut edit_style = wm::WS_BORDER | tab | wm::ES_AUTOHSCROLL as u32;
+        if password {
+            edit_style |= wm::ES_PASSWORD as u32;
+        }
         item(edit_style, [7, 20, 226, 12], EDIT as u16, edit, default);
         let ok = wm::BS_DEFPUSHBUTTON as u32 | tab;
         item(ok, [129, 40, 50, 14], wm::IDOK as u16, button, "OK");
@@ -375,7 +393,8 @@ mod tests {
         let long = std::ffi::CString::new("a".repeat(2000)).unwrap();
         for (scope, max, default, expect) in [
             (0, 0, long.as_ptr(), 1025),
-            (PASSWORD, 8, c"abc".as_ptr(), 9),
+            // The stub marks what a password dialog hid with "*".
+            (PASSWORD, 8, c"abc".as_ptr(), 10),
         ] {
             let mut b = block();
             let title = c"Type".as_ptr();
@@ -389,5 +408,59 @@ mod tests {
             let used = std::ptr::null_mut();
             assert_eq!(result(this, &mut b, size, out.as_mut_ptr(), used), S_OK);
         }
+    }
+
+    /// The console's Password input scope (31) hides what is typed (GDK:
+    /// "the textbox hides characters as the user types"); any other scope
+    /// leaves it visible.
+    #[test]
+    fn a_password_entry_asks_for_a_text_box_that_hides_what_is_typed() {
+        let this: This = &OBJECT;
+        type Entry = extern "system" fn(
+            This,
+            *mut AsyncBlock,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            u32,
+            u32,
+        ) -> HRESULT;
+        type Size = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        type Result_ =
+            extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
+        let null = std::ptr::null();
+        let entry = method::<Entry>(&OBJECT, 0x88);
+        let size_of = method::<Size>(&OBJECT, 0x90);
+        let result = method::<Result_>(&OBJECT, 0x98);
+        let default = c"abc".as_ptr();
+        // Password scope: the dialog was asked to hide the text ("*").
+        let mut b = block();
+        assert_eq!(
+            entry(this, &mut b, c"Type".as_ptr(), null, default, 31, 16),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        let mut size = 0;
+        assert_eq!(size_of(this, &mut b, &mut size), S_OK);
+        assert_eq!(size, 10);
+        let mut out = [0 as c_char; 10];
+        let mut used = 0;
+        assert_eq!(result(this, &mut b, 10, out.as_mut_ptr(), &mut used), S_OK);
+        assert_eq!(
+            (text(out.as_ptr()).as_deref(), used),
+            (Some("abctyped*"), 10)
+        );
+        // The default scope shows it, as before.
+        let mut b = block();
+        assert_eq!(
+            entry(this, &mut b, c"Type".as_ptr(), null, default, 0, 16),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        assert_eq!(size_of(this, &mut b, &mut size), S_OK);
+        assert_eq!(size, 9);
+        let mut out = [0 as c_char; 9];
+        assert_eq!(result(this, &mut b, 9, out.as_mut_ptr(), &mut used), S_OK);
+        assert_eq!((text(out.as_ptr()).as_deref(), used), (Some("abctyped"), 9));
     }
 }
