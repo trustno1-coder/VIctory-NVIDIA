@@ -260,6 +260,111 @@ type File = *mut c_void;
 
 // kernel32 and its file API sets.
 
+/// `VICTORY_FILE_BUFFERED` (on by default, `=0` off): a read-only open of a
+/// title file loses `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_RANDOM_ACCESS`,
+/// so the host's file cache and read-ahead serve it. The title opens its
+/// archives unbuffered and reads them at loading in some 80,000 small
+/// synchronous calls, each of which then waits for the drive. The bytes are
+/// the same either way; opens for writing keep their flags.
+mod title_io {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    const NO_BUFFERING: u32 = 0x2000_0000;
+    const RANDOM_ACCESS: u32 = 0x1000_0000;
+    /// GENERIC_WRITE, GENERIC_ALL, FILE_WRITE_DATA, FILE_APPEND_DATA.
+    const WRITES: u32 = 0x4000_0000 | 0x1000_0000 | 0x0000_0002 | 0x0000_0004;
+
+    fn buffered() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_FILE_BUFFERED").is_none_or(|v| v != "0");
+            tracing::info!(on, "title files: read-only opens go through the host's file cache (VICTORY_FILE_BUFFERED)");
+            on
+        })
+    }
+
+    /// The flags a read-only open goes to the host with when `on`.
+    pub(super) fn sent(access: u32, flags: u32, on: bool) -> u32 {
+        if on && access & WRITES == 0 {
+            flags & !(NO_BUFFERING | RANDOM_ACCESS)
+        } else {
+            flags
+        }
+    }
+
+    /// The flags an open goes to the host with; the first open of each kind
+    /// of flags is logged with its path.
+    pub(super) fn flags(path: &str, access: u32, flags: u32) -> u32 {
+        let out = sent(access, flags, buffered());
+        let read_only = access & WRITES == 0;
+        static KINDS: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+        let mut kinds = KINDS.lock().unwrap_or_else(|e| e.into_inner());
+        let kind = (flags & 0xFFFF_0000, read_only);
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+            tracing::info!(
+                flags = format_args!("{flags:#010x}"),
+                sent = format_args!("{out:#010x}"),
+                access = format_args!("{access:#010x}"),
+                path,
+                "title file opened, the first with these flags"
+            );
+        }
+        out
+    }
+
+    /// Since the last line: calls, bytes, nanoseconds in the host's
+    /// `ReadFile`, and of the calls those of 4 KiB or less.
+    static READS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static LAST: AtomicU64 = AtomicU64::new(0);
+
+    /// A `ReadFile` of the title's, timed. A line every 2 s or more, when
+    /// at least 1,000 calls came since the last (the loading bursts).
+    pub(super) fn read(len: u32, ns: u64) {
+        READS[0].fetch_add(1, Relaxed);
+        READS[1].fetch_add(u64::from(len), Relaxed);
+        READS[2].fetch_add(ns, Relaxed);
+        if len <= 4096 {
+            READS[3].fetch_add(1, Relaxed);
+        }
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let now = START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64;
+        let last = LAST.load(Relaxed);
+        if now.saturating_sub(last) < 2000
+            || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err()
+        {
+            return;
+        }
+        let v: [u64; 4] = std::array::from_fn(|i| READS[i].swap(0, Relaxed));
+        if v[0] >= 1000 {
+            let secs = (now - last).max(1) as f64 / 1000.0;
+            tracing::info!(
+                "title ReadFile, last {secs:.1} s: {} calls ({} of 4 KiB or less), {:.1} MB, {:.0} us a call in the host's ReadFile",
+                v[0],
+                v[3],
+                v[1] as f64 / 1e6,
+                v[2] as f64 / v[0] as f64 / 1e3,
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_opens_lose_no_buffering_and_random_access() {
+        const READ: u32 = 0x8000_0000;
+        assert_eq!(sent(READ, NO_BUFFERING, true), 0);
+        assert_eq!(sent(READ, NO_BUFFERING | RANDOM_ACCESS | 0x80, true), 0x80);
+        assert_eq!(sent(READ, 0x4000_0000, true), 0x4000_0000); // FILE_FLAG_OVERLAPPED stays
+        assert_eq!(sent(READ, NO_BUFFERING, false), NO_BUFFERING);
+        // An open that may write keeps its flags.
+        assert_eq!(sent(READ | 0x4000_0000, NO_BUFFERING, true), NO_BUFFERING);
+        assert_eq!(sent(0x0000_0002, NO_BUFFERING, true), NO_BUFFERING);
+    }
+}
+
 pub extern "system" fn CreateFileW(
     path: *const u16,
     access: u32,
@@ -270,6 +375,13 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
+    // SAFETY: a NUL-terminated wide path (the host path, or the title's).
+    let shown = unsafe {
+        let ptr = p.ptr();
+        let len = (0..).take_while(|&i| *ptr.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+    };
+    let flags = title_io::flags(&shown, access, flags);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
@@ -292,6 +404,11 @@ pub extern "system" fn CreateFileA(
 ) -> Handle {
     match narrow(path) {
         Some(p) => {
+            let flags = title_io::flags(
+                &String::from_utf16_lossy(&p[..p.len().saturating_sub(1)]),
+                access,
+                flags,
+            );
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 p.as_ptr(),
                 access,
@@ -303,6 +420,15 @@ pub extern "system" fn CreateFileA(
             )
         }
         None => {
+            // SAFETY: the title passes a NUL-terminated path, or none.
+            let shown = if path.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(path) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let flags = title_io::flags(&shown, access, flags);
             host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 path,
                 access,
@@ -325,6 +451,31 @@ pub extern "system" fn CreateFile2(
     params: *const c_void,
 ) -> Handle {
     let p = wide(path);
+    // CREATEFILE2_EXTENDED_PARAMETERS: dwSize, dwFileAttributes, dwFileFlags,
+    // dwSecurityQosFlags, then two pointers (32 bytes on x64). The flags are
+    // noted, and with `VICTORY_FILE_BUFFERED` changed in a copy.
+    let mut copy = [0u8; 32];
+    let mut params = params;
+    if !params.is_null() {
+        // SAFETY: the title's parameter block; its size is its first word.
+        let size = unsafe { *(params as *const u32) } as usize;
+        if size >= 12 && size <= copy.len() {
+            // SAFETY: as above, `size` bytes of it.
+            unsafe { std::ptr::copy_nonoverlapping(params as *const u8, copy.as_mut_ptr(), size) };
+            let flags = u32::from_le_bytes([copy[8], copy[9], copy[10], copy[11]]);
+            // SAFETY: a NUL-terminated wide path.
+            let shown = unsafe {
+                let ptr = p.ptr();
+                let len = (0..).take_while(|&i| *ptr.add(i) != 0).count();
+                String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+            };
+            let sent = title_io::flags(&shown, access, flags);
+            if sent != flags {
+                copy[8..12].copy_from_slice(&sent.to_le_bytes());
+                params = copy.as_ptr() as *const c_void;
+            }
+        }
+    }
     host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
         access,
@@ -536,12 +687,15 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
+    let began = std::time::Instant::now();
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
+    let ns = began.elapsed().as_nanos() as u64;
     // The call's error is the title's to ask for.
     // SAFETY: plain calls.
     let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    title_io::read(len, ns);
     // shortcut: a read that goes on after the call (overlapped) is written
     // into pages the kernel has locked by now: it lands all the same, but a
     // refresh that guards its blocks before it does will not see it.
