@@ -166,6 +166,9 @@ mod tests {
         let sent = crate::timeline::ticks();
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            // Behind every submission published and not sent yet
+            // (`VICTORY_SUBMIT_SPLIT`), whose fence values are lower.
+            super::wait_sent();
             *submitted += 1;
             // SAFETY: closed lists; the fence and event are the host's, under
             // its lock.
