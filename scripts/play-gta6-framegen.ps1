@@ -113,7 +113,7 @@ if (-not (Test-Path (Join-Path $sl 'sl.interposer.dll'))) {
 }
 if ($hagsOff) { Write-Host 'Hardware-accelerated GPU scheduling is off: frame generation will not work until it is on.' }
 
-# 4. Start (play-foxhound.ps1 builds target\release\victory.exe the first time).
+# 4. Start (play-foxhound.ps1 builds target\release\victory.exe: a few minutes the first time, seconds after).
 if (-not (Test-Path $victory)) { Write-Host 'First start: building the layer, a few minutes ...' }
 Write-Host "Starting GTA VI: $what"
 Write-Host 'In the game: F1 settings menu, F3 stats panel. Keep this window open while playing.'

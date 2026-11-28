@@ -429,6 +429,76 @@ fn log_file(logs: &Path) -> Result<PathBuf> {
     Ok(logs.join(format!("{LOG_PREFIX}{}-{}.log", stamp(now), std::process::id())))
 }
 
+/// The commit this program was built from (build.rs), or `unknown`.
+const BUILD_COMMIT: &str = env!("VICTORY_BUILD_COMMIT");
+/// Whether tracked files differed from that commit when it was built.
+const BUILD_DIRTY: bool = matches!(env!("VICTORY_BUILD_DIRTY").as_bytes(), b"1");
+
+/// A commit and whether tracked files differ from it, as a log says it.
+fn commit_said(commit: &str, dirty: bool) -> String {
+    if dirty { format!("{commit}, with changes not committed") } else { commit.to_owned() }
+}
+
+/// What is wrong when a build of `built` (`unknown` where build.rs could not
+/// ask git) runs while its checkout is at `checkout`: a run once measured a
+/// build older than the checkout it was logged as (2026-11-28). Nothing when
+/// they agree, or when both have changes not committed (whether the same ones
+/// is not known). scripts\play-foxhound.ps1 says the same.
+fn source_warning(built: &str, built_dirty: bool, checkout: &str, checkout_dirty: bool) -> Option<String> {
+    let short = |c: &str| c.get(..10).unwrap_or(c).to_owned();
+    if built == "unknown" {
+        Some(format!("this victory.exe does not know the commit it was built from; the checkout is at {}", short(checkout)))
+    } else if built != checkout {
+        Some(format!(
+            "this victory.exe was built from {}, but its checkout is now at {}: this run is of the build, not the checkout",
+            short(built),
+            short(checkout)
+        ))
+    } else if checkout_dirty && !built_dirty {
+        Some("the checkout has changes not committed that this victory.exe was built without".to_owned())
+    } else {
+        None
+    }
+}
+
+/// The log's lines on what this program was built from and, where it sits in
+/// a checkout's `target\<profile>\` (a build of one's own), that checkout. It
+/// cannot build itself again, so a build older than its checkout says so here
+/// and in the window.
+fn source_lines(program: &Path) -> String {
+    let mut lines = format!("# run: built from: {}\n", commit_said(BUILD_COMMIT, BUILD_DIRTY));
+    let Some(repo) = program
+        .parent()
+        .and_then(Path::parent)
+        .filter(|target| target.file_name().is_some_and(|n| n.eq_ignore_ascii_case("target")))
+        .and_then(Path::parent)
+        .filter(|repo| repo.join(".git").exists())
+    else {
+        return lines;
+    };
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    };
+    let Some(commit) = git(&["rev-parse", "HEAD"]) else { return lines };
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+    // Changes to the program's sources, as build.rs counts them (an edited note is none).
+    let status = ["status", "--porcelain", "--untracked-files=no", "--", "apps", "crates", "Cargo.toml", "Cargo.lock"];
+    let dirty = git(&status).is_some_and(|s| !s.is_empty());
+    lines += &format!("# run: checkout: {branch} at {}\n", commit_said(&commit, dirty));
+    if let Some(warning) = source_warning(BUILD_COMMIT, BUILD_DIRTY, &commit, dirty) {
+        println!("Warning: {warning}. Build it again: cargo build --release --locked -p victory");
+        lines += &format!("# run: warning: {warning}\n");
+    }
+    lines
+}
+
 /// The start of the built-in launcher's log names (scripts\play-foxhound.ps1's
 /// are `victory-nvidia-<date>-<time>.log`, kept apart from these).
 const LOG_PREFIX: &str = "victory-nvidia-play-";
@@ -916,7 +986,8 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         println!("Beside this program, loaded in its place by Windows: {} (a mod, e.g. MFG Unlocker).", mods.join(", "));
         format!("# beside victory.exe (mods, loaded instead of Windows' own): {}\n", mods.join(" "))
     };
-    std::fs::write(&log, format!("# console={console} build=release switches: {}\n{mods_line}", line.join(" ")))
+    let source = source_lines(&program);
+    std::fs::write(&log, format!("# console={console} build=release switches: {}\n{mods_line}{source}", line.join(" ")))
         .with_context(|| format!("writing {}", log.display()))?;
     println!("Log: {}", log.display());
     s.insert("VICTORY_LOG_FILE".to_owned(), log.to_string_lossy().into_owned());
@@ -994,6 +1065,19 @@ mod tests {
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    #[test]
+    fn a_build_older_than_its_checkout_is_told() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        assert_eq!(source_warning(&a, false, &a, false), None);
+        assert_eq!(source_warning(&a, true, &a, true), None);
+        assert_eq!(source_warning(&a, true, &a, false), None);
+        let moved = source_warning(&a, false, &b, false).expect("another commit is told");
+        assert!(moved.contains("aaaaaaaaaa") && moved.contains("bbbbbbbbbb"), "{moved}");
+        assert!(source_warning(&a, false, &a, true).is_some(), "changes the build has not are told");
+        assert!(source_warning("unknown", false, &a, false).is_some(), "a build that does not know is told");
+        assert!(BUILD_COMMIT == "unknown" || BUILD_COMMIT.len() == 40, "{BUILD_COMMIT}");
     }
 
     #[test]
