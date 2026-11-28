@@ -75,9 +75,14 @@ pub(crate) const SPIN: usize = 20;
 /// the range to what it makes read-only (1), where it has nothing to ask
 /// Windows between them; 0: it takes the lock for each (`crate::watch::guard`).
 pub(crate) const ONCE: usize = 21;
+/// Megabytes between two ranges of a submission up to which the write watch is asked about
+/// both in one asking (`crate::watch::ask_ahead`; 0: 8, as made). With the title's ray tracing
+/// 133 askings a frame are of 64 MB buffers that lie 64 MB and more apart, 64-88 us each,
+/// where one asking over 1 GiB takes 156 us (run 61).
+pub(crate) const GAP: usize = 22;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 22] = [
+const KNOBS: [(&str, i64); 23] = [
     ("reuse", 1),
     ("zero", 1),
     ("a", 0),
@@ -100,8 +105,9 @@ const KNOBS: [(&str, i64); 22] = [
     ("p", 0),
     ("spin", 0),
     ("once", 0),
+    ("gap", 0),
 ];
-static VALUES: [AtomicI64; 22] = [const { AtomicI64::new(0) }; 22];
+static VALUES: [AtomicI64; 23] = [const { AtomicI64::new(0) }; 23];
 
 /// Switch `p`, asked by the submitting thread before each submission: its
 /// priority is "highest" with 1 or 2, "above normal" (as made) with 0. (The

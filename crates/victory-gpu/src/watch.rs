@@ -355,13 +355,18 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
+    // (Lab: switch `gap` gives the megabytes in place of [`AHEAD_GAP`]'s 8.)
+    let gap = match crate::lab::knob(crate::lab::GAP) {
+        mb if mb > 0 => ((mb as usize) << 20) / PAGE,
+        _ => AHEAD_GAP,
+    };
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + gap
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
