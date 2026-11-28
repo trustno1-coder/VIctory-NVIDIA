@@ -13,6 +13,15 @@ pub enum Console {
 }
 
 impl Console {
+    /// The GPU's pipes and packers, which the addresses of the XOR swizzle
+    /// modes depend on.
+    pub fn pipes(self) -> victory_formats::texture::PipeConfig {
+        match self {
+            Console::SeriesX => victory_formats::texture::PipeConfig::Pipes32Packers8,
+            Console::SeriesS => victory_formats::texture::PipeConfig::Pipes8Packers4,
+        }
+    }
+
     /// Title memory in bytes: (GPU-optimal, standard). Series X in the
     /// advanced configuration; Series S has one range, counted as standard
     /// (7,776 MiB, the published console-mode figure).

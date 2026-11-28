@@ -3533,7 +3533,10 @@ pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
 
 /// Texture `this`'s console layout (one plane), where it lies in title
 /// memory and the bytes that layout takes, for `crate::texback`; `None` for
-/// a buffer or a texture with planes.
+/// a buffer or a texture with planes. A texture in an XOR mode at a block
+/// boundary (as the ocean's height map in `SW_64KB_R_X`) is addressed with
+/// the console's pipes and packers
+/// ([`victory_formats::texture::Layout::configure_xor`]).
 #[cfg(windows)]
 pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
     if this.is_null() {
@@ -3544,10 +3547,13 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
         return None;
     }
     let t = texture_layout(&r.desc)?;
-    let [plane] = &t.planes[..] else {
-        return None;
-    };
-    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+    let [mut plane]: [_; 1] = t.planes.try_into().ok()?;
+    let at = r.data() as usize;
+    // The XOR modes' addresses assume a block-aligned start.
+    if at.is_multiple_of(plane.layout.alignment as usize) {
+        plane.layout.configure_xor(crate::console::current().pipes());
+    }
+    Some((plane.layout, at, t.size as usize))
 }
 
 /// The bytes of title memory a texture with the resource description
@@ -3984,6 +3990,26 @@ mod tests {
             mip_levels: mips,
             layout: 0,
             ..buffer(0)
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn xor_layouts_are_addressed_at_a_block_boundary() {
+        // SW_4KB_S always; the XOR modes (SW_64KB_R_X, SW_64KB_S_X) only at
+        // a 64 KiB boundary.
+        for (swizzle, bias, addressable) in [(0x105, 0, true), (0x11b, 0, true),
+            (0x11b, 256, false), (0x119, 0, true), (0x119, 4096, false)] {
+            let desc = ResourceDesc { layout: swizzle, flags: 4, ..texture(256, 256, 41, 1) };
+            let bytes = footprint(&desc).unwrap().size as usize;
+            let memory = vec![0u8; bytes + 65536 + bias];
+            let at = (memory.as_ptr() as usize).next_multiple_of(65536) + bias;
+            let mut r = std::ptr::null();
+            assert_eq!(create_at_address(std::ptr::null(), at as u64, &desc, 0,
+                std::ptr::null(), &PAGEABLE_IIDS[0], &mut r), object::S_OK);
+            let destination = title_texture(r).map(|(layout, base, extent)| (layout.addressable(), base, extent));
+            assert_eq!(destination, Some((addressable, at, bytes)), "layout {swizzle:#x}, {bias} bytes off");
+            assert_eq!(resource_release(r), 0);
         }
     }
 
