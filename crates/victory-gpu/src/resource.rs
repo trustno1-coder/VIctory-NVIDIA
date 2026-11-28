@@ -2492,6 +2492,12 @@ fn slot_evict_settings() -> Option<(u64, u64, u64)> {
     })
 }
 
+/// Whether [`slot_evict`] is on (`VICTORY_SLOT_EVICT=1`), for its log line.
+#[cfg(windows)]
+pub(crate) fn slot_evict_on() -> bool {
+    slot_evict_settings().is_some()
+}
+
 /// How many bytes over `percent` of `budget` the card's `used` is.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn excess(budget: u64, used: u64, percent: u64) -> u64 {
