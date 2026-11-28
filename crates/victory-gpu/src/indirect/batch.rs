@@ -94,15 +94,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[1] = g.y;
             record[2] = g.z;
         } else {
+            // The console supplies only X for mesh dispatches.
             if (record[0] > 65535u) {
                 record[0] = 0;
                 record[1] = 0;
                 record[2] = 0;
+            } else {
+                record[1] = 1;
+                record[2] = 1;
             }
             asked = record[0];
-            record[1] = min(record[1], 1u);
-            record[2] = min(record[2], 1u);
-            cost = record[0] * record[1] * record[2] * 128u;
+            cost = record[0] * 128u;
         }
         cost *= job.x >> 16;
     }

@@ -127,19 +127,13 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else if (active) {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = src_args.Load3(src_at);
-        // A record over the most a dispatch runs is a slot the title has
-        // not filled (the title leaves all ones there): empty,
-        // and not counted below either. (65,535 groups of meshlets read
-        // through the garbage beside it read past every buffer.)
-        if (g.x > 65535u) {
-            g = uint3(0, 0, 0);
+        // The console supplies only X for mesh dispatches. Unfilled slots can have X above 65535.
+        uint x = src_args.Load(src_at);
+        if (x <= 65535u) {
+            asked = x;
+            cost = x * 128u;
+            groups = uint3(x, 1u, 1u);
         }
-        asked = g.x;
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128u;
-        groups = g;
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
@@ -2295,15 +2289,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
     }
 
-    /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
-    /// wraparound across >64 huge indexed-draw records (`count = None`), while
-    /// preserving `StartIndexLocation`, `BaseVertexLocation`,
-    /// `StartInstanceLocation`, and custom stride padding, and leaving
-    /// `src_args` untouched.
-    /// A window of mesh records clamped ahead: the filled ones come out as
-    /// they are and are charged, the slots of all ones come out empty and
-    /// charge nothing; clamped as single records the same slots are clamped
-    /// to the most and spend the budget.
+    /// Filled mesh records with only X set must run, and unused slots must
+    /// remain empty without charging the budget.
     #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
         let Some(mut warp) = WarpHarness::new() else {
@@ -2312,11 +2299,11 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         const KIND_MESH: u32 = 10;
         const STRIDE: u32 = 32;
         const RECORDS: u32 = 16;
-        let filled = [5u32, 0, 519];
+        let filled = [[1593u32, 0, 0], [0, 1, 1], [519, u32::MAX, 0]];
         let total = (STRIDE * RECORDS) as usize;
         let mut src = vec![0xffu8; total];
-        for (i, groups) in filled.into_iter().enumerate() {
-            let words = [groups, 1, 1, 0xAB00 + i as u32];
+        for (i, [x, y, z]) in filled.into_iter().enumerate() {
+            let words = [x, y, z, 0xAB00 + i as u32];
             for (w, word) in words.into_iter().enumerate() {
                 let at = i * STRIDE as usize + w * 4;
                 src[at..at + 4].copy_from_slice(&word.to_le_bytes());
@@ -2362,18 +2349,18 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                     std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
                 )
             };
-            for (i, groups) in filled.into_iter().enumerate() {
+            for (i, [groups, ..]) in filled.into_iter().enumerate() {
                 let rec = &out[i * 8..i * 8 + 4];
-                assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
+                assert_eq!(rec, [groups, 1, 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
             }
-            let charged_filled = (5 + 519) * 128;
+            let charged_filled = (1593 + 519) * 128;
             // As one window ahead of its draws and one by one alike.
             for i in filled.len()..RECORDS as usize {
                 assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
                 assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
             }
             assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
-            assert_eq!(largest, 519, "and are not counted as asked for");
+            assert_eq!(largest, 1593, "and are not counted as asked for");
         }
     }
 
@@ -3102,7 +3089,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let (back, back_ptr, _) = warp.shared_buffer(64 << 10);
         let dst = warp.default_uav(64 << 10);
         let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
-        for (i, (kind, _)) in records.iter().enumerate().step_by(3) {
+        for (i, (kind, input)) in records.iter().enumerate().step_by(3) {
             let offset = i as u64 * 32;
             let words = batch::words(*kind).unwrap();
             let stride = words * 4;
@@ -3142,8 +3129,11 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 let budget: Vec<u32> = (0..3).map(|k| unsafe { budget_ptr.cast::<u32>().add(k).read_volatile() }).collect();
                 seen.push((read(back_ptr), budget));
             }
-            // (A mesh record that asks for nothing notes nothing.)
-            assert_eq!(seen[0], seen[1], "record {i} of kind {kind}: {:?}", records[i].1);
+            if *kind == 10 && input[0] <= 65535 {
+                assert_eq!(seen[1].0, [input[0], 1, 1]);
+                assert_eq!(seen[1].1[0], input[0] * 128);
+            }
+            assert_eq!(seen[0], seen[1], "record {i} of kind {kind}: {input:?}");
         }
     }
 
