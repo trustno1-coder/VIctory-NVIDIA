@@ -5814,10 +5814,44 @@ mod many_askers_tests {
     }
 
     /// A range's bits are all of its blocks', whatever lies beside them.
+    #[test]
+    fn bits_of_ranges() {
+        static BITS: super::Bits = super::Bits::new();
+        let blocks = [0usize, 1, 63, 64, 65, 127, 128, 200, 65535, 65536, 65537, 1 << 20, (1 << 31) - 1];
+        for &b in &blocks {
+            assert!(!BITS.all(b, b + 1));
+            BITS.set(b);
+            assert!(BITS.all(b, b + 1));
+        }
+        assert!(BITS.all(0, 2) && BITS.all(63, 66) && BITS.all(127, 129) && BITS.all(65535, 65538));
+        assert!(!BITS.all(0, 3) && !BITS.all(62, 64) && !BITS.all(65534, 65536) && !BITS.all(5, 5));
+        for b in 300..700 {
+            BITS.set(b);
+        }
+        assert!(BITS.all(300, 700) && !BITS.all(299, 700) && !BITS.all(300, 701));
+        BITS.clear(511);
+        assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
+        assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+        // Cleared by ranges, whatever lies beside them; to the end of all.
+        BITS.clear_all(310, 400);
+        assert!(!BITS.any(310, 400) && BITS.all(300, 310) && BITS.all(400, 511) && BITS.all(512, 700));
+        BITS.clear_all(65535, 65536);
+        assert!(!BITS.any(65535, 65536) && BITS.all(65536, 65538));
+        BITS.clear_all(0, usize::MAX);
+        assert!(!BITS.any(0, 1 << 31));
+        assert!(!BITS.swap_on(70) && BITS.swap_on(70) && BITS.all(70, 71));
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
     /// Private write-watched memory as large as a seal takes, asked about
     /// once (clean from here on).
     fn sealable() -> (usize, usize, usize) {
-        use windows_sys::Win32::System::Memory::{MEM_WRITE_WATCH, VirtualAlloc};
         // SAFETY: a plain allocation.
         let at = unsafe { VirtualAlloc(std::ptr::null(), SEAL_LEAST, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
         assert_ne!(at, 0);
@@ -5876,7 +5910,6 @@ mod many_askers_tests {
 
     #[test]
     fn our_writes_the_kernels_and_a_free_open_a_seal() {
-        use windows_sys::Win32::System::Memory::VirtualFree;
         let (at, first, last) = sealable();
         seal_now(first, last);
         writing(at + 100, 10);
@@ -5898,35 +5931,7 @@ mod many_askers_tests {
         title_memory_freed(at, 0);
         assert!(writable(at));
         // SAFETY: ours.
-        assert_ne!(unsafe { VirtualFree(at as *mut _, 0, windows_sys::Win32::System::Memory::MEM_RELEASE) }, 0);
+        assert_ne!(unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) }, 0);
         assert!(!sealed(first, last));
-    }
-
-    #[test]
-    fn bits_of_ranges() {
-        static BITS: super::Bits = super::Bits::new();
-        let blocks = [0usize, 1, 63, 64, 65, 127, 128, 200, 65535, 65536, 65537, 1 << 20, (1 << 31) - 1];
-        for &b in &blocks {
-            assert!(!BITS.all(b, b + 1));
-            BITS.set(b);
-            assert!(BITS.all(b, b + 1));
-        }
-        assert!(BITS.all(0, 2) && BITS.all(63, 66) && BITS.all(127, 129) && BITS.all(65535, 65538));
-        assert!(!BITS.all(0, 3) && !BITS.all(62, 64) && !BITS.all(65534, 65536) && !BITS.all(5, 5));
-        for b in 300..700 {
-            BITS.set(b);
-        }
-        assert!(BITS.all(300, 700) && !BITS.all(299, 700) && !BITS.all(300, 701));
-        BITS.clear(511);
-        assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
-        assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
-        // Cleared by ranges, whatever lies beside them; to the end of all.
-        BITS.clear_all(310, 400);
-        assert!(!BITS.any(310, 400) && BITS.all(300, 310) && BITS.all(400, 511) && BITS.all(512, 700));
-        BITS.clear_all(65535, 65536);
-        assert!(!BITS.any(65535, 65536) && BITS.all(65536, 65538));
-        BITS.clear_all(0, usize::MAX);
-        assert!(!BITS.any(0, 1 << 31));
-        assert!(!BITS.swap_on(70) && BITS.swap_on(70) && BITS.all(70, 71));
     }
 }
