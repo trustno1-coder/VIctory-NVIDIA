@@ -583,14 +583,45 @@ thread_local! {
 /// asked about, the 4 KiB pages found written and the nanoseconds.
 static ASKS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// The submitting thread's askings by size (under 1 MB, to 8, to 64, to 256, more): each the
+/// askings, the kilobytes and the nanoseconds since the last frame-rate line.
+static ASK_SIZES: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+
+/// Its askings of 8 MB and more, by where they begin (MB) and their size (MB): how often, and
+/// the nanoseconds.
+static ASK_BIG: std::sync::Mutex<Vec<(usize, usize, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
 /// One asking of the kernel's write watch, begun at `began`, about `kb`
-/// kilobytes, which found `found` pages written.
-pub(crate) fn asked(kb: usize, found: usize, began: Instant) {
+/// kilobytes from `start`, which found `found` pages written.
+pub(crate) fn asked(start: usize, kb: usize, found: usize, began: Instant) {
+    let ns = began.elapsed().as_nanos() as u64;
     let at = if SUBMITS.get() { 0 } else { 4 };
     ASKS[at].fetch_add(1, Relaxed);
     ASKS[at + 1].fetch_add(kb as u64, Relaxed);
     ASKS[at + 2].fetch_add(found as u64, Relaxed);
-    ASKS[at + 3].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    ASKS[at + 3].fetch_add(ns, Relaxed);
+    if at == 0 {
+        let size = match kb >> 10 {
+            0 => 0,
+            1..8 => 1,
+            8..64 => 2,
+            64..256 => 3,
+            _ => 4,
+        };
+        ASK_SIZES[size * 3].fetch_add(1, Relaxed);
+        ASK_SIZES[size * 3 + 1].fetch_add(kb as u64, Relaxed);
+        ASK_SIZES[size * 3 + 2].fetch_add(ns, Relaxed);
+        if size >= 2 {
+            let (mb_at, mb) = (start >> 20, kb >> 10);
+            let mut big = ASK_BIG.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = big.iter().position(|b| b.0 == mb_at && b.1 == mb) {
+                big[at].2 += 1;
+                big[at].3 += ns;
+            } else if big.len() < 4096 {
+                big.push((mb_at, mb, 1, ns));
+            }
+        }
+    }
 }
 
 #[link(name = "kernel32")]
@@ -978,6 +1009,30 @@ pub(crate) fn log(frames: f64) {
             a[5] / 1024.0,
             a[6],
             a[7] / 1e6
+        );
+    }
+    let sizes: Vec<f64> = ASK_SIZES.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let mut big = std::mem::take(&mut *ASK_BIG.lock().unwrap_or_else(|e| e.into_inner()));
+    if sizes.iter().step_by(3).sum::<f64>() > 0.0 {
+        big.sort_by_key(|b| std::cmp::Reverse(b.3));
+        let kinds = big.len();
+        let top: Vec<String> = big
+            .iter()
+            .take(8)
+            .map(|b| format!("{:#x} MB + {} MB: {:.1} times {:.2} ms", b.0, b.1, b.2 as f64 / frames, b.3 as f64 / frames / 1e6))
+            .collect();
+        let names = ["under 1 MB", "1 to 8 MB", "8 to 64 MB", "64 to 256 MB", "256 MB and more"];
+        let by: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("{n}: {:.1} askings over {:.0} MB {:.2} ms", sizes[i * 3], sizes[i * 3 + 1] / 1024.0, sizes[i * 3 + 2] / 1e6))
+            .collect();
+        tracing::info!(
+            "the submitting thread's askings of the write watch per frame, by size (lab): {}; of 8 MB and more, {} kinds, the costliest by \
+             where they begin and their size: {}",
+            by.join("; "),
+            kinds,
+            top.join("; ")
         );
     }
     let stood: Vec<String> = STOOD

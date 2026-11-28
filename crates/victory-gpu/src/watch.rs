@@ -291,7 +291,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         } != 0;
         drop(piece);
         // (Lab: what the askings are and cost, in every build.)
-        crate::lab::asked((last - first) * (PAGE >> 10), if failed { 0 } else { count }, began);
+        crate::lab::asked(first * PAGE, (last - first) * (PAGE >> 10), if failed { 0 } else { count }, began);
         #[cfg(feature = "diagnostics")]
         {
             tally(10, u64::from(failed));
