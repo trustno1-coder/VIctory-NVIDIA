@@ -26,6 +26,14 @@
 //!   with an effect stands between them (another thread's unsynchronised
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
+//! - [`LICM`]: an instruction in a loop whose operands come from before the
+//!   loop, and which cannot fault or change anything, is computed once in
+//!   the block that enters the loop (made for it when the loop's one way in
+//!   is a conditional branch). A call (a handle, a constant buffer read) is
+//!   moved only from a block every exit of the loop passes through, so it
+//!   is made exactly when the loop ran it before. Wave operations and reads
+//!   of memory stay where they are. Off unless asked: no card has measured
+//!   it yet.
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
@@ -33,8 +41,8 @@
 use std::collections::HashMap;
 
 use super::{
-    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
-    successors,
+    Attr, Bin, Cast, Const, Func, Inst, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand,
+    pred, successors,
 };
 
 /// Dead-code elimination.
@@ -60,14 +68,17 @@ pub const FIRST: u32 = 32;
 /// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
 /// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
+/// What a loop computes the same way on every pass, computed once before
+/// it.
+pub const LICM: u32 = 128;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | LICM;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+/// The passes that run when nothing says which: every one but [`WIDE`] and
+/// [`LICM`], which no card has shown a gain for yet
+/// (`VICTORY_SHADER_OPT=255` asks for both, `191` for `LICM` alone).
+pub const DEFAULT: u32 = ALL & !WIDE & !LICM;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -242,6 +253,9 @@ impl Module {
                     break;
                 }
             }
+        }
+        if passes & LICM != 0 {
+            self.hoist();
         }
         if passes & DEAD != 0 {
             self.drop_dead();
@@ -1213,6 +1227,232 @@ impl Module {
     }
 }
 
+/// A natural loop: its header, its blocks, and the blocks in it with a way
+/// out.
+struct Loop {
+    header: usize,
+    blocks: Vec<bool>,
+    size: usize,
+    exiting: Vec<usize>,
+}
+
+impl Module {
+    /// [`LICM`]. Rounds until nothing moves: a value moved out of an inner
+    /// loop lands in a block of the outer one, which the next loop out may
+    /// take further.
+    fn hoist(&mut self) -> bool {
+        let effects = self.effects();
+        let mut moved = false;
+        for _ in 0..32 {
+            match self.hoist_round(&effects) {
+                Round::Entered => {}
+                Round::Moved => moved = true,
+                Round::Done => break,
+            }
+        }
+        moved
+    }
+
+    /// The natural loops of the reached blocks, inner ones first, and a
+    /// test of dominance.
+    fn loops(&self, tree: &Tree) -> (Vec<Loop>, Dom) {
+        let n = self.blocks.len();
+        // Entry and exit times of a walk of the dominator tree: `a`
+        // dominates `b` when `b`'s span lies in `a`'s.
+        let (mut enter, mut leave) = (vec![usize::MAX; n], vec![0; n]);
+        if n > 0 {
+            let mut clock = 1;
+            enter[0] = 0;
+            let mut stack = vec![(0usize, 0usize)];
+            while let Some(top) = stack.last_mut() {
+                let (b, k) = *top;
+                top.1 += 1;
+                if let Some(&c) = tree.children[b].get(k) {
+                    enter[c] = clock;
+                    clock += 1;
+                    stack.push((c, 0));
+                } else {
+                    leave[b] = clock;
+                    clock += 1;
+                    stack.pop();
+                }
+            }
+        }
+        let dom = Dom { enter, leave };
+        let dominates = |a: usize, b: usize| dom.dominates(a, b);
+        let mut latches: Vec<(usize, Vec<usize>)> = Vec::new();
+        for &b in &tree.order {
+            for &h in successors(self.blocks[b].term).iter() {
+                if dominates(h, b) {
+                    match latches.iter_mut().find(|l| l.0 == h) {
+                        Some(l) => l.1.push(b),
+                        None => latches.push((h, vec![b])),
+                    }
+                }
+            }
+        }
+        let mut loops: Vec<Loop> = latches
+            .into_iter()
+            .map(|(header, latch)| {
+                let mut blocks = vec![false; n];
+                blocks[header] = true;
+                let mut stack = latch;
+                while let Some(b) = stack.pop() {
+                    if !blocks[b] {
+                        blocks[b] = true;
+                        stack.extend(tree.preds[b].iter().copied());
+                    }
+                }
+                let size = blocks.iter().filter(|&&x| x).count();
+                let exiting = (0..n)
+                    .filter(|&b| {
+                        blocks[b] && successors(self.blocks[b].term).iter().any(|&s| !blocks[s])
+                    })
+                    .collect();
+                Loop {
+                    header,
+                    blocks,
+                    size,
+                    exiting,
+                }
+            })
+            .collect();
+        loops.sort_by_key(|l| l.size);
+        (loops, dom)
+    }
+
+    /// The one block a loop is entered from, ending in a branch to its
+    /// header and nowhere else; `None` when there are several (or none).
+    fn way_in(&self, tree: &Tree, l: &Loop) -> Option<usize> {
+        let outside: Vec<usize> = tree.preds[l.header]
+            .iter()
+            .copied()
+            .filter(|&p| !l.blocks[p])
+            .collect();
+        match outside[..] {
+            [p] => Some(p),
+            _ => None,
+        }
+    }
+
+    fn hoist_round(&mut self, effects: &[Effect]) -> Round {
+        if self.blocks.is_empty() {
+            return Round::Done;
+        }
+        let tree = self.dominator_tree();
+        let (loops, dom) = self.loops(&tree);
+        // A loop entered by a conditional branch gets a block of its own to
+        // enter by. Its blocks are then no longer what was found: again.
+        let mut entered = false;
+        for l in &loops {
+            let Some(p) = self.way_in(&tree, l) else {
+                continue;
+            };
+            if let Some(Term::CondBr(c, t, f)) = self.blocks[p].term {
+                if t == f {
+                    continue;
+                }
+                let entry = self.new_block();
+                self.blocks[entry].term = Some(Term::Br(l.header));
+                let to = |x: usize| if x == l.header { entry } else { x };
+                self.blocks[p].term = Some(Term::CondBr(c, to(t), to(f)));
+                for &phi in &self.blocks[l.header].phis.clone() {
+                    if let Op::Phi(inc) = &mut self.insts[phi as usize].op {
+                        for x in inc.iter_mut().filter(|x| x.1 == p) {
+                            x.1 = entry;
+                        }
+                    }
+                }
+                entered = true;
+            }
+        }
+        if entered {
+            return Round::Entered;
+        }
+        // Where each instruction is.
+        let mut home = vec![usize::MAX; self.insts.len()];
+        for &b in &tree.order {
+            for &i in self.blocks[b].phis.iter().chain(&self.blocks[b].body) {
+                home[i as usize] = b;
+            }
+        }
+        let mut moved = false;
+        for l in &loops {
+            let Some(p) = self.way_in(&tree, l) else {
+                continue;
+            };
+            if !matches!(self.blocks[p].term, Some(Term::Br(h)) if h == l.header) {
+                continue;
+            }
+            for &b in tree.order.iter().filter(|&&b| l.blocks[b]) {
+                let every_pass = l.exiting.iter().all(|&e| dom.dominates(b, e));
+                let mut stays = Vec::with_capacity(self.blocks[b].body.len());
+                for &i in &self.blocks[b].body.clone() {
+                    let inst = &self.insts[i as usize];
+                    let mut invariant = true;
+                    for_each_operand(&inst.op, |v| {
+                        if let V::Inst(j) = v {
+                            let at = home[j as usize];
+                            invariant &= at != usize::MAX && !l.blocks[at];
+                        }
+                    });
+                    if invariant && self.may_move(inst, effects, every_pass) {
+                        self.blocks[p].body.push(i);
+                        home[i as usize] = p;
+                        moved = true;
+                    } else {
+                        stays.push(i);
+                    }
+                }
+                self.blocks[b].body = stays;
+            }
+        }
+        if moved { Round::Moved } else { Round::Done }
+    }
+
+    /// Whether `inst`, its operands computed before the loop, may be
+    /// computed there too: it cannot fault, write, depend on memory or on
+    /// which lanes run it; a call only if the loop ran it on every pass.
+    fn may_move(&self, inst: &Inst, effects: &[Effect], every_pass: bool) -> bool {
+        match &inst.op {
+            // A division by zero is undefined for integers; floats divide
+            // by zero without fault.
+            Op::Bin(Bin::UDiv | Bin::SDiv | Bin::URem, ..) => matches!(
+                self.types[inst.ty.0 as usize],
+                TypeDef::Float | TypeDef::Double
+            ),
+            Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) => true,
+            Op::Gep(..) => true,
+            Op::Call(f, _) => every_pass && effects[*f as usize] == Effect::Pure,
+            _ => false,
+        }
+    }
+}
+
+/// Entry and exit times of a walk of the dominator tree.
+struct Dom {
+    enter: Vec<usize>,
+    leave: Vec<usize>,
+}
+
+impl Dom {
+    /// Whether `a` dominates `b` (both reached): `b`'s span lies in `a`'s.
+    fn dominates(&self, a: usize, b: usize) -> bool {
+        self.enter[a] != usize::MAX
+            && self.enter[b] != usize::MAX
+            && self.enter[a] <= self.enter[b]
+            && self.leave[b] <= self.leave[a]
+    }
+}
+
+/// What a round of [`Module::hoist`] did.
+enum Round {
+    /// Made a loop a block to be entered by.
+    Entered,
+    Moved,
+    Done,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1304,6 +1544,220 @@ mod tests {
         assert_eq!(m.blocks[head].phis.len(), 1, "the counter");
         assert_eq!(body(&m, head), 2, "the step and the test");
         assert_eq!(body(&m, exit), 1);
+        m.write();
+    }
+
+    /// Where an instruction is: the block whose body holds it.
+    fn home(m: &Module, v: V) -> Option<usize> {
+        let V::Inst(i) = v else { return None };
+        (0..m.blocks.len()).find(|&b| m.blocks[b].body.contains(&i))
+    }
+
+    /// `b` -> `head` (a counted loop that leaves from its head) -> `exit`.
+    /// Returns the head, the exit, the counter and its step, the counter's
+    /// test still to be made.
+    fn counted(m: &mut Module, b: usize, entered: Option<V>) -> (usize, usize, V) {
+        let i32t = m.int(32);
+        let (zero, one) = (m.i32(0), m.i32(1));
+        let (head, exit) = (m.new_block(), m.new_block());
+        match entered {
+            Some(c) => m.terminate(b, Term::CondBr(c, head, exit)),
+            None => m.terminate(b, Term::Br(head)),
+        }
+        let count = m.phi(head, i32t);
+        let next = m.bin(head, Bin::Add, count, one);
+        let eight = m.i32(8);
+        let more = m.cmp(head, pred::IULT, next, eight);
+        m.terminate(head, Term::CondBr(more, head, exit));
+        m.set_phi(count, vec![(zero, b), (next, head)]);
+        m.terminate(exit, Term::Ret);
+        (head, exit, count)
+    }
+
+    #[test]
+    fn what_a_loop_computes_the_same_way_each_pass_is_computed_before_it() {
+        let Kit {
+            mut m,
+            b,
+            pure,
+            reads,
+            writes,
+        } = kit();
+        let (one, two) = (m.i32(1), m.i32(2));
+        let before = m.call(b, reads, vec![one, two]);
+        let (head, exit, count) = counted(&mut m, b, None);
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let wave = m.function("dx.op.waveActiveOp.i32", fty, Some(Attr::ReadOnly), false);
+        // Made of what was there before the loop: out.
+        let same = m.bin(head, Bin::Mul, before, two);
+        let same_too = m.bin(head, Bin::Xor, same, one);
+        let handle = m.call(head, pure, vec![same_too, one]);
+        // A counter's use, memory, other lanes, a division: in.
+        let varies = m.bin(head, Bin::Add, count, handle);
+        let read = m.call(head, reads, vec![before, one]);
+        let lanes = m.call(head, wave, vec![before, one]);
+        let divided = m.bin(head, Bin::UDiv, before, two);
+        let sum = m.bin(head, Bin::Add, varies, read);
+        let sum = m.bin(head, Bin::Add, sum, lanes);
+        let sum = m.bin(head, Bin::Add, sum, divided);
+        m.call(head, writes, vec![sum, one]);
+        m.optimise(LICM);
+        for v in [same, same_too, handle] {
+            assert_eq!(home(&m, v), Some(b), "{v:?} is computed once, before");
+        }
+        for v in [varies, read, lanes, divided, sum] {
+            assert_eq!(home(&m, v), Some(head), "{v:?} stays in the loop");
+        }
+        assert_eq!(body(&m, exit), 0);
+        m.write();
+    }
+
+    #[test]
+    fn a_loop_entered_by_a_conditional_branch_gets_a_block_to_enter_by() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (one, two) = (m.i32(1), m.i32(2));
+        let before = m.call(b, reads, vec![one, two]);
+        let go = m.cmp(b, pred::NE, before, one);
+        let (head, exit, count) = counted(&mut m, b, Some(go));
+        let same = m.bin(head, Bin::Shl, before, two);
+        let varies = m.bin(head, Bin::Add, count, same);
+        m.call(head, writes, vec![varies, one]);
+        let blocks = m.blocks.len();
+        m.optimise(LICM);
+        assert_eq!(m.blocks.len(), blocks + 1, "a block to enter the loop by");
+        let entry = blocks;
+        assert!(matches!(m.blocks[b].term, Some(Term::CondBr(_, t, f)) if t == entry && f == exit));
+        assert!(matches!(m.blocks[entry].term, Some(Term::Br(h)) if h == head));
+        let V::Inst(c) = count else { unreachable!() };
+        let Op::Phi(inc) = &m.insts[c as usize].op else {
+            unreachable!()
+        };
+        assert!(inc.iter().any(|x| x.1 == entry) && inc.iter().all(|x| x.1 != b));
+        assert_eq!(home(&m, same), Some(entry));
+        assert_eq!(home(&m, varies), Some(head));
+        m.write();
+    }
+
+    #[test]
+    fn a_call_on_some_passes_only_stays_and_arithmetic_leaves() {
+        let Kit {
+            mut m,
+            b,
+            pure,
+            reads,
+            writes,
+        } = kit();
+        let (one, two) = (m.i32(1), m.i32(2));
+        let before = m.call(b, reads, vec![one, two]);
+        // head (leaves here) -> some (on some passes) -> latch -> head
+        let i32t = m.int(32);
+        let (head, some, latch, exit) =
+            (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        m.terminate(b, Term::Br(head));
+        let count = m.phi(head, i32t);
+        let (zero, eight) = (m.i32(0), m.i32(8));
+        let more = m.cmp(head, pred::IULT, count, eight);
+        m.terminate(head, Term::CondBr(more, some, exit));
+        let odd = m.bin(some, Bin::And, count, one);
+        let take = m.cmp(some, pred::NE, odd, zero);
+        let call = m.call(some, pure, vec![before, two]);
+        let math = m.bin(some, Bin::Sub, before, two);
+        let both = m.bin(some, Bin::Add, call, math);
+        let kept = m.select(some, take, both, count);
+        m.call(some, writes, vec![kept, one]);
+        m.terminate(some, Term::Br(latch));
+        let next = m.bin(latch, Bin::Add, count, one);
+        m.terminate(latch, Term::Br(head));
+        m.set_phi(count, vec![(zero, b), (next, latch)]);
+        m.terminate(exit, Term::Ret);
+        m.optimise(LICM);
+        assert_eq!(home(&m, math), Some(b), "arithmetic cannot fault");
+        assert_eq!(
+            home(&m, call),
+            Some(some),
+            "not made where the loop did not make it"
+        );
+        assert_eq!(home(&m, both), Some(some));
+        m.write();
+    }
+
+    #[test]
+    fn a_value_the_same_in_both_loops_leaves_both() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
+        let before = m.call(b, reads, vec![one, two]);
+        let i32t = m.int(32);
+        let (outer, inner, outer_latch, exit) =
+            (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        m.terminate(b, Term::Br(outer));
+        let i = m.phi(outer, i32t);
+        m.terminate(outer, Term::Br(inner));
+        let j = m.phi(inner, i32t);
+        let same = m.bin(inner, Bin::Or, before, two);
+        let in_outer = m.bin(inner, Bin::Add, i, same);
+        let varies = m.bin(inner, Bin::Add, j, in_outer);
+        m.call(inner, writes, vec![varies, one]);
+        let j_next = m.bin(inner, Bin::Add, j, one);
+        let four = m.i32(4);
+        let again = m.cmp(inner, pred::IULT, j_next, four);
+        m.terminate(inner, Term::CondBr(again, inner, outer_latch));
+        m.set_phi(j, vec![(zero, outer), (j_next, inner)]);
+        let i_next = m.bin(outer_latch, Bin::Add, i, one);
+        let more = m.cmp(outer_latch, pred::IULT, i_next, four);
+        m.terminate(outer_latch, Term::CondBr(more, outer, exit));
+        m.set_phi(i, vec![(zero, b), (i_next, outer_latch)]);
+        m.terminate(exit, Term::Ret);
+        m.optimise(LICM);
+        assert_eq!(home(&m, same), Some(b), "out of both loops");
+        assert_eq!(
+            home(&m, in_outer),
+            Some(outer),
+            "out of the inner loop only"
+        );
+        assert_eq!(home(&m, varies), Some(inner));
+        m.write();
+    }
+
+    #[test]
+    fn a_float_division_leaves_and_an_integer_one_stays() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (one, two) = (m.i32(1), m.i32(2));
+        let before = m.call(b, reads, vec![one, two]);
+        let (head, _, count) = counted(&mut m, b, None);
+        let f32t = m.float();
+        let x = m.cast(head, Cast::Bitcast, before, f32t);
+        let (half, i32t) = (m.f32(2.0f32.to_bits()), m.int(32));
+        let fdiv = m.bin(head, Bin::SDiv, x, half);
+        let back = m.cast(head, Cast::Bitcast, fdiv, i32t);
+        let sdiv = m.bin(head, Bin::SDiv, before, two);
+        let urem = m.bin(head, Bin::URem, before, two);
+        let sum = m.bin(head, Bin::Add, back, sdiv);
+        let sum = m.bin(head, Bin::Add, sum, urem);
+        let sum = m.bin(head, Bin::Add, sum, count);
+        m.call(head, writes, vec![sum, one]);
+        m.optimise(LICM);
+        assert_eq!(home(&m, fdiv), Some(b));
+        assert_eq!(home(&m, sdiv), Some(head));
+        assert_eq!(home(&m, urem), Some(head));
         m.write();
     }
 
@@ -2175,6 +2629,7 @@ mod tests {
     #[test]
     fn every_pass_leaves_what_random_programs_store() {
         let mut removed = 0;
+        let mut hoisted = 0;
         for seed in 1..=400u64 {
             let plain = random_program(seed);
             let inputs: Vec<Vec<u32>> = (0..6u32)
@@ -2208,6 +2663,8 @@ mod tests {
                 LOADS,
                 FOLD | FACTS,
                 FOLD | REUSE | DEAD,
+                LICM,
+                LICM | FOLD | DEAD,
                 ALL,
             ] {
                 let mut m = random_program(seed);
@@ -2219,10 +2676,19 @@ mod tests {
                     let left: usize = m.blocks.iter().map(|b| b.body.len() + b.phis.len()).sum();
                     removed += written - left;
                 }
+                if passes == LICM
+                    && (0..plain.blocks.len()).any(|b| m.blocks[b].body != plain.blocks[b].body)
+                {
+                    hoisted += 1;
+                }
                 m.write();
             }
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+        assert!(
+            hoisted > 40,
+            "values moved out of loops in {hoisted} programs"
+        );
     }
 }
