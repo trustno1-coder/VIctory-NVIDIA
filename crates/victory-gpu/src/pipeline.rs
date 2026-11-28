@@ -207,12 +207,18 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
-    let stores = programs.is_empty() || programs.iter().any(stores);
+    let (stores, stores_by_address) = if programs.is_empty() {
+        (true, true)
+    } else {
+        programs.iter().fold((false, false), |(s, sa), prog| {
+            let (ps, psa) = classify_stores(prog);
+            (s || ps, sa || psa)
+        })
+    };
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
         _ => None,
     });
-    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -360,50 +366,57 @@ pub(crate) fn builder_runs() -> bool {
     true
 }
 
-/// Whether a console program can store to buffer memory: it has a buffer,
-/// typed-buffer, scalar-memory, flat or global store or atomic, or code
-/// that is not all known (an instruction of those kinds outside our table,
-/// an indirect jump, code that does not decode). Stores to textures
-/// (image instructions) and to the program's own scratch memory do not
-/// count: neither reaches a buffer's host copy. After upstream #413,
-/// which leaves scalar-memory stores out and counts image stores.
+/// Classifies a console program's store capabilities in a single decode
+/// pass, returning `(stores, stores_by_address)`.
+///
+/// `stores`: the program can store to buffer memory (buffer, typed-buffer,
+/// scalar-memory, flat or global store or atomic, or undecodable code).
+/// Stores to textures and scratch do not count.
+///
+/// `stores_by_address`: the program can store through raw addresses (flat
+/// or global store or atomic, or undecodable code).
 #[cfg(windows)]
-fn stores(program: &victory_shader::NativeProgram) -> bool {
+fn classify_stores(program: &victory_shader::NativeProgram) -> (bool, bool) {
     use victory_shader::gfx10::{Encoding, decode};
     let Ok(code) = decode(&program.code) else {
-        return true;
+        return (true, true);
     };
-    code.iter().any(|i| {
-        let name = i.name();
-        match i.encoding {
-            Encoding::Mubuf
-            | Encoding::Mtbuf
-            | Encoding::Smem
-            | Encoding::Flat
-            | Encoding::Global => name.is_none_or(|n| {
-                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
-            }),
-            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
-            _ => false,
+    let (mut stores, mut by_addr) = (false, false);
+    for i in code.iter() {
+        if !stores {
+            let name = i.name();
+            match i.encoding {
+                Encoding::Mubuf
+                | Encoding::Mtbuf
+                | Encoding::Smem
+                | Encoding::Flat
+                | Encoding::Global => {
+                    if name.is_none_or(|n| {
+                        (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+                    }) {
+                        stores = true;
+                    }
+                }
+                Encoding::Sop1 => {
+                    if name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) {
+                        stores = true;
+                    }
+                }
+                _ => {}
+            }
         }
-    })
-}
-
-/// Whether a console program can store to memory through raw addresses
-/// (`crate::memory`): a flat or global store or atomic, or code that does
-/// not decode. The programs that only walk ray-tracing structures do not,
-/// whatever they store through views.
-#[cfg(windows)]
-fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
-    code.iter().any(|i| {
-        matches!(i.encoding, Encoding::Flat | Encoding::Global)
+        if !by_addr
+            && matches!(i.encoding, Encoding::Flat | Encoding::Global)
             && i.name()
                 .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
-    })
+        {
+            by_addr = true;
+        }
+        if stores && by_addr {
+            break;
+        }
+    }
+    (stores, by_addr)
 }
 
 #[repr(C)]
