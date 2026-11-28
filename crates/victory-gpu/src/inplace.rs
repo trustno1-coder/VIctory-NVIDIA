@@ -66,7 +66,10 @@ pub(crate) fn probe_level() -> u8 {
 /// buffers that lies in private memory committed whole is not copied: a
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// except the big ones in the card's memory. With the launcher's
+/// `VICTORY_CARD_BUFFERS_MIN_KB=64` (or `VICTORY_CARD_ALL`) every registered
+/// title buffer is one of those big ones, so stage 2 then places windows
+/// only; it does not place buffers as its name suggests.
 ///
 /// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
 /// memory (the page pool) is turned down here: its section is made
@@ -75,9 +78,10 @@ pub(crate) fn probe_level() -> u8 {
 ///
 /// What it assumes, for 2: nothing reads title memory that a submission
 /// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// for that holds; with submissions in the air (the relay, on by default)
+/// it does not, since the flights' rules know shader writes only by the
+/// ranges copies declare. Do not combine 2 with late submissions: the host
+/// warns at startup when it sees the combination, but nothing gates it.
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows

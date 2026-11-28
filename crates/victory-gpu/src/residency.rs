@@ -1,4 +1,6 @@
-﻿//! Host-memory admission for speculative texture work and reusable upload storage.
+//! Host-memory admission for speculative texture work and reusable upload storage,
+//! and the placement ledger: which heap class the API reports for the host buffers
+//! the layer creates, and which copies had to stay in system memory.
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -118,7 +120,8 @@ pub(crate) fn refresh() {
                 frame = crate::frame::current(),
                 physical_free_mib = physical >> 20,
                 available_commit_mib = commit >> 20,
-                buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
+                vram_copy_mib = crate::shadow::live_span_bytes() >> 20,
+                system_fallback_copy_mib = fallback_live_bytes() >> 20,
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
                 game_filled_gpu_texture_mib = crate::resource::KINDS[1].load(Ordering::Relaxed) >> 20,
@@ -158,9 +161,341 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
     }
 }
 
+// --- Where the copies went -------------------------------------------------
+//
+// The admission rules above decide how much host memory the layer may take.
+// What the copy machinery (shadow.rs) and the host buffer creators (host.rs)
+// then do is recorded here: the heap class the API reports for every host
+// buffer made, and the copies that had to stay in system memory because no
+// device-local side was available. This changes no behaviour; it is the
+// ledger the separation work is measured with (`docs/memory-separation.md`).
+
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_CUSTOM, D3D12_HEAP_TYPE_DEFAULT,
+    D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD, D3D12_MEMORY_POOL_L0,
+    ID3D12Resource,
+};
+
+/// The heap class the API reports for a host buffer, from
+/// `ID3D12Resource::GetHeapProperties` (what the source asked for, before a
+/// driver's answer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HeapClass {
+    /// `DEFAULT`: GPU-owned, device-local memory as the system accounts it.
+    DeviceLocal,
+    /// `CUSTOM`/WRITE_BACK/L0: system memory the CPU maps and shaders reach.
+    CpuVisible,
+    /// `UPLOAD`: CPU-written staging.
+    Staging,
+    /// `READBACK`: GPU-to-CPU staging.
+    Readback,
+    /// `GPU_UPLOAD`: VRAM the CPU maps (resizable BAR).
+    MappedVram,
+    /// Anything else: the API answered differently than the creation site asked.
+    Other,
+}
+
+const CLASSES: usize = 6;
+
+impl HeapClass {
+    fn index(self) -> usize {
+        match self {
+            HeapClass::DeviceLocal => 0,
+            HeapClass::CpuVisible => 1,
+            HeapClass::Staging => 2,
+            HeapClass::Readback => 3,
+            HeapClass::MappedVram => 4,
+            HeapClass::Other => 5,
+        }
+    }
+}
+
+/// Buffers made since the start, as (count, bytes), by the class the API reports.
+static MADE_BY_CLASS: [[AtomicU64; 2]; CLASSES] = [const { [const { AtomicU64::new(0) }; 2] }; CLASSES];
+
+fn class_of_properties(props: &D3D12_HEAP_PROPERTIES) -> HeapClass {
+    if props.Type == D3D12_HEAP_TYPE_DEFAULT {
+        HeapClass::DeviceLocal
+    } else if props.Type == D3D12_HEAP_TYPE_UPLOAD {
+        HeapClass::Staging
+    } else if props.Type == D3D12_HEAP_TYPE_READBACK {
+        HeapClass::Readback
+    } else if props.Type == D3D12_HEAP_TYPE_GPU_UPLOAD {
+        HeapClass::MappedVram
+    } else if props.Type == D3D12_HEAP_TYPE_CUSTOM
+        && props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+        && props.MemoryPoolPreference == D3D12_MEMORY_POOL_L0
+    {
+        HeapClass::CpuVisible
+    } else {
+        HeapClass::Other
+    }
+}
+
+/// The class of a host buffer, as the API reports it now.
+pub(crate) fn class_of(resource: &ID3D12Resource) -> HeapClass {
+    let mut props = D3D12_HEAP_PROPERTIES::default();
+    // SAFETY: a live resource, and an out structure of the right type.
+    match unsafe { resource.GetHeapProperties(Some(&raw mut props), None) } {
+        Ok(()) => class_of_properties(&props),
+        Err(_) => HeapClass::Other,
+    }
+}
+
+/// A host buffer was created: count it by the class the API reports.
+pub(crate) fn placed(resource: &ID3D12Resource, bytes: u64) {
+    let [count, total] = &MADE_BY_CLASS[class_of(resource).index()];
+    count.fetch_add(1, Ordering::Relaxed);
+    total.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Why a copy has no device-local side (see `shadow::card_for`,
+/// `shadow::window_card_for` and `shadow::by_address`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Fallback {
+    /// The switch that makes device-local sides is off.
+    SwitchOff,
+    /// Too small, too big, or the path does not apply to it.
+    NotEligible,
+    /// The host compare machinery or the device is missing.
+    HostUnavailable,
+    /// The DXGI budget line refused it.
+    Budget,
+    /// The path's own byte cap refused it.
+    Cap,
+    /// D3D12 refused the allocation.
+    AllocationFailed,
+    /// A copy that is never given a device-local side by design (a view's own bytes).
+    ViewCopy,
+}
+
+const FALLBACKS: usize = 7;
+
+impl Fallback {
+    fn index(self) -> usize {
+        match self {
+            Fallback::SwitchOff => 0,
+            Fallback::NotEligible => 1,
+            Fallback::HostUnavailable => 2,
+            Fallback::Budget => 3,
+            Fallback::Cap => 4,
+            Fallback::AllocationFailed => 5,
+            Fallback::ViewCopy => 6,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Fallback::SwitchOff => "switch off",
+            Fallback::NotEligible => "not eligible",
+            Fallback::HostUnavailable => "host unavailable",
+            Fallback::Budget => "budget",
+            Fallback::Cap => "cap",
+            Fallback::AllocationFailed => "allocation failed",
+            Fallback::ViewCopy => "view copy",
+        }
+    }
+}
+
+/// Copies alive whose GPU-visible side is system memory, as (count, bytes), by reason;
+/// and those made since the start.
+static FALLBACK_LIVE: [[AtomicU64; 2]; FALLBACKS] = [const { [const { AtomicU64::new(0) }; 2] }; FALLBACKS];
+static FALLBACK_TOTAL: [[AtomicU64; 2]; FALLBACKS] = [const { [const { AtomicU64::new(0) }; 2] }; FALLBACKS];
+
+/// A copy without a device-local side was made: count it while it lives.
+pub(crate) fn fallback_add(bytes: u64, why: Fallback) {
+    if bytes == 0 {
+        return;
+    }
+    let i = why.index();
+    FALLBACK_LIVE[i][0].fetch_add(1, Ordering::Relaxed);
+    FALLBACK_LIVE[i][1].fetch_add(bytes, Ordering::Relaxed);
+    FALLBACK_TOTAL[i][0].fetch_add(1, Ordering::Relaxed);
+    FALLBACK_TOTAL[i][1].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Bytes of copies alive now whose GPU-visible side is system memory.
+pub(crate) fn fallback_live_bytes() -> u64 {
+    let mut bytes = 0u64;
+    for reason in [
+        Fallback::SwitchOff,
+        Fallback::NotEligible,
+        Fallback::HostUnavailable,
+        Fallback::Budget,
+        Fallback::Cap,
+        Fallback::AllocationFailed,
+        Fallback::ViewCopy,
+    ] {
+        bytes += FALLBACK_LIVE[reason.index()][1].load(Ordering::Relaxed);
+    }
+    bytes
+}
+
+/// Such a copy went.
+pub(crate) fn fallback_freed(bytes: u64, why: Fallback) {
+    if bytes == 0 {
+        return;
+    }
+    let i = why.index();
+    FALLBACK_LIVE[i][0].fetch_sub(1, Ordering::Relaxed);
+    FALLBACK_LIVE[i][1].fetch_sub(bytes, Ordering::Relaxed);
+}
+
+/// The MB figures the placement line prints for fallback bytes. Split out so a
+/// unit slip (the line once printed raw bytes as MB) has a test.
+fn fallback_mib(bytes: u64) -> u64 {
+    bytes >> 20
+}
+
+/// The placement line: what the API reported for the host buffers made since
+/// the start, the copies still living in system memory because no device-local
+/// side was available and why, and the system's DXGI groups to compare with.
+/// Logged every 5 seconds while `VICTORY_MEMORY_REPORT=1` is set or a
+/// fallback copy is alive.
+pub(crate) fn placement_line(memory: Option<[[u64; 4]; 2]>) {
+    /// Most useful first.
+    const ORDER: [Fallback; FALLBACKS] = [
+        Fallback::Budget,
+        Fallback::Cap,
+        Fallback::AllocationFailed,
+        Fallback::HostUnavailable,
+        Fallback::NotEligible,
+        Fallback::SwitchOff,
+        Fallback::ViewCopy,
+    ];
+    // `VICTORY_MEMORY_REPORT=0` silences the line; =1 forces it when no copy is
+    // in system memory; unset prints it only while such a copy is alive.
+    let asked = std::env::var_os("VICTORY_MEMORY_REPORT");
+    if asked.as_deref().is_some_and(|v| v == "0") {
+        return;
+    }
+    let forced = asked.is_some();
+    let live_bytes: u64 = ORDER.iter().map(|r| FALLBACK_LIVE[r.index()][1].load(Ordering::Relaxed)).sum();
+    if !forced && live_bytes == 0 {
+        return;
+    }
+    let (mut live_count, mut total_count, mut total_bytes) = (0u64, 0u64, 0u64);
+    let mut reasons = String::new();
+    for reason in ORDER {
+        let i = reason.index();
+        let n = FALLBACK_LIVE[i][0].load(Ordering::Relaxed);
+        let b = FALLBACK_LIVE[i][1].load(Ordering::Relaxed);
+        live_count += n;
+        total_count += FALLBACK_TOTAL[i][0].load(Ordering::Relaxed);
+        total_bytes += FALLBACK_TOTAL[i][1].load(Ordering::Relaxed);
+        if n != 0 {
+            reasons.push_str(&format!("{} {} MB, ", reason.name(), b >> 20));
+        }
+    }
+    if reasons.ends_with(", ") {
+        reasons.truncate(reasons.len() - 2);
+    }
+    let made = |class: HeapClass| {
+        let [count, bytes] = &MADE_BY_CLASS[class.index()];
+        (count.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed) >> 20)
+    };
+    let (dl_n, dl_mb) = made(HeapClass::DeviceLocal);
+    let (cv_n, cv_mb) = made(HeapClass::CpuVisible);
+    let (up_n, up_mb) = made(HeapClass::Staging);
+    let (rb_n, rb_mb) = made(HeapClass::Readback);
+    let (mv_n, mv_mb) = made(HeapClass::MappedVram);
+    let (ot_n, ot_mb) = made(HeapClass::Other);
+    let (local_used, local_budget, shared_used, shared_budget) = match memory {
+        Some([[budget, used, ..], [shared_budget, shared_used, ..]]) => {
+            (used >> 20, budget >> 20, shared_used >> 20, shared_budget >> 20)
+        }
+        None => (0, 0, 0, 0),
+    };
+    let (live_mb, total_mb) = (fallback_mib(live_bytes), fallback_mib(total_bytes));
+    let detail = if reasons.is_empty() { String::new() } else { format!(": {reasons}") };
+    tracing::info!(
+        "memory placement: host buffers the copy and transfer machinery made since the start, as the API reports them: \
+         device-local {dl_n} ({dl_mb} MB), CPU-visible {cv_n} ({cv_mb} MB), staging {up_n} ({up_mb} MB), \
+         readback {rb_n} ({rb_mb} MB), CPU-mapped VRAM {mv_n} ({mv_mb} MB), other {ot_n} ({ot_mb} MB); copies whose \
+         GPU-visible side is system memory, alive {live_count} ({live_mb} MB){detail}, {total_count} ({total_mb} MB) \
+         made since the start; DXGI local {local_used}/{local_budget} MB, shared {shared_used}/{shared_budget} MB"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heap_classes_come_from_the_heap_the_api_reports() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let of = |props: D3D12_HEAP_PROPERTIES| class_of_properties(&props);
+        assert_eq!(
+            of(D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            }),
+            HeapClass::DeviceLocal
+        );
+        assert_eq!(
+            of(D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            }),
+            HeapClass::Staging
+        );
+        assert_eq!(
+            of(D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            }),
+            HeapClass::Readback
+        );
+        assert_eq!(
+            of(D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+                ..Default::default()
+            }),
+            HeapClass::MappedVram
+        );
+        assert_eq!(
+            of(D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }),
+            HeapClass::CpuVisible
+        );
+        // A custom heap that is not the CPU-visible write-back one is not classified
+        // as system memory the shaders reach.
+        assert_eq!(
+            of(D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }),
+            HeapClass::Other
+        );
+    }
+
+    #[test]
+    fn fallback_bytes_are_printed_in_mib() {
+        assert_eq!(fallback_mib(0), 0);
+        assert_eq!(fallback_mib((1 << 20) - 1), 0);
+        assert_eq!(fallback_mib(1 << 20), 1);
+        assert_eq!(fallback_mib(4 << 20), 4);
+        assert_eq!(fallback_mib(3 << 30), 3 * 1024);
+    }
+
+    #[test]
+    fn a_fallback_copy_is_counted_while_it_lives_and_after() {
+        let live = || FALLBACK_LIVE[Fallback::Cap.index()][1].load(Ordering::Relaxed);
+        let made = || FALLBACK_TOTAL[Fallback::Cap.index()][1].load(Ordering::Relaxed);
+        let (live_before, made_before) = (live(), made());
+        fallback_add(1 << 20, Fallback::Cap);
+        assert_eq!(live(), live_before + (1 << 20));
+        assert_eq!(made(), made_before + (1 << 20));
+        fallback_freed(1 << 20, Fallback::Cap);
+        assert_eq!(live(), live_before);
+        assert_eq!(made(), made_before + (1 << 20), "what was made stays counted");
+    }
 
     #[test]
     fn bake_and_lookahead_leave_room_for_live_game_allocations() {

@@ -105,6 +105,19 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Bytes of this copy whose GPU-visible side is system memory because no
+    /// device-local side was made, and why ([crate::residency::Fallback]);
+    /// counted in [crate::residency] while the copy lives. The number is the
+    /// copy's allocation size (rounded up to the copy machinery's 64 KiB where
+    /// it rounds); a view's own copy counts the length asked for.
+    fallback: (u64, crate::residency::Fallback),
+    /// With [`by_address`]: how many bytes of its lifetime cap this copy holds.
+    address_card: u64,
+    /// How many bytes of [`WINDOW_CARD_BYTES`] this copy added; given back by
+    /// `Drop`. Only a device-local side is counted there: a window or by-address
+    /// copy that fell back to system memory does not consume the window VRAM
+    /// budget (it is counted in [`crate::residency`] instead).
+    window_card: u64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -114,10 +127,11 @@ struct Card {
     /// is copied into it as into any copy, and what changed in it goes to
     /// the card's side before the next submission.
     staging: ID3D12Resource,
-    /// The card side's bytes as they were when the submission's shaders
-    /// started, in the card's memory too: made when shader writes are
-    /// first declared for the copy, and compared with the card's side, on
-    /// the card, after each submission that declares some.
+    /// The card side's pieces as they were when the submission's shaders
+    /// started, in the card's memory too: 16 bytes of hashes per 64 KiB piece
+    /// (not a byte copy of the side), made when shader writes are first
+    /// declared for the copy and compared with the card's side, on the card,
+    /// after each submission that declares some.
     before: Mutex<Option<ID3D12Resource>>,
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
@@ -134,6 +148,29 @@ struct Card {
     me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+impl Card {
+    /// A copy's two sides: `staging` is the CPU's side it is made with.
+    fn new(staging: ID3D12Resource, size: u64) -> Card {
+        Card {
+            staging,
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            touched: Default::default(),
+            me: std::sync::OnceLock::new(),
+            size,
+        }
+    }
+}
+
+/// The side shaders see of a copy: a buffer in the card's own memory, or (with
+/// `VICTORY_CARD_ALL` / `VICTORY_WINDOWS_OWN`) a second system-memory buffer
+/// when the card had no room, with the reason no card side was made.
+enum CardSide {
+    Vram(ID3D12Resource),
+    Ram(ID3D12Resource, crate::residency::Fallback),
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -266,7 +303,7 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
-/// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).
+/// (`VICTORY_CARD_ROOM_FOR_BUFFERS`; on by default, =0 turns it off).
 ///
 /// The copies are made in one burst when the world loads (run 189: 94 of
 /// its 95 within two seconds, right before the first world frame), and
@@ -354,21 +391,33 @@ pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 pub(crate) fn live_span_bytes() -> u64 {
     CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + ADDRESS_CARD_USED.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
 }
 
+/// Bytes alive of windows' device-local sides, for the room lines.
+pub(crate) fn window_card_bytes() -> u64 {
+    WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes alive of by-address arenas' device-local sides, for the room lines.
+pub(crate) fn address_card_bytes() -> u64 {
+    ADDRESS_CARD_USED.load(Ordering::Relaxed)
+}
+
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
-/// bytes and their "before" twins' bytes.
-pub(crate) fn card_stats() -> [u64; 10] {
-    let mut out = [0u64; 10];
+/// bytes, their "before" twins' bytes, and the windows turned down since the
+/// start (count, bytes).
+pub(crate) fn card_stats() -> [u64; 12] {
+    let mut out = [0u64; 12];
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
     out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
-    out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
-        + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
-        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
+    out[8] = live_span_bytes();
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
+    out[10] = WINDOW_REFUSED[0].load(Ordering::Relaxed);
+    out[11] = WINDOW_REFUSED[1].load(Ordering::Relaxed);
     out
 }
 
@@ -379,23 +428,34 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 16
 }
 
-/// A buffer of `size` bytes in the card's memory for a title buffer's
-/// copy, if the copy is to be there: [`cards`] is on, the size is within
-/// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
-/// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = card_room_for(size);
-    if there.is_some() || !card_all() || size >= 1 << 30 {
-        return there;
+/// The side shaders see for a title buffer's copy of `size` bytes, if it is to
+/// have one: [`cards`] is on, the size is within [`card_limits`] and below
+/// 1 GiB (the compare counts in 32 bits), and the host has what it takes
+/// (`Host::card_ready`). `Err` is why not: the copy then stays single-sided in
+/// system memory, counted in [`crate::residency`] by the caller.
+fn card_for(size: u64) -> Result<CardSide, crate::residency::Fallback> {
+    match card_room_for(size) {
+        Ok(buffer) => Ok(CardSide::Vram(buffer)),
+        Err(why) => {
+            if !card_all() || size >= 1 << 30 || !cards() {
+                return Err(why);
+            }
+            // Two sides all the same, the card's in the PC's memory.
+            let Some(host) = host() else {
+                return Err(crate::residency::Fallback::HostUnavailable);
+            };
+            if !host.card_ready() {
+                return Err(crate::residency::Fallback::HostUnavailable);
+            }
+            let Some((buffer, _)) = host.shared_buffer(size) else {
+                // The copy stays single-sided staging, as before: the reason it
+                // has no card side is still the refusal, not this failure.
+                return Err(why);
+            };
+            CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+            Ok(CardSide::Ram(buffer, why))
+        }
     }
-    // Two sides all the same, the card's in the PC's memory.
-    let host = host()?;
-    if !cards() || !host.card_ready() {
-        return None;
-    }
-    let (buffer, _) = host.shared_buffer(size)?;
-    CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
 }
 
 /// Whether every title buffer's copy has two sides, however small
@@ -413,17 +473,20 @@ fn card_all() -> bool {
 }
 
 /// [`card_for`] in the card's own memory.
-fn card_room_for(size: u64) -> Option<ID3D12Resource> {
+fn card_room_for(size: u64) -> Result<ID3D12Resource, crate::residency::Fallback> {
+    use crate::residency::Fallback;
     if !cards() {
-        return None;
+        return Err(Fallback::SwitchOff);
     }
     let (least, most) = card_limits();
     if size < least || size >= 1 << 30 {
-        return None;
+        return Err(Fallback::NotEligible);
     }
-    let host = host()?;
+    let Some(host) = host() else {
+        return Err(Fallback::HostUnavailable);
+    };
     if !host.card_ready() {
-        return None;
+        return Err(Fallback::HostUnavailable);
     }
     crate::ahead::want_card();
     // Only while the card has room: with this copy on it, a fifth of the
@@ -458,23 +521,26 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
                 crate::frame::current()
             );
         }
-        return None;
+        return Err(Fallback::Budget);
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
+        return Err(Fallback::Cap);
     }
     // (one made ahead, if it is of that size and one is in store: `crate::ahead`)
     let ahead = if size == crate::ahead::SIZE { crate::ahead::card() } else { None };
-    let buffer = ahead.or_else(|| host.uav_buffer(size));
-    if buffer.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    match ahead.or_else(|| host.uav_buffer(size)) {
+        Some(buffer) => Ok(buffer),
+        None => {
+            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+            Err(Fallback::AllocationFailed)
+        }
     }
-    buffer
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
-/// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
+/// memory (`VICTORY_CARD_WINDOWS_MB`; unset follows the card's budget: none
+/// below an 8 GiB local budget, else 9% of it capped at 1024 MiB).
 ///
 /// Windows are two thirds of the PC memory the card shares (run 104: 861
 /// windows, 3,552 MB of 5,400), and every draw that takes vertices, indices
@@ -517,24 +583,49 @@ fn default_window_card_mb(local_vram_budget: Option<u64>) -> u64 {
     }
 }
 
-/// Bytes alive of windows' card sides ([`window_card_most`]).
+/// Bytes alive of windows' device-local card sides ([`window_card_most`]).
+/// A window whose side is system memory (`VICTORY_WINDOWS_OWN`) is not here:
+/// it lives in the placement ledger instead.
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// A buffer in the card's memory for a window of `size` bytes, if it is to
-/// be there ([`window_card_most`]).
-fn window_card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = window_room_for(size);
-    if there.is_some() || !windows_own() || !cards() {
-        return there;
+/// Windows whose device-local side was refused, since the start: count,
+/// bytes. Said like `CARD_REFUSED`: the first 64, then every 32nd.
+static WINDOW_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A window's device-local side was refused for `size` bytes: count it. The
+/// 5-second meter prints the counts (the refusal may happen under the windows'
+/// write lock, so nothing is logged from here).
+fn window_refused(size: u64) {
+    WINDOW_REFUSED[0].fetch_add(1, Ordering::Relaxed);
+    WINDOW_REFUSED[1].fetch_add(size, Ordering::Relaxed);
+}
+
+/// The side shaders see for a window of `size` bytes, if it is to have one
+/// ([`window_card_most`]); `Err` is why not.
+fn window_card_for(size: u64) -> Result<CardSide, crate::residency::Fallback> {
+    match window_room_for(size) {
+        Ok(buffer) => Ok(CardSide::Vram(buffer)),
+        Err(why) => {
+            if !windows_own() || !cards() {
+                return Err(why);
+            }
+            // Two sides all the same, the card's in the PC's memory.
+            let Some(host) = host() else {
+                return Err(crate::residency::Fallback::HostUnavailable);
+            };
+            if !host.card_ready() {
+                return Err(crate::residency::Fallback::HostUnavailable);
+            }
+            let Some((buffer, _)) = host.shared_buffer(size) else {
+                // As in `card_for`: the work is single-sided staging either way,
+                // and the reason no card side was made is the refusal.
+                return Err(why);
+            };
+            // The second side is system memory: it is counted in the placement
+            // ledger, not against the windows' device-local budget.
+            Ok(CardSide::Ram(buffer, why))
+        }
     }
-    // Two sides all the same, the card's in the PC's memory.
-    let host = host()?;
-    if !host.card_ready() {
-        return None;
-    }
-    let (buffer, _) = host.shared_buffer(size)?;
-    WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
 }
 
 /// The most bytes of windows outside buffers that lie in the card's memory
@@ -593,29 +684,37 @@ fn windows_own() -> bool {
 }
 
 /// [`window_card_for`] in the card's own memory.
-fn window_room_for(size: u64) -> Option<ID3D12Resource> {
+fn window_room_for(size: u64) -> Result<ID3D12Resource, crate::residency::Fallback> {
+    use crate::residency::Fallback;
     let most = window_card_most();
     if most == 0 || !cards() {
-        return None;
+        return Err(Fallback::SwitchOff);
     }
-    let host = host()?;
+    let Some(host) = host() else {
+        return Err(Fallback::HostUnavailable);
+    };
     if !host.card_ready() {
-        return None;
+        return Err(Fallback::HostUnavailable);
     }
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
-        return None;
+        window_refused(size);
+        return Err(Fallback::Budget);
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
-        return None;
+        window_refused(size);
+        return Err(Fallback::Cap);
     }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+    match host.uav_buffer(size) {
+        Some(buffer) => Ok(buffer),
+        None => {
+            WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            window_refused(size);
+            Err(Fallback::AllocationFailed)
+        }
     }
-    buffer
 }
 
 /// What went up, by send: its number, and the offsets, in order and joined
@@ -965,7 +1064,7 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
+/// (`VICTORY_RELAY=1` or `2`; on by default outside tests; not with kept snapshots,
 /// [`keeps`]). `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
@@ -2906,12 +3005,31 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Bytes of by-address copies currently counted against their lifetime cap
+/// (`VICTORY_MEMORY_CARD_MB`), given back when the copy goes.
+static ADDRESS_CARD_USED: AtomicU64 = AtomicU64::new(0);
+
+/// Takes `len` bytes of the cap `most` that `used` counts, if they fit; never
+/// takes part of it.
+fn reserve_cap(used: &AtomicU64, len: u64, most: u64) -> bool {
+    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        used.checked_add(len).filter(|&n| n <= most)
+    })
+    .is_ok()
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
             return;
+        }
+        if self.fallback.0 != 0 {
+            crate::residency::fallback_freed(self.fallback.0, self.fallback.1);
+        }
+        if self.address_card != 0 {
+            ADDRESS_CARD_USED.fetch_sub(self.address_card, Ordering::Relaxed);
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
@@ -2926,14 +3044,15 @@ impl Drop for Shadow {
             CARD_BYTES[0].fetch_sub(self.width(), Ordering::Relaxed);
         }
         if let Some(card) = &mut self.card {
-            if window {
-                WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
-            } else {
+            if !window {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
             }
+        }
+        if self.window_card != 0 {
+            WINDOW_CARD_BYTES.fetch_sub(self.window_card, Ordering::Relaxed);
         }
     }
 }
@@ -3425,6 +3544,9 @@ impl Shadow {
             wc: AtomicU8::new(0),
             mapped: false,
             place: None,
+            fallback: (0, crate::residency::Fallback::ViewCopy),
+            address_card: 0,
+            window_card: 0,
         }
     }
 
@@ -5479,30 +5601,26 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(shadow));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        let (staging, data) = host()?.shared_buffer(size)?;
+        crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+        // memory, and the one just made is the CPU's side. Refused, the copy
+        // stays single-sided in system memory: counted in `crate::residency`.
+        let (buffer, card, fallback) = match card_for(size) {
+            Ok(CardSide::Vram(on_card)) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                touched: Default::default(),
-                me: std::sync::OnceLock::new(),
-                    size,
-                };
-                (on_card, Some(card))
+                (on_card, Some(Card::new(staging, size)), (0, crate::residency::Fallback::ViewCopy))
             }
-            None => (buffer, None),
+            Ok(CardSide::Ram(on_card, why)) => {
+                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} in the PC's memory", key.0));
+                (on_card, Some(Card::new(staging, size)), (size, why))
+            }
+            Err(why) => (staging, None, (size, why)),
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5521,6 +5639,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.fallback = fallback;
+        if fallback.0 != 0 {
+            crate::residency::fallback_add(fallback.0, fallback.1);
+        }
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             carded(&shadow);
@@ -5693,42 +5815,57 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     // At most so much on the card's own memory (4 GiB unless
     // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
-    // that the side shaders see is in the PC's memory.
+    // that the side shaders see is in the PC's memory. The cap is taken only
+    // when the copy fits and given back when it goes ([`Shadow::drop`]).
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    let reserved = room && reserve_cap(&ADDRESS_CARD_USED, len, most);
+    let on_card = if reserved {
+        match host.uav_buffer(len) {
+            Some(buffer) => Some(buffer),
+            None => {
+                ADDRESS_CARD_USED.fetch_sub(len, Ordering::Relaxed);
+                None
+            }
+        }
     } else {
         None
     };
+    let why = if !room {
+        crate::residency::Fallback::Budget
+    } else if !reserved {
+        crate::residency::Fallback::Cap
+    } else {
+        crate::residency::Fallback::AllocationFailed
+    };
+    let on_card_there = on_card.is_some();
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
-    // (Counted down with the windows' on the card when it goes.)
-    WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+    // A device-local side is charged to the by-address cap
+    // (`ADDRESS_CARD_USED`), which is what admitted it, never to the windows'
+    // budget; a fallback is system memory and lives in the placement ledger
+    // instead. Both are given back by `Shadow::drop`.
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
-    shadow.card = Some(Card {
-        staging,
-        before: Mutex::default(),
-        dirty: Mutex::default(),
-        sent: Mutex::default(),
-        touched: Default::default(),
-        me: std::sync::OnceLock::new(),
-        size: len,
-    });
+    shadow.card = Some(Card::new(staging, len));
+    if on_card_there {
+        shadow.address_card = len;
+    } else {
+        shadow.fallback = (len, why);
+        crate::residency::fallback_add(len, why);
+    }
     let shadow = Arc::new(shadow);
     carded(&shadow);
     Some(shadow)
@@ -5803,25 +5940,26 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+    let (staging, data) = host()?.shared_buffer(len)?;
+    crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
+    // buffer there, and the one just made is the CPU's side. Refused, the window
+    // stays single-sided in system memory: counted in `crate::residency`.
+    let (buffer, card, fallback, window_card) = match window_card_for(len) {
+        Ok(CardSide::Vram(on_card)) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                touched: Default::default(),
-                me: std::sync::OnceLock::new(),
-                size: len,
-            };
-            (on_card, Some(card))
+            (
+                on_card,
+                Some(Card::new(staging, len)),
+                (0, crate::residency::Fallback::ViewCopy),
+                len,
+            )
         }
-        None => (buffer, None),
+        Ok(CardSide::Ram(on_card, why)) => {
+            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} in the PC's memory"));
+            (on_card, Some(Card::new(staging, len)), (len, why), 0)
+        }
+        Err(why) => (staging, None, (len, why), 0),
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5833,6 +5971,11 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    shadow.fallback = fallback;
+    shadow.window_card = window_card;
+    if fallback.0 != 0 {
+        crate::residency::fallback_add(fallback.0, fallback.1);
+    }
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         carded(&shadow);
@@ -5897,7 +6040,12 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    // A view's own bytes never get a card side (see the function's note); it
+    // is the one copy kind that is system memory by design.
+    shadow.fallback = (len, crate::residency::Fallback::ViewCopy);
+    crate::residency::fallback_add(len, crate::residency::Fallback::ViewCopy);
+    let shadow = Arc::new(shadow);
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
@@ -5963,8 +6111,8 @@ mod write_combined_tests {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, reserve_cap,
+        resolve_card_limits, tail_of, window_of,
     };
 
     #[test]
@@ -6007,6 +6155,62 @@ mod window_tests {
         assert_eq!(super::default_window_card_mb(Some(8 * GIB)), 737);
         assert_eq!(super::default_window_card_mb(Some(11229 << 20)), 1010);
         assert_eq!(super::default_window_card_mb(Some(24 * GIB)), 1024);
+    }
+
+    /// The by-address lifetime cap takes a copy only when its whole size fits,
+    /// and a refusal leaves the counter as it was.
+    #[test]
+    fn the_by_address_cap_takes_only_what_fits() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let used = AtomicU64::new(0);
+        assert!(reserve_cap(&used, 3, 5));
+        assert_eq!(used.load(Ordering::Relaxed), 3);
+        assert!(!reserve_cap(&used, 3, 5), "two bytes left, not three");
+        assert_eq!(used.load(Ordering::Relaxed), 3, "a refusal takes nothing");
+        assert!(reserve_cap(&used, 2, 5));
+        assert_eq!(used.load(Ordering::Relaxed), 5);
+        assert!(!reserve_cap(&used, u64::MAX, 5), "no overflow");
+    }
+
+    /// A by-address copy's cap is given back when the copy goes: the release
+    /// lives in `Shadow::drop`, not in the caller.
+    #[test]
+    fn the_by_address_cap_is_given_back_when_a_copy_goes() {
+        let host = crate::host::host().expect("a D3D12 device (WARP is enough)");
+        let (buffer, data) = host.shared_buffer_now(1 << 16).expect("a shared buffer");
+        // SAFETY: a live buffer of 64 KiB with its mapping.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = super::Shadow::new(buffer, data, gpu, 0, 1 << 16);
+        let before = super::ADDRESS_CARD_USED.load(std::sync::atomic::Ordering::Relaxed);
+        shadow.address_card = 1 << 16;
+        super::ADDRESS_CARD_USED.fetch_add(1 << 16, std::sync::atomic::Ordering::Relaxed);
+        drop(shadow);
+        assert_eq!(
+            super::ADDRESS_CARD_USED.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "the copy's lifetime cap comes back when it goes"
+        );
+    }
+
+    /// A window's device-local side leaves the window VRAM budget when the copy
+    /// goes, and a system-memory fallback never took any of it.
+    #[test]
+    fn a_window_side_is_given_back_when_the_copy_goes() {
+        let host = crate::host::host().expect("a D3D12 device (WARP is enough)");
+        let (buffer, data) = host.shared_buffer_now(1 << 16).expect("a shared buffer");
+        // SAFETY: a live buffer of 64 KiB with its mapping.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = super::Shadow::new(buffer, data, gpu, 0, 1 << 16);
+        let before = super::WINDOW_CARD_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        shadow.window = true;
+        shadow.window_card = 1 << 16;
+        super::WINDOW_CARD_BYTES.fetch_add(1 << 16, std::sync::atomic::Ordering::Relaxed);
+        drop(shadow);
+        assert_eq!(
+            super::WINDOW_CARD_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "the window's card side count comes back when it goes"
+        );
     }
 
     /// An ask that may take any window takes the longest that holds all of

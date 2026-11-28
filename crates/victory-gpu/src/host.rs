@@ -875,6 +875,112 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// What to say about an in-place level: whether it places title memory in
+/// place (level 1 and up) and whether it is the combination the file calls
+/// unsupported, with submissions in the air (level 2 and up with late waits).
+/// Values, not spellings: `inplace::level()` trims and parses a number.
+fn inplace_notes(level: u8, late: bool) -> (bool, bool) {
+    (level >= 1, level >= 2 && late)
+}
+
+/// Names the separation-relevant switches this run has set, and warns once for
+/// each combination the code documents as unsupported or as place&shy;ment
+/// weakening. A run's log then says which exceptions are in force, instead of
+/// the switches being invisible unless the reader knows them all.
+fn say_separation_switches() {
+    const NAMED: &[&str] = &[
+        "VICTORY_CARD_BUFFERS",
+        "VICTORY_CARD_BUFFERS_MIN_KB",
+        "VICTORY_CARD_BUFFERS_MIN_MB",
+        "VICTORY_CARD_BUFFERS_MB",
+        "VICTORY_CARD_ALL",
+        "VICTORY_CARD_WINDOWS_MB",
+        "VICTORY_CARD_ROOM_FOR_BUFFERS",
+        "VICTORY_WINDOWS_OWN",
+        "VICTORY_WINDOWS_BAR_MB",
+        "VICTORY_SEND_BAR",
+        "VICTORY_WC_BAR",
+        "VICTORY_WC_NO_BACK",
+        "VICTORY_INPLACE",
+        "VICTORY_INPLACE_MB",
+        "VICTORY_PORT_CONSTANTS",
+        "VICTORY_MEMORY_CARD_MB",
+        "VICTORY_RELAY_COPY",
+        "VICTORY_FETCH_CHECK",
+        "VICTORY_SEND_OWN",
+        "VICTORY_LATE_WAIT",
+        "VICTORY_CARD_AWAKE",
+        "VICTORY_LEVELS_ON_DEMAND",
+        "VICTORY_TEXTURE_POOL",
+        "VICTORY_SLOT_EVICT",
+        "VICTORY_ALLOCATOR_TRIM",
+        "VICTORY_BUDGET_PACK",
+        "VICTORY_VRAM_BUDGET_MB",
+        "VICTORY_KEEP_FREED",
+        "VICTORY_WAIT_RESIDENT",
+        "VICTORY_CARD_STEPS",
+        "VICTORY_WC_NO_BACK_MIN_KB",
+        "VICTORY_INDIRECT_CARD_BUDGET",
+    ];
+    let value = |name: &str| std::env::var(name).ok();
+    // The switches' own predicates: `one` for "exactly 1" switches, `on` for
+    // "set and not 0", a positive number for the ones parsed as sizes.
+    let one = |name: &str| value(name).is_some_and(|v| v == "1");
+    let none_zero = |name: &str| value(name).is_some_and(|v| v == "0");
+    let set: Vec<String> = NAMED.iter().filter_map(|name| value(name).map(|v| format!("{name}={v}"))).collect();
+    if set.is_empty() {
+        tracing::info!("memory separation: no placement switches set, library defaults in force");
+    } else {
+        tracing::info!("memory separation: placement switches set: {}", set.join(", "));
+    }
+    let (inplace, unsupported_late) = inplace_notes(crate::inplace::level(), late_stage() > 0);
+    if inplace {
+        tracing::warn!(
+            "memory separation: VICTORY_INPLACE={} gives the GPU the title's own system memory (opt-in placement exception)",
+            crate::inplace::level()
+        );
+    }
+    if unsupported_late {
+        tracing::warn!(
+            "memory separation: VICTORY_INPLACE={} with submissions in the air is unsupported: nothing tracks what shaders write to the placed memory (inplace.rs)",
+            crate::inplace::level()
+        );
+    }
+    if one("VICTORY_PORT_CONSTANTS") {
+        tracing::warn!(
+            "memory separation: VICTORY_PORT_CONSTANTS puts the title's 32-bit graphics heap in place (GPU reads/writes title system memory)"
+        );
+    }
+    if one("VICTORY_SEND_BAR") || one("VICTORY_WC_BAR") || value("VICTORY_WINDOWS_BAR_MB").is_some_and(|v| v.trim().parse::<u64>().is_ok_and(|mb| mb != 0)) {
+        tracing::warn!(
+            "memory separation: CPU-mapped VRAM in use (VICTORY_SEND_BAR/VICTORY_WINDOWS_BAR_MB/VICTORY_WC_BAR): the CPU writes GPU memory through the bus"
+        );
+    }
+    if one("VICTORY_CARD_ALL") {
+        tracing::warn!(
+            "memory separation: VICTORY_CARD_ALL gives refused copies a second system-memory side, counted with the card copies; it does not make them device-local"
+        );
+    }
+    if one("VICTORY_WINDOWS_OWN") {
+        tracing::warn!("memory separation: VICTORY_WINDOWS_OWN gives windows a second system-memory side");
+    }
+    if none_zero("VICTORY_INDIRECT_CARD_BUDGET") {
+        tracing::warn!(
+            "memory separation: VICTORY_INDIRECT_CARD_BUDGET=0 keeps the indirect clamp atomics in system memory instead of a device-local buffer"
+        );
+    }
+    if !send::own() {
+        tracing::warn!(
+            "memory separation: VICTORY_SEND_OWN=0 lets a later refresh rewrite the staging buffer an in-flight submission's copy reads (relay and late submissions are on by default)"
+        );
+    }
+    if relay_copy() && !torn::on() {
+        tracing::warn!(
+            "memory separation: VICTORY_RELAY_COPY=1 without VICTORY_FETCH_CHECK=1: a copy-queue fetch may bring torn pieces and their detection is off"
+        );
+    }
+}
+
 fn create() -> anyhow::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -1049,6 +1155,7 @@ fn create() -> anyhow::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         tracing::info!("host D3D12 device ready");
+        say_separation_switches();
         crate::upload::reserve_early();
         Ok(Host {
             device,
@@ -3781,6 +3888,28 @@ unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, conte
     }
 }
 
+/// Waits on `event` for `target` on `fence` after the caller set it, and fails
+/// the run when the wait did not complete or the fence did not reach the target
+/// (a removed device answers `u64::MAX`). The callers keep their own
+/// `SetEventOnCompletion` because they wait on their own copy or fetch queues.
+///
+/// # Safety
+///
+/// `event` is the calling thread's own and alive for the wait; `fence` is live.
+unsafe fn wait_event_for_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) {
+    // SAFETY: the caller's fence and event.
+    let status = unsafe { WaitForSingleObject(event, INFINITE) };
+    if status != WAIT_OBJECT_0 {
+        fail(format_args!("{context}: fence wait failed: {status:?}"));
+    }
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!(
+            "{context}: fence {completed} did not reach {target}"
+        ));
+    }
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -4819,7 +4948,28 @@ impl Host {
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
-        let own = if send::own() { send::take(self, &dirty) } else { None };
+        let own = if send::own() {
+            let own = send::take(self, &dirty);
+            if own.is_none() && !dirty.is_empty() {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::warn!(
+                        "memory separation: no per-submission send memory; sends are recorded straight from the CPU staging while submissions are in the air"
+                    );
+                });
+            }
+            own
+        } else {
+            if !dirty.is_empty() {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::warn!(
+                        "memory separation: VICTORY_SEND_OWN=0 records sends straight from the CPU staging while submissions are in the air"
+                    );
+                });
+            }
+            None
+        };
         taking.end();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
@@ -5273,7 +5423,7 @@ impl Host {
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
-                    WaitForSingleObject(event, INFINITE);
+                    wait_event_for_fence(&fence, sent, event, "what shaders wrote to the card's memory (copy queue)");
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -5288,7 +5438,7 @@ impl Host {
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
+                wait_event_for_fence(&fence, sent, event, "what shaders wrote to the card's memory");
                 Ok(after)
             })()
         };
@@ -5579,7 +5729,12 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    wait_event_for_fence(
+                        &self.fence,
+                        *submitted,
+                        self.event,
+                        "what shaders wrote to the card's memory",
+                    );
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -5858,7 +6013,12 @@ impl Host {
                             working(false);
                             #[cfg(feature = "diagnostics")]
                             let _card = crate::timeline::card_wait(Some(*submitted));
-                            WaitForSingleObject(self.event, INFINITE);
+                            wait_event_for_fence(
+                                &self.fence,
+                                *submitted,
+                                self.event,
+                                "the submissions sent ahead",
+                            );
                             stood(waiting);
                             working(true);
                         }
@@ -9541,7 +9701,7 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => buffer.inspect(|buffer| crate::residency::placed(buffer, size)),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
@@ -9595,7 +9755,11 @@ impl Host {
             crate::book::made(b, || "an upload buffer".into());
         }
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::residency::placed(&buffer, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
@@ -9904,14 +10068,15 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
                 // What the queue's room test (`crate::resource::room`) weighs.
-                if let Some([budget, used, blocks, buffers, targets, line]) =
+                if let Some([budget, used, blocks, buffers, targets, line, windows, arenas]) =
                     crate::resource::room_terms(host().and_then(|h| h.video_memory()))
                 {
                     let weighed = used.saturating_sub(blocks) + buffers + targets;
                     tracing::info!(
                         "the texture queue's room: {used} MB in use - {blocks} MB free in texture blocks + {buffers} MB kept for \
                          card copies of title buffers + {targets} MB kept for render targets = {weighed} MB against a line of \
-                         {line} MB ({:.1} % of a budget of {budget} MB): {}",
+                         {line} MB ({:.1} % of a budget of {budget} MB): {}; outside this line, alive now: windows' device-local \
+                         sides {windows} MB, by-address arenas' device-local sides {arenas} MB (both already inside \"in use\")",
                         line as f64 * 100.0 / budget.max(1) as f64,
                         if weighed < line { "room" } else { "no room, new textures wait" }
                     );
@@ -10097,9 +10262,11 @@ impl Meter {
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
-                    "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
+                    "host copies in the card's memory: {} copies with two sides (VICTORY_CARD_ALL/WINDOWS_OWN count their \
+                     system-memory second sides too), {} MB in their device-local sides, {} MB of hashes from before; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
-                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
+                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms); windows turned down since the start: \
+                     {} ({} MB)",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,
@@ -10109,9 +10276,14 @@ impl Meter {
                     per_frame(3),
                     per_frame(4) / 1e6,
                     per_frame(5),
-                    per_frame(6) / 1e3
+                    per_frame(6) / 1e3,
+                    card[10],
+                    card[11] >> 20
                 );
             }
+            crate::residency::placement_line(
+                crate::host::host_made().and_then(|host| host.video_memory_groups()),
+            );
             let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
@@ -10900,7 +11072,11 @@ impl Host {
             crate::book::made(b, || "a shared buffer".into());
         }
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::residency::placed(&buffer, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
@@ -10983,7 +11159,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::residency::placed(&buffer, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no buffer in card memory the CPU maps");
                 None
@@ -11032,7 +11212,7 @@ impl Host {
         }
         let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
         match made {
-            Ok(()) => buffer,
+            Ok(()) => buffer.inspect(|buffer| crate::residency::placed(buffer, size)),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None
@@ -12149,6 +12329,49 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use crate::residency::HeapClass;
+
+    /// The host buffers land in the heap the API reports for them: the
+    /// system-memory side, the two staging kinds, and device-local memory.
+    #[test]
+    fn host_buffers_land_in_the_heap_the_api_reports() {
+        // WARP is enough for this and windows-latest provides it; a run without
+        // any D3D12 device should be a failure here, not a silent pass.
+        let host = crate::host::host().expect("a D3D12 device for the heap-class test");
+        let (shared, _) = host.shared_buffer_now(4096).expect("a shared buffer");
+        assert_eq!(crate::residency::class_of(&shared), HeapClass::CpuVisible);
+        let (upload, _) = host.upload_buffer(4096).expect("an upload buffer");
+        assert_eq!(crate::residency::class_of(&upload), HeapClass::Staging);
+        let back = host.read_back_buffer(4096).expect("a read-back buffer");
+        assert_eq!(crate::residency::class_of(&back), HeapClass::Readback);
+        let local = host.uav_buffer(4096).expect("a device-local buffer");
+        assert_eq!(crate::residency::class_of(&local), HeapClass::DeviceLocal);
+        // CPU-mapped VRAM is offered by some adapters only.
+        if host.mapped_card_memory()
+            && let Some((mapped, _)) = host.mapped_card_buffer(4096, false)
+        {
+            assert_eq!(crate::residency::class_of(&mapped), HeapClass::MappedVram);
+        }
+    }
+}
+
+#[cfg(test)]
+mod separation_switch_tests {
+    /// The warning uses the values `inplace::level()` parses, not spellings a
+    /// reader might expect: "02", " 2" and "3" are level 2/3 like "2".
+    #[test]
+    fn inplace_warnings_use_the_parsed_level() {
+        assert_eq!(super::inplace_notes(0, true), (false, false));
+        assert_eq!(super::inplace_notes(1, false), (true, false));
+        assert_eq!(super::inplace_notes(1, true), (true, false));
+        assert_eq!(super::inplace_notes(2, false), (true, false));
+        assert_eq!(super::inplace_notes(2, true), (true, true));
+        assert_eq!(super::inplace_notes(3, true), (true, true));
     }
 }
 

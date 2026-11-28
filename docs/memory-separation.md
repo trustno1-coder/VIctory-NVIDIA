@@ -3,8 +3,10 @@
 This document maps which memory of the ported title lives in system RAM, which lives in the
 host GPU's own memory, how the two domains are crossed, and which remaining paths still let
 the GPU read or write system memory. It is the Phase 1 deliverable of the RAM/VRAM separation
-work: an evidence-based audit made before any allocation behaviour was changed. Every claim
-below was checked against the source at 63b902f; line numbers are of that tree.
+work. Sections 1-6 are the evidence-based audit made before any allocation behaviour was
+changed: every claim there was checked against the source at 63b902f and line numbers are of that
+tree. Section 7 describes the changes made afterwards (references are to those commits) and
+section 8 records the verification and its limits.
 
 The project's rule: **system RAM holds CPU-owned state; GPU VRAM holds GPU-owned resources;
 crossing the boundary goes through an explicit transfer.** Lower memory use or higher frame
@@ -34,8 +36,8 @@ Two consequences shape everything below:
 | Device-local | `D3D12_HEAP_TYPE_DEFAULT` | no | host textures, render targets, depth and colour twins (`resource.rs:3052-3095`, `resource.rs:451-592`); pooled texture blocks (`pool.rs:826-850`); card side of two-sided title-buffer copies and their hash twins (`host.rs:10996-11041`, `shadow.rs:4664-4682`); indirect argument/scratch and clamp buffers; overlay/panel/compose/Streamline resources; reserved texture + tiles when `VICTORY_LEVELS_ON_DEMAND` is on (`resource.rs:3046-3060`, `tiles.rs:154-210`) |
 | System memory, GPU-visible | `D3D12_HEAP_TYPE_CUSTOM`, CPU page WRITE_BACK, pool L0, UAV allowed, mapped | yes | **single-side** title-buffer and window copies the GPU reads/writes directly (`host.rs:10853-10909`, `shadow.rs:5482-5506`); the CPU staging side of two-sided copies; the GPU→CPU channels below; CPU snapshots are RAM-only |
 | Staging (CPU→GPU) | `D3D12_HEAP_TYPE_UPLOAD` | yes (write-combine) | texture/list staging, per-submission send memory (`host.rs:9552-9605`, `host/send.rs:138-160`) |
-| Readback (GPU→CPU) | `D3D12_HEAP_TYPE_READBACK` | yes | texture readback and `texback` (`host.rs:9513-9550`, `texback.rs:144-249`), fetched card-copy pieces (`host.rs:5557-5560`), deferred query readbacks (`list.rs:1341-1358`) |
-| CPU-mapped VRAM | `D3D12_HEAP_TYPE_GPU_UPLOAD` (resizable BAR) | yes | opt-in only: `VICTORY_SEND_BAR`, `VICTORY_WINDOWS_BAR_MB`, `VICTORY_WC_BAR`; `VICTORY_CARD_AWAKE` keep-awake buffer (`host.rs:10937-10992`, `host/awake.rs:144-164`) |
+| Readback (GPU→CPU) | `D3D12_HEAP_TYPE_READBACK` | yes | texture readback and `texback` (`host.rs:9513-9550`, `texback.rs:144-249`), deferred texture read-backs into title memory (`list.rs:1340-1374`); fetched card-copy pieces go to a shared system-memory buffer, not a READBACK heap (`host.rs:5579-5582`) |
+| CPU-mapped VRAM | `D3D12_HEAP_TYPE_GPU_UPLOAD` (resizable BAR) | yes | opt-in only: `VICTORY_SEND_BAR`, `VICTORY_WINDOWS_BAR_MB`, `VICTORY_WC_BAR` (`host.rs:10937-10992`); the keep-awake buffer of `VICTORY_CARD_AWAKE` is a device-local 256-byte `DEFAULT` buffer, not CPU-mapped VRAM (`host/awake.rs:144-164`) |
 | Opened title memory | `OpenExistingHeapFromAddress/Address1/FileMapping` | yes | opt-in only: `VICTORY_INPLACE` windows/buffers (`inplace.rs:116-168`) and the renderer port's constants heap (`port.rs:143-226`) |
 | Driver-managed, opaque | descriptor heaps, command allocators/lists, root signatures, pipeline states, query heaps, swap chain | no API | placement is not stated to the application and cannot be classified from source |
 
@@ -72,20 +74,22 @@ Two consequences shape everything below:
   `host.rs:2461-2544`) or against CPU snapshots (one-sided copies, `shadow.rs:3502-3685`); differing
   pieces are fetched into a readback or shared buffer, waited for, merged into title memory and the
   copy's CPU side (`host.rs:5521-5648`, `shadow.rs:4775-4817`). CPU-read textures go through
-  `texback` (`texback.rs:144-249`). Deferred query values are copied into title memory after their
-  list ran (`host.rs:4365-4399`).
+  `texback` (`texback.rs:144-249`). Deferred texture read-backs are copied into title memory after
+  their list ran (`host.rs:4365-4399`, `host.rs:7686-7687`).
 
 ### 3.4 Justified CPU-visible shared exceptions
 
 - GPU→CPU channels the CPU polls once a frame, kept in small system-memory UAV buffers because a
-  readback would add a submission and a fence wait each frame: the by-address faults buffer (8 KiB,
-  `memory.rs:230`), the card-compare results area (1 MiB, `host.rs:4728-4732`), and the indirect
+  readback would add a submission and a fence wait each frame: the by-address faults buffer (16 KiB:
+  `MEMORY_FAULTS` is 4096 dwords, `memory.rs:230`), the card-compare results area (1 MiB, `host.rs:4728-4732`), and the indirect
   work budgets (256-byte slots, `host.rs:2054-2112`).
-- Small CPU-authored buffers the shaders read directly from UPLOAD memory: the shared
-  descriptor-stride table (an 8 MiB root SRV, `descriptor/host.rs:2056-2068`, `descriptor/host.rs:3479-3491`),
-  per-draw constant/rectangle data (`host.rs:7707-7755`), and list upload data (`host.rs:7695-7705`).
-  These follow D3D12's standard CPU-written staging pattern; copying them into VRAM would add a
-  submission and a copy per draw, so the transfer is the direct read of the upload heap instead.
+- CPU-authored buffers the shaders read directly from UPLOAD memory, following D3D12's standard
+  CPU-written staging pattern: the descriptor-stride table (an 8 MiB root SRV,
+  `descriptor/host.rs:2056-2068`, `descriptor/host.rs:3479-3491`) and per-draw
+  constant/rectangle data (`host.rs:7707-7755`). Copying them into VRAM would add a submission and
+  a copy per draw. List upload data is UPLOAD memory on the default path; with
+  `VICTORY_CARD_STEPS=2` (set by the launcher) it is the shared write-back buffer instead
+  (`host.rs:7731-7733`), still CPU-authored data read by the GPU.
 - `VICTORY_WC_NO_BACK` (set by the launcher, `apps/victory/src/play.rs:78-80`) deliberately leaves
   shader writes in large write-combined copies on the card instead of copying them back; RAM is
   stale for those ranges by design (`shadow.rs:2366-2410`).
@@ -102,7 +106,9 @@ Two consequences shape everything below:
   it under pressure and D3D12 exposes no per-resource residency query. The source requests
   device-local memory; the API reports only budget and usage totals.
 - The real behaviour of `GPU_UPLOAD` and of heaps opened on title memory on the target NVIDIA
-  driver — only a feature check exists in source (`host.rs:10914-10932`, `inplace.rs:13-36`).
+  driver: GPU_UPLOAD is only feature-checked in source (`host.rs:10914-10932`) and the
+  OpenExistingHeap rules were measured only against the software adapter
+  (`inplace.rs:9-36`); no target-driver behaviour is established here.
 
 ## 4. How two-sided copies are admitted today
 
@@ -145,10 +151,11 @@ measured on target hardware.
 - Device removal is detected at submission, late-wait and relay points and ends the run with a
   crash report (`host.rs:797-834`); it is not recovered from.
 
-## 6. Remaining separation gaps (verified)
+## 6. Separation gaps found by the Phase 1 audit, and their status at HEAD
 
-6.1 **Single-side copies.** A title buffer the checks above refuse, a window below the window
-budget, and any copy at or above 1 GiB stay as one CUSTOM/WRITE_BACK/L0 buffer in system memory
+6.1 **Single-side copies.** A title buffer the checks above refuse, a window whose card side would
+go past the window budget (on a card below the 8 GiB local-budget threshold that is every window),
+and any copy at or above 1 GiB stay as one CUSTOM/WRITE_BACK/L0 buffer in system memory
 that shaders read and write over PCIe (`shadow.rs:5482-5506`, `shadow.rs:5790-5843`). Refusals are
 permanent: a copy is asked for once and a refused one is not retried when room appears
 (`shadow.rs:5486-5506`; `CARD_REFUSED`, `shadow.rs:301-321`). This is the main remaining default
@@ -159,18 +166,23 @@ it fully is a budget/priority decision, not an allocation-type fix.
 a second system-memory buffer as its "card side", counted in `CARD_BYTES` as card memory
 (`shadow.rs:386-399`). The switch is off by default and is not a separation policy.
 
-6.3 **By-address arena accounting defect.** In `shadow::by_address` the lifetime cap counter is
-incremented before the size check (`shadow.rs:5705`), so refusals grow it too, and it is never
-decremented when a copy goes (`Shadow::drop`, `shadow.rs:2909-2938` decrements the window counter
-instead). After enough raw-address memory has been streamed, new arenas silently fall back to
-system memory for the rest of the run although VRAM is free. The fallback buffer is also counted
-as card memory (`shadow.rs:5716-5717`).
+6.3 **By-address arena accounting defect. Fixed in 7.2 and 7.4.** In `shadow::by_address` the
+lifetime cap counter was incremented before the size check (`shadow.rs:5705` in the audit), so
+refusals grew it too, and it was never decremented when a copy went (`Shadow::drop`,
+`shadow.rs:2909-2938` decremented the window counter instead). After enough raw-address memory had
+streamed, new arenas silently fell back to system memory for the rest of the run although VRAM was
+free. The fallback buffer was also counted as window card memory (`shadow.rs:5716-5717`), so it
+consumed window VRAM budget; 7.4 keeps it out of that counter.
 
-6.4 **Fallbacks are not classified or reported.** Every refusal returns `None` or a system-memory
-copy with at most a warn log; nothing counts bytes by heap class or by fallback reason, and
-`GetHeapProperties`/`GetHeapDesc` are never called (`host.rs:10753-11042` reports only DXGI
-totals). `MADE[4]/[5]` even conflates CPU-mapped VRAM with device-local buffers
-(`host.rs:10941-10942`, `host.rs:10997-10998`).
+6.4 **Fallbacks are not classified or reported. Addressed in 7.1 for the copy machinery's
+buffers.** Before 7.1 every refusal returned `None` or a system-memory copy with at most a warn
+log; nothing counted bytes by heap class or by fallback reason, and
+`GetHeapProperties`/`GetHeapDesc` were never called (`host.rs:10753-11042` reported only DXGI
+totals). The ledger now reports the API heap class of the buffers it makes and every live fallback
+copy by reason. Still open: textures, render targets, depth resources, descriptor heaps and the
+swap chain are not in that ledger, and `MADE[4]/[5]` still conflates CPU-mapped VRAM with
+device-local buffers (`host.rs:10941-10942`/`host.rs:10997-10998` in the audit; line numbers have
+shifted).
 
 6.5 **GPU→CPU channels in system memory.** The faults buffer, compare results and indirect budgets
 of 3.4 are GPU-written system memory. They are small and one-way and their design trade is
@@ -178,10 +190,13 @@ explicit, but they are unreported and were kept as they are: moving them to VRAM
 add a submission and a fence wait per frame, and the audit did not establish that as safe without
 hardware.
 
-6.6 **Device-removal waits.** `card_back`, `relay_card_back` and `settle` wait with
-`WaitForSingleObject(INFINITE)` without re-checking the completed value the way `wait_host_fence`
-does (`host.rs:5576-5582`, `host.rs:5267-5291`, `host.rs:5856-5862`, `host.rs:3765-3782`), so a
-removed device can produce a stale merge or a hang before the run is failed.
+6.6 **Device-removal waits. Addressed in 7.3 for the three named sites.** `card_back`,
+`relay_card_back` and `settle` waited with `WaitForSingleObject(INFINITE)` without re-checking
+the completed value the way `wait_host_fence` does (`host.rs:5576-5582`, `host.rs:5267-5291`,
+`host.rs:5856-5862`, `host.rs:3765-3782` in the audit), so a removed device could produce a stale
+merge before the run was failed. They now re-check the fence after the wait (7.3). Whether a
+removed device signals the event at all remains driver behaviour and needs hardware removal/TDR
+evidence.
 
 6.7 **No VRAM admission for render targets, depth and twins.** Only the index-picked texture
 pass has a room test (`draw.rs:3085-3094`); render targets, depth planes, colour twins and a
@@ -206,30 +221,99 @@ bytes of hashes per 64 KiB piece (`shadow.rs:110-121` against `shadow.rs:4664-46
 
 ## 7. Minimum safe changes made on this branch
 
-Phase 2 keeps the existing allocation behaviour and adds only what the audit shows can be changed
-safely:
+Phase 2 keeps every admission rule, size threshold, budget and render path as it was. It adds
+measurement, corrects two accounting defects, and re-checks three copy-back waits:
 
-1. Placement accounting and a placement report (no behaviour change): every buffer the layer
-   creates is classified by the heap the API reports (`GetHeapProperties`), the system-memory
-   fallbacks of the copy machinery are counted by reason, and one periodic line reports
-   device-local vs fallback bytes against the DXGI budget/usage groups.
-2. The by-address lifetime-cap defect (6.3): the reservation is taken only when it fits, given
-   back when the copy goes, and a copy whose VRAM side was refused is no longer counted as card
-   memory.
-3. The device-removal fence waits (6.6) are re-checked like `wait_host_fence`.
+- the placement ledger (7.1) only counts and prints; it changes no allocation;
+- the by-address lifetime cap (7.2) and the window VRAM counter (7.4) are accounting fixes: 7.2
+  does change by-address placement after releases (the intended repair), and 7.4 stops a
+  system-memory fallback from consuming window VRAM budget;
+- the checked waits (7.3) are a drive-by correctness fix in the copy-back path, not part of the
+  separation design; they are kept because they are small and strictly narrow the failure window.
+- no rendering path changed.
 
-Deliberately not changed, with reasons: the size thresholds and maxima of two-sided copies
-(6.1/6.2) are a VRAM budget policy and the product path already asks for VRAM on every copy
-(launcher sets `VICTORY_CARD_BUFFERS_MIN_KB=64`); their effect on target hardware is unmeasured
-here, and `VICTORY_CARD_ALL` remains off. The window default below an 8 GiB budget stays 0
-because window VRAM is not reserved in the texture queue's accounting, so changing it without
-hardware would risk texture starvation. The GPU→CPU channels of 6.5 stay in system memory (small,
-one-way, polled once a frame) and are documented as the justified exception. No room test is added
-for render targets, depth and twins (6.7): refusing them changes what the title renders and needs
-hardware measurement; the placement report's tracked-vs-DXGI reconciliation is what will show
-whether the process overshoots its budget. No Evict,
-SetResidencyPriority or reservation API is added: there is no evidence of OS paging to act on,
-and evicting resources a submission may name is a known device-loss hazard.
+### 7.1 Placement ledger (no behaviour change)
+
+`crates/victory-gpu/src/residency.rs` gained a read-only ledger:
+
+- host buffers made by the five constructors of the copy and transfer machinery
+  (`upload_buffer`, `read_back_buffer`, `shared_buffer_now`, `mapped_card_buffer`,
+  `uav_buffer` in `host.rs`) are classified from the heap
+  `ID3D12Resource::GetHeapProperties` reports — the API's creation-time heap class, not a
+  parallel table of call-site assumptions and not physical residency — and counted with their
+  bytes (`HeapClass`: device-local, CPU-visible, upload, readback, CPU-mapped VRAM, other).
+  Buffers created directly are not in this ledger (overlay panel/menu, keep-awake, the
+  upload-mapping helper's two 256-byte buffers), and neither are textures, render targets, depth
+  resources, descriptor heaps or the swap chain;
+- every copy the copy machinery builds over a host copy that has no device-local side is counted
+  while it lives and when it goes, with the reason: budget line, byte cap, allocation failure,
+  host compare unavailable, not eligible (size thresholds / 1 GiB), switch off, or a view's own
+  bytes (`ViewCopy`). Opt-in placed copies (`VICTORY_INPLACE`, `VICTORY_PORT_CONSTANTS`) are
+  the title's memory itself rather than host copies and are not in this count;
+- one line every five seconds reports the host buffers the copy and transfer machinery made
+  since the start by API-reported class, the copies currently living in system memory with their
+  reasons, and the DXGI LOCAL and NON_LOCAL budget/usage groups. The class figures are cumulative
+  creation totals, not live bytes, and cover buffers only: textures, render targets, depth
+  resources, descriptor heaps and the swap chain are not in this ledger. `VICTORY_MEMORY_REPORT=1`
+  forces the line when no fallback is alive; `=0` silences it. Only the live fallback bytes and the
+  existing live card-side counters (`shadow::card_stats`, `live_span_bytes`) can be read against
+  DXGI usage; the class totals cannot. Nothing here is a per-resource residency query: the heap
+  class and DXGI usage are the API's report, not proof of physical placement.
+
+This is the measurement base for Phase 3; it is why the code now says which side a copy has.
+
+### 7.2 By-address lifetime cap (verified defect fixed)
+
+`shadow::by_address` used to add the requested bytes to its lifetime cap before testing the cap
+(`shadow.rs:5705` in the audit), so refusals grew the counter, and the counter was never given
+back when a copy went: after enough raw-address memory had streamed, new arenas fell back to
+system memory for the rest of the run although VRAM was free. Now the cap is reserved atomically
+only when the whole size fits and given back by `Shadow::drop`, and the copy's fallback reason is
+counted. This is the one place where a real separation loss is repaired rather than measured. The
+failure also no longer consumes the window VRAM budget: the window counter is charged only for a
+copy whose side is device-local (7.4).
+
+### 7.3 Device-removal waits (correctness)
+
+`Host::card_back`, `Host::relay_card_back` and the settle path waited with
+`WaitForSingleObject(INFINITE)` and read the fetched bytes without re-checking the fence's
+completed value. They now use a checked wait like `wait_host_fence`: a wait that did not complete,
+or a fence that did not reach its target (a removed device answers `u64::MAX`), fails the run
+instead of merging stale bytes. The wait itself is still `WaitForSingleObject(INFINITE)`:
+whether a removed device signals the event (rather than leaving the wait blocked) is driver
+behaviour, so this narrows the failure window but is not proof that a removal cannot hang. That
+needs a device-removal/TDR run on hardware.
+
+### 7.4 Window VRAM budget accounting (accounting fix)
+
+`WINDOW_CARD_BYTES` is the counter that limits the card sides of windows outside buffers
+(`VICTORY_CARD_WINDOWS_MB`, or 9% of a local budget of 8 GiB and more) and that
+`shadow::card_stats`/`live_span_bytes` report as window VRAM. `shadow::by_address` used to add
+every arena to it, including arenas whose GPU-visible side is the system-memory fallback (6.3),
+so a fallback consumed window VRAM budget and could refuse later windows the VRAM side they would
+otherwise get. The counter is now charged only when the copy's side is device-local and is given
+back by `Shadow::drop` through a per-copy `window_card` field; a window whose
+`VICTORY_WINDOWS_OWN` second side is system memory no longer counts either. No threshold, cap
+or default was changed; the effect is that a refused or fallback arena no longer holds window
+budget it never used, so a later window can get the VRAM side it was previously refused. That is
+an accounting correction, and it should be measured on a real card before any budget is tuned
+from it.
+
+### 7.5 Deliberately not changed
+
+The size thresholds and maxima of two-sided copies (6.1/6.2) are a VRAM budget policy and the
+product path already asks for VRAM on every copy (the launcher sets
+`VICTORY_CARD_BUFFERS_MIN_KB=64`); their effect on target hardware is unmeasured here, and
+`VICTORY_CARD_ALL` remains off. The window default below an 8 GiB budget stays 0 because window
+VRAM is not reserved in the texture queue's accounting, so changing it without hardware would risk
+texture starvation. The GPU→CPU channels of 6.5 stay in system memory (small, one-way, polled once
+a frame) and are documented as the justified exception; the audit did not establish that moving
+them to VRAM plus a readback is safe without hardware. No room test is added for render targets,
+depth and twins (6.7): refusing them changes what the title renders; whether the whole process (textures, render
+targets and driver memory included) stays inside its budget is observable through DXGI usage and,
+on hardware, GPUView/ETW, not from this ledger's class totals. No Evict,
+SetResidencyPriority or reservation API is added: there is no evidence of OS paging to act on, and
+evicting resources a submission may name is a known device-loss hazard (6.9 stays in place).
 
 ## 8. What cannot be established in this environment
 
