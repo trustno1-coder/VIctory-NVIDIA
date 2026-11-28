@@ -184,6 +184,9 @@ place of the title's FidelityFX` (render and output sizes, DLSS mode, optimal
 size, formats; again when they change). Every second: `DLSS per frame: …
 upscalings by DLSS, … failed, … left to the title's FidelityFX` and `DLSS Frame
 Generation: … presents with it on, … off, … frames shown by it (status …)`.
+While Streamline warns that the card's memory is past its budget (`warning:
+out of VRAM`, 39), the first line ends with `… of them with the card's memory
+past its budget`: those upscalings are recorded all the same.
 `FidelityFX: the title's own upscaling runs: <why>` names each reason once.
 
 Frame generation: `DLSS Frame Generation switched frame=… on=… code=…` at each
@@ -265,7 +268,8 @@ Before it, once: `victory upscaler-check --present` (below, line 1).
    difference of `in use` is what frame generation took (NVIDIA: about 489 MB
    at 1440p). `in use` over the budget of the card's own memory, or the PC's
    shared memory growing by hundreds of MB in the memory line, means it does
-   not fit: use a smaller DLSS mode.
+   not fit: use a smaller DLSS mode. So does `DLSS: Streamline recorded an
+   upscaling with the card's memory past its budget`.
 11. A removed device: `host GPU device removed after …`, `; device removed:
    …`, `DLSS Frame Generation: a present failed hresult=0x887a0005` (removed),
    `0x887a0006` (hung) or `0x887a0007` (reset), the window gone with exit code
