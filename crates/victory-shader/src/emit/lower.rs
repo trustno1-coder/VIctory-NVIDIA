@@ -2717,7 +2717,8 @@ impl<'a> Lower<'a> {
             let original = self.s.entry;
             let width = self.s.threads.expect("compute thread count")[0];
             let limit = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS_X), 0, width);
-            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            // (With the part of the dispatch it is in: [`Lower::group_x`].)
+            let Val::I32(group) = self.group_x() else {
                 unreachable!()
             };
             let Val::I32(thread) = self.thread_id(0) else {
@@ -2939,6 +2940,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            Input::GroupId(0) if self.x.native.stage == HwStage::Cs => return self.group_x(),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
@@ -3005,6 +3007,19 @@ impl<'a> Lower<'a> {
     }
 
     /// A component of a compute thread or group id, read in the entry block.
+    /// A compute program's group x: the host's plus the first group of the
+    /// part of the dispatch running (`USER_GROUP_BASE`, a dword the host
+    /// sets). The host runs at most 65,535 groups in x at once, the console
+    /// more, so the host runs a larger dispatch in parts. (Read in the entry
+    /// block, as [`Lower::compute_id`].)
+    fn group_x(&mut self) -> Val {
+        let Val::I32(id) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+        Val::I32(self.s.m.bin(self.s.entry, Bin::Add, id, base))
+    }
+
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
         Val::I32(
