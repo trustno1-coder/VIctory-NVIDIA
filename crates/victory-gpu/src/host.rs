@@ -1358,6 +1358,9 @@ pub(crate) struct HostList {
     /// ([`HostList::leave_open`]): that reset finds nothing to undo. The
     /// list's title calls and epoch then, each plus one (0: not left open).
     left_open: [std::sync::atomic::AtomicU64; 2],
+    /// Pooled 256 KiB 64 KiB-page dirty bitmap (`u251`) for shaders that
+    /// track buffer writes on the GPU, returned when the list is reset.
+    dirty: Mutex<Option<std::sync::Arc<crate::dirty::DirtySlot>>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1385,6 +1388,9 @@ static PRELUDES: Mutex<Vec<(Prelude, u64)>> = Mutex::new(Vec::new());
 
 impl Drop for HostList {
     fn drop(&mut self) {
+        if let Some(slot) = self.dirty.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            crate::dirty::release(slot);
+        }
         if self.prelude.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
             PRELUDES_ALIVE.fetch_sub(1, Ordering::Relaxed);
         }
@@ -2667,8 +2673,9 @@ enum Step {
     /// Work that writes host memory only, and the title memory it reads
     /// (from, to; empty for none).
     Host(Box<dyn Fn() + Send>, (usize, usize)),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy;
+    /// `bool`: whether `SLOT_DIRTY` tracks every store to it.
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -2704,9 +2711,9 @@ struct Deferred {
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     /// Ranges declared written by shaders since the list last wrote title
-    /// memory (host copy, address, bytes): declaring them again would
-    /// change nothing.
-    gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// memory (host copy, address, bytes, tracked): declaring them again
+    /// would change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize, bool), std::hash::BuildHasherDefault<AddressHash>>,
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
@@ -3070,6 +3077,8 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    untracked: Vec<Declared>,
+    dirty_slots: Vec<std::sync::Arc<crate::dirty::DirtySlot>>,
     /// What was taken off it to be done on the card.
     own: Option<card_steps::Taken>,
     /// Title-memory ranges written when its shader textures are copied back.
@@ -3089,6 +3098,8 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    untracked: Vec<Declared>,
+    dirty_slots: Vec<std::sync::Arc<crate::dirty::DirtySlot>>,
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
     texture_back_ranges: Vec<(usize, usize)>,
@@ -3997,24 +4008,52 @@ fn relay_worker() {
 /// which needs nothing that the fetch from the card's memory brings), and
 /// the merge.
 struct RelayBack {
-    work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)>,
+    dirty_slots: Vec<std::sync::Arc<crate::dirty::DirtySlot>>,
     found: Option<Vec<Vec<(usize, usize)>>>,
 }
 
-fn relay_hand_back(back: &[Declared]) -> RelayBack {
-    let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+fn relay_hand_back(
+    back: &[Declared],
+    untracked: &[Declared],
+    dirty_slots: Vec<std::sync::Arc<crate::dirty::DirtySlot>>,
+) -> RelayBack {
+    let mut work = Vec::new();
+    let use_dirty = crate::dirty::on();
     for (shadow, declared) in back {
         if shadow.carded() {
             continue;
         }
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        join_ranges(&mut spans, declared.iter().copied());
-        for &(from, to) in &spans {
-            shadow.relay_compared(from, to - from);
+        let mut all_spans = Vec::new();
+        join_ranges(&mut all_spans, declared.iter().copied());
+        if !use_dirty {
+            for &(from, to) in &all_spans {
+                shadow.relay_compared(from, to - from);
+            }
+            work.extend(all_spans.into_iter().map(|(from, to)| (shadow.clone(), from, to, false)));
+            continue;
         }
-        work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+        let mut unt_spans = Vec::new();
+        if let Some((_, u)) = untracked.iter().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+            join_ranges(&mut unt_spans, u.iter().copied());
+        }
+        for &(from, to) in &unt_spans {
+            shadow.relay_compared(from, to - from);
+            work.push((shadow.clone(), from, to, false));
+        }
+        for (from, to) in all_spans {
+            for (tf, tt) in crate::shadow::outside(from, to, unt_spans.clone()) {
+                if crate::dirty::check() {
+                    shadow.relay_compared(tf, tt - tf);
+                } else {
+                    let (a, b) = shadow.inside(tf, tt - tf);
+                    crate::dirty::TRACKED_SKIPPED_BYTES.fetch_add((b - a) as u64, Ordering::Relaxed);
+                }
+                work.push((shadow.clone(), tf, tt, true));
+            }
+        }
     }
-    RelayBack { work, found: None }
+    RelayBack { work, dirty_slots, found: None }
 }
 
 impl RelayBack {
@@ -4024,11 +4063,36 @@ impl RelayBack {
             return;
         }
         let scanning = std::time::Instant::now();
-        // Looked through without a lock: a piece that changes meanwhile (a
-        // later flight writing, the title's bytes going in) is found now or
-        // by that flight's landing, and the merge looks again under the
-        // lock.
-        self.found = Some(crate::shadow::find_all(&self.work));
+        let check = crate::dirty::check();
+        let cpu_scans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = self
+            .work
+            .iter()
+            .filter(|w| !w.3 || check)
+            .map(|(s, f, t, _)| (s.clone(), *f, *t))
+            .collect();
+        let mut cpu_found = if cpu_scans.is_empty() {
+            Vec::new()
+        } else {
+            crate::shadow::find_all(&cpu_scans)
+        }
+        .into_iter();
+        let mut out = Vec::with_capacity(self.work.len());
+        for (shadow, from, to, tracked) in &self.work {
+            if !*tracked {
+                out.push(cpu_found.next().unwrap_or_default());
+                continue;
+            }
+            let (a, b) = shadow.inside(*from, to - from);
+            let gpu_pieces = crate::dirty::dirty_pieces(&self.dirty_slots, shadow.span().0 as usize, a, b);
+            if check {
+                let cpu_pieces = cpu_found.next().unwrap_or_default();
+                crate::dirty::verify_check(shadow.span().0, &cpu_pieces, &gpu_pieces);
+                out.push(cpu_pieces);
+            } else {
+                out.push(gpu_pieces);
+            }
+        }
+        self.found = Some(out);
         crate::land::spent(stat, scanning);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
@@ -4041,6 +4105,7 @@ impl RelayBack {
         let Some(found) = self.found else {
             return;
         };
+        let check = crate::dirty::check();
         let merging = std::time::Instant::now();
         let mut written: Vec<u64> = Vec::new();
         if land::on() {
@@ -4058,7 +4123,12 @@ impl RelayBack {
                 let mut notes = land::Notes::default();
                 for &p in &order[jobs[j].clone()] {
                     let (i, at, n) = pieces[p];
-                    put[i].fetch_add(self.work[i].0.land_back(at, n, &mut notes), Ordering::Relaxed);
+                    let bytes = if self.work[i].3 && !check {
+                        self.work[i].0.land_dirty(at, n, &mut notes)
+                    } else {
+                        self.work[i].0.land_back(at, n, &mut notes)
+                    };
+                    put[i].fetch_add(bytes, Ordering::Relaxed);
                 }
                 notes.flush();
                 land::spent(land::stat::BACK_ALL, working);
@@ -4067,13 +4137,17 @@ impl RelayBack {
             written.extend(put.iter().map(|p| p.load(Ordering::Relaxed)));
         } else {
             let (mut now, mut title) = (Vec::new(), Vec::new());
-            for ((shadow, ..), found) in self.work.iter().zip(found) {
-                let merge = |(at, n)| shadow.relay_merge(at, n, &mut now, &mut title) as u64;
-                written.push(found.into_iter().map(merge).sum());
+            for ((shadow, _, _, tracked), found) in self.work.iter().zip(found) {
+                let bytes: u64 = if *tracked && !check {
+                    found.into_iter().map(|(at, n)| shadow.relay_merge_dirty(at, n, &mut now, &mut title) as u64).sum()
+                } else {
+                    found.into_iter().map(|(at, n)| shadow.relay_merge(at, n, &mut now, &mut title) as u64).sum()
+                };
+                written.push(bytes);
             }
         }
         land::spent(land::stat::BACK, merging);
-        for ((_, from, to), written) in self.work.iter().zip(written) {
+        for ((_, from, to, _), written) in self.work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written as usize);
@@ -4309,7 +4383,7 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
 }
 
-/// See [`HostList::defer_gpu_write`].
+/// See [`HostList::defer_gpu_write_with`].
 fn declare_once() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0"))
@@ -4325,7 +4399,7 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut seen = std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len, _) = step {
                 let key = std::sync::Arc::as_ptr(shadow) as usize;
                 if !seen.insert((key, *address, *len)) {
                     continue;
@@ -4339,6 +4413,44 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
         }
     }
     back
+}
+
+/// Ranges declared without `SLOT_DIRTY` tracking ( plus dynamically picked heap UAVs).
+fn untracked_writes(
+    runs: &[&HostList],
+    picked: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+) -> Vec<Declared> {
+    let mut out: Vec<Declared> = Vec::new();
+    let mut places: ByCopy<usize> = ByCopy::default();
+    let mut seen = std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, address, len, false) = step {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                if seen.insert((key, *address, *len)) {
+                    let i = *places.entry(key).or_insert_with(|| {
+                        out.push((shadow.clone(), Vec::new()));
+                        out.len() - 1
+                    });
+                    out[i].1.push((*address, *address + *len));
+                }
+            }
+        }
+    }
+    crate::picked::with(out, picked)
+}
+
+/// Unique `SLOT_DIRTY` bitmap buffers bound across `runs`.
+fn dirty_slots_of(runs: &[&HostList]) -> Vec<std::sync::Arc<crate::dirty::DirtySlot>> {
+    let mut slots: Vec<std::sync::Arc<crate::dirty::DirtySlot>> = Vec::new();
+    for list in runs {
+        if let Some(slot) = list.dirty_slot()
+            && !slots.iter().any(|s| std::sync::Arc::ptr_eq(s, &slot))
+        {
+            slots.push(slot);
+        }
+    }
+    slots
 }
 
 /// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
@@ -4400,69 +4512,83 @@ fn read_backs(list: &HostList) {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
-fn hand_back(back: &[Declared]) {
-    if crate::shadow::wide_back() {
-        // Every range first (the pieces that differ, found on several
-        // threads), then the merges, in order, as below.
-        let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for (shadow, declared) in back {
-            if shadow.carded() {
-                continue;
-            }
-            let mut sorted = declared.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
-                }
-            }
-            work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
-        }
-        #[cfg(feature = "diagnostics")]
-        let scanning = std::time::Instant::now();
-        let found = crate::shadow::find_all(&work);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
-        for ((shadow, from, to), found) in work.iter().zip(found) {
-            let written = shadow.copy_back_with(*from, to - from, Some(found));
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(*from, to - from, written);
-        }
-        for (shadow, declared) in back {
-            shadow.copy_back_done(declared);
-        }
-        return;
-    }
+fn hand_back(
+    back: &[Declared],
+    untracked: &[Declared],
+    dirty_slots: &[std::sync::Arc<crate::dirty::DirtySlot>],
+) {
+    let use_dirty = crate::dirty::on();
+    let check = crate::dirty::check();
+    let mut unt_work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut trk_work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
         if shadow.carded() {
-            // Done before (`Host::card_back`).
-            shadow.copy_back_done(declared);
             continue;
         }
-        // Each byte compared once: the world declares dozens of views
-        // of its 174 MB heap that overlap almost entirely, and comparing
-        // every one whole was gigabytes a frame (0.3-0.5 s) for the few
-        // MB shaders wrote. Only ranges that overlap or touch are
-        // joined: what lies between two was not given to shaders (the
-        // snapshot does not hold it).
-        let mut sorted = declared.clone();
-        sorted.sort_unstable();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for (from, to) in sorted {
-            match spans.last_mut() {
-                Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                _ => spans.push((from, to)),
+        let mut all_spans: Vec<(usize, usize)> = Vec::new();
+        join_ranges(&mut all_spans, declared.iter().copied());
+        if !use_dirty {
+            unt_work.extend(all_spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+            continue;
+        }
+        let mut unt_spans: Vec<(usize, usize)> = Vec::new();
+        if let Some((_, u)) = untracked.iter().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+            join_ranges(&mut unt_spans, u.iter().copied());
+        }
+        unt_work.extend(unt_spans.iter().map(|&(from, to)| (shadow.clone(), from, to)));
+        for (from, to) in all_spans {
+            for (tf, tt) in crate::shadow::outside(from, to, unt_spans.clone()) {
+                trk_work.push((shadow.clone(), tf, tt));
             }
         }
-        for (from, to) in spans {
-            let written = shadow.copy_back(from, to - from);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+    }
+    if !unt_work.is_empty() {
+        if crate::shadow::wide_back() {
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(from, to - from, written);
+            let scanning = std::time::Instant::now();
+            let found = crate::shadow::find_all(&unt_work);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+            for ((shadow, from, to), found) in unt_work.iter().zip(found) {
+                let written = shadow.copy_back_with(*from, to - from, Some(found));
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::compared(*from, to - from, written);
+            }
+        } else {
+            for (shadow, from, to) in &unt_work {
+                let written = shadow.copy_back(*from, to - from);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::compared(*from, to - from, written);
+            }
         }
+    }
+    if !trk_work.is_empty() {
+        if check {
+            let cpu_found = crate::shadow::find_all(&trk_work);
+            for ((shadow, from, to), cpu_pieces) in trk_work.into_iter().zip(cpu_found) {
+                let (a, b) = shadow.inside(from, to - from);
+                let gpu_pieces = crate::dirty::dirty_pieces(dirty_slots, shadow.span().0 as usize, a, b);
+                crate::dirty::verify_check(shadow.span().0, &cpu_pieces, &gpu_pieces);
+                let written = shadow.copy_back_with(from, to - from, Some(cpu_pieces));
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::compared(from, to - from, written);
+            }
+        } else {
+            for (shadow, from, to) in trk_work {
+                let (a, b) = shadow.inside(from, to - from);
+                crate::dirty::TRACKED_SKIPPED_BYTES.fetch_add((b - a) as u64, Ordering::Relaxed);
+                let pieces = crate::dirty::dirty_pieces(dirty_slots, shadow.span().0 as usize, a, b);
+                let written = shadow.copy_back_dirty(from, to - from, pieces);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::compared(from, to - from, written);
+            }
+        }
+    }
+    for (shadow, declared) in back {
         shadow.copy_back_done(declared);
     }
 }
@@ -4634,6 +4760,7 @@ impl Host {
                 upscale: std::sync::atomic::AtomicU64::new(0),
                 hudless: std::sync::atomic::AtomicU64::new(0),
                 left_open: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
+                dirty: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -5399,6 +5526,8 @@ impl Host {
                 let plans: Vec<(&CardPlan, u64)> = flights.iter().filter_map(|f| Some((f.card.as_ref()?, f.fence))).collect();
                 // (Each byte once: the ranges are joined.)
                 let mut back: Vec<Declared> = Vec::new();
+                let mut untracked: Vec<Declared> = Vec::new();
+                let mut dirty_slots: Vec<std::sync::Arc<crate::dirty::DirtySlot>> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in flight.back.iter().filter(|(shadow, _)| !shadow.carded()) {
                         match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
@@ -5406,8 +5535,19 @@ impl Host {
                             None => back.push((shadow.clone(), ranges.clone())),
                         }
                     }
+                    for (shadow, ranges) in flight.untracked.iter().filter(|(shadow, _)| !shadow.carded()) {
+                        match untracked.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                            Some((_, all)) => all.extend_from_slice(ranges),
+                            None => untracked.push((shadow.clone(), ranges.clone())),
+                        }
+                    }
+                    for slot in &flight.dirty_slots {
+                        if !dirty_slots.iter().any(|s| std::sync::Arc::ptr_eq(s, slot)) {
+                            dirty_slots.push(slot.clone());
+                        }
+                    }
                 }
-                let mut hand_back = relay_hand_back(&back);
+                let mut hand_back = relay_hand_back(&back, &untracked, dirty_slots);
                 stage.next("landing: copies in the card's memory");
                 self.relay_card_back(&plans, fetch, &mut || {
                     if crate::land::on() {
@@ -5446,6 +5586,9 @@ impl Host {
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
+                    }
+                    for slot in flight.dirty_slots {
+                        crate::dirty::release(slot);
                     }
                     if let Some(own) = flight.own {
                         own.landed();
@@ -5731,6 +5874,8 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                untracked: sent.untracked,
+                dirty_slots: sent.dirty_slots,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
             }));
@@ -5787,6 +5932,8 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                untracked: sent.untracked,
+                dirty_slots: sent.dirty_slots,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
             }));
@@ -5894,6 +6041,8 @@ impl Host {
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
+                let mut untracked: Vec<Declared> = Vec::new();
+                let mut dirty_slots: Vec<std::sync::Arc<crate::dirty::DirtySlot>> = Vec::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
@@ -5913,8 +6062,26 @@ impl Host {
                             None => back.push((shadow.clone(), ranges.clone())),
                         }
                     }
+                    for (shadow, ranges) in &flight.untracked {
+                        match untracked.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                            Some((_, all)) => {
+                                for range in ranges {
+                                    if !all.contains(range) {
+                                        all.push(*range);
+                                    }
+                                }
+                            }
+                            None => untracked.push((shadow.clone(), ranges.clone())),
+                        }
+                    }
+                    for slot in &flight.dirty_slots {
+                        if !dirty_slots.iter().any(|s| std::sync::Arc::ptr_eq(s, slot)) {
+                            dirty_slots.push(slot.clone());
+                        }
+                    }
                 }
-                hand_back(&back);
+                hand_back(&back, &untracked, &dirty_slots);
+                drop(dirty_slots);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -5929,6 +6096,9 @@ impl Host {
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        for slot in flight.dirty_slots {
+                            crate::dirty::release(slot);
                         }
                         for detached in &mut flight.lists {
                             detached.release_tables();
@@ -6290,6 +6460,8 @@ impl Host {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             split.part(5);
+            let untracked = untracked_writes(runs, &picked.written);
+            let dirty_slots = dirty_slots_of(runs);
             let back = crate::picked::with(declared, &picked.written);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
@@ -6304,6 +6476,8 @@ impl Host {
                 number: this_submission,
                 card,
                 back,
+                untracked,
+                dirty_slots,
                 own,
                 texture_back_ranges,
                 writes,
@@ -6421,8 +6595,10 @@ impl Host {
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
+        let untracked = untracked_writes(runs, &picked.written);
+        let dirty_slots = dirty_slots_of(runs);
         let back = crate::picked::with(declared, &picked.written);
-        hand_back(&back);
+        hand_back(&back, &untracked, &dirty_slots);
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -6982,7 +7158,10 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // Nor runs its prelude: the next submission to need one takes it.
+        // Nor runs its prelude or writes its dirty bitmap: the next list takes them.
+        if let Some(slot) = self.dirty.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            crate::dirty::release(slot);
+        }
         self.give_prelude();
         // Open and empty since it was made or last reset: the allocator holds
         // nothing, the list nothing recorded (`HostList::leave_open`).
@@ -7662,21 +7841,40 @@ impl HostList {
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
-    /// host copy: copied back into title memory once the list has run.
+    /// host copy: copied back into title memory once the list has run
+    /// (`tracked`: whether `SLOT_DIRTY` records the stage's buffer stores).
     /// Declared once until the list next writes title memory (but with
     /// `VICTORY_DECLARE_ONCE=0`): the dispatches of a frame declared the
     /// same ranges thousands of times, each a step of its own.
-    pub(crate) fn defer_gpu_write(
+    pub(crate) fn defer_gpu_write_with(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        tracked: bool,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len, tracked);
         if deferred.gpu_written.insert(key) || !declare_once() {
-            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len, tracked));
         }
+    }
+
+    /// GPU virtual address of this list's 256 KiB `SLOT_DIRTY` bitmap buffer,
+    /// lazily acquired from [`crate::dirty`].
+    pub(crate) fn dirty_gpu(&self) -> Option<u64> {
+        let mut slot = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = crate::dirty::acquire();
+        }
+        slot.as_deref().map(crate::dirty::DirtySlot::gpu)
+    }
+
+    /// The `SLOT_DIRTY` bitmap buffer bound on this list, if any.
+    pub(crate) fn dirty_slot(&self) -> Option<std::sync::Arc<crate::dirty::DirtySlot>> {
+        self.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -8205,7 +8403,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, tracked) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -8214,7 +8412,7 @@ impl HostList {
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
+                    shadow.writing_with(*address, *len, *tracked);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);

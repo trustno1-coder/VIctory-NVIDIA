@@ -181,6 +181,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        dirty_tracked: lowered.dirty_tracked,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -234,7 +235,7 @@ fn run_cases_on(
             for u in &shader.user_data {
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
-                    (RootType::Table, 1) => 0,
+                    (RootType::Table, 1) | (RootType::Other(_), _) => 0,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }
@@ -1918,6 +1919,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        dirty_tracked: lowered.dirty_tracked,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -1946,7 +1948,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             for u in &shader.user_data {
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
-                    (RootType::Table, 1) => 0,
+                    (RootType::Table, 1) | (RootType::Other(_), _) => 0,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }
@@ -2128,6 +2130,7 @@ fn build_table_typed_cs(body: &[u32], used: Vec<UsedResource>) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        dirty_tracked: lowered.dirty_tracked,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

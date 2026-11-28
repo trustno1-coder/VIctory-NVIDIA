@@ -25,6 +25,10 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// GPU-side 64 KiB dirty-page bitmap (`SLOT_DIRTY`) instrumentation.
+#[path = "dirty.rs"]
+pub(super) mod dirty;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -57,6 +61,8 @@ pub(crate) struct Lowered {
     pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Whether every buffer/memory write in the shader updates `SLOT_DIRTY`.
+    pub dirty_tracked: bool,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
     /// Heap handles made with a non-uniform index.
@@ -114,10 +120,28 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    let want_dirty = dirty::dirty_bitmap();
+    let (first, retry) = lower_once(parts, counted, want_dirty)?;
+    if retry {
+        return Ok(lower_once(parts, counted, false)?.0);
+    }
+    Ok(first)
+}
+
+fn lower_once(parts: &Parts, counted: bool, dirty_on: bool) -> Result<(Lowered, bool), ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
-            Ok(l) => return Ok(l),
+        let mut lower = Lower::new(parts, &bad);
+        lower.dirty.enabled = dirty_on;
+        match lower.run(counted) {
+            Ok(mut l) => {
+                if dirty_on && l.dirty_tracked && !dirty::within_root_budget(parts.native.stage, &l) {
+                    l.dirty_tracked = false;
+                    return Ok((l, true));
+                }
+                let retry = dirty_on && !l.dirty_tracked;
+                return Ok((l, retry));
+            }
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -291,6 +315,7 @@ struct Lower<'a> {
     root_copy: Option<V>,
     /// Whether the page [`Lower::memory`] last looked for has a copy.
     page_there: Option<V>,
+    dirty: dirty::DirtyState,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
@@ -2011,6 +2036,7 @@ impl<'a> Lower<'a> {
             coherent: HashSet::new(),
             root_copy: None,
             page_there: None,
+            dirty: dirty::DirtyState::default(),
             ordered: if x.native.stage == HwStage::Ps {
                 ordered_section(p)
             } else {
@@ -2838,6 +2864,7 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let dirty_tracked = !self.dirty.has_writes || (self.dirty.enabled && !self.dirty.aborted);
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2853,6 +2880,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            dirty_tracked,
         })
     }
 
@@ -3570,11 +3598,16 @@ impl<'a> Lower<'a> {
         );
         self.end_guarded(noting, &[]);
         let c = self.cur;
-        self.page_there = Some(self.s.m.cmp(c, pred::NE, copy, zero));
+        let there = self.s.m.cmp(c, pred::NE, copy, zero);
+        self.page_there = Some(there);
         let copy = if store {
             let closed = self.s.m.cmp(c, pred::SLT, number, zero);
+            let true_v = self.s.m.bool(true);
+            let open = self.s.m.bin(c, Bin::Xor, closed, true_v);
+            self.dirty.writable_page = Some(self.s.m.bin(c, Bin::And, there, open));
             self.s.m.select(c, closed, zero, copy)
         } else {
+            self.dirty.writable_page = None;
             copy
         };
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
@@ -3640,6 +3673,7 @@ impl<'a> Lower<'a> {
             hi = self.s.m.select(c, near, hi, zero);
         }
         let (h, byte) = self.memory(sum, hi, guard, store);
+        self.dirty.root_mem = store.then_some((sum, hi, self.dirty.writable_page));
         self.root_copy = Some(h);
         Some((h, byte))
     }
@@ -3718,6 +3752,7 @@ impl<'a> Lower<'a> {
             args.push(self.s.m.i8((1u8 << n) - 1));
             args.push(align);
             let at = self.begin_guarded(guard);
+            self.dirty_memory(lo, hi, 4 * u32::from(n));
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
             self.end_guarded(at, &[]);
@@ -3760,6 +3795,7 @@ impl<'a> Lower<'a> {
             _ => return Err(name),
         };
         let at = self.begin_guarded(guard);
+        self.dirty_memory(lo, hi, 4);
         let was = match simple {
             Some((code, x)) => {
                 let code = self.s.m.i32(code);
@@ -12567,6 +12603,8 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked buffer")?;
+        self.dirty.root_mem = None;
+        let mut unbiased_off = off;
         let used = self.used_kind(src);
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
@@ -12589,6 +12627,7 @@ impl<'a> Lower<'a> {
         {
             let at = self.s.m.bin(c, Bin::Mul, element, stride);
             off = self.s.m.bin(c, Bin::Add, at, off);
+            unbiased_off = self.s.m.bin(c, Bin::Add, at, unbiased_off);
             index = None;
         }
         // A structured buffer by its used-resource entry's stride: raw
@@ -12604,6 +12643,7 @@ impl<'a> Lower<'a> {
             let k = self.s.m.i32(u.stride);
             let at = self.s.m.bin(c, Bin::Mul, element, k);
             off = self.s.m.bin(c, Bin::Add, at, off);
+            unbiased_off = self.s.m.bin(c, Bin::Add, at, unbiased_off);
             index = None;
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
@@ -12657,11 +12697,12 @@ impl<'a> Lower<'a> {
             // only the value's own bits (other lanes may write the rest of
             // the dword at the same time). A 16-bit value at a dword's
             // last byte continues in the next dword.
-            let byte = match index {
-                None => off,
-                Some(index) if used.is_some_and(|u| u.stride == 1) => {
-                    self.s.m.bin(c, Bin::Add, index, off)
-                }
+            let (byte, unbiased_byte) = match index {
+                None => (off, unbiased_off),
+                Some(index) if used.is_some_and(|u| u.stride == 1) => (
+                    self.s.m.bin(c, Bin::Add, index, off),
+                    self.s.m.bin(c, Bin::Add, index, unbiased_off),
+                ),
                 Some(_) => return Err("a byte or 16-bit buffer access by index"),
             };
             let h = self.handle(site, src, false, (11 | u, 0))?;
@@ -12722,6 +12763,15 @@ impl<'a> Lower<'a> {
             let (and, or) = (self.s.m.i32(1), self.s.m.i32(2));
             let i32t = self.s.t.i32;
             let at = self.begin_guarded(guard);
+            self.dirty_buffer(
+                src,
+                dirty::DirtyShape::Raw {
+                    h,
+                    byte_in_view: byte,
+                    unbiased_off: unbiased_byte,
+                    bytes: bits / 8,
+                },
+            )?;
             for (op, x) in [(and, keep), (or, set)] {
                 let args = [h, op, aligned, iu, iu, x];
                 self.s
@@ -12742,11 +12792,17 @@ impl<'a> Lower<'a> {
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
+            let (h, coords, dirty_shape) = match index {
                 // A raw buffer (stride 1) read by index: the index is the byte.
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
                     let byte = self.s.m.bin(c, Bin::Add, index, off);
-                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                    let ub = self.s.m.bin(c, Bin::Add, index, unbiased_off);
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    (
+                        h,
+                        [byte, iu, iu],
+                        dirty::DirtyShape::Raw { h, byte_in_view: byte, unbiased_off: ub, bytes: 4 },
+                    )
                 }
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -12754,9 +12810,25 @@ impl<'a> Lower<'a> {
                         return Err("a structured buffer of unknown stride");
                     }
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    (
+                        h,
+                        [index, off, iu],
+                        dirty::DirtyShape::Structured { h, index, off, stride, bytes: 4 },
+                    )
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => {
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    (
+                        h,
+                        [off, iu, iu],
+                        dirty::DirtyShape::Raw {
+                            h,
+                            byte_in_view: off,
+                            unbiased_off,
+                            bytes: 4,
+                        },
+                    )
+                }
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -12767,6 +12839,7 @@ impl<'a> Lower<'a> {
                 _ => self.s.m.i32(0),
             };
             let at = self.begin_guarded(guard);
+            self.dirty_buffer(src, dirty_shape)?;
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -12834,48 +12907,86 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
-            let (op, name) = if typed {
+            let (op, name, dirty_shape) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                let stride_word = if self.dirty.enabled
+                    && !self.dirty.aborted
+                    && self.is_static_table_uav(src).is_some()
+                {
+                    self.slot_word(src, true)?
+                } else {
+                    None
+                };
+                let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                let elem_index = index.unwrap_or(self.s.m.i32(0));
+                args.push(h);
+                args.extend([elem_index, iu]);
                 for x in vals {
                     args.push(self.as_float(x));
                 }
-                (69, "bufferStore.f32")
+                (
+                    69,
+                    "bufferStore.f32",
+                    dirty::DirtyShape::Typed { h, index: elem_index, stride_word },
+                )
             } else {
-                match index {
+                let shape = match index {
                     // A raw buffer (stride 1) written by index: the index is the byte.
                     Some(index) if used.is_some_and(|u| u.stride == 1) => {
                         let byte = self.s.m.bin(c, Bin::Add, index, off);
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+                        let ub = self.s.m.bin(c, Bin::Add, index, unbiased_off);
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        args.push(h);
                         args.extend([byte, iu]);
+                        dirty::DirtyShape::Raw {
+                            h,
+                            byte_in_view: byte,
+                            unbiased_off: ub,
+                            bytes: 4 * count,
+                        }
                     }
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        args.push(h);
                         args.extend([index, off]);
+                        dirty::DirtyShape::Structured {
+                            h,
+                            index,
+                            off,
+                            stride,
+                            bytes: 4 * count,
+                        }
                     }
                     None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        args.push(h);
                         args.extend([off, iu]);
+                        dirty::DirtyShape::Raw {
+                            h,
+                            byte_in_view: off,
+                            unbiased_off,
+                            bytes: 4 * count,
+                        }
                     }
-                }
+                };
                 args.extend(&vals);
                 args.resize(3 + 4, iu);
-                (140, "rawBufferStore.i32")
+                (140, "rawBufferStore.i32", shape)
             };
             args.push(self.s.m.i8(if typed { 0xF } else { (1u8 << count) - 1 }));
             if !typed {
                 args.push(self.s.m.i32(4));
             }
             let at = self.begin_guarded(guard);
+            self.dirty_buffer(src, dirty_shape)?;
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);

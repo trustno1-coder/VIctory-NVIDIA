@@ -53,6 +53,15 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Subset of `pending` whose bytes were snapshotted into `before`
+    /// (untracked shader writes or `VICTORY_DIRTY_CHECK=1`).
+    snapshotted: Mutex<Vec<(usize, usize)>>,
+    /// Per 64 KiB piece: whether CPU refreshes or untracked writes ever put
+    /// non-zero bytes into `data` before `dirty_before` was initialized.
+    populated: Mutex<Vec<u64>>,
+    /// Sparse per-64KiB-piece baseline for `SLOT_DIRTY`-tracked copies in PC
+    /// memory (replaces the full-copy `before` snapshot).
+    dirty_before: crate::dirty::DirtyBefore,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -1064,7 +1073,7 @@ impl Flights {
 /// later flight at this moment, and a store there, even of the value just
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
-fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+pub(crate) fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
@@ -1077,7 +1086,7 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
-fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
     let mut out = Vec::new();
     let mut at = from;
@@ -2182,7 +2191,7 @@ mod wide_tests {
 /// those are to be written, so a title write that lands between the read
 /// and the write elsewhere in the stretch stays (upstream VIctory #2009).
 /// `mask` is scratch.
-fn back_piece(
+pub(crate) fn back_piece(
     host: &mut [u8],
     old: &[u8],
     title: &mut Vec<u8>,
@@ -2275,7 +2284,7 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+pub(crate) fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2612,7 +2621,7 @@ fn under_wide() -> bool {
 ///
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
-fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+pub(crate) fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
     crate::watch::landing(at, title.len());
     if !exact_back() {
         crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());
@@ -2977,14 +2986,14 @@ fn kept_most() -> u64 {
 /// The 64 KiB pieces, cut at multiples of 64 KiB of title memory, that
 /// hold offsets `[from, to)` of a copy of memory from `start` on
 /// (`from < to`); piece 0 holds offset 0.
-fn pieces_of(start: usize, from: usize, to: usize) -> std::ops::Range<usize> {
+pub(crate) fn pieces_of(start: usize, from: usize, to: usize) -> std::ops::Range<usize> {
     let first = start / PIECE;
     (start + from) / PIECE - first..(start + to - 1) / PIECE - first + 1
 }
 
 /// The offsets that piece `piece` holds of a copy of `len` bytes of memory
 /// from `start` on.
-fn piece_at(start: usize, len: usize, piece: usize) -> (usize, usize) {
+pub(crate) fn piece_at(start: usize, len: usize, piece: usize) -> (usize, usize) {
     let first = start / PIECE;
     let lo = ((first + piece) * PIECE).saturating_sub(start);
     let hi = ((first + piece + 1) * PIECE - start).min(len);
@@ -3390,7 +3399,7 @@ impl Shadow {
         *self.width.get_or_init(|| unsafe { self.buffer.GetDesc() }.Width)
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+    pub(crate) fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
@@ -3407,6 +3416,9 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            snapshotted: Mutex::default(),
+            populated: Mutex::default(),
+            dirty_before: crate::dirty::DirtyBefore::new(),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3429,7 +3441,7 @@ impl Shadow {
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
-    fn inside(&self, address: usize, len: usize) -> (usize, usize) {
+    pub(crate) fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
         (from - start, (address + len).clamp(from, end) - start)
@@ -3440,23 +3452,16 @@ impl Shadow {
     /// is copied back into title memory, where the title reads it; until
     /// then no refresh copies title memory over it. Call after the
     /// [`Shadow::refresh`] that gives the shaders the title's data.
-    ///
-    /// shortcut: what shaders wrote is found by keeping the range's bytes
-    /// before the submission (a copy per declared range and submission);
-    /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
-        // shortcut: another host copy of the same bytes (a title buffer
-        // inside this one with a copy of its own, a texture in it) is not
-        // told: the card's writes are not seen by write watching.
+        self.gpu_writes_dirty(list, address, len, false);
+    }
+
+    /// [`Shadow::gpu_writes`]; `tracked`: `SLOT_DIRTY` records every 64 KiB
+    /// page written by this stage, avoiding `Shadow::before` full snapshots.
+    pub(crate) fn gpu_writes_dirty(self: &Arc<Self>, list: &HostList, address: u64, len: u64, tracked: bool) {
         if self.place.is_some() {
             return;
         }
-        // Write-combined title memory, which the title's CPU does not read
-        // (`VICTORY_WC_NO_BACK`, and always for `VICTORY_WC_BAR`'s copies,
-        // which the CPU would read through the bus): what shaders write stays
-        // on the card.
         if (self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() || self.mapped && !self.window)
             && self.write_combined()
         {
@@ -3466,7 +3471,7 @@ impl Shadow {
         }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize);
+        list.defer_gpu_write_with(self, address as usize, len as usize, tracked);
     }
 
     /// Whether all of the copy's title memory was asked for write-combined
@@ -3500,8 +3505,20 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        self.writing_with(address, len, false);
+    }
+
+    /// [`Shadow::writing`]; when `tracked` and [`crate::dirty::on`] hold
+    /// (without `VICTORY_DIRTY_CHECK`), `dirty_before` replaces the full-range
+    /// CPU snapshot in `before`.
+    pub(crate) fn writing_with(&self, address: usize, len: usize, tracked: bool) {
         if self.place.is_some() {
             return;
+        }
+        let use_dirty = tracked && crate::dirty::on() && !crate::dirty::check();
+        if self.card.is_none() && use_dirty {
+            self.dirty_before
+                .ensure(self.start as usize, self.len as usize, self.data, &self.populated);
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -3510,22 +3527,24 @@ impl Shadow {
         if relay() {
             self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
         }
-        // Dispatches declare the same ranges thousands of times.
-        if pending.contains(&range) {
+        if self.card.is_some() || use_dirty {
+            if !pending.contains(&range) {
+                pending.push(range);
+            }
             return;
         }
-        // In the card's memory: no snapshot. What shaders wrote is found on
-        // the card (`Host::card_before` reads the declared ranges from the
-        // lists).
-        if self.card.is_some() {
+        if !pending.contains(&range) {
             pending.push(range);
+        }
+        let mut snapshotted = self.snapshotted.lock().unwrap_or_else(|e| e.into_inner());
+        if snapshotted.contains(&range) {
             return;
         }
-        // The parts no declared range holds yet: their bytes are taken now,
-        // just after the range's refresh (a part declared earlier has not
+        // The parts no snapshotted range holds yet: their bytes are taken now,
+        // just after the range's refresh (a part snapshotted earlier has not
         // been refreshed since, and keeps the bytes taken then).
         let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
+        for &(a, e) in snapshotted.iter() {
             let (a, e) = self.inside(a, e - a);
             let mut rest = Vec::with_capacity(parts.len() + 1);
             for (from, to) in parts {
@@ -3542,7 +3561,8 @@ impl Shadow {
             }
             parts = rest;
         }
-        pending.push(range);
+        snapshotted.push(range);
+        drop(snapshotted);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3672,6 +3692,7 @@ impl Shadow {
                 if !runs.is_empty() {
                     written += put_changed(start + at + first, &was[..n], &title[..n]);
                 }
+                self.note_populated_or_sync(at, at + host.len());
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -3758,7 +3779,79 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
+        self.note_populated_from(at + first, held);
         put_changed(start + at, &was, title)
+    }
+
+    /// [`Shadow::copy_back_with`] for `SLOT_DIRTY`-tracked pieces `pieces` of
+    /// `[address, address + len)` (no `before` full-copy snapshot or scan).
+    pub(crate) fn copy_back_dirty(&self, address: usize, len: usize, pieces: Vec<(usize, usize)>) -> usize {
+        if self.place.is_some() || self.card.is_some() || pieces.is_empty() {
+            return 0;
+        }
+        let _ = len;
+        let _ = address;
+        for &(at, n) in &pieces {
+            self.changed(at, at + n);
+        }
+        self.dirty_before
+            .copy_back(self.start as usize, self.len as usize, self.data, &pieces)
+    }
+
+    /// [`Shadow::relay_merge`] for a `SLOT_DIRTY`-tracked piece `[at, at + n)`.
+    pub(crate) fn relay_merge_dirty(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        if self.card.is_some() || n == 0 || at + n > self.len as usize {
+            return 0;
+        }
+        self.dirty_before
+            .relay_merge(self.start as usize, self.len as usize, self.data, at, n, now, title)
+    }
+
+    /// [`Shadow::land_back`] for a `SLOT_DIRTY`-tracked piece `[at, at + n)`.
+    pub(crate) fn land_dirty(&self, at: usize, n: usize, notes: &mut crate::land::Notes) -> u64 {
+        if self.card.is_some() || n == 0 || at + n > self.len as usize {
+            return 0;
+        }
+        let waiting = std::time::Instant::now();
+        let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
+        crate::land::spent(crate::land::stat::LOCK, waiting);
+        self.dirty_before
+            .land_piece(self.start as usize, self.len as usize, self.data, at, n, notes, self)
+    }
+
+    /// Marks 64 KiB pieces covering `[from, to)` populated, or syncs
+    /// `dirty_before` from `self.data[from..to]` once initialized.
+    fn note_populated_or_sync(&self, from: usize, to: usize) {
+        if from >= to || self.card.is_some() {
+            return;
+        }
+        let (start, len) = (self.start as usize, self.len as usize);
+        if self.dirty_before.is_init() {
+            self.dirty_before.sync_from_data(start, len, self.data, from, to);
+            return;
+        }
+        let pieces = pieces_of(start, from, to);
+        let total = pieces_of(start, 0, len.max(1)).end;
+        let mut bits = self.populated.lock().unwrap_or_else(|e| e.into_inner());
+        if bits.is_empty() {
+            bits.resize(total.div_ceil(64), 0);
+        }
+        for p in pieces {
+            bits[p / 64] |= 1 << (p % 64);
+        }
+    }
+
+    /// Marks `[at, at + slice.len())` populated or copies `slice` into `dirty_before`.
+    fn note_populated_from(&self, at: usize, slice: &[u8]) {
+        if slice.is_empty() || self.card.is_some() {
+            return;
+        }
+        let (start, len) = (self.start as usize, self.len as usize);
+        if self.dirty_before.is_init() {
+            self.dirty_before.put_slice(start, len, at, slice);
+            return;
+        }
+        self.note_populated_or_sync(at, at + slice.len());
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -3829,8 +3922,16 @@ impl Shadow {
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
             pending.retain(|r| free.binary_search(r).is_err());
+            self.snapshotted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|r| free.binary_search(r).is_err());
         } else {
             pending.retain(|r| !ranges.contains(r));
+            self.snapshotted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|r| !ranges.contains(r));
         }
         if !pending.is_empty() || self.card.is_some() {
             return;
@@ -4008,12 +4109,13 @@ impl Shadow {
             // bytes for the title's.
             let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            let use_dirty_before = self.card.is_none() && before.is_none() && self.dirty_before.is_init();
             let held = if self.card.is_some() {
                 self.data as usize
             } else {
                 before.as_mut().map_or(0, |snapshot| snapshot.as_mut_ptr() as usize)
             };
-            if held == 0 {
+            if held == 0 && !use_dirty_before {
                 note_stale(3);
                 return true;
             }
@@ -4028,11 +4130,21 @@ impl Shadow {
             let one = |i: usize| {
                 let (lo, hi) = page_of(i);
                 if lo < hi && !over.load(Ordering::Relaxed) {
-                    // SAFETY: the reference holds the copy's bytes at the
-                    // copy's offsets, and these are in a declared range; the
-                    // locks held above keep out what else writes them, and
-                    // no two pages are the same.
-                    let runs = unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) };
+                    let runs = if use_dirty_before {
+                        Ok(self.dirty_before.merge_page_under_writes(
+                            start,
+                            self.len as usize,
+                            self.data,
+                            lo,
+                            hi - lo,
+                        ))
+                    } else {
+                        // SAFETY: the reference holds the copy's bytes at the
+                        // copy's offsets, and these are in a declared range; the
+                        // locks held above keep out what else writes them, and
+                        // no two pages are the same.
+                        unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) }
+                    };
                     match runs {
                         Ok(runs) => *done[i].lock().unwrap_or_else(|e| e.into_inner()) = runs,
                         Err(()) => over.store(true, Ordering::Relaxed),
@@ -4134,6 +4246,7 @@ impl Shadow {
                 // written here and nothing around them.
                 unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                 held[r..r + m].copy_from_slice(&title[r..r + m]);
+                self.note_populated_from(at + r, &title[r..r + m]);
             }
             Ok(Some(runs))
         })
@@ -4549,6 +4662,7 @@ impl Shadow {
             crate::host::copy_mapped(at, from as *const u8, to - from, false);
         }
         // After the bytes are in: a snapshot taken meanwhile is not current.
+        self.note_populated_or_sync(from - start, to - start);
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
@@ -4623,9 +4737,12 @@ impl Shadow {
             // SAFETY: inside the mapping of the CPU's side, in a range no
             // refresh writes; the lock keeps the landing out.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
-        } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            // SAFETY: the snapshot's allocation holds the copy's length.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
+        } else {
+            if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                // SAFETY: the snapshot's allocation holds the copy's length.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
+            }
+            self.note_populated_from(from, bytes);
         }
         self.changed(from, to);
     }
@@ -5003,7 +5120,13 @@ impl Shadow {
         // keeps out what else writes them. Title memory that is not there
         // is looked at again when the next flight that declared the range
         // lands.
-        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
+        let out = unsafe {
+            crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self)
+        };
+        // SAFETY: `held` covers `[at, at + n)` under `before`'s lock above.
+        let synced = unsafe { std::slice::from_raw_parts(held.add(at).cast_const(), n) };
+        self.note_populated_from(at, synced);
+        out
     }
 
     /// What shaders wrote in 64 KiB block `block` (of title memory) of this

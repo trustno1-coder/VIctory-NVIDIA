@@ -519,9 +519,10 @@ impl HostPipeline {
                     let uav = kind == D3D12_ROOT_PARAMETER_TYPE_UAV;
                     // Ours, not the title's, stay root descriptors: the
                     // table of strides, the directory of title memory by
-                    // address and its fault notes.
+                    // address, its fault notes and the dirty-page bitmap.
                     let ours = if uav {
                         slot == victory_shader::emit::SLOT_FAULTS
+                            || slot == victory_shader::emit::SLOT_DIRTY
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_TABLE_STRIDES

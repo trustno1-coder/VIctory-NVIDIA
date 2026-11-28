@@ -13,8 +13,19 @@ use super::HostShader;
 use super::container::SigElement;
 use crate::dxbc::{Container, FourCC};
 
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct SigInfo {
+    constants: Vec<(u32, u32)>,
+    uavs: Vec<(u32, u8)>,
+}
+
 pub struct Host {
     pub device: ID3D12Device,
+    #[cfg(test)]
+    sigs: std::sync::Mutex<std::collections::HashMap<usize, SigInfo>>,
+    #[cfg(test)]
+    last_dirty: std::sync::Mutex<Vec<u32>>,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -231,7 +242,13 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            Ok(Host {
+                device,
+                #[cfg(test)]
+                sigs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                #[cfg(test)]
+                last_dirty: std::sync::Mutex::new(Vec::new()),
+            })
         }
     }
 
@@ -269,18 +286,32 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
-        let mut views: Vec<(u8, u8)> = stages
+        // CBVs and SRVs first (by slot, then kind), then UAVs by slot so test
+        // callers binding `root_cbvs` + `root_srvs` at `1 + n` stay aligned.
+        let mut views: Vec<(bool, u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
-                let srvs = s.root_srvs.iter().map(|&r| (r, 1));
-                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
+                let cbvs = s.root_cbvs.iter().map(|&r| (false, r, 0));
+                let srvs = s.root_srvs.iter().map(|&r| (false, r, 1));
+                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (true, r, 2)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, kind) in views {
+        #[cfg(test)]
+        let mut sig_info = SigInfo {
+            constants: stages
+                .iter()
+                .enumerate()
+                .map(|(i, &(s, _))| (i as u32, s.user_data_dwords().max(1)))
+                .collect(),
+            uavs: Vec::new(),
+        };
+        for (_, slot, kind) in views {
+            #[cfg(test)]
+            if kind == 2 {
+                sig_info.uavs.push((params.len() as u32, slot));
+            }
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
                     1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
@@ -355,7 +386,14 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let sig: ID3D12RootSignature =
+                self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            #[cfg(test)]
+            self.sigs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(sig.as_raw() as usize, sig_info);
+            Ok(sig)
         }
     }
 
@@ -724,6 +762,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
+        dirty_tracked: false,
     }
 }
 
@@ -742,6 +781,8 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root UAV over a buffer pre-filled with `data` ([`Host::dispatch`] only).
+    Uav(Vec<u32>),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -762,6 +803,12 @@ pub struct Draw<'a> {
 
 #[cfg(test)]
 impl Host {
+    /// Sorted 64 KiB title page indices flagged in `u<SLOT_DIRTY>` by the most
+    /// recent [`Host::draw`] or [`Host::dispatch`].
+    pub fn dirty_pages(&self) -> Vec<u32> {
+        self.last_dirty.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Draws one triangle into an RGBA32F target and returns its texels.
     pub fn draw(
         &self,
@@ -959,16 +1006,32 @@ impl Host {
                 vb.Unmap(0, None);
                 Some(vb)
             };
+            let sig_info = self
+                .sigs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(root.as_raw() as usize))
+                .cloned()
+                .unwrap_or_default();
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
             list.SetGraphicsRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        let need = sig_info
+                            .constants
+                            .iter()
+                            .find(|&&(p, _)| p == *param)
+                            .map_or(data.len(), |&(_, n)| (n as usize).max(data.len()));
+                        let mut padded = data.clone();
+                        padded.resize(need, 0);
+                        list.SetGraphicsRoot32BitConstants(
+                            *param,
+                            padded.len() as u32,
+                            padded.as_ptr().cast(),
+                            0,
+                        );
+                    }
                     Root::Table { sampler, index } => {
                         let (heap, size) = if *sampler {
                             (&sampler_heap, sampler_size)
@@ -979,7 +1042,34 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
+                }
+            }
+            let mut dirty_rb: Option<(ID3D12Resource, ID3D12Resource)> = None;
+            for &(param, slot) in &sig_info.uavs {
+                if d.roots.iter().any(|(p, _)| *p == param) {
+                    continue;
+                }
+                let dwords = if slot == super::SLOT_DIRTY {
+                    super::DIRTY_WORDS
+                } else {
+                    super::MEMORY_FAULTS
+                };
+                let bytes = u64::from(dwords) * 4;
+                let mut uav_desc = buf_desc(bytes);
+                uav_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                let b = make(D3D12_HEAP_TYPE_DEFAULT, &uav_desc, D3D12_RESOURCE_STATE_COMMON, None)?;
+                list.SetGraphicsRootUnorderedAccessView(param, b.GetGPUVirtualAddress());
+                if slot == super::SLOT_DIRTY {
+                    let rb = make(
+                        D3D12_HEAP_TYPE_READBACK,
+                        &buf_desc(bytes),
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                    )?;
+                    dirty_rb = Some((b, rb));
+                } else {
+                    keep.push(b);
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1047,6 +1137,14 @@ impl Host {
                 },
             };
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            if let Some((ref b, ref rb)) = dirty_rb {
+                list.ResourceBarrier(&[transition(
+                    b,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.CopyBufferRegion(rb, 0, b, 0, u64::from(super::DIRTY_WORDS) * 4);
+            }
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
@@ -1074,6 +1172,15 @@ impl Host {
                 out.extend_from_slice(row);
             }
             readback.Unmap(0, None);
+            let mut pages = Vec::new();
+            if let Some((_b, rb)) = dirty_rb {
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).map_err(err)?;
+                let words = std::slice::from_raw_parts(p.cast::<u32>(), super::DIRTY_WORDS as usize);
+                pages = collect_dirty_pages(words);
+                rb.Unmap(0, None);
+            }
+            *self.last_dirty.lock().unwrap_or_else(|e| e.into_inner()) = pages;
             drop(keep);
             Ok(out)
         }
@@ -1578,16 +1685,32 @@ impl Host {
                 at.ptr += i * sampler_size;
                 dev.CreateSampler(s, at);
             }
+            let sig_info = self
+                .sigs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(root.as_raw() as usize))
+                .cloned()
+                .unwrap_or_default();
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetComputeRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        let need = sig_info
+                            .constants
+                            .iter()
+                            .find(|&&(p, _)| p == *param)
+                            .map_or(data.len(), |&(_, n)| (n as usize).max(data.len()));
+                        let mut padded = data.clone();
+                        padded.resize(need, 0);
+                        list.SetComputeRoot32BitConstants(
+                            *param,
+                            padded.len() as u32,
+                            padded.as_ptr().cast(),
+                            0,
+                        );
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)
@@ -1608,6 +1731,60 @@ impl Host {
                         }
                         keep.push(b);
                     }
+                    Root::Uav(data) => {
+                        let n = data.len().max(1) as u32;
+                        let bytes = u64::from(n) * 4;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        if !data.is_empty() {
+                            let up = upload(data)?;
+                            list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                            keep.push(up);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, n, rb));
+                    }
+                }
+            }
+            let mut dirty_rb: Option<(ID3D12Resource, ID3D12Resource)> = None;
+            for &(param, slot) in &sig_info.uavs {
+                if d.roots.iter().any(|(p, _)| *p == param) {
+                    continue;
+                }
+                let dwords = if slot == super::SLOT_DIRTY {
+                    super::DIRTY_WORDS
+                } else {
+                    super::MEMORY_FAULTS
+                };
+                let bytes = u64::from(dwords) * 4;
+                let b = make(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                    D3D12_RESOURCE_STATE_COMMON,
+                )?;
+                list.SetComputeRootUnorderedAccessView(param, b.GetGPUVirtualAddress());
+                if slot == super::SLOT_DIRTY {
+                    let rb = make(
+                        D3D12_HEAP_TYPE_READBACK,
+                        &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )?;
+                    dirty_rb = Some((b, rb));
+                } else {
+                    keep.push(b);
                 }
             }
             let [x, y, z] = d.groups;
@@ -1630,6 +1807,14 @@ impl Host {
                     ),
                     None => list.CopyBufferRegion(rb, 0, r, 0, u64::from(*n) * 4),
                 }
+            }
+            if let Some((ref b, ref rb)) = dirty_rb {
+                list.ResourceBarrier(&[transition(
+                    b,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.CopyBufferRegion(rb, 0, b, 0, u64::from(super::DIRTY_WORDS) * 4);
             }
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
@@ -1664,8 +1849,31 @@ impl Host {
                 rb.Unmap(0, None);
                 out.push(words);
             }
+            let mut pages = Vec::new();
+            if let Some((_b, rb)) = dirty_rb {
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).map_err(err)?;
+                let words = std::slice::from_raw_parts(p.cast::<u32>(), super::DIRTY_WORDS as usize);
+                pages = collect_dirty_pages(words);
+                rb.Unmap(0, None);
+            }
+            *self.last_dirty.lock().unwrap_or_else(|e| e.into_inner()) = pages;
             drop(keep);
             Ok(out)
         }
     }
+}
+
+#[cfg(test)]
+fn collect_dirty_pages(words: &[u32]) -> Vec<u32> {
+    let mut pages = Vec::new();
+    for (wi, &w) in words.iter().enumerate() {
+        let mut bits = w;
+        while bits != 0 {
+            let b = bits.trailing_zeros();
+            pages.push(wi as u32 * 32 + b);
+            bits &= bits - 1;
+        }
+    }
+    pages
 }
