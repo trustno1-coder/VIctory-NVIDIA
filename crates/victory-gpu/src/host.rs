@@ -2393,12 +2393,14 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 /// since the start.
 pub(crate) static SPARE_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Drops spare scratch chunks kept idle when host memory is pressured.
-fn trim_spare_chunks() {
+/// Drops the spare scratch chunks kept idle: when host memory is pressured,
+/// and when an upload buffer is refused for want of memory
+/// ([`Host::upload_buffer`]). The bytes freed.
+fn trim_spare_chunks() -> u64 {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
-            return;
+            return 0;
         }
         spare.bytes = 0;
         spare.low = 0;
@@ -2411,7 +2413,27 @@ fn trim_spare_chunks() {
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
     drop(freed);
+    bytes
 }
+
+/// What `make` gives, and when it failed for want of memory (`E_OUTOFMEMORY`)
+/// what it gives once more after `free` gave memory back; with the bytes
+/// `free` gave back (0: not asked again).
+fn make_or_free_and_retry<T>(
+    make: impl Fn() -> windows::core::Result<T>,
+    free: impl FnOnce() -> u64,
+) -> (windows::core::Result<T>, u64) {
+    match make() {
+        Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => match free() {
+            0 => (Err(e), 0),
+            freed => (make(), freed),
+        },
+        made => (made, 0),
+    }
+}
+
+/// Upload buffers made on the second try ([`make_or_free_and_retry`]).
+static UPLOAD_RETRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
@@ -9549,9 +9571,43 @@ impl Host {
         }
     }
 
+    /// A committed upload buffer of `size` bytes, mapped.
+    ///
+    /// Refused for want of memory (`0x8007000E`), it is asked again once
+    /// after the spare scratch chunks no list holds are freed: they are upload
+    /// buffers too, in the same budget, the PC's memory the card may use. That
+    /// budget can run out while the PC itself still has memory free, and then
+    /// nothing else frees them (the sweep does once the PC is short, every
+    /// second). With 15.7 GB of RAM, 368 buffers of 256 KiB were refused in
+    /// 4 s at world load and the run ended there (#944), while up to 128 MiB
+    /// of them can be kept spare on such a PC.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
+        let (made, freed) = make_or_free_and_retry(|| self.make_upload_buffer(size), trim_spare_chunks);
+        if freed > 0 && made.is_ok() {
+            let times = UPLOAD_RETRIED.fetch_add(1, Ordering::Relaxed) + 1;
+            if times.is_power_of_two() {
+                tracing::warn!(
+                    size,
+                    freed_mb = freed >> 20,
+                    times,
+                    "an upload buffer refused for want of memory (0x8007000E) was made once the spare scratch chunks were freed"
+                );
+            }
+        }
+        match made {
+            Ok(made) => Some(made),
+            Err(e) => {
+                crate::residency::allocation_error(&e);
+                tracing::warn!(error = %e, size, "no upload buffer");
+                None
+            }
+        }
+    }
+
+    /// [`Host::upload_buffer`]'s one try.
+    fn make_upload_buffer(&self, size: u64) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             ..Default::default()
@@ -9594,14 +9650,8 @@ impl Host {
         {
             crate::book::made(b, || "an upload buffer".into());
         }
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                crate::residency::allocation_error(&e);
-                tracing::warn!(error = %e, size, "no upload buffer");
-                None
-            }
-        }
+        made?;
+        Ok((buffer.ok_or_else(windows::core::Error::empty)?, data.cast()))
     }
 }
 
@@ -11311,7 +11361,47 @@ mod trail {
 
 #[cfg(test)]
 mod spare {
-    use super::Spare;
+    use super::{Spare, make_or_free_and_retry};
+
+    /// Refused for want of memory, a buffer is asked again once memory was
+    /// given back; not when none was, nor after another refusal (#944).
+    #[test]
+    fn an_out_of_memory_refusal_is_tried_again_once_memory_is_given_back() {
+        use std::cell::Cell;
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        use windows::core::{Error, HRESULT};
+        let tries = Cell::new(0);
+        // Refused, then made once 4 MiB went.
+        let refused_once = || {
+            tries.set(tries.get() + 1);
+            if tries.get() == 1 { Err(Error::from(E_OUTOFMEMORY)) } else { Ok(7) }
+        };
+        let (made, freed) = make_or_free_and_retry(refused_once, || 4 << 20);
+        assert_eq!((made.ok(), freed, tries.get()), (Some(7), 4 << 20, 2));
+        // Refused, with nothing to give back: tried once.
+        let refused = |code: HRESULT| {
+            tries.set(tries.get() + 1);
+            Err::<u32, _>(Error::from(code))
+        };
+        tries.set(0);
+        let (made, freed) = make_or_free_and_retry(|| refused(E_OUTOFMEMORY), || 0);
+        assert_eq!((made.map_err(|e| e.code()), freed, tries.get()), (Err(E_OUTOFMEMORY), 0, 1));
+        // Another refusal: nothing is freed for it, and it is tried once.
+        let asked_to_free = Cell::new(false);
+        tries.set(0);
+        let (made, freed) = make_or_free_and_retry(
+            || refused(E_INVALIDARG),
+            || {
+                asked_to_free.set(true);
+                1
+            },
+        );
+        assert_eq!((made.map_err(|e| e.code()), freed, tries.get()), (Err(E_INVALIDARG), 0, 1));
+        assert!(!asked_to_free.get());
+        // Made at once: nothing freed.
+        let (made, freed) = make_or_free_and_retry(|| Ok(3), || unreachable!("nothing to free for"));
+        assert_eq!((made.ok(), freed), (Some(3), 0));
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.
