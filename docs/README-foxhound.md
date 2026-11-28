@@ -135,6 +135,7 @@ Every `VICTORY_...` switch is described in a comment where the code reads it. Th
 | `VICTORY_NATIVE_1440P` | on | Series X renders and outputs 2560x1440 (image patched) |
 | `VICTORY_SOFT_VIEWS` | `copies` | the title's tiled-heap page mappings kept without Windows views: no freezes at scene cuts |
 | `VICTORY_WC_NO_BACK`, `_MIN_KB` | `1`, `1024` | shader writes into big write-combined copies are not copied back |
+| `VICTORY_GPU_RO_SKIP`, `_CHECK` | on (`0` off), off | subtracts GPU-read-only (`PAGE_GRAPHICS_*`) sub-ranges from shader UAV write declarations; `_CHECK=1` keeps full ranges and warns if a GPU compare sees any write in them |
 | `VICTORY_AMBIENT`, `VICTORY_AMBIENT_SPECULAR` | `0.8`, `1` | estimates of indirect light and of reflections (no ray tracing) |
 | `VICTORY_EARLY_DEPTH` | on | pixel programs keep the console's early depth test |
 | `VICTORY_PRELUDE_UPLOADS`, `VICTORY_SHOW_NEW_LATER`, `VICTORY_TABLED_REREAD` | on | texture upload order and slot changes (flicker, device losses) |

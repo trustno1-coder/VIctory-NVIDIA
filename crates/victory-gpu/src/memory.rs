@@ -769,7 +769,7 @@ impl Memory {
                 && !self.pages.contains_key(&page)
             {
                 self.copies[k].refresh(list, at, n);
-                self.copies[k].gpu_writes(list, at, n);
+                self.copies[k].shader_writes(list, at, n, 1);
                 self.stats.back += 1;
             }
             at += n;

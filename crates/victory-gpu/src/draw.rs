@@ -2198,9 +2198,7 @@ impl State {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
-                #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
-                s.gpu_writes(list, a, len);
+                s.shader_writes(list, a, len, self.pipeline);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -5653,9 +5651,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(address, len, 0);
-                shadow.gpu_writes(list, address, len);
+                shadow.shader_writes(list, address, len, 0);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {
