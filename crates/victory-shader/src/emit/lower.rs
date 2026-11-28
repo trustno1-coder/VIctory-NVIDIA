@@ -612,6 +612,56 @@ pub(super) fn loop_branches(p: &Program, st: &Structured) -> HashSet<usize> {
 /// (reads give 0, writes are dropped; `VICTORY_LDS_BOUNDS=0`: taken as inside, as before).
 fn lds_bounds() -> bool {
     !std::env::var("VICTORY_LDS_BOUNDS").is_ok_and(|v| v.trim() == "0")
+        && !lds_bounds_exempt()
+}
+
+/// Programs the bounds above are not applied to (`VICTORY_LDS_BOUNDS_EXEMPT=<16 hex digits>[,..]`,
+/// the BLAKE3 of the title's container as run logs name shaders; `0` or empty: none; unset: the
+/// face programs below). The face network's operations (`compute_graph_ops`: the matrix
+/// products, dot products and reductions) and the two programs that rebuild the face's normals
+/// from its blend shapes use shared memory past the size their headers give; held to that size,
+/// their results were zeros and cutscene faces were not drawn but for the eyes and teeth (Series X,
+/// 1.0.2.1, the interview and the store flashback). Every other program keeps the bounds:
+/// without them anywhere, the submitting thread waited 71 ms a frame for the card (median, RTX
+/// 5080; about 1 ms with them) and the frame rate halved.
+const FACE_PROGRAMS: [&str; 25] = [
+    "38a65783327c30b6", "60c4f9d76c3aed89", "3eed5349508763fb", "25c0eac2493ca478",
+    "f8425d3c03df62a0", "44679bc29abcf17a", "d603b4c3b6505026", "3931481a3e2ff49f",
+    "7031554d409c394f", "e72489e94f2e167a", "e52a6557e730c889", "c41ee78453b1eed8",
+    "fcbb2e25040a325b", "24a83bd1f400880f", "6b1ec09dad51d662", "95efe597345a9e17",
+    "e45172602f6280b6", "0709e8356abd9082", "e4576c6eca0f8ce3", "6831220e1ed5878f",
+    "433e7b2c5496ceea", "7de0f9db96ddd295", "3d65925d7cd4a39a", "7ae4af7c4309b836",
+    "e4a7e088c7780ce8",
+];
+
+thread_local! {
+    /// The 16 hex digits of the container being translated on this thread ([`with_program`]).
+    static PROGRAM: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Runs `f` (a translation) with `hash` (16 hex digits of the container's BLAKE3) as the program
+/// being translated, for the settings that name programs ([`lds_bounds_exempt`]).
+pub fn with_program<T>(hash: &str, f: impl FnOnce() -> T) -> T {
+    PROGRAM.with(|p| hash.clone_into(&mut p.borrow_mut()));
+    let out = f();
+    PROGRAM.with(|p| p.borrow_mut().clear());
+    out
+}
+
+fn lds_bounds_exempt() -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| match std::env::var("VICTORY_LDS_BOUNDS_EXEMPT") {
+        Err(_) => FACE_PROGRAMS.iter().map(|h| (*h).to_owned()).collect(),
+        Ok(v) => v
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty() && h != "0")
+            .collect(),
+    });
+    !list.is_empty() && PROGRAM.with(|p| {
+        let p = p.borrow();
+        !p.is_empty() && list.iter().any(|h| p.starts_with(h.as_str()))
+    })
 }
 
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
