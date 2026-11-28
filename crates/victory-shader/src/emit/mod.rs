@@ -92,6 +92,7 @@ mod filter3d_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod lds_exact;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -516,6 +517,9 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// wave together ([`loops_wave`]) is tried once more without them, as before that step: the
 /// underwater picture's program (`926c46bab3b86bd6`) translated before it and no longer did, so
 /// its dispatch was dropped and diving showed a field of white flares (#539, #570).
+/// With `VICTORY_LDS_EXACT=1`, a program neither of those takes is tried both ways again with
+/// the exact LDS regions ([`lds_exact`]) as its last forms, so that a program that translates
+/// without them keeps its form.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -524,12 +528,30 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    let first = emit_once(c, native, p, st, io, res);
+    let first = emit_loops(c, native, p, st, io, res, false);
+    if !matches!(first, Err(ShaderError::Unsupported { .. })) || !lds_exact::switch() {
+        return first;
+    }
+    emit_loops(c, native, p, st, io, res, true).or(first)
+}
+
+/// [`emit`] with the loops taken by each host wave together, then without them; the exact
+/// LDS regions among the last forms of each try if `exact`.
+fn emit_loops(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    exact: bool,
+) -> Result<HostShader, ShaderError> {
+    let first = emit_once(c, native, p, st, io, res, exact);
     if !matches!(first, Err(ShaderError::Unsupported { .. })) || !loops_wave(native) {
         return first;
     }
     LOOPS_OFF.with(|off| off.set(true));
-    let again = emit_once(c, native, p, st, io, res);
+    let again = emit_once(c, native, p, st, io, res, exact);
     LOOPS_OFF.with(|off| off.set(false));
     match again {
         Ok(shader) => {
@@ -543,11 +565,11 @@ pub fn emit(
 }
 
 thread_local! {
-    /// [`emit`]'s second try: [`loops_wave`] off.
+    /// [`emit_loops`]'s second try: [`loops_wave`] off.
     static LOOPS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// One try of [`emit`].
+/// One try of [`emit_loops`].
 fn emit_once(
     c: &Container,
     native: &NativeProgram,
@@ -555,6 +577,7 @@ fn emit_once(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    exact: bool,
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -769,6 +792,38 @@ fn emit_once(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // After everything else (`VICTORY_LDS_EXACT=1`, [`emit`]'s tries after the others): the
+        // lane-branch regions of LDS that need no order between the halves ([`lds_exact`]), in
+        // each form above whole, and as the allocation idiom's local waves. Only here, so that a
+        // program that translates without them keeps its form.
+        if exact {
+            let mut bases = Vec::new();
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f {
+                    bases.push((*name, p, st, io, res));
+                }
+            }
+            bases.push(("as it is", p, st, io, res));
+            for (name, p, st, io, res) in bases {
+                let whole = lds_exact::with_exact(|| emit_program(c, native, p, st, io, res));
+                report(&format!("exact LDS regions, {name}"), &whole);
+                if done(&whole) {
+                    return whole.map(|(shader, _)| shader);
+                }
+                if local_on && !exact_only && lds_exact::with_exact(|| idiom(p, st)) {
+                    let local = lds_exact::with_exact(|| {
+                        lower::with_local_waves(|| emit_program(c, native, p, st, io, res))
+                    });
+                    report(
+                        &format!("exact LDS regions, local waves (idiom), {name}"),
+                        &local,
+                    );
+                    if done(&local) {
+                        return local.map(|(shader, _)| shader);
+                    }
                 }
             }
         }
