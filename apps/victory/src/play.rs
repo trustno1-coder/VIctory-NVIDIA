@@ -104,7 +104,8 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_AMBIENT_SPECULAR", "1"),
     // Pixel programs keep the console's early depth test
     ("VICTORY_EARLY_DEPTH", "1"),
-    // Left out: the decal heap's defragmentation and the heat-haze pass
+    // 默认跳过人脸重定位和热浪过程；启用人脸修复的启动器会只保留热浪跳过。
+    // Left out: the face-relocation compute and the heat-haze pass
     ("VICTORY_LEAVE_OUT", "02384a60fda6f2d0,731a39171b568298"),
     // Pipelines the title makes are written down, for `victory warm`
     ("VICTORY_PIPELINE_BOOK", "1"),

@@ -12,10 +12,17 @@ param(
     [ValidateSet('1', '2', '3', '4', '5', '6')][string]$Mode = '1',
     [string]$GameDir = '',
     [switch]$Check,
-    [switch]$NoBackup
+    [switch]$NoBackup,
+    # 启用人脸网格重定位计算，修复人物只剩眼睛、牙齿而脸部网格缺失的问题。
+    [switch]$FaceMeshFix
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
+
+# 标题管线哈希：前者负责人脸网格重定位，后者负责热浪/折射。
+# 默认启动为了性能会同时跳过两者；FaceMeshFix 只保留热浪跳过。
+$FACE_MESH_RELOCATION_HASH = '02384a60fda6f2d0'
+$HEAT_HAZE_HASH = '731a39171b568298'
 
 # A game folder holds the executable and its data (a lone copy of the exe does not count).
 function Test-GameDir([string]$d) {
@@ -120,6 +127,10 @@ elseif ($cpus -ge 16) { $more.VICTORY_THIN_THREADS = '12'; $more.VICTORY_UNDER_T
 if (($Mode -in @('5', '6')) -and $cpus -ge 24) { $more.VICTORY_LAND_THREADS = '12'; $more.VICTORY_PIPELINE_WORKERS = '4' }
 if ($env:GTA6_NO_TUNE -eq '1') { $more = @{}; Write-Host 'GTA6_NO_TUNE=1: foxhound defaults (no pool or placed-order tuning).' }
 else { Write-Host ("Tuning for {0} logical CPUs: {1}" -f $cpus, (($more.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')) }
+if ($FaceMeshFix) {
+    $more.VICTORY_LEAVE_OUT = $HEAT_HAZE_HASH
+    Write-Host "Face mesh relocation enabled (kept $FACE_MESH_RELOCATION_HASH; heat haze remains skipped)."
+}
 $opts.More = $more
 # RTX 50 cards do multi frame generation: 4x there (the layer asks the driver and gives no more than it does).
 # GTA6_FRAMEGEN_X=2..6 overrides. RTX 40 stays at 2x.

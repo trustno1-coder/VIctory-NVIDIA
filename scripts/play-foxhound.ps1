@@ -93,7 +93,8 @@ $settings = @{
     VICTORY_AMBIENT = '0.8'; VICTORY_AMBIENT_AIR = '1.5'; VICTORY_AMBIENT_SPECULAR = '1'
     # Pixel programs keep the console's early depth test
     VICTORY_EARLY_DEPTH = '1'
-    # Left out: the decal heap's defragmentation (5.6 ms of GPU a frame) and the heat-haze pass (smeared blocks)
+    # 默认跳过人脸重定位和热浪；人脸重定位的新 Wave32 路径由 PLAY_FACES_FIX 启用。
+    # Left out: the face-relocation compute and the heat-haze pass
     VICTORY_LEAVE_OUT = '02384a60fda6f2d0,731a39171b568298'
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
     VICTORY_PIPELINE_BOOK = '1'
