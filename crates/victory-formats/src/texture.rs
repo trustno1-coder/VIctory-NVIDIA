@@ -296,7 +296,7 @@ impl Layout {
                     && d.dimension == Dimension::Tex2d
                     && d.mips == 1
                     && d.swizzle != Swizzle::LINEAR))
-            && (d.dimension != Dimension::Tex1d || d.height == 1)
+            && (d.dimension != Dimension::Tex1d || (d.height == 1 && d.block == 1))
             && (d.dimension != Dimension::Tex3d
                 || matches!(d.swizzle.0, 0 | 5 | 9 | 17 | 21 | 24..=27));
         if !valid {
@@ -961,6 +961,95 @@ mod tests {
         samples: 1,
         swizzle: Swizzle::SW_4KB_S,
     };
+
+    const RGBA8_1D_TEXTURE: TextureDesc = TextureDesc {
+        dimension: Dimension::Tex1d,
+        height: 1,
+        swizzle: Swizzle::LINEAR,
+        ..RGBA8_TEXTURE
+    };
+
+    #[test]
+    fn bc_1d_formats_are_rejected() {
+        for format in (70..=84).chain(94..=99) {
+            let desc = TextureDesc {
+                format,
+                ..RGBA8_1D_TEXTURE
+            };
+            assert_eq!(Texture::new(&desc), Err(Error::Invalid), "DXGI {format}");
+        }
+    }
+
+    #[test]
+    fn bc_1d_layouts_are_rejected() {
+        for (format_name, block_bytes) in [("BC1", 8), ("BC7", 16)] {
+            let layout_desc = Desc {
+                dimension: Dimension::Tex1d,
+                block: 4,
+                ..desc(4, 1, 1, block_bytes, Swizzle::LINEAR)
+            };
+            assert_eq!(
+                Layout::new(&layout_desc),
+                Err(Error::Invalid),
+                "{format_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn bc_1d_validation_preserves_uncompressed_layouts() {
+        for (format, width, slices, expected_size) in [(28, 4, 1, 256), (61, 257, 2, 1024)] {
+            let texture = Texture::new(&TextureDesc {
+                format,
+                width,
+                depth_or_array: slices,
+                ..RGBA8_1D_TEXTURE
+            })
+            .unwrap();
+            assert_eq!((texture.size, texture.alignment), (expected_size, 256));
+        }
+    }
+
+    #[test]
+    fn bc_1d_validation_preserves_2d_and_3d_bc_layouts() {
+        for format in [71, 98] {
+            let two_d = Texture::new(&TextureDesc {
+                format,
+                ..RGBA8_TEXTURE
+            })
+            .unwrap();
+            let three_d = Texture::new(&TextureDesc {
+                format,
+                dimension: Dimension::Tex3d,
+                depth_or_array: 2,
+                swizzle: Swizzle::LINEAR,
+                ..RGBA8_TEXTURE
+            })
+            .unwrap();
+            assert_eq!((two_d.size, two_d.alignment), (4096, 4096), "DXGI {format}");
+            assert_eq!(
+                (three_d.size, three_d.alignment),
+                (512, 256),
+                "DXGI {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn bc_1d_validation_preserves_height_restrictions() {
+        for (format, height) in [(28, 0), (28, 2), (71, 2)] {
+            let desc = TextureDesc {
+                format,
+                height,
+                ..RGBA8_1D_TEXTURE
+            };
+            assert_eq!(
+                Texture::new(&desc),
+                Err(Error::Invalid),
+                "DXGI {format}, height {height}"
+            );
+        }
+    }
 
     #[test]
     fn bc_formats_accept_single_sample_layouts() {
