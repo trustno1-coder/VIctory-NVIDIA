@@ -101,6 +101,12 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // Ray-tracing node tests answering no hit (`VICTORY_BVH_NO_HIT=1`,
+        // opt-in; off by default and never active with `VICTORY_BVH_BUILDER=1`).
+        // Keyed only when active so default full-traversal caches stay valid.
+        if victory_shader::emit::bvh_no_hit() {
+            bytes.extend_from_slice(b"VICTORY_BVH_NO_HIT=1\0");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -454,5 +460,55 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    /// Toggling `VICTORY_BVH_NO_HIT` or `VICTORY_BVH_BUILDER` separates the
+    /// shader cache key so no-hit translations never collide with full BVH
+    /// traversal translations.
+    #[test]
+    fn bvh_no_hit_changes_the_shader_cache_key() {
+        const CHILD: &str = "VICTORY_CACHE_BVH_NO_HIT_KEY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            println!("\nbvh-cache-key={}", blake3::Hash::from_bytes(build()));
+            return;
+        }
+        let key = |no_hit: Option<&str>, builder: Option<&str>| {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "bvh_no_hit_changes_the_shader_cache_key",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env_remove("VICTORY_BVH_NO_HIT")
+            .env_remove("VICTORY_BVH_BUILDER");
+            if let Some(v) = no_hit {
+                cmd.env("VICTORY_BVH_NO_HIT", v);
+            }
+            if let Some(v) = builder {
+                cmd.env("VICTORY_BVH_BUILDER", v);
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.split_once("bvh-cache-key=").map(|(_, k)| k.to_owned()))
+                .expect("child printed its cache key")
+        };
+        let default_key = key(None, None);
+        let disabled = key(Some("0"), None);
+        let builder_on = key(None, Some("1"));
+        let builder_overrides_no_hit = key(Some("1"), Some("1"));
+        let opt_in_on = key(Some("1"), None);
+        let opt_in_builder_off = key(Some("1"), Some("0"));
+        assert_eq!(default_key, disabled, "default is off and matches VICTORY_BVH_NO_HIT=0");
+        assert_eq!(default_key, builder_on, "default shares key with VICTORY_BVH_BUILDER=1");
+        assert_eq!(
+            default_key, builder_overrides_no_hit,
+            "VICTORY_BVH_BUILDER=1 disables VICTORY_BVH_NO_HIT=1"
+        );
+        assert_eq!(opt_in_on, opt_in_builder_off, "opt-in no-hit shares one key");
+        assert_ne!(default_key, opt_in_on, "VICTORY_BVH_NO_HIT=1 must use a distinct key");
     }
 }

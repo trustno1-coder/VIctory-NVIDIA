@@ -670,6 +670,126 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     }
 }
 
+/// Pure env policy check for `VICTORY_BVH_NO_HIT` / `VICTORY_BVH_BUILDER`.
+#[test]
+fn bvh_no_hit_policy_is_opt_in_and_blocked_when_builder_is_on() {
+    use std::ffi::OsStr;
+    let s = OsStr::new;
+    assert!(!super::bvh_no_hit_for(None, None));
+    assert!(!super::bvh_no_hit_for(None, Some(s("0"))));
+    assert!(!super::bvh_no_hit_for(Some(s("0")), None));
+    assert!(!super::bvh_no_hit_for(Some(s("0")), Some(s("0"))));
+    assert!(super::bvh_no_hit_for(Some(s("1")), None));
+    assert!(super::bvh_no_hit_for(Some(s("1")), Some(s("0"))));
+    assert!(!super::bvh_no_hit_for(None, Some(s("1"))));
+    assert!(!super::bvh_no_hit_for(Some(s("1")), Some(s("1"))));
+    assert!(!super::bvh_no_hit_for(Some(s("0")), Some(s("1"))));
+}
+
+/// With `VICTORY_BVH_NO_HIT=1` a node test lowers and validates with zero
+/// `SLOT_MEMORY` loads and zero `SLOT_FAULTS` writes, and executes cleanly on
+/// D3D12 hardware and WARP without binding any memory directory.
+#[test]
+fn a_node_test_that_answers_no_hit_reads_nothing_on_hardware_and_warp() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran_devices = 0;
+    for wide in [true, false] {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::lower::intersect::TEST_NO_HIT.set(false);
+            }
+        }
+        let _reset = Reset;
+        super::lower::intersect::TEST_NO_HIT.set(true);
+        let (shader, _) = build(wide, WHOLE).expect("lowers with no_hit");
+        let (table_shader, _) = build(wide, Descriptor::Table).expect("table lowers with no_hit");
+        drop(_reset);
+
+        assert!(
+            !shader.root_srvs.contains(&super::SLOT_MEMORY),
+            "wide={wide}: no_hit must emit zero SLOT_MEMORY loads"
+        );
+        assert!(
+            !shader.root_uavs.contains(&super::SLOT_FAULTS),
+            "wide={wide}: no_hit must emit zero SLOT_FAULTS writes"
+        );
+        assert!(
+            !table_shader.root_srvs.contains(&super::SLOT_MEMORY),
+            "wide={wide}: table no_hit must emit zero SLOT_MEMORY loads"
+        );
+        let (full, _) = build(wide, WHOLE).expect("lowers through the directory");
+        assert!(full.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(full.root_uavs.contains(&super::SLOT_FAULTS));
+
+        let mut data = vec![0u32; (THREADS * RECORD / 4) as usize];
+        for t in 0..THREADS as usize {
+            let base = t * (RECORD / 4) as usize;
+            let active = t < 16;
+            let kind = (t % 8) as u32;
+            let ptr_lo = ((t as u32 + 1) << 6) | kind;
+            let ptr_hi = if wide { 0x12u32 } else { 0 };
+            data[base] = ptr_lo;
+            data[base + 1] = ptr_hi;
+            data[base + 2] = 100.0f32.to_bits();
+            data[base + 6] = 1.0f32.to_bits();
+            data[base + 9] = 1.0f32.to_bits();
+            data[base + 12] = u32::from(active);
+        }
+
+        let miss = bvh::MISS.map(f32::to_bits);
+        let none = [bvh::NONE; 4];
+
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label} wide={wide}: compute_pipeline failed: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(4 * THREADS),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} wide={wide}: dispatch failed: {e}"));
+
+            for t in 0..THREADS as usize {
+                let got = &out[0][4 * t..4 * t + 4];
+                let want = if t >= 16 {
+                    BEFORE
+                } else if matches!(t % 8, 4 | 5) {
+                    none
+                } else {
+                    miss
+                };
+                assert_eq!(
+                    got, want,
+                    "{label} wide={wide} thread {t} (kind={}): got {got:x?} want {want:x?}",
+                    t % 8
+                );
+            }
+            ran_devices += 1;
+        }
+    }
+    assert!(ran_devices > 0, "no SM 6.6 device available");
+}
+
 #[test]
 fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     // Triangle return mode 0 (bit 24 of dword 3 clear): the last two

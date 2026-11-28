@@ -283,6 +283,28 @@ pub fn builder_bounds() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
 }
 
+/// Whether ray-tracing node tests answer "no hit" and read nothing
+/// (opt-in via `VICTORY_BVH_NO_HIT=1`; off by default; never active with
+/// `VICTORY_BVH_BUILDER=1`).
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s does).
+pub fn bvh_no_hit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        bvh_no_hit_for(
+            std::env::var_os("VICTORY_BVH_NO_HIT").as_deref(),
+            std::env::var_os("VICTORY_BVH_BUILDER").as_deref(),
+        )
+    })
+}
+
+/// Pure decision for [`bvh_no_hit`], for testing.
+pub(crate) fn bvh_no_hit_for(
+    no_hit_env: Option<&std::ffi::OsStr>,
+    builder_env: Option<&std::ffi::OsStr>,
+) -> bool {
+    no_hit_env.is_some_and(|v| v == "1") && builder_env.is_none_or(|v| v != "1")
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a

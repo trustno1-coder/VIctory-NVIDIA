@@ -37,6 +37,31 @@ thread_local! {
     /// and their directory.)
     pub(in crate::emit) static TEST_MEMORY: std::cell::Cell<Option<(u32, u64)>> =
         const { std::cell::Cell::new(None) };
+    /// The tests' way to translate as with `VICTORY_BVH_NO_HIT=1`
+    /// ([`no_hit`]).
+    pub(in crate::emit) static TEST_NO_HIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether a node test answers "no hit" and reads nothing
+/// (opt-in via `VICTORY_BVH_NO_HIT=1`; off by default; never active with
+/// `VICTORY_BVH_BUILDER=1`).
+///
+/// With the structure builder off, ray-traced passes still run and walk
+/// unrehydrated packed memory. Answering no hit lets every ray leave on its
+/// first node test without loading `SLOT_MEMORY` or touching `SLOT_FAULTS`.
+/// Ported from `fxceless/victory-fork`.
+fn no_hit() -> bool {
+    // Unit tests opt in via `TEST_NO_HIT` so existing traversal tests keep
+    // running the full node test without environment mutation.
+    #[cfg(test)]
+    {
+        TEST_NO_HIT.get()
+    }
+    #[cfg(not(test))]
+    {
+        crate::emit::bvh_no_hit()
+    }
 }
 
 /// Where the instruction's node is.
@@ -135,6 +160,22 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        if no_hit() {
+            // No structures: a box enters no child, anything else is missed
+            // ([`no_hit`]). Nothing is read, and nothing is asked of the
+            // directory of title memory.
+            let _ = &ray;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.into_iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
