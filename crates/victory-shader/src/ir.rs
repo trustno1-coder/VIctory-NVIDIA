@@ -1110,11 +1110,23 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
     set[i / 64] >> (i % 64) & 1 != 0
 }
 
-/// In [`Reg`] order, which is also index order.
+/// In [`Reg`] order, which is also index order. Walks the set's words by
+/// their lowest bit, not every one of the `REGS` places: a set holds a few
+/// registers, and this runs twice a block (slatefield's change,
+/// Marvisak/VIctory#1833: `ir::build` 4.5 % faster on programs of 12,000
+/// and 24,000 instructions). Only [`insert`] sets bits, so none lies past
+/// `REGS`; one there would end the walk.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
-    (0..REGS)
-        .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
-        .map(reg_at)
+    let (mut word, mut bits) = (0, set[0]);
+    std::iter::from_fn(move || loop {
+        if bits != 0 {
+            let at = word * 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            return (at < REGS).then(|| reg_at(at));
+        }
+        word += 1;
+        bits = *set.get(word)?;
+    })
 }
 
 /// `outs` is sorted by register, and holds every register live out.
@@ -1869,6 +1881,44 @@ mod tests {
     use super::*;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// [`members`] gives what a test of every place gives, in the same order:
+    /// for no register, every one, and random sets of a few to many.
+    #[test]
+    fn a_live_set_walked_by_its_bits_is_every_place_tested() {
+        let every_place = |set: &RegSet| -> Vec<Reg> {
+            (0..REGS).filter(|&i| set[i / 64] >> (i % 64) & 1 != 0).map(reg_at).collect()
+        };
+        let mut sets = vec![[0u64; REGS.div_ceil(64)]];
+        let mut all = [0u64; REGS.div_ceil(64)];
+        for i in 0..REGS {
+            insert(&mut all, reg_at(i));
+        }
+        sets.push(all);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for count in [1, 2, 3, 7, 40, 300] {
+            for _ in 0..50 {
+                let mut set = [0u64; REGS.div_ceil(64)];
+                for _ in 0..count {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    insert(&mut set, reg_at(seed as usize % REGS));
+                }
+                sets.push(set);
+            }
+        }
+        // The places at the ends of words, and the first and last register.
+        for i in [0, 63, 64, 255, 256, 257, 319, 320, REGS - 1] {
+            let mut set = [0u64; REGS.div_ceil(64)];
+            insert(&mut set, reg_at(i));
+            sets.push(set);
+        }
+        for set in &sets {
+            assert_eq!(members(set).collect::<Vec<_>>(), every_place(set));
+        }
+        assert_eq!(members(&all).count(), REGS);
+    }
 
     fn build_words(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
