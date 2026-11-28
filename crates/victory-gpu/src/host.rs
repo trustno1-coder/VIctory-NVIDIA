@@ -291,8 +291,13 @@ fn ahead_thread() -> bool {
 }
 
 fn note_wait(kind: Made, step: usize, us: u64) {
+    note_waits(kind, step, us, 1);
+}
+
+/// [`note_wait`] of one wait for `objects` made together.
+fn note_waits(kind: Made, step: usize, us: u64, objects: u64) {
     let w = waited(kind as usize, usize::from(ahead_thread()), step);
-    w[0].fetch_add(1, Ordering::Relaxed);
+    w[0].fetch_add(objects, Ordering::Relaxed);
     w[1].fetch_add(us, Ordering::Relaxed);
     w[2].fetch_max(us, Ordering::Relaxed);
 }
@@ -375,6 +380,11 @@ fn mapped_together() -> bool {
 /// that: run n11 was lost as n08 was with it alone.) Best done off a hot
 /// path: a tenth of a millisecond to some.
 pub(crate) fn mapped(device: &ID3D12Device, kind: Made) -> windows::core::Result<()> {
+    mapped_for(device, kind, 1)
+}
+
+/// [`mapped`] once for `objects` made before it.
+fn mapped_for(device: &ID3D12Device, kind: Made, objects: u64) -> windows::core::Result<()> {
     static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
     if !wait_resident() {
         return Ok(());
@@ -464,7 +474,7 @@ pub(crate) fn mapped(device: &ID3D12Device, kind: Made) -> windows::core::Result
         }
     }
     let us = started.elapsed().as_micros() as u64;
-    note_wait(kind, 1, us);
+    note_waits(kind, 1, us, objects);
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
     MAPPED[2].fetch_max(us, Ordering::Relaxed);
@@ -487,13 +497,20 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface, kind: Mad
     if !wait_resident() {
         return Ok(());
     }
+    resident_all(device, &[Some(object.cast()?)], kind)
+}
+
+/// [`resident`] for several objects in one call to the system.
+fn resident_all(device: &ID3D12Device, objects: &[Option<ID3D12Pageable>], kind: Made) -> windows::core::Result<()> {
+    if !wait_resident() || objects.is_empty() {
+        return Ok(());
+    }
     let started = std::time::Instant::now();
-    let object: ID3D12Pageable = object.cast()?;
-    // SAFETY: a live heap or resource of the device's.
-    let made = unsafe { device.MakeResident(&[Some(object)]) };
+    // SAFETY: live heaps or resources of the device's.
+    let made = unsafe { device.MakeResident(objects) };
     let us = started.elapsed().as_micros() as u64;
-    note_wait(kind, 0, us);
-    RESIDENT[0].fetch_add(1, Ordering::Relaxed);
+    note_waits(kind, 0, us, objects.len() as u64);
+    RESIDENT[0].fetch_add(objects.len() as u64, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
     RESIDENT[2].fetch_max(us, Ordering::Relaxed);
     static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1456,6 +1473,54 @@ mod tests {
         }
         // (With `VICTORY_D3D12_DEBUG=1` in a diagnostics build: a list of the
         // mapping copies sent again while the card still read it is an error.)
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+    }
+
+    /// Buffers made together are all there, each its own, mapped where it
+    /// lies in the PC's memory, and as many as asked for; and making them
+    /// together is not slower than one at a time (the times are printed).
+    #[test]
+    fn buffers_made_together_are_whole_and_their_own() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        const SIZE: u64 = 64 << 10;
+        let shared = host.shared_buffers_now(SIZE, 16);
+        let card = host.uav_buffers(SIZE, 16);
+        assert_eq!((shared.len(), card.len()), (16, 16));
+        let mut addresses: Vec<u64> = shared
+            .iter()
+            .map(|(b, _)| b)
+            .chain(card.iter())
+            // SAFETY: live buffers.
+            .map(|b| unsafe { b.GetGPUVirtualAddress() })
+            .collect();
+        addresses.sort_unstable();
+        assert!(addresses.windows(2).all(|w| w[1] >= w[0] + SIZE), "buffers overlap");
+        for (i, (_, data)) in shared.iter().enumerate() {
+            assert!(!data.is_null());
+            // SAFETY: the buffer's whole mapping.
+            unsafe { std::ptr::write_bytes(*data, i as u8, SIZE as usize) };
+        }
+        for (i, (_, data)) in shared.iter().enumerate() {
+            // SAFETY: as above.
+            let bytes = unsafe { std::slice::from_raw_parts(*data, SIZE as usize) };
+            assert!(bytes.iter().all(|&b| b == i as u8), "mapping {i} is not its own");
+        }
+        let time = |f: &dyn Fn()| {
+            let began = std::time::Instant::now();
+            f();
+            began.elapsed().as_secs_f64() * 1e3
+        };
+        let alone = time(&|| {
+            let made: Vec<_> = (0..64).filter_map(|_| host.uav_buffer(SIZE)).collect();
+            assert_eq!(made.len(), 64);
+        });
+        let together = time(&|| {
+            let made: Vec<_> = (0..4).flat_map(|_| host.uav_buffers(SIZE, 16)).collect();
+            assert_eq!(made.len(), 64);
+        });
+        eprintln!("64 card buffers of 64 KiB: {alone:.1} ms one at a time, {together:.1} ms sixteen at a time");
         assert_eq!(host.log_messages(), None, "the debug layer found an error");
     }
 
@@ -11207,13 +11272,37 @@ impl Host {
 
     /// [`Host::shared_buffer`], made now.
     pub(crate) fn shared_buffer_now(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        MADE[2].fetch_add(1, Ordering::Relaxed);
-        MADE[3].fetch_add(size, Ordering::Relaxed);
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            ..Default::default()
+        self.buffers_now(size, 1, true).pop().map(|(b, data)| (b, data as *mut u8))
+    }
+
+    /// `n` of [`Host::shared_buffer_now`] at once, with one wait for them all
+    /// (fewer if the host refused some).
+    pub(crate) fn shared_buffers_now(&self, size: u64, n: usize) -> Vec<(ID3D12Resource, *mut u8)> {
+        self.buffers_now(size, n, true).into_iter().map(|(b, data)| (b, data as *mut u8)).collect()
+    }
+
+    /// `n` buffers of `size` bytes, made together: in the PC's memory and
+    /// mapped by the CPU (`shared`, with where they lie), or in the card's
+    /// (address 0); shaders may write them; they start in the common state.
+    /// Their memory is asked for in one call to the system and waited for
+    /// with one copy ([`resident`], [`mapped`]): made one at a time, each
+    /// stood its thread still for both, about 0.4 ms (`crate::ahead`).
+    fn buffers_now(&self, size: u64, n: usize, shared: bool) -> Vec<(ID3D12Resource, usize)> {
+        let (count, bytes, kind) = if shared { (2, 3, Made::Shared) } else { (4, 5, Made::Card) };
+        MADE[count].fetch_add(n as u64, Ordering::Relaxed);
+        MADE[bytes].fetch_add(size * n as u64, Ordering::Relaxed);
+        let heap = if shared {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }
+        } else {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            }
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -11229,12 +11318,12 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
+        let mut buffers: Vec<ID3D12Resource> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a buffer.
+            let made = unsafe {
+                self.device.CreateCommittedResource(
                     &heap,
                     not_resident(),
                     &desc,
@@ -11242,26 +11331,47 @@ impl Host {
                     None,
                     &mut buffer,
                 )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b, Made::Shared)?;
-                    mapped(&self.device, Made::Shared)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        #[cfg(feature = "diagnostics")]
-        if made.is_ok()
-            && let Some(b) = &buffer
-        {
-            crate::book::made(b, || "a shared buffer".into());
-        }
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
-                None
+            };
+            match (made, buffer) {
+                (Ok(()), Some(b)) => {
+                    #[cfg(feature = "diagnostics")]
+                    crate::book::made(&b, || {
+                        if shared { "a shared buffer".into() } else { "an unordered access buffer".into() }
+                    });
+                    buffers.push(b);
+                }
+                (Err(e), _) => {
+                    tracing::warn!(error = %e, size, shared, "no buffer");
+                    break;
+                }
+                (Ok(()), None) => break,
             }
         }
+        if buffers.is_empty() {
+            return Vec::new();
+        }
+        let pageable: windows::core::Result<Vec<Option<ID3D12Pageable>>> =
+            buffers.iter().map(|b| b.cast().map(Some)).collect();
+        let waited = pageable
+            .and_then(|objects| resident_all(&self.device, &objects, kind))
+            .and_then(|()| mapped_for(&self.device, kind, buffers.len() as u64));
+        if let Err(e) = waited {
+            tracing::warn!(error = %e, size, shared, n = buffers.len(), "buffers whose memory is not there");
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(buffers.len());
+        for b in buffers {
+            let mut data = std::ptr::null_mut();
+            if shared {
+                // SAFETY: the whole of a CPU-visible buffer.
+                if let Err(e) = unsafe { b.Map(0, None, Some(&mut data)) } {
+                    tracing::warn!(error = %e, size, "no shared buffer");
+                    continue;
+                }
+            }
+            out.push((b, data as usize));
+        }
+        out
     }
 
     /// Whether buffers can lie in the card's memory and be mapped by the CPU
@@ -11350,52 +11460,13 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
-        MADE[4].fetch_add(1, Ordering::Relaxed);
-        MADE[5].fetch_add(size, Ordering::Relaxed);
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a device-local buffer.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                not_resident(),
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut buffer,
-            )
-        };
-        #[cfg(feature = "diagnostics")]
-        if let Some(b) = &buffer {
-            crate::book::made(b, || "an unordered access buffer".into());
-        }
-        let made = made
-            .and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b, Made::Card)))
-            .and_then(|()| mapped(&self.device, Made::Card));
-        match made {
-            Ok(()) => buffer,
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no unordered-access buffer");
-                None
-            }
-        }
+        self.buffers_now(size, 1, false).pop().map(|(b, _)| b)
+    }
+
+    /// `n` of [`Host::uav_buffer`] at once, with one wait for them all (fewer
+    /// if the host refused some).
+    pub(crate) fn uav_buffers(&self, size: u64, n: usize) -> Vec<ID3D12Resource> {
+        self.buffers_now(size, n, false).into_iter().map(|(b, _)| b).collect()
     }
 }
 
