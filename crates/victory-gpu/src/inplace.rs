@@ -324,6 +324,8 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 pub fn title_memory_section_gone(section: usize) {
     let whole = {
         let mut v = views_mut();
+        // (The number may be given to another section: not this one's size.)
+        v.sections.retain(|s| s.0 != section);
         let at = v.whole.iter().position(|w| w.0 == section);
         at.map(|i| v.whole.swap_remove(i).1)
     };

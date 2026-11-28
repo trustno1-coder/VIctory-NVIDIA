@@ -6177,6 +6177,10 @@ mod tests {
         };
         let memory = vec![0u64; 1 << 13];
         let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // 8 bytes in is off the 456-byte elements unless the copy's window
+        // happens to begin a multiple of 456 bytes before: then a page on.
+        let on = |at: u64| crate::shadow::find(at + 8, 4 * 456).is_some_and(|c| c.offset(at + 8).is_multiple_of(456));
+        let start = if on(start) { start + 4096 } else { start };
         // SAFETY: a plain CPU-side heap of one view.
         let cpu: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {

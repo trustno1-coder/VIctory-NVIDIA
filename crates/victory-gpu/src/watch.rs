@@ -1057,12 +1057,15 @@ static ALIASED: Bits = Bits::new();
 
 /// A block a write fault opened without the guards' lock, when, the other
 /// views of its page it told as written ([`TOLD`]), and [`hot`] as the
-/// faulting thread found it.
+/// faulting thread found it; `took`: the fault made it writable. (Not when
+/// another opened it, and it was settled, between this fault and its look:
+/// the guards may have taken it again since, and keep it.)
 struct Opened {
     block: usize,
     at: std::time::Instant,
     others: Vec<usize>,
     hot: Option<std::time::Duration>,
+    took: bool,
 }
 
 /// Those whose notes are not settled yet ([`settle`]), and how many.
@@ -1144,6 +1147,7 @@ fn open_unlocked(block: usize) -> bool {
     let mut old = 0;
     // SAFETY: a block we made read-only.
     let mut done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
+    let took = !(done && old == PAGE_READWRITE);
     if done && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
         // Not what we left there (as in `unguard`): other memory's, which
         // keeps its protection.
@@ -1156,7 +1160,7 @@ fn open_unlocked(block: usize) -> bool {
     // After the protection: who settles it may let the block be guarded again.
     {
         let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
-        opened.push(Opened { block, at, others, hot: hot() });
+        opened.push(Opened { block, at, others, hot: hot(), took });
         TO_SETTLE.store(opened.len(), SeqCst);
     }
     #[cfg(feature = "diagnostics")]
@@ -1186,7 +1190,17 @@ fn settle(g: &mut Guards) {
         TO_SETTLE.store(0, SeqCst);
         std::mem::take(&mut *opened)
     };
-    for Opened { block, at, mut others, hot } in opened {
+    for Opened { block, at, mut others, hot, took } in opened {
+        if !took {
+            // Writable already: what guards it now came after. Undone, the
+            // block stayed read-only with no guard, and the next write was
+            // an access violation nobody took.
+            for &other in &others {
+                TOLD.clear(other);
+            }
+            OPENING.clear(block);
+            continue;
+        }
         if g.aliased.contains(block) {
             if others.is_empty() {
                 // Guarded with its other views after the fault looked: they
@@ -3545,10 +3559,11 @@ mod tests {
             assert!(!g.protected.contains(at / BLOCK) && !g.clean.contains(at / BLOCK));
         }
         assert!(!published(at, at + BLOCK));
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(view) };
         drop(changing);
         assert!(!guards().left_alone(at / BLOCK));
+        // SAFETY: our view. (Not during the change: another test would take
+        // the address for a view the guards leave alone as changing.)
+        unsafe { UnmapViewOfFile(view) };
     }
 
     /// Memory at an address where blocks were guarded or absent is not
@@ -3992,6 +4007,9 @@ mod tests {
                 })
             };
         }
+        // As the runtime lets go (`xmem.rs`): told before the handle is
+        // closed, or a test that gets the number next loses its own view.
+        crate::title_memory_section_gone(section);
         // SAFETY: the section's last reference.
         unsafe { CloseHandle(section as *mut std::ffi::c_void) };
     }
@@ -4320,7 +4338,6 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![page(one)]));
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
         drop_views(section, &[one, two], BLOCK);
-        crate::title_memory_section_gone(section);
     }
 
     /// Stores that fault, and copies, as the title makes them: what is there
@@ -4391,7 +4408,6 @@ mod tests {
         assert!(writable(one));
         crate::titlewrite::ON_IN_TEST.set(false);
         drop_views(section, &[one, two], SIZE);
-        crate::title_memory_section_gone(section);
     }
 
     /// Of a page taken before, what is taken again is the kernel's pages
@@ -4615,6 +4631,33 @@ mod tests {
         UNLOCKED_IN_TEST.set(false);
     }
 
+    /// A fault that looks at its block only after another opened it, and
+    /// that was settled, finds it writable: the guard taken since stays.
+    #[test]
+    fn a_late_fault_leaves_the_guard_taken_since() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (section, one, two) = two_views(BLOCK);
+        let b = one / BLOCK;
+        assert_eq!(guard(one, one + BLOCK), Some(vec![b]));
+        // The fault looked while another's opening was being settled: the
+        // block was writable, and is guarded again before this is settled.
+        assert!(!OPENING.swap_on(b));
+        {
+            let mut opened = OPENED.lock().unwrap();
+            opened.push(Opened { block: b, at: std::time::Instant::now(), others: Vec::new(), hot: None, took: false });
+            TO_SETTLE.store(opened.len(), SeqCst);
+        }
+        {
+            let g = guards();
+            assert!(g.protected.contains(b) && PROTECTED.any(b, b + 1) && !OPENING.any(b, b + 1));
+        }
+        assert!(!writable(one));
+        // SAFETY: the guarded view: the handler opens it.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert_eq!(guard(one, one + BLOCK), Some(vec![b]));
+        drop_views(section, &[one, two], BLOCK);
+    }
+
     /// A fault that takes no lock opens the view it came through, and tells
     /// the page's other views as written: by their bits at once, and at
     /// every asking until the next holder of the guards' lock has settled
@@ -4683,7 +4726,7 @@ mod tests {
         unsafe { windows_sys::Win32::System::Memory::VirtualProtect(two as *const _, BLOCK, PAGE_READWRITE, &mut old) };
         {
             let mut opened = OPENED.lock().unwrap();
-            opened.push(Opened { block: block(two), at: std::time::Instant::now(), others: vec![block(one)], hot: None });
+            opened.push(Opened { block: block(two), at: std::time::Instant::now(), others: vec![block(one)], hot: None, took: true });
             TO_SETTLE.store(opened.len(), SeqCst);
         }
         assert_eq!(guard(one, one + BLOCK), Some(vec![block(one)]));
@@ -4933,8 +4976,12 @@ mod many_askers_tests {
                         {
                             let _changing = super::title_memory_remapping();
                             super::title_memory_unmapping(one, PAGE);
-                            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ }) };
                         }
+                        // Let go of once the change is done: an address freed
+                        // during it is another test's next view, which the
+                        // guards would leave alone as still changing. (The
+                        // runtime maps into placeholders of its own.)
+                        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ }) };
                         last = [last[asked]; VIEWS];
                     }
                 });
