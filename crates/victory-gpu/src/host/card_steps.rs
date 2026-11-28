@@ -728,11 +728,53 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    /// The slots it fills, if they are written later ([`Host::card_steps`]).
+    slots: Option<Slots>,
+}
+
+/// The descriptor slots a submission's steps on the card fill: each is
+/// made a view of the bytes the list copies into the buffer between
+/// ([`Own`]) for them (heap, index, address, bytes).
+pub(super) struct Slots {
+    ops: Vec<(usize, u32, u64, u32)>,
+    between: ID3D12Resource,
+    parts: usize,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the slots are written by one
+// thread, once.
+unsafe impl Send for Slots {}
+
+impl Slots {
+    /// By the sender ([`crate::host::off_line`], from Biskwit/VIctory-reloaded
+    /// 821867c), on the threads of the heaps' records, which it has just
+    /// waited for, not on those the line's thread puts title bytes under
+    /// flights' writes with: those were 1.4 ms a frame longer beside the
+    /// sender's slots (split-now-off-1..3). (11,000 slots a frame in a
+    /// street, two descriptors each: on several threads, a slot always on
+    /// the same one, in the steps' order.)
+    pub(super) fn write(self) {
+        let Slots { ops, between, parts } = self;
+        crate::land::each_view(true, parts, &|part| {
+            for &(heap, index, gpu, len) in &ops {
+                if index as usize / 4 % parts == part {
+                    // (A heap that is gone: nothing can read the slot.)
+                    crate::descriptor::constant_slot(heap, index, &between, gpu, len);
+                }
+            }
+        });
+    }
 }
 
 impl Taken {
     pub(super) fn list(&self) -> &HostList {
         &self.own.list
+    }
+
+    /// The slots left for later, to write before the submission's lists go
+    /// to the queue.
+    pub(super) fn slots(&mut self) -> Option<Slots> {
+        self.slots.take()
     }
 
     /// Whether step `i` of `list` is done by this.
@@ -762,8 +804,10 @@ impl Host {
     /// With flights in the air: if what keeps `runs` from being prepared
     /// now is reads of title memory that can all be done on the card
     /// ([`stage`]), the list that does them. `None` if nothing is in the
-    /// way or the old wait is due. Under the submission lock.
-    pub(super) fn card_steps(&self, runs: &[&HostList]) -> Option<Taken> {
+    /// way or the old wait is due. Under the submission lock. With `later`
+    /// the slots it fills are not written here but kept in it
+    /// ([`Taken::slots`]).
+    pub(super) fn card_steps(&self, runs: &[&HostList], later: bool) -> Option<Taken> {
         if stage() == 0 || !relay_exact() {
             return None;
         }
@@ -778,7 +822,7 @@ impl Host {
         let taken = if copied_read(&copies, runs) {
             Err("a copy done on the card is read through another host copy")
         } else {
-            self.take_steps(&written, runs)
+            self.take_steps(&written, runs, later)
         };
         match taken {
             Ok(taken) => taken,
@@ -793,7 +837,7 @@ impl Host {
         }
     }
 
-    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
+    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList], later: bool) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (mut does, steps) = does_of(written, runs);
         let by_source = placed_reads() && read_behind_placed(&mut does, written) > 0;
@@ -945,20 +989,37 @@ impl Host {
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
         spent.next("steps on the card: the slots");
-        // (11,000 slots a frame in a street, two descriptors each: on
-        // several threads, a slot always on the same one, in the steps'
-        // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
-            for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+        // With `later` (`VICTORY_OFF_LINE`): kept for the thread that sends
+        // the submission ([`Slots::write`]); else written here, as always.
+        let slots = if later {
+            Some(Slots {
+                ops: ops
+                    .iter()
+                    .filter_map(|op| match op.to {
+                        To::Slot(heap, index) => Some((heap, index, gpu + op.at, op.len as u32)),
+                        _ => None,
+                    })
+                    .collect(),
+                between: own.between.clone(),
+                parts,
+            })
+        } else {
+            // (11,000 slots a frame in a street, two descriptors each: on
+            // several threads, a slot always on the same one, in the steps'
+            // order.)
+            crate::land::each_under(parts, &|part| {
+                for op in &ops {
+                    if let To::Slot(heap, index) = &op.to
+                        && *index as usize / 4 % parts == part
+                    {
+                        // (A heap that is gone: nothing can read the slot.)
+                        crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    }
                 }
-            }
-        });
+            });
+            None
+        };
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
@@ -970,6 +1031,7 @@ impl Host {
             own,
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
+            slots,
         }))
     }
 

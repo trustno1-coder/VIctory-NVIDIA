@@ -3076,6 +3076,234 @@ struct Sent {
     texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Published ([`split_send`]): what the thread that sends it does.
+    handoff: Option<Box<Handoff>>,
+}
+
+/// Whether the descriptor slots a published submission's steps on the card
+/// fill ([`card_steps::Slots`]) are written by [`sender`], not by the line's
+/// thread (opt-in with `VICTORY_OFF_LINE=1`, and only with [`split_send`];
+/// unset: written on the line's thread, exactly as before; `VICTORY_AB` can
+/// switch it in diagnostics builds).
+///
+/// Ported from Biskwit/VIctory-reloaded (commit 821867c, "perf(host): the
+/// card steps' slots and list closes off the line", GPL-3.0-or-later), where
+/// it is on by default with the split. Only its slots half is here: its
+/// other half closed host lists when they are reset instead of when one is
+/// taken for a title's list, and this tree already leaves those lists open
+/// for the title's next reset (`HostList::leave_open`). Its diagnostics
+/// count of slot records (`VICTORY_SLOT_ORDER_COUNT`) is left out too.
+///
+/// Why: there the line's thread was 37 of a 39 ms frame (split-now-tl-3),
+/// 1.9 ms of it these slots (11,000 a frame, 7 ms on all threads), while the
+/// sender was idle 30 ms; frames came out about 1.7 ms shorter
+/// (split-now-off2-1..3, i9-12900K + RTX 4090).
+///
+/// The slots, published: the sender writes them after the submission's
+/// heaps' records and before its lists go to the queue, in the order
+/// submissions were published, as the slots that wait for textures.
+/// - Nothing of the preparing reads host heap slots (what a draw reads
+///   through a table it made itself, when recorded), so the next
+///   submission's preparing does not wait for them.
+/// - Records the title copied before the submission are made first, and
+///   the slot after them, as the card's fill comes after them on the
+///   console. (Before, the line's thread wrote the slot first and the
+///   records' round after it.) In Biskwit's cell, no slot such a step fills
+///   had its title record changed at all (counted, split-now-cnt-1): the
+///   order changed nothing there.
+/// - The title writes such a slot again only once the submission ran (its
+///   fence), so no later record of its is written over.
+/// - A slot two submissions fill is written in their order: both by the
+///   sender, or the later one by the line's thread once every published
+///   one was sent ([`wait_sent`]).
+pub(crate) fn off_line() -> bool {
+    crate::asked_for!("VICTORY_OFF_LINE") && split_send()
+}
+
+/// Whether a submission's preparing and its sending are done by two threads
+/// in a row (opt-in with `VICTORY_SUBMIT_SPLIT=1`; unset or anything else:
+/// one thread does both, exactly as before): the line's thread prepares the
+/// next submission while [`sender`] sends this one. Only with the relay's
+/// second stage, its fetches on the copy queue and the sends taken at
+/// preparing (`relay_exact`, `relay_copy` = `VICTORY_RELAY_COPY=1`,
+/// `send::own`); without any of those the switch does nothing.
+///
+/// Ported from Biskwit/VIctory-reloaded (commit d5bd9d8, "perf(host): prepare
+/// a submission while one is sent", GPL-3.0-or-later), where it is on by
+/// default; here it is off until measured on more machines. It was also
+/// carried, off by default, in Keel62155/VIctoryUnified.
+///
+/// One thread did both, 45 of a 47 ms frame (timeline split-tl-1), some 7 ms
+/// of it after the submission was prepared: the lists that send to copies
+/// in the card's memory and the compare, the wait for the heaps' records,
+/// the slots that wait for textures, the lists' sending. Nothing of the next
+/// submission's preparing needs those.
+///
+/// The line's thread prepares as before, takes what goes up to copies in the
+/// card's memory (`card_take`, numbered in the queue's order) and puts the
+/// placed copies' bytes into their references. Then it *publishes* the
+/// submission under the submission lock: its fence value, and its flight,
+/// bottom-of-pipe writes and declared ranges in [`LINE`]; the rest goes to
+/// [`SENDS`]. The sender takes them in that order, records what was taken
+/// (`card_record`), gives the flight its compare plan, waits for the heaps'
+/// records, sends the lists and signals the fence value.
+///
+/// What the next submission's preparing may assume of a published one:
+/// - It is in the air. Whatever asks what flights write (the line's ranges,
+///   the copies done on the card, bottom-of-pipe writes, `writes_pending`)
+///   sees it, so the next one waits for it to land where it would have, or
+///   has the card read behind it. Such a wait ends: the relay lands it once
+///   the card reached its fence, and the sender needs nothing the waiter
+///   holds (below).
+/// - Its CPU work is done: title memory its steps wrote, its declared ranges
+///   and snapshots, its bytes for copies in the card's memory (taken, so the
+///   next one's refreshes of those CPU sides do not reach it), its placed
+///   copies' references.
+/// - Not done: nothing of it is on the queue, its compare plan is not made
+///   (only [`Host::relay_land`] reads it, once the card ran it), its slots
+///   that wait for textures are not made, nor (with [`off_line`]) the slots
+///   its steps on the card fill.
+///
+/// Order: no submission of ours goes to the queue ahead of a published one.
+/// Every other one (waited for, the present's copy) first waits, under the
+/// submission lock, until every one published was sent ([`wait_sent`]), and
+/// gets a higher fence value. The relay's fetches go to the copy queue and
+/// know their order from their plans' numbers, not from the drawing queue.
+///
+/// Locks: the sender never takes the submission lock nor waits for the
+/// line's thread, only for landings of flights it sent (`card_results_low`)
+/// and for the heaps' records' thread. So a holder of the submission lock
+/// may wait for published flights to land (a title's thread at a blocking
+/// fence wait, a submission that is waited for, the line's thread).
+///
+/// A published submission is sent or the host fails: the sender alone takes
+/// from [`SENDS`] and does every one; a failed send or signal, a lost card or
+/// a panic on it is [`fail`], as on the one thread before.
+fn split_send() -> bool {
+    // With `VICTORY_AB` naming it (diagnostics builds) it goes on and off
+    // while the title runs; a submission sent here first waits for those
+    // published ([`wait_sent`]).
+    crate::asked_for!("VICTORY_SUBMIT_SPLIT") && relay_exact() && relay_copy() && send::own()
+}
+
+/// What [`Host::submit`] took for copies in the card's memory, for
+/// [`Host::card_record`].
+struct CardTake {
+    declared: Vec<Declared>,
+    looked: Vec<crate::picked::Range>,
+    sent_as: u64,
+    dirty: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+    whole: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    own: Option<send::Own>,
+}
+
+/// A published submission ([`split_send`]), for [`sender`].
+struct Handoff {
+    /// Its number among the submissions started, and its fence value.
+    number: u64,
+    fence: u64,
+    lists: Vec<Option<ID3D12CommandList>>,
+    /// Where each run's lists begin in `lists`, and the runs at which
+    /// another part begins.
+    firsts: Vec<usize>,
+    parts: Vec<usize>,
+    take: Option<CardTake>,
+    flown: bool,
+    heaps: crate::descriptor::SyncedHeaps,
+    /// The slots its steps on the card fill ([`off_line`]).
+    slots: Option<card_steps::Slots>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; a handoff is touched by the
+// thread that publishes it and then by the sender alone.
+unsafe impl Send for Handoff {}
+
+/// With [`split_send`]: the submissions published and not taken by [`sender`]
+/// yet, oldest first; how many were published, and how many sent.
+static SENDS: Mutex<(std::collections::VecDeque<Box<Handoff>>, u64, u64)> =
+    Mutex::new((std::collections::VecDeque::new(), 0, 0));
+static SENDS_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// The fence value of the last submission [`sender`] sent.
+static SENT_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame-rate line, of [`sender`]: submissions sent,
+/// microseconds it worked, of them waiting for landings; microseconds other
+/// submissions waited for it ([`wait_sent`]).
+static SEND_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A submission is published ([`split_send`]): the sender sends it.
+fn publish(handoff: Box<Handoff>) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if let Err(e) = std::thread::Builder::new().name("victory-send".into()).spawn(sender) {
+            fail(format_args!("no thread to send prepared submissions (VICTORY_SUBMIT_SPLIT): {e}"));
+        }
+        tracing::info!("submissions are sent by a thread of their own, the next one prepared meanwhile (VICTORY_SUBMIT_SPLIT)");
+    });
+    EVER_PUBLISHED.store(true, Ordering::Relaxed);
+    let mut sends = SENDS.lock().unwrap_or_else(|e| e.into_inner());
+    sends.0.push_back(handoff);
+    sends.1 += 1;
+    drop(sends);
+    SENDS_MOVED.notify_all();
+}
+
+/// Whether anything was ever published ([`publish`]); until then
+/// [`wait_sent`] has nothing to wait for and does not take [`SENDS`], so a run
+/// without `VICTORY_SUBMIT_SPLIT` never touches it.
+static EVER_PUBLISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Waits until [`sender`] has sent every submission published so far.
+fn wait_sent() {
+    // (Set by the thread that publishes, under the submission lock, which
+    // every caller of this holds: never missed by one that must wait.)
+    if !EVER_PUBLISHED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut sends = SENDS.lock().unwrap_or_else(|e| e.into_inner());
+    if sends.1 == sends.2 {
+        return;
+    }
+    let waiting = std::time::Instant::now();
+    let _waiting = crate::timeline::span("waiting for published submissions to be sent");
+    while sends.1 != sends.2 {
+        sends = SENDS_MOVED.wait(sends).unwrap_or_else(|e| e.into_inner());
+    }
+    SEND_STATS[3].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// The thread that sends published submissions ([`split_send`]), in order.
+fn sender() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    // SAFETY: this thread's own priority.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+    crate::cores::keep_on_fast_cores("victory-send");
+    // It does work the line of the title's submissions waits for.
+    crate::queue::no_drain_here();
+    let Some(host) = host() else {
+        return;
+    };
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loop {
+            let handoff = {
+                let mut sends = SENDS.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(handoff) = sends.0.pop_front() {
+                        break handoff;
+                    }
+                    sends = SENDS_MOVED.wait(sends).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            host.send_published(*handoff);
+            SENDS.lock().unwrap_or_else(|e| e.into_inner()).2 += 1;
+            SENDS_MOVED.notify_all();
+        }
+    }));
+    if ended.is_err() {
+        // Nothing published would ever be sent, nor land.
+        fail(format_args!("the thread that sends prepared submissions panicked (VICTORY_SUBMIT_SPLIT)"));
+    }
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -4088,6 +4316,17 @@ fn late_line(frames: f64) {
     if !late() {
         return;
     }
+    let sends: Vec<f64> = SEND_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if sends[0] > 0.0 || split_send() {
+        tracing::info!(
+            "the thread that sends prepared submissions, per frame (VICTORY_SUBMIT_SPLIT): {:.1} sent, it worked {:.1} ms, \
+             {:.1} of them waiting for landings; other submissions waited {:.1} ms for it",
+            sends[0],
+            sends[1] / 1000.0,
+            sends[2] / 1000.0,
+            sends[3] / 1000.0
+        );
+    }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4772,6 +5011,18 @@ impl Host {
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
     fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+        // With the relay: the order of the queue is held from here until
+        // what is taken is on the queue, and the taking is numbered.
+        let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+        let take = self.card_take(declared, picked, order.as_deref_mut())?;
+        self.card_record(take, order, flown)
+    }
+
+    /// [`Host::card_before`]'s first half: what changed on the copies' CPU
+    /// sides is taken, numbered with `order` (the order of the queue, which
+    /// the caller holds), with its bytes as they are now ([`send`]); copies
+    /// declared for the first time get the buffers of their hashes.
+    fn card_take(&self, declared: &[Declared], picked: &crate::picked::Ranges, order: Option<&mut u64>) -> Option<CardTake> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4780,15 +5031,12 @@ impl Host {
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
         let declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
         // (Of a copy with a declared range here, that says it.)
-        let looked: Vec<&crate::picked::Range> =
-            picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
-        // With the relay: the order of the queue is held from here until
-        // what is taken is on the queue, and the taking is numbered.
-        let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
-        let sent_as = match order.as_mut() {
+        let looked: Vec<crate::picked::Range> =
+            picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).cloned().collect();
+        let sent_as = match order {
             Some(order) => {
-                **order += 1;
-                **order
+                *order += 1;
+                *order
             }
             None => 0,
         };
@@ -4798,8 +5046,7 @@ impl Host {
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let work = work.as_mut()?;
+        CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?;
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -4815,12 +5062,37 @@ impl Host {
                 }
             }
         }
-        let mut used: Vec<(bool, Prelude)> = Vec::new();
-        let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
+        Some(CardTake {
+            declared,
+            looked,
+            sent_as,
+            dirty,
+            whole,
+            own,
+        })
+    }
+
+    /// [`Host::card_before`]'s second half: the list that sends what was
+    /// taken goes to the queue (`order`, if held, is let go once it is
+    /// there), and the compare of the declared ranges is recorded.
+    fn card_record(&self, take: CardTake, order: Option<std::sync::MutexGuard<'_, u64>>, flown: bool) -> Option<CardPlan> {
+        use std::sync::Arc;
+        let CardTake {
+            declared,
+            looked,
+            sent_as,
+            dirty,
+            whole,
+            own,
+        } = take;
+        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let work = work.as_mut()?;
+        let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut looks = None;
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4964,7 +5236,7 @@ impl Host {
                 }
             }
         }
-        for (shadow, from, len) in looked {
+        for (shadow, from, len) in &looked {
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
@@ -5652,7 +5924,7 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
-        let _ = self.submit(runs, &[], false);
+        let _ = self.submit(runs, &[], false, false);
     }
 
     /// Runs a closed internal upload-only host list synchronously without
@@ -5660,7 +5932,7 @@ impl Host {
     /// when invoked from `VICTORY_THIN=1` worker threads. Settles in-flight
     /// GPU work and waits for the upload list's fence before returning.
     pub(crate) fn execute_sync_internal(&self, list: &HostList) {
-        let _ = self.submit(&[list], &[], false);
+        let _ = self.submit(&[list], &[], false, false);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -5700,9 +5972,10 @@ impl Host {
     }
 
     fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+        let apart = split_send();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, parts, true)
+            self.submit(&runs, parts, true, apart)
         };
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
@@ -5737,6 +6010,10 @@ impl Host {
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
         };
+        // Published: in the air from here on; the sender sends it.
+        if let Some(handoff) = sent.handoff {
+            publish(handoff);
+        }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
         if told && !late_writes() {
@@ -5752,8 +6029,12 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        // Published: the helper thread does it, poked by every landing
+        // ([`late_helper`]), and this one goes on to the next submission.
+        if !apart {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            land();
+        }
         AFTER_SEND.fetch_add(after.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
@@ -5764,7 +6045,7 @@ impl Host {
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
+        let Some((submitted, sent)) = self.submit(&[list], &[], true, false) else {
             return 0;
         };
         let number = sent.number;
@@ -5797,6 +6078,96 @@ impl Host {
         RELAY_MOVED.notify_one();
         drop(submitted);
         number
+    }
+
+    /// [`sender`]: the rest of [`Host::submit`] for a published submission
+    /// ([`split_send`]), without the submission lock.
+    fn send_published(&self, mut h: Handoff) {
+        let began = std::time::Instant::now();
+        let split = Split::begin();
+        let mut stage = crate::timeline::span("sending: copies in the card's memory");
+        // The compare's results start from the beginning only when no plan
+        // is out: until the flights sent so far have landed (those published
+        // behind them have none yet, and only this thread sends them).
+        if h.flown && self.card_results_low() {
+            let sent = SENT_FENCE.load(Ordering::Relaxed);
+            let waiting = std::time::Instant::now();
+            relay_wait(WHY_MOST, |line| {
+                !line.settling && !line.line.iter().any(|l| matches!(l, Late::Run(f) if f.fence <= sent))
+            });
+            SEND_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let card = h.take.take().and_then(|take| self.card_record(take, None, h.flown));
+        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+            h.lists.push(Some(check));
+        }
+        // The plan goes with its flight before the card can reach it.
+        if let Some(card) = card {
+            let mut line = line();
+            match line.line.iter_mut().find_map(|l| match l {
+                Late::Run(f) if f.number == h.number => Some(f),
+                _ => None,
+            }) {
+                Some(flight) => flight.card = Some(card),
+                None => fail(format_args!("a published submission is not in the line (VICTORY_SUBMIT_SPLIT)")),
+            }
+        }
+        split.part(4);
+        stage.next("sending: waiting for the heaps' records");
+        let heaps_began = std::time::Instant::now();
+        drop(h.heaps);
+        if crate::heap_marks::on() {
+            crate::heap_marks::heaps_waited(heaps_began.elapsed().as_nanos() as u64);
+        }
+        // The slots that waited for a texture's host copy, before the
+        // lists that may read them run.
+        crate::descriptor::make_waiting();
+        // The slots its steps on the card fill, after the records.
+        if let Some(slots) = h.slots.take() {
+            stage.next("sending: the slots steps on the card fill");
+            slots.write();
+        }
+        split.part(15);
+        stage.next("sending: the lists");
+        // When it runs on the card, for the timeline.
+        #[cfg(feature = "diagnostics")]
+        let stamp = stamps::take();
+        #[cfg(feature = "diagnostics")]
+        if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
+            h.lists.insert(0, Some(ahead));
+            h.lists.push(Some(behind));
+            h.firsts.iter_mut().for_each(|first| *first += 1);
+        }
+        #[cfg(feature = "diagnostics")]
+        let sending = crate::timeline::ticks();
+        #[cfg(feature = "diagnostics")]
+        if let Some([front, behind]) = self.span_lists(h.fence) {
+            h.lists.insert(0, Some(front));
+            h.lists.push(Some(behind));
+            h.firsts.iter_mut().for_each(|first| *first += 1);
+        }
+        let cuts: Vec<usize> = h.parts.iter().filter_map(|&n| h.firsts.get(n).copied()).collect();
+        // SAFETY: closed lists; the fence is ours, and its value was given
+        // under the submission lock, in the order of this thread's sends.
+        let signalled = unsafe {
+            let mut from = 0;
+            for to in cuts.into_iter().chain([h.lists.len()]) {
+                self.queue.ExecuteCommandLists(&h.lists[from..to]);
+                from = to;
+            }
+            self.queue.Signal(&self.fence, h.fence)
+        };
+        awake::sent(&self.device);
+        #[cfg(feature = "diagnostics")]
+        crate::timeline::sent(sending, h.fence, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
+        self.card_sent();
+        if let Err(e) = signalled {
+            fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+        }
+        SENT_FENCE.store(h.fence, Ordering::Relaxed);
+        split.part(5);
+        SEND_STATS[0].fetch_add(1, Ordering::Relaxed);
+        SEND_STATS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     /// Waits for the card to run every flight in the air ([`late`]) and
@@ -6000,7 +6371,17 @@ impl Host {
     /// `parts`: the lists of `runs` at which another part begins
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
-    fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+    ///
+    /// `publish` ([`split_send`], with `late`): the submission is prepared and
+    /// published, and the thread that sends submissions sends it
+    /// (`Sent::handoff`); else it is sent here, after every one published.
+    fn submit<'a>(
+        &'a self,
+        runs: &[&HostList],
+        parts: &[usize],
+        late: bool,
+        publish: bool,
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
@@ -6008,6 +6389,12 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // What goes to the queue from here goes behind what was published
+        // (with `VICTORY_SUBMIT_SPLIT` unset nothing ever is, and this
+        // returns at once).
+        if !publish {
+            wait_sent();
+        }
         // Upscalings these lists recorded, in submission order: the next
         // present tags the latest (frame generation).
         for run in runs {
@@ -6035,7 +6422,7 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late { self.card_steps(runs) } else { None };
+        let mut own = if late { self.card_steps(runs, publish && off_line()) } else { None };
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
         let mut waited_for_flights = false;
@@ -6214,7 +6601,8 @@ impl Host {
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
         let flown = late && relay();
-        if flown && self.card_results_low() {
+        // (Published: the thread that sends it waits, for the flights it sent.)
+        if flown && !publish && self.card_results_low() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
@@ -6226,10 +6614,18 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        // Published: what goes up is taken here, before the next
+        // submission's steps and refreshes write the CPU sides ([`send`]);
+        // the list that sends it is recorded by the thread that sends.
+        let (card, take) = if publish {
+            (None, self.card_take(&declared, &picked, Some(&mut *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()))))
+        } else {
+            (self.card_before(&declared, &picked, flown), None)
+        };
         if let Some(probe) = probe {
             let finished = FINISHED.load(Ordering::Acquire);
-            two_queues::place(probe, this_submission, card.is_some(), own.is_some(), runs.len(), finished);
+            let carded = card.is_some() || take.is_some();
+            two_queues::place(probe, this_submission, carded, own.is_some(), runs.len(), finished);
         }
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
@@ -6240,6 +6636,44 @@ impl Host {
             lists.push(Some(check));
         }
         split.part(4);
+        if publish {
+            // Its fence value now, under the lock: what is sent later, by
+            // any thread, signals a higher one.
+            *submitted += 1;
+            let back = crate::picked::with(declared, &picked.written);
+            let mut texture_back_ranges = Vec::new();
+            for list in runs {
+                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+            }
+            let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            SUBMISSION_US[0].fetch_add(started.elapsed().saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
+            submitting(0, 0);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::submission_ends(lock);
+            let handoff = Handoff {
+                number: this_submission,
+                fence: *submitted,
+                lists,
+                firsts,
+                parts,
+                take,
+                flown,
+                heaps: heaps_synced,
+                slots: own.as_mut().and_then(card_steps::Taken::slots),
+            };
+            let sent = Sent {
+                number: this_submission,
+                card: None,
+                back,
+                own,
+                texture_back_ranges,
+                writes,
+                handoff: Some(Box::new(handoff)),
+            };
+            batch.give_back();
+            working(was_working);
+            return Some((submitted, sent));
+        }
         stage.next("submit: waiting for the heaps' records");
         let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
@@ -6307,6 +6741,7 @@ impl Host {
                 own,
                 texture_back_ranges,
                 writes,
+                handoff: None,
             };
             batch.give_back();
             working(was_working);
