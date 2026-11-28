@@ -2213,7 +2213,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
+        for d in [a.dynamic, a.dynamic2].into_iter().flatten() {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
@@ -2831,6 +2831,10 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        #[cfg(test)]
+        if let Some(inspect) = tests::INSPECT_OFFSETS.take() {
+            inspect(&self.s.m);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -7528,6 +7532,9 @@ impl<'a> Lower<'a> {
 
     /// `s_load_dword*` from the program's constant table.
     fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
+        if a.dynamic2.is_some() {
+            return Err("an address with two computed terms");
+        }
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -7928,10 +7935,14 @@ impl<'a> Lower<'a> {
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
-                let mut x = match address.dynamic {
-                    Some(v) => Some(self.i32_of(v)?),
-                    None => None,
-                };
+                let mut x = None;
+                for term in [address.dynamic, address.dynamic2].into_iter().flatten() {
+                    let term = self.i32_of(term)?;
+                    x = Some(match x {
+                        Some(first) => self.s.m.bin(self.cur, Bin::Add, first, term),
+                        None => term,
+                    });
+                }
                 if let Some(bias) = self.root_bias(address.param) {
                     x = Some(match x {
                         Some(d) => self.s.m.bin(self.cur, Bin::Add, d, bias),
@@ -13661,6 +13672,11 @@ mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
+    thread_local! {
+        pub(super) static INSPECT_OFFSETS: std::cell::Cell<Option<fn(&super::super::bitcode::Module)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
         use super::super::container::SigElement;
@@ -13875,6 +13891,86 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    #[test]
+    fn scalar_table_load_uses_the_base_index_and_computed_soffset() {
+        // User data: table byte base 160, base index 2, soffset index 3.
+        INSPECT_OFFSETS.set(Some(|m| {
+            let slots: Vec<_> = m
+                .call_args("dx.op.createHandleFromHeap")
+                .map(|args| m.address_value(args[1], &[160, 2, 3]))
+                .collect();
+            assert_eq!(slots, [Some((160 + (2 << 5) + (3 << 5) + 32) >> 5)]);
+        }));
+        lower_with(
+            &resource::tests::TWO_TERM_TABLE_LOAD,
+            vec![
+                root(RootType::Table, 0, 0),
+                RootParam {
+                    sgprs: 2,
+                    ..root(RootType::Constants, 1, 1)
+                },
+            ],
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+        )
+        .unwrap();
+        assert!(INSPECT_OFFSETS.get().is_none());
+    }
+
+    #[test]
+    fn global_load_adds_the_root_view_index_and_computed_vgpr_offset() {
+        let words = [
+            0x8F06_8202, // s_lshl_b32 s6, s2, 2
+            0x8004_0600, // s_add_u32 s4, s0, s6
+            0x8205_8001, // s_addc_u32 s5, s1, 0
+            0x7E02_0203, // v_mov_b32 v1, s3
+            0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+            0xDC30_800C,
+            0x0204_0001, // global_load_dword v2, v1, s[4:5] offset:12
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        INSPECT_OFFSETS.set(Some(|m| {
+            let bytes: Vec<_> = m
+                .call_args("dx.op.rawBufferLoad.f32")
+                .map(|args| m.address_value(args[2], &[0, 0, 7, 11]))
+                .collect();
+            assert_eq!(bytes, [Some((7 << 2) + (11 << 2) + 12)]);
+        }));
+        let lowered = lower_with(
+            &words,
+            vec![
+                root(RootType::Descriptor, 0, 0),
+                RootParam {
+                    sgprs: 2,
+                    ..root(RootType::Constants, 2, 1)
+                },
+            ],
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(lowered.root_srvs, [0]);
+        assert!(INSPECT_OFFSETS.get().is_none());
     }
 
     /// Lowers a one-thread compute program that copies four root constants
