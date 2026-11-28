@@ -9711,6 +9711,10 @@ struct Meter {
     frames: u32,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
+    /// Every presented frame's length since the last long `frame times` line (diagnostics: for
+    /// the percentiles of `scripts\bench.ps1`), taken from [`Meter::intervals`].
+    #[cfg(feature = "diagnostics")]
+    each: FrameTimes,
     drawn: u64,
     logged: std::time::Instant,
     /// The last present counted, and the intervals between presents since
@@ -9721,6 +9725,64 @@ struct Meter {
     caption: Option<Vec<u16>>,
 }
 
+/// The length of each presented frame, in tenths of a millisecond (diagnostics builds):
+/// the 5-second line has one second's average, the percentiles need every frame. Frames
+/// the title presents, so with frame generation these are the rendered ones. Filled from the
+/// intervals the meter measures for [`frame_times_line`], not by a clock of its own.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct FrameTimes {
+    since: Option<std::time::Instant>,
+    each: Vec<u32>,
+    /// Frames past [`FrameTimes::MAX`], not kept.
+    lost: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl FrameTimes {
+    const MAX: usize = 50_000;
+
+    /// The intervals between presents the meter measured (milliseconds), taken before it
+    /// sorts and clears them.
+    fn add(&mut self, intervals: &[f32]) {
+        self.since.get_or_insert_with(std::time::Instant::now);
+        for ms in intervals {
+            if self.each.len() < Self::MAX {
+                // (rounded up to a tenth, as the line says)
+                let tenths = (ms * 10.0).ceil().max(0.0);
+                self.each.push(tenths as u32);
+            } else {
+                self.lost += 1;
+            }
+        }
+    }
+
+    /// The `frame times` line of the frames since the last one, and starts again. Read by
+    /// `scripts\bench.ps1`: `each (0.1 ms): <lengths in tenths of a millisecond>`.
+    fn line(&mut self) {
+        let each = std::mem::take(&mut self.each);
+        let started = self.since.replace(std::time::Instant::now());
+        let seconds = started.map_or(0.0, |s| s.elapsed().as_secs_f64());
+        let lost = std::mem::take(&mut self.lost);
+        if each.is_empty() {
+            return;
+        }
+        let mut sorted = each.clone();
+        sorted.sort_unstable();
+        let tenth = |i: usize| f64::from(sorted[i]) / 10.0;
+        let list: Vec<String> = each.iter().map(u32::to_string).collect();
+        tracing::info!(
+            target: "victory_gpu::framelog",
+            "frame times: {} frames in {seconds:.1} s ({lost} not kept): shortest {:.1} ms, median {:.1}, longest {:.1}; each (0.1 ms): {}",
+            each.len(),
+            tenth(0),
+            tenth(sorted.len() / 2),
+            tenth(sorted.len() - 1),
+            list.join(" ")
+        );
+    }
+}
+
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
@@ -9729,6 +9791,8 @@ impl Meter {
             frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
+            #[cfg(feature = "diagnostics")]
+            each: FrameTimes::default(),
             drawn: crate::draw::drawn(),
             logged: now,
             last: now,
@@ -9760,6 +9824,8 @@ impl Meter {
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        self.each.add(&self.intervals);
         frame_times_line(&mut self.intervals);
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
@@ -9875,6 +9941,8 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            self.each.line();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -10411,8 +10479,10 @@ impl Host {
                 list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
             }
+            // (`read_now`: asked once per frame; a `now` file landing between two asks
+            // must not send a read-back of a list that was sent ahead.)
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
+            let capture = read_now
                 .then(|| {
                     if composed {
                         list.ResourceBarrier(&[transition(
@@ -11288,6 +11358,25 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod frame_times {
+    use super::FrameTimes;
+
+    /// Each interval the meter measured adds a length in tenths of a millisecond (rounded up),
+    /// and the cap counts what it leaves out.
+    #[test]
+    fn each_interval_adds_a_length() {
+        let mut times = FrameTimes::default();
+        times.add(&[]);
+        assert!(times.each.is_empty());
+        times.add(&[2.0, 16.65, 0.04]);
+        assert_eq!(times.each, [20, 167, 1]);
+        times.each.resize(FrameTimes::MAX, 1);
+        times.add(&[3.0]);
+        assert_eq!((times.each.len(), times.lost), (FrameTimes::MAX, 1));
     }
 }
 
