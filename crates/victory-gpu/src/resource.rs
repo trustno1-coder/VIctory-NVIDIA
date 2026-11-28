@@ -2471,6 +2471,43 @@ const FAST_BACK_MS: u64 = 2_000;
 #[cfg(windows)]
 const PROTECT_MS: u64 = 60_000;
 
+/// For the frame-rate line, with `VICTORY_SLOT_EVICT=1`: what [`slot_evict`]
+/// did since the last line, when it did anything. Its counts were kept but
+/// written nowhere, so a log could not tell whether eviction was at work
+/// while textures came and went (#955).
+#[cfg(windows)]
+pub(crate) fn slot_evict_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if slot_evict_settings().is_none() {
+        return;
+    }
+    let counts = SLOT_EVICT.each_ref().map(|c| c.swap(0, Relaxed));
+    let state = SLOT_STATE.each_ref().map(|c| c.load(Relaxed));
+    if let Some(text) = slot_evict_text(counts, state) {
+        tracing::info!("{text}");
+    }
+}
+
+/// [`slot_evict_line`]'s text from [`SLOT_EVICT`]'s counts since the last
+/// line and [`SLOT_STATE`]; `None` when nothing was let go, put back to
+/// waiting, made again or given up.
+#[cfg(windows)]
+fn slot_evict_text(counts: [u64; 8], state: [u64; 4]) -> Option<String> {
+    let [gone, bytes, waiting, back, soon, away, given_up, _] = counts;
+    if gone + waiting + back + given_up == 0 {
+        return None;
+    }
+    let [on, kept, blocked, idle] = state;
+    // Tenths of a second, summed over the textures made again.
+    let away = if back == 0 { 0.0 } else { away as f64 / 10.0 / back as f64 };
+    Some(format!(
+        "slot eviction since the last line (VICTORY_SLOT_EVICT=1): {gone} host copies of textures let go though slots showed them ({:.1} MB), {waiting} slots put back to waiting; {back} let go before and made again, {soon} of them within {} s (let go too soon), away {away:.1} s on average; {given_up} given up as a draw used the texture meanwhile. Evicting: {}; of the last {idle} idle-looking textures, {kept} kept as a draw's table showed them, {blocked} not to be taken (a slot shaders pick by index shows them)",
+        bytes as f64 / 1e6,
+        FAST_BACK_MS / 1000,
+        if on != 0 { "yes" } else { "no" },
+    ))
+}
+
 /// `VICTORY_SLOT_EVICT=1` (off by default): under pressure, idle host
 /// copies of textures the title fills are let go although title slots a
 /// draw reads through a table show them. Two lines: eviction starts above
@@ -3872,6 +3909,33 @@ mod tests {
 
     // Slot eviction's tests: memory stack by skornuta (skornuta/victory-memory-stack 57fb136,
     // GPL-3.0).
+
+    /// The slot eviction line says nothing while nothing happened, and what
+    /// was let go, made again and given up when something did (#955).
+    #[test]
+    #[cfg(windows)]
+    fn the_slot_eviction_line_tells_what_eviction_did() {
+        assert_eq!(slot_evict_text([0; 8], [1, 5, 2, 40]), None);
+        // 50 tenths of a second away for the two made again.
+        let text = slot_evict_text([3, 12_000_000, 7, 2, 1, 50, 1, 0], [1, 5, 2, 40]).unwrap();
+        for part in [
+            "3 host copies",
+            "(12.0 MB)",
+            "7 slots put back",
+            "2 let go before and made again",
+            "1 of them within 2 s",
+            "away 2.5 s",
+            "1 given up",
+            "Evicting: yes",
+            "40 idle-looking",
+            "5 kept",
+            "2 not to be taken",
+        ] {
+            assert!(text.contains(part), "{part:?} in {text:?}");
+        }
+        // Only made again, nothing let go this time: still told.
+        assert!(slot_evict_text([0, 0, 0, 1, 0, 30, 0, 0], [0, 0, 0, 0]).is_some_and(|t| t.contains("Evicting: no")));
+    }
 
     /// Between the lines nothing starts; over the high one eviction starts
     /// and takes the excess over the low one, a capped step at a time, until
