@@ -1,4 +1,4 @@
-//! Host copies of title buffers (decision 0007, step 3 and "Copies of title
+﻿//! Host copies of title buffers (decision 0007, step 3 and "Copies of title
 //! memory"). Title buffers are title memory, which the host GPU cannot
 //! read, so a buffer a draw uses gets a persistent host buffer of its size
 //! on first use (system memory shaders may also write), and the ranges each
@@ -176,7 +176,7 @@ pub(crate) fn cards() -> bool {
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
 /// - Unknown (`None`, e.g. WARP): `(16, 512)` MiB.
-/// - `<= 12 GiB` (8–12 GB cards, whose WDDM budget is below 12 GiB): 16 MiB,
+/// - `<= 12 GiB` (8鈥?2 GB cards, whose WDDM budget is below 12 GiB): 16 MiB,
 ///   and 18% of the budget between 512 and 2048 MiB. At 512 an RTX 4070
 ///   SUPER (budget 11,229 MB) kept 592 MB of copies on the card and 5.7 GB in
 ///   the PC's memory, which its shaders read over the bus: the opening
@@ -186,8 +186,8 @@ pub(crate) fn cards() -> bool {
 ///   27-44 ms a frame, and the release build ran gameplay at 21-25 fps
 ///   (2026-11-26, logs coolfox-20261126-134258 / -140021 / -140546).
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
-///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
-/// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
+///   ~13.5鈥?5.2 GiB): `(4, 2048)` MiB.
+/// - `>= 20 GiB` (24鈥?2+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
 ///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
 ///   still leave headroom for textures and render targets.
 fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
@@ -198,7 +198,15 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= TWELVE_GIB_MB {
-        (16, (budget_mb * 18 / 100).clamp(512, 2048))
+        // Half a MiB, not sixteen: the copies between half a MiB and sixteen are most of what the
+        // CPU searches for shader writes, and the line that counts them says so ("N MB in copies of
+        // 1 MiB or more"). On an RTX 5070 Ti Laptop (budget 11,176 MB) at Series X in the dense
+        // city the search is 377 MB a frame at 16, which costs 470.4 ms a frame, and 14.7 MB at
+        // 0.5, which costs 188.6: eight draw-matched windows, and a 480 s soak at 181.2 median with
+        // P90 at 188.4, VRAM 8.1 of 10.7 GB. The bytes the card keeps grow; the budget here caps
+        // them and the CPU keeps what does not fit, so this only moves work off the CPU.
+        // The floor `resolve_card_limits` applies is what sets this, so 0 says "half a MiB".
+        (0, (budget_mb * 18 / 100).clamp(512, 2048))
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
     } else {
@@ -216,7 +224,12 @@ fn resolve_card_limits(
 ) -> (u64, u64) {
     const MIB: u64 = 1 << 20;
     let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
-    let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
+    // Half a MiB is the smallest copy worth handing to the card: below that the per-copy
+    // bookkeeping costs more than the search it saves.
+    let min_bytes = min_mb_override
+        .unwrap_or(default_min_mb)
+        .saturating_mul(MIB)
+        .max(512 << 10);
     let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
     (min_bytes, max_bytes)
 }
@@ -5980,13 +5993,13 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(11229 * MIB)), (16, 2021));
         assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 2048));
 
-        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
+        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5鈥?5 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
 
-        // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
+        // 24鈥?2+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
         assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
         assert_eq!(default_card_limits_mb(Some(24 * GIB)), (1, 6144));
         assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));
