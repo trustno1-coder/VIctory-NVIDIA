@@ -134,6 +134,20 @@ struct Card {
     me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// Whether this is [`by_address`]'s copy of an arena, and where its card side lies: the bytes
+    /// of those on the card are [`ARENA_CARD_BYTES`], not the windows' [`WINDOW_CARD_BYTES`].
+    arena: Arena,
+}
+
+/// What a [`Card`] is of the ray-tracing arenas of title memory by address.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arena {
+    /// Not an arena's.
+    No,
+    /// An arena's, its card side in the card's memory.
+    OnCard,
+    /// An arena's, its card side in the PC's memory: nothing of the card's.
+    Spilled,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -354,6 +368,7 @@ pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 pub(crate) fn live_span_bytes() -> u64 {
     CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + ARENA_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
 }
 
@@ -367,6 +382,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + ARENA_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
@@ -519,6 +535,20 @@ fn default_window_card_mb(local_vram_budget: Option<u64>) -> u64 {
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes alive of the card sides of ray-tracing arenas of title memory by address
+/// ([`by_address`]), held to their own most, not to [`window_card_most`]: they once were added to
+/// [`WINDOW_CARD_BYTES`] and took the windows' room.
+static ARENA_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Adds `len` to `counter` if the sum stays within `most`; otherwise leaves it as it was.
+fn take_under(counter: &AtomicU64, len: u64, most: u64) -> bool {
+    if counter.fetch_add(len, Ordering::Relaxed) + len > most {
+        counter.fetch_sub(len, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
@@ -2926,7 +2956,11 @@ impl Drop for Shadow {
             CARD_BYTES[0].fetch_sub(self.width(), Ordering::Relaxed);
         }
         if let Some(card) = &mut self.card {
-            if window {
+            if card.arena == Arena::OnCard {
+                ARENA_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+            } else if card.arena == Arena::Spilled {
+                // (Nothing of the card's was counted.)
+            } else if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
@@ -4897,6 +4931,7 @@ impl Shadow {
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
                 size: len.next_multiple_of(PIECE as u64),
+                arena: Arena::No,
             });
         }
         let shadow = Arc::new(shadow);
@@ -5054,6 +5089,7 @@ mod land_tests {
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
             size: len as u64,
+            arena: super::Arena::No,
         });
         Some(shadow)
     }
@@ -5499,6 +5535,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
                     size,
+                    arena: Arena::No,
                 };
                 (on_card, Some(card))
             }
@@ -5695,26 +5732,29 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
     // that the side shaders see is in the PC's memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    let on_card = if room && take_under(&ARENA_CARD_BYTES, len, most) {
+        let made = host.uav_buffer(len);
+        if made.is_none() {
+            ARENA_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+        }
+        made
     } else {
         None
     };
+    let arena = if on_card.is_some() { Arena::OnCard } else { Arena::Spilled };
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
-    // (Counted down with the windows' on the card when it goes.)
-    WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+    // (Counted down in [`ARENA_CARD_BYTES`] when it goes.)
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
@@ -5728,6 +5768,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         touched: Default::default(),
         me: std::sync::OnceLock::new(),
         size: len,
+        arena,
     });
     let shadow = Arc::new(shadow);
     carded(&shadow);
@@ -5818,6 +5859,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
                 size: len,
+                arena: Arena::No,
             };
             (on_card, Some(card))
         }
@@ -6141,4 +6183,25 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod arena_card_tests {
+    use super::take_under;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Arenas are counted in a counter of their own: they take none of the windows' room, and
+    /// what is over their most leaves their count as it was.
+    #[test]
+    fn arenas_do_not_use_the_windows_room() {
+        let windows = AtomicU64::new(0);
+        let arenas = AtomicU64::new(0);
+        assert!(take_under(&arenas, 3 << 30, 4 << 30));
+        assert_eq!(windows.load(Ordering::Relaxed), 0);
+        assert!(take_under(&windows, 1 << 30, 1 << 30), "the windows' 1024 MB is whole");
+        assert!(!take_under(&arenas, 2 << 30, 4 << 30));
+        assert_eq!(arenas.load(Ordering::Relaxed), 3 << 30);
+        assert!(take_under(&arenas, 1 << 30, 4 << 30), "exactly the most fits");
+        assert!(!take_under(&windows, 1, 1 << 30));
+    }
 }
