@@ -56,6 +56,11 @@ or pass -Build.
 .\scripts\bench.ps1 -Compare <run folder>,<run folder>
 
 .EXAMPLE
+# The same walk in every run, from the world's first frame: 5 s ahead, turn
+# right for 2 s, 6 s ahead (VICTORY_KEYS_FROM=world).
+.\scripts\bench.ps1 -Label walk -Route '5-10:W,10-12:L,12-18:W'
+
+.EXAMPLE
 # No saves yet: make one, then measure from it.
 .\scripts\bench.ps1 -FirstBoot -Label seed -Seconds 60
 .\scripts\bench.ps1 -Seed <the seed run's folder>\data -Label baseline
@@ -102,6 +107,13 @@ param(
     [int]$BootTimeout = 900,
     # Keep pressing A in the world (skips cutscenes; runs then differ more).
     [switch]$SkipCutscenes,
+    # A route walked in the world: a file of lines `<seconds>:<key>` or
+    # `<from>-<to>:<key>` (`#` starts a comment), or such entries separated by
+    # commas. It goes to VICTORY_KEYS with VICTORY_KEYS_FROM=world, so the
+    # seconds count from the world's first frame (builds without that switch
+    # count them from when input starts). Keys: W/A/S/D move, I/J/K/L turn the
+    # camera, Enter is A. Its text's hash is in the summary.
+    [string]$Route,
     # Seconds between captured frames (0: none).
     [int]$CaptureEvery = 20,
     # Seconds between samples of the load (processor, memory, card) in
@@ -571,6 +583,19 @@ if ($FrameGen -eq 'off') {
     $playSet['VICTORY_FRAMEGEN'] = '0'
     $playSet['VICTORY_FRAMEGEN_X'] = '0'
 }
+$routeHash = $null
+if ($Route) {
+    $text = if (Test-Path -LiteralPath $Route -PathType Leaf) { Get-Content -Raw -LiteralPath $Route } else { $Route }
+    $entries = @($text -split "`r?`n" | ForEach-Object { $_ -replace '#.*$', '' } | ForEach-Object { $_ -split ',' } |
+        ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    foreach ($e in $entries) {
+        if ($e -notmatch '^\d+(\.\d+)?(-\d+(\.\d+)?)?:\w+$') { throw "-Route: '$e' is not <seconds>:<key> or <from>-<to>:<key>" }
+    }
+    $playSet['VICTORY_KEYS'] = $entries -join ','
+    $playSet['VICTORY_KEYS_FROM'] = 'world'
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $routeHash = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($playSet['VICTORY_KEYS'])) | Select-Object -First 8 | ForEach-Object { $_.ToString('x2') })
+}
 foreach ($k in $Switches.Keys) { $playSet[$k] = [string]$Switches[$k] }
 $playArgs = @('play', "`"$Exe`"", '--dlss', $Dlss)
 if ($FrameGen -eq 'off') { $playArgs += '--no-framegen-ready' }
@@ -581,6 +606,7 @@ $config = [ordered]@{
     dlss             = $Dlss
     frame_generation = $FrameGen
     pipeline_book    = $PipelineBook
+    route            = $(if (-not $Route) { $null } elseif (Test-Path -LiteralPath $Route -PathType Leaf) { "$(Split-Path -Leaf $Route) ($routeHash)" } else { "inline ($routeHash)" })
 }
 
 # `play` reads the F1 menu's saved choices over its options (settings() in play.rs).
