@@ -99,6 +99,11 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
+| `VICTORY_MEMORY_NEAR=1` | in the programs that walk the title's structures, a load by address of a page an earlier load looked up goes through that look's view (off: every load looks); part of the shader cache key |
+| `VICTORY_DYNAMIC_WAIT=1` | a draw that finds no free dynamic descriptor slot waits for the next landing without the submission lock, and slots go back at the start of a landing (off: everything in the air is settled under the lock); `alt`: on and off in turns of 20 s |
+| `VICTORY_THIN_GATE=1` | a list's translation pauses while dynamic descriptor slots are short, so the lists sent next keep theirs (off: every list takes what it finds) |
+| `VICTORY_TABLES_ONCE=1` | a table a list reads to different lengths is copied once, as long as any stage reads it (off: each length takes slots of its own) |
+| `VICTORY_WATER_TILE_SLOTS=1` | on a host of 32-lane waves, the tile lists of one program of the water light take a slot a lane, so no tile is lost between the two host waves (off: the program as it is); part of the shader cache key |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
