@@ -5,8 +5,9 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::Context;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
@@ -3725,6 +3726,163 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether a draw that finds no free dynamic descriptor slot waits for the
+/// next landing without the submission lock (`VICTORY_DYNAMIC_WAIT=1`; off
+/// by default: everything in the air is settled under the submission lock,
+/// as before, [`settle_for_fence`]).
+///
+/// Why: the slots come back flight by flight, when the thread that lands
+/// flights is done with one (`Detached::release_tables`), and that thread
+/// never takes the submission lock. The settle waited for all of them and
+/// kept the lock meanwhile, so the submitting thread stood at the lock with
+/// submissions ready and the card ran dry behind it. In fxceless's run 402,
+/// 9,000 to 11,000 draws: 0.64 such settles a frame, 19.7 ms each; the
+/// submitting thread's "waiting for the submission lock" was the same
+/// 12.4 ms a frame (0.99 correlated over 364 lines). In the lines with a
+/// settle the frame took 92.7 ms and the card stood idle 25.7 ms, in those
+/// without 68.1 ms and 3.1 ms.
+///
+/// What changes: the thread that translates the draw waits until a landing
+/// gave slots back, and takes them; other submissions go on meanwhile. With
+/// nothing in the air and nothing being landed no slot can come back that
+/// way: then, without the relay, or after a bounded wait, settle as before.
+pub(crate) fn dynamic_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| dynamic_wait_mode(std::env::var_os("VICTORY_DYNAMIC_WAIT").as_deref()))
+}
+
+fn dynamic_wait_mode(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+// A busy line may never return enough contiguous slots. After this grace
+// period, revert to the old settle rather than keep the translator waiting.
+const DYNAMIC_WAIT_LIMIT: Duration = Duration::from_millis(50);
+
+fn dynamic_wait_delay(queue_empty: bool, landing: bool, waited: Duration) -> Duration {
+    if queue_empty && !landing {
+        return Duration::ZERO;
+    }
+    let left = DYNAMIC_WAIT_LIMIT.saturating_sub(waited);
+    left.min(Duration::from_millis(1))
+}
+
+/// Since the last frame-rate line: draws that found no free dynamic
+/// descriptor slot; the microseconds they waited; those that had their slots
+/// after a landing ([`dynamic_wait`]); those that settled everything in the
+/// air under the submission lock; and those that went without.
+static DYNAMIC_WAITS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// `take` found no free dynamic descriptor slots (it gives `None`): waits
+/// for flights to land, which gives their lists' slots back, and asks again.
+/// With [`dynamic_wait`] without the submission lock and only until `take`
+/// has its slots or the wait runs out; else by [`settle_for_fence`], as before.
+pub(crate) fn wait_for_slots(mut take: impl FnMut() -> Option<u32>) -> Option<u32> {
+    if !dynamic_wait() {
+        settle_for_fence();
+        return take();
+    }
+    let began = std::time::Instant::now();
+    DYNAMIC_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    let mut found = None;
+    if relay() {
+        let _waiting = crate::timeline::span("waiting for landings: dynamic descriptor slots");
+        loop {
+            // Look before asking, and drop the line lock before taking the
+            // heap's. A flight taken off the line may still be landing.
+            let (queue_empty, landing) = {
+                let line = line();
+                (line.line.is_empty(), line.settling)
+            };
+            found = take();
+            let delay = dynamic_wait_delay(queue_empty, landing, began.elapsed());
+            if found.is_some() || delay.is_zero() {
+                break;
+            }
+            // If a landing ended between the asking and here, look again
+            // after at most one poll interval instead of missing the wake.
+            let line = line();
+            drop(
+                LINE_LANDED
+                    .wait_timeout(line, delay)
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+        }
+    }
+    if found.is_some() {
+        DYNAMIC_WAITS[2].fetch_add(1, Ordering::Relaxed);
+    } else {
+        DYNAMIC_WAITS[3].fetch_add(1, Ordering::Relaxed);
+        settle_for_fence();
+        found = take();
+        if found.is_none() {
+            DYNAMIC_WAITS[4].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    DYNAMIC_WAITS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
+}
+
+/// For the frame-rate line: [`DYNAMIC_WAITS`] per frame, and the fewest
+/// dynamic slots a view heap had free since the last line.
+fn dynamic_wait_line(frames: f64) {
+    if !dynamic_wait() {
+        return;
+    }
+    let [shortages, waited, landed, settled, missed] = DYNAMIC_WAITS
+        .each_ref()
+        .map(|w| w.swap(0, Ordering::Relaxed) as f64 / frames);
+    let low = crate::descriptor::host::DYNAMIC_LOW.swap(u64::MAX, Ordering::Relaxed);
+    if low == u64::MAX && shortages <= 0.0 {
+        return;
+    }
+    let (free, capacity) = if low == u64::MAX {
+        (0, 0)
+    } else {
+        ((low >> 32) as u32, low as u32)
+    };
+    tracing::info!(
+        "dynamic descriptor slots: the fewest free since the last line {} of {}; per frame {:.2} draws found none and waited \
+         {:.1} ms, {:.2} had their slots after a landing, {:.2} settled everything in the air under the submission lock, \
+         {:.2} went without (VICTORY_DYNAMIC_WAIT=1 waits for the next landing without that lock: relay {})",
+        free,
+        capacity,
+        shortages,
+        waited / 1000.0,
+        landed,
+        settled,
+        missed,
+        if relay() { "on" } else { "off" },
+    );
+}
+
+#[test]
+fn dynamic_wait_mode_requires_one() {
+    use std::ffi::OsStr;
+    assert!(!dynamic_wait_mode(None));
+    for off in ["0", "", "alt", "true", " 1"] {
+        assert!(!dynamic_wait_mode(Some(OsStr::new(off))));
+    }
+    assert!(dynamic_wait_mode(Some(OsStr::new("1"))));
+}
+
+#[test]
+fn dynamic_wait_delay_requires_a_flight_or_landing() {
+    let delay = |empty, landing| dynamic_wait_delay(empty, landing, Duration::ZERO);
+    assert_eq!(delay(true, false), Duration::ZERO);
+    assert_eq!(delay(false, false), Duration::from_millis(1));
+    assert_eq!(delay(true, true), Duration::from_millis(1));
+}
+
+#[test]
+fn dynamic_wait_delay_stops_when_the_grace_period_ends() {
+    let left = Duration::from_micros(500);
+    let delay = |elapsed| dynamic_wait_delay(false, true, elapsed);
+    assert_eq!(delay(DYNAMIC_WAIT_LIMIT - left), left);
+    assert_eq!(delay(DYNAMIC_WAIT_LIMIT), Duration::ZERO);
+    assert_eq!(delay(DYNAMIC_WAIT_LIMIT + left), Duration::ZERO);
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -4179,6 +4337,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    dynamic_wait_line(frames);
     crate::port::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]

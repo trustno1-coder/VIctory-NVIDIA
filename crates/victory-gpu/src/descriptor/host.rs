@@ -1958,6 +1958,11 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// For the line of `crate::host::wait_for_slots`: the fewest free dynamic
+/// slots (high 32 bits) and that view heap's capacity (low 32 bits).
+/// `u64::MAX` means no sample. Keep the pair together across heaps.
+pub(crate) static DYNAMIC_LOW: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
@@ -2297,6 +2302,9 @@ impl HostHeap {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
+            if crate::host::dynamic_wait() {
+                self.note_dynamic_low(self.free.load(Ordering::Relaxed));
+            }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -2310,9 +2318,17 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let before = self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        if crate::host::dynamic_wait() {
+            self.note_dynamic_low(before.saturating_sub(n as u32));
+        }
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    fn note_dynamic_low(&self, free: u32) {
+        let sample = (u64::from(free) << 32) | u64::from(self.dynamic);
+        DYNAMIC_LOW.fetch_min(sample, Ordering::Relaxed);
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
