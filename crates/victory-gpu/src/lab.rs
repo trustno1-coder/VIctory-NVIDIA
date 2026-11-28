@@ -87,9 +87,13 @@ pub(crate) const CUT: usize = 23;
 /// asked as one again each time, as made; 0: it is remembered for ten seconds and asked by
 /// its halves at once (`crate::watch::ask_run`).
 pub(crate) const NF: usize = 24;
+/// 0: a refresh that copies nothing learns so from tables read with no lock taken where they
+/// can say it (`crate::watch::nothing_since`), and where a flush has very many refreshes those
+/// go before a thread is woken for them; 1: from the journal, on the threads, as made.
+pub(crate) const Q: usize = 25;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 25] = [
+const KNOBS: [(&str, i64); 26] = [
     ("reuse", 1),
     ("zero", 1),
     ("a", 0),
@@ -115,8 +119,9 @@ const KNOBS: [(&str, i64); 25] = [
     ("gap", 0),
     ("cut", 0),
     ("nf", 0),
+    ("q", 0),
 ];
-static VALUES: [AtomicI64; 25] = [const { AtomicI64::new(0) }; 25];
+static VALUES: [AtomicI64; 26] = [const { AtomicI64::new(0) }; 26];
 
 /// Switch `p`, asked by the submitting thread before each submission: its
 /// priority is "highest" with 1 or 2, "above normal" (as made) with 0. (The
@@ -619,7 +624,18 @@ pub(crate) fn run_known_refused() {
     SPANS[5].fetch_add(1, Relaxed);
 }
 
-static ASK_BIG: std::sync::Mutex<Vec<(usize, usize, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static ASK_BIG: std::sync::Mutex<Vec<(usize, usize, u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Refreshes asked of the tables (switch `q`): told to copy nothing by them, not told; and of
+/// each, those asked before any thread was woken.
+static QUICK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn quick(same: bool, front: bool) {
+    QUICK[usize::from(!same)].fetch_add(1, Relaxed);
+    if front {
+        QUICK[2 + usize::from(!same)].fetch_add(1, Relaxed);
+    }
+}
 
 /// One asking of the kernel's write watch, begun at `began`, about `kb`
 /// kilobytes from `start`, which found `found` pages written.
@@ -647,8 +663,9 @@ pub(crate) fn asked(start: usize, kb: usize, found: usize, began: Instant) {
             if let Some(at) = big.iter().position(|b| b.0 == mb_at && b.1 == mb) {
                 big[at].2 += 1;
                 big[at].3 += ns;
+                big[at].4 += found as u64;
             } else if big.len() < 4096 {
-                big.push((mb_at, mb, 1, ns));
+                big.push((mb_at, mb, 1, ns, found as u64));
             }
         }
     }
@@ -1063,8 +1080,27 @@ pub(crate) fn log(frames: f64) {
         let top: Vec<String> = big
             .iter()
             .take(8)
-            .map(|b| format!("{:#x} MB + {} MB: {:.1} times {:.2} ms", b.0, b.1, b.2 as f64 / frames, b.3 as f64 / frames / 1e6))
+            .map(|b| {
+                format!(
+                    "{:#x} MB + {} MB: {:.1} times {:.2} ms, {:.1} pages found written",
+                    b.0,
+                    b.1,
+                    b.2 as f64 / frames,
+                    b.3 as f64 / frames / 1e6,
+                    b.4 as f64 / frames
+                )
+            })
             .collect();
+        // Of the askings of 64 MB and more: how many found nothing written at all.
+        let (large, found): (Vec<_>, Vec<_>) = (big.iter().filter(|b| b.1 >= 64).collect(), big.iter().filter(|b| b.1 >= 64 && b.4 == 0).collect());
+        let large_line = format!(
+            "of 64 MB and more: {} kinds asked {:.1} times a frame, {} of them ({:.1} times a frame) with no page found written in the second; all of them found {:.1} pages a frame",
+            large.len(),
+            large.iter().map(|b| b.2).sum::<u64>() as f64 / frames,
+            found.len(),
+            found.iter().map(|b| b.2).sum::<u64>() as f64 / frames,
+            large.iter().map(|b| b.4).sum::<u64>() as f64 / frames
+        );
         let names = ["under 1 MB", "1 to 8 MB", "8 to 64 MB", "64 to 256 MB", "256 MB and more"];
         let by: Vec<String> = names
             .iter()
@@ -1073,10 +1109,22 @@ pub(crate) fn log(frames: f64) {
             .collect();
         tracing::info!(
             "the submitting thread's askings of the write watch per frame, by size (lab): {}; of 8 MB and more, {} kinds, the costliest by \
-             where they begin and their size: {}",
+             where they begin and their size: {}; {}",
             by.join("; "),
             kinds,
-            top.join("; ")
+            top.join("; "),
+            large_line
+        );
+    }
+    let q: Vec<f64> = QUICK.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    if q[0] + q[1] > 0.0 {
+        tracing::info!(
+            "refreshes asked of the tables per frame (lab, q): {:.0} told to copy nothing with no lock taken, {:.0} left to the journal; \
+             of these before any thread was woken: {:.0} told, {:.0} left",
+            q[0],
+            q[1],
+            q[2],
+            q[3]
         );
     }
     let stood: Vec<String> = STOOD

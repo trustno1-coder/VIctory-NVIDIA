@@ -9282,6 +9282,14 @@ impl Batch {
         // many: then beside the others.
         const FEW: usize = 256;
         let mut spans = spans;
+        // (Lab, switch `q`=1: as made.) Where they are very many, those the
+        // tables alone know to copy nothing go here, before a thread is
+        // woken: what is left is mostly few.
+        if spans.len() > FEW && crate::lab::knob(crate::lab::Q) == 0 {
+            let all = spans.len();
+            spans.retain(|(shadow, from, to)| !shadow.nothing_new_quick(*from, *to - *from));
+            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+        }
         let many = spans.len() > FEW;
         if !many {
             let all = spans.len();
@@ -9428,6 +9436,14 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
+        // (Lab, switch `q`=1: as made.) As in `refresh_front`.
+        if light && self.refreshes.len() > FEW && crate::lab::knob(crate::lab::Q) == 0 {
+            let started = std::time::Instant::now();
+            let all = self.refreshes.len();
+            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new_quick(*from, *to - *from));
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+        }
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
             let all = self.refreshes.len();

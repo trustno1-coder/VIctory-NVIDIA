@@ -4195,6 +4195,17 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        self.nothing_new_by(address, len, false)
+    }
+
+    /// [`Shadow::nothing_new`] by what is known with no lock but the copy's
+    /// own taken (lab, switch `q`; `crate::watch::nothing_since`): `false`
+    /// also where the journal would have said yes.
+    pub(crate) fn nothing_new_quick(&self, address: usize, len: usize) -> bool {
+        self.nothing_new_by(address, len, true)
+    }
+
+    fn nothing_new_by(&self, address: usize, len: usize, quick: bool) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -4210,6 +4221,25 @@ impl Shadow {
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
+        // (Lab, switch `q`=1: as made.) The range was taken whole after an
+        // asking, and nothing was noted in its pages since: known from the
+        // tables, with the journal's lock and `copied`'s left alone.
+        if crate::lab::knob(crate::lab::Q) == 0 {
+            let same = crate::watch::nothing_since(from, to, self.ranged(from, to));
+            crate::lab::quick(same, quick);
+            if same {
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from) as u64);
+                }
+                return true;
+            }
+        }
+        if quick {
+            return false;
+        }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
         #[cfg(feature = "diagnostics")]
@@ -4222,7 +4252,8 @@ impl Shadow {
     }
 
     /// The latest asking after which a range that holds `[from, to)` was
-    /// taken whole (0: none is known). The caller holds `copied`'s lock.
+    /// taken whole (0: none is known). The caller holds `copied`'s lock, or
+    /// wants no more than a number that was true when it was noted.
     fn ranged(&self, from: usize, to: usize) -> u64 {
         let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
         ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)

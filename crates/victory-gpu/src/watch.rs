@@ -59,6 +59,7 @@ impl Journal {
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.insert(page, now).unwrap_or(0);
+        since_noted(page, now);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
             return before;
@@ -79,6 +80,127 @@ impl Journal {
             None => WHOLE,
         }
     }
+}
+
+/// (Lab, switch `q`.) The latest asking that noted a write, by page and by
+/// run of [`SINCE_RUN`] pages, in tables a refresh reads with no lock taken
+/// ([`nothing_since`]). Pages and runs that share a place share its number:
+/// a number here is never lower than the journal's for any page it stands
+/// for, so what the tables call clean the journal calls clean; what they do
+/// not is asked of the journal ([`nothing_new`]).
+///
+/// Of 10,000 refreshes a frame 9,000 copy nothing, and each learned so
+/// under the journal's lock, by a look through the list asked ahead and a
+/// search of every page ever written (runs 56-65: 13 ms a frame of the
+/// submitting thread in refreshes, with four helpers woken 35-47 times).
+const SINCE_PAGES: usize = 1 << 16;
+const SINCE_RUNS: usize = 1 << 12;
+const SINCE_RUN: usize = 64;
+static SINCE_PAGE: [std::sync::atomic::AtomicU64; SINCE_PAGES] = [const { std::sync::atomic::AtomicU64::new(0) }; SINCE_PAGES];
+static SINCE_RUNS_AT: [std::sync::atomic::AtomicU64; SINCE_RUNS] = [const { std::sync::atomic::AtomicU64::new(0) }; SINCE_RUNS];
+
+fn since_noted(page: usize, now: u64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    SINCE_PAGE[page & (SINCE_PAGES - 1)].fetch_max(now, SeqCst);
+    SINCE_RUNS_AT[(page / SINCE_RUN) & (SINCE_RUNS - 1)].fetch_max(now, SeqCst);
+}
+
+/// The journal's `ahead` as a refresh reads it with no lock taken: its
+/// ranges in order, under a count that is odd while the journal's holder
+/// changes the list or notes what its asking found ([`Journal::ahead_hide`],
+/// [`Journal::ahead_show`]). A reader that saw the count odd, or changed,
+/// knows nothing and asks the journal.
+const AHEAD_SEEN: usize = 1024;
+static AHEAD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AHEAD_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static AHEAD_AT: [std::sync::atomic::AtomicUsize; 2 * AHEAD_SEEN] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2 * AHEAD_SEEN];
+
+impl Journal {
+    /// Before `ahead` changes, with the journal held alone: nothing is read
+    /// from the list without the lock until [`Journal::ahead_show`].
+    fn ahead_hide(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if AHEAD_COUNT.load(SeqCst) & 1 == 0 {
+            AHEAD_COUNT.fetch_add(1, SeqCst);
+        }
+    }
+
+    /// After `ahead` changed, and after the notes of the asking that
+    /// changed it: the list as it is now, for readers without the lock.
+    fn ahead_show(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        debug_assert!(AHEAD_COUNT.load(SeqCst) & 1 == 1);
+        if self.ahead.len() > AHEAD_SEEN {
+            AHEAD_LEN.store(usize::MAX, SeqCst);
+        } else {
+            self.ahead.sort_unstable();
+            for (i, &(a, b)) in self.ahead.iter().enumerate() {
+                AHEAD_AT[2 * i].store(a, SeqCst);
+                AHEAD_AT[2 * i + 1].store(b, SeqCst);
+            }
+            AHEAD_LEN.store(self.ahead.len(), SeqCst);
+        }
+        AHEAD_COUNT.fetch_add(1, SeqCst);
+    }
+}
+
+/// The count under which pages `[first, last)` were seen inside one range
+/// of the list asked ahead, with no lock taken; `None` if they were not, or
+/// the list is being changed. Only the last range that begins at or before
+/// `first` is looked at: a miss asks the journal.
+fn ahead_seen(first: usize, last: usize) -> Option<u64> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let count = AHEAD_COUNT.load(SeqCst);
+    let len = AHEAD_LEN.load(SeqCst);
+    if count & 1 != 0 || len == 0 || len > AHEAD_SEEN {
+        return None;
+    }
+    let (mut low, mut high) = (0, len);
+    while low < high {
+        let mid = (low + high) / 2;
+        if AHEAD_AT[2 * mid].load(SeqCst) <= first {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    let at = low.checked_sub(1)?;
+    let (a, b) = (AHEAD_AT[2 * at].load(SeqCst), AHEAD_AT[2 * at + 1].load(SeqCst));
+    (a <= first && last <= b).then_some(count)
+}
+
+/// [`nothing_new`] for a copy that took a range holding `[start, end)` whole
+/// after asking `ranged`, where the tables can say so with no lock taken
+/// (lab, switch `q`): the range is known by its bits or lies in one asked
+/// ahead, and no asking after `ranged` noted a write in its pages. `false`
+/// says nothing: the journal is asked then.
+///
+/// Why this is the journal's own answer at some moment: the bits are read
+/// before the tables as [`nothing_new`] reads them before the journal; the
+/// tables' numbers only rise, so pages seen clean one after another were
+/// all clean when the first was read; and the list asked ahead was the same
+/// before and after (its count), with its holder's notes made while it was
+/// hidden.
+pub(crate) fn nothing_since(start: usize, end: usize, ranged: u64) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    if ranged == 0 || start >= end {
+        return false;
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let count = if published(start, end) {
+        None
+    } else {
+        match ahead_seen(first, last) {
+            Some(count) => Some(count),
+            None => return false,
+        }
+    };
+    let clean = if last - first <= SINCE_RUN {
+        (first..last).all(|page| SINCE_PAGE[page & (SINCE_PAGES - 1)].load(SeqCst) <= ranged)
+    } else {
+        (first / SINCE_RUN..=(last - 1) / SINCE_RUN).all(|run| SINCE_RUNS_AT[run & (SINCE_RUNS - 1)].load(SeqCst) <= ranged)
+    };
+    clean && count.is_none_or(|count| AHEAD_COUNT.load(SeqCst) == count)
 }
 
 /// Of the pages of a copy that were written after it took them (page number,
@@ -377,12 +499,14 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     note_hot(&written);
     let mut j = journal_mut();
+    j.ahead_hide();
     j.ahead_asked = next_asking();
     j.ahead = asked;
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
     }
+    j.ahead_show();
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -525,7 +649,9 @@ fn ask_early(every: std::time::Duration) {
 pub(crate) fn ask_ahead_done() {
     let mut j = journal_mut();
     if !j.kept {
+        j.ahead_hide();
         j.ahead.clear();
+        j.ahead_show();
     }
 }
 
@@ -569,8 +695,11 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
+    // (Hidden from here to the end, where the list stands again: what is
+    // asked in between is noted before anything reads the list unlocked.)
     let mut ahead = {
         let mut j = journal_mut();
+        j.ahead_hide();
         std::mem::take(&mut j.ahead)
     };
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
@@ -604,6 +733,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
+    j.ahead_show();
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -612,7 +742,9 @@ pub(crate) fn ask_once_end() {
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
+        j.ahead_hide();
         j.ahead.clear();
+        j.ahead_show();
     }
 }
 
