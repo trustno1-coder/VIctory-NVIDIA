@@ -19,19 +19,15 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::font::{colours, glyph};
+use super::font::{ASCII_WIDTH, TextBox, colours, width as text_width};
+use super::language::Language;
 use super::{Host, HostList, transition};
+pub(super) use crate::streamline::NOTICE_COLUMNS;
 
 /// How often the numbers change.
 const EVERY: Duration = Duration::from_millis(500);
 
-/// A character's dots, and with the space beside and below it.
-const GLYPH: (u32, u32) = (5, 7);
-const CELL: (u32, u32) = (6, 9);
-/// Characters in a line, lines, and the box's rim in dots.
-const COLUMNS: u32 = 40;
-const LINES: u32 = 10;
-const RIM: u32 = 3;
+const PANEL: TextBox = TextBox { columns: 40, lines: 10, rim: 3 };
 
 /// The texts are put into one of these in turn: the card reads the others,
 /// at most half a second old.
@@ -62,60 +58,10 @@ fn pressed() -> bool {
     process == std::process::id()
 }
 
-/// A box's characters in a line, and lines.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct Shape {
-    columns: u32,
-    lines: u32,
-}
-
-/// The numbers panel's box.
-const PANEL: Shape = Shape { columns: COLUMNS, lines: LINES };
-
-/// The box's size in pixels, a dot being `scale` of them each way.
-const fn size(shape: Shape, scale: u32) -> (u32, u32) {
-    ((shape.columns * CELL.0 + 2 * RIM) * scale, (shape.lines * CELL.1 + 2 * RIM) * scale)
-}
-
 /// Pixels to a dot for a picture that high: a 720-line screenshot of it
 /// shows one and a third.
 fn scale(height: u32) -> u32 {
     (height / 540).max(1)
-}
-
-/// Whether a dot of the picture of `lines` is white.
-fn lit(lines: &[String], shape: Shape, x: u32, y: u32) -> bool {
-    let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
-        return false;
-    };
-    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= shape.columns {
-        return false;
-    }
-    let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
-        return false;
-    };
-    (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
-}
-
-/// The box as rows of `pitch` bytes.
-fn painted(lines: &[String], shape: Shape, scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
-    let (width, height) = size(shape, scale);
-    let bytes = colours[0].len();
-    let mut out = vec![0; pitch * height as usize];
-    for y in 0..height / scale {
-        let top = pitch * (y * scale) as usize;
-        for x in 0..width / scale {
-            let colour = colours[usize::from(lit(lines, shape, x, y))];
-            for i in 0..scale {
-                let at = top + (x * scale + i) as usize * bytes;
-                out[at..at + bytes].copy_from_slice(colour);
-            }
-        }
-        for i in 1..scale as usize {
-            out.copy_within(top..top + pitch, top + i * pitch);
-        }
-    }
-    out
 }
 
 /// The counters read for it. They grow, and go back to 0 with the frame-rate
@@ -174,42 +120,106 @@ fn process_memory() -> (u64, u64) {
 }
 
 /// The frame generation line: `per` frames shown for each one rendered.
-fn generated(fps: f64, per: u32) -> String {
-    match per {
-        0 | 1 => "FRAME GEN OFF".to_owned(),
-        per => format!("FRAME GEN {per}X  SHOWN {:.1} FPS", fps * f64::from(per)),
+fn generated(fps: f64, per: u32, language: Language) -> String {
+    if per <= 1 {
+        return language.text(["FRAME GEN OFF", "帧生成关闭", "畫格生成已關閉", "GEN. DE FOTOGRAMAS DESACTIVADA"]).to_owned();
+    }
+    let shown = fps * f64::from(per);
+    match language {
+        Language::English => format!("FRAME GEN {per}X  SHOWN {shown:.1} FPS"),
+        Language::SimplifiedChinese => format!("帧生成 {per}X  显示帧率 {shown:.1}"),
+        Language::TraditionalChinese => format!("畫格生成 {per}X  顯示畫格率 {shown:.1}"),
+        Language::Spanish => format!("GEN. FOTOGRAMAS {per}X  SALIDA {shown:.1} FPS"),
     }
 }
 
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
-fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
+fn text(
+    c: &[f64; COUNTERS],
+    ms: f64,
+    worst: f64,
+    cost: f64,
+    (working, private): (u64, u64),
+    [budget, used, _, shared]: [u64; 4],
+    language: Language,
+) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let (working, private) = process_memory();
-    let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
     let fps = 1e3 / ms.max(0.001);
-    vec![
-        format!("FPS {fps:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}"),
-        generated(fps, crate::streamline::shown_per_frame()),
-        format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
-        format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
-        format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
-        if cfg!(feature = "diagnostics") {
-            format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3)
-        } else {
-            format!("COPY BACK {:.1} MS", c[5] / 1e3)
-        },
-        format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
-        format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
-        format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
-        format!("THIS PANEL {:.0} US A FRAME", cost),
-    ]
+    let generated = generated(fps, crate::streamline::shown_per_frame(), language);
+    match language {
+        Language::English => vec![
+            format!("FPS {fps:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}"),
+            generated,
+            format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
+            format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
+            format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
+            if cfg!(feature = "diagnostics") {
+                format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3)
+            } else {
+                format!("COPY BACK {:.1} MS", c[5] / 1e3)
+            },
+            format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
+            format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
+            format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
+            format!("THIS PANEL {:.0} US A FRAME", cost),
+        ],
+        Language::SimplifiedChinese => vec![
+            format!("帧率 {fps:.1}  帧时 {ms:.1} MS  最长 {worst:.0}"),
+            generated,
+            format!("绘制 {:.0}  跳过 {:.0}", c[10], c[8]),
+            format!("提交 {:.1}  等待 GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
+            format!("GPU 忙碌 {:.1}  后续空闲 {:.1}", ms - idle, c[2] / 1e3),
+            if cfg!(feature = "diagnostics") {
+                format!("录制 {:.0} MS  回拷 {:.1}", c[9] / 1e6, c[5] / 1e3)
+            } else {
+                format!("回拷 {:.1} MS", c[5] / 1e3)
+            },
+            format!("上传 {:.0}  纹理 {:.0}  回拷 {:.0} MB", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
+            format!("内存 {:.1} GB  常驻 {:.1}", gb(private), gb(working)),
+            format!("显存 {:.1}/{:.1} GB  共享 {:.1}", gb(used), gb(budget), gb(shared)),
+            format!("面板开销 {:.0} 微秒/帧", cost),
+        ],
+        Language::TraditionalChinese => vec![
+            format!("畫格率 {fps:.1}  單格 {ms:.1} MS  最長 {worst:.0}"),
+            generated,
+            format!("繪製 {:.0}  略過 {:.0}", c[10], c[8]),
+            format!("提交耗時 {:.1}  等待 GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
+            format!("GPU 忙碌 {:.1}  後續閒置 {:.1}", ms - idle, c[2] / 1e3),
+            if cfg!(feature = "diagnostics") {
+                format!("錄製 {:.0} MS  讀回 {:.1}", c[9] / 1e6, c[5] / 1e3)
+            } else {
+                format!("讀回 {:.1} MS", c[5] / 1e3)
+            },
+            format!("上傳 {:.0}  紋理 {:.0}  讀回 {:.0} MB", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
+            format!("記憶體 {:.1} GB  常駐 {:.1}", gb(private), gb(working)),
+            format!("顯示記憶體 {:.1}/{:.1} GB  共用 {:.1}", gb(used), gb(budget), gb(shared)),
+            format!("面板耗時 {:.0} 微秒/畫格", cost),
+        ],
+        Language::Spanish => vec![
+            format!("FPS {fps:.1}  {ms:.1} MS/FOT.  MÁX. {worst:.0}"),
+            generated,
+            format!("LLAMADAS DE DIBUJO {:.0}  OMITIDAS {:.0}", c[10], c[8]),
+            format!("ENVÍO {:.1}  ESPERA GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
+            format!("GPU OCUPADA {:.1}  INACTIVA {:.1}", ms - idle, c[2] / 1e3),
+            if cfg!(feature = "diagnostics") {
+                format!("GRABACIÓN {:.0} MS  LECTURA {:.1}", c[9] / 1e6, c[5] / 1e3)
+            } else {
+                format!("LECTURA {:.1} MS", c[5] / 1e3)
+            },
+            format!("SUBIDA {:.0}  TEX. {:.0}  LECTURA {:.0} MB", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
+            format!("RAM {:.1} GB  RESIDENTE {:.1}", gb(private), gb(working)),
+            format!("VRAM {:.1}/{:.1} GB  COMP. {:.1}", gb(used), gb(budget), gb(shared)),
+            format!("PANEL {:.0} US POR FOTOGRAMA", cost),
+        ],
+    }
 }
 
 /// The buffers of a box that size and format.
 struct Buffers {
-    shape: Shape,
+    shape: TextBox,
+    extent: (u32, u32),
     format: DXGI_FORMAT,
     scale: u32,
     pitch: u32,
@@ -225,8 +235,8 @@ struct Buffers {
 unsafe impl Send for Buffers {}
 
 impl Buffers {
-    fn new(host: &Host, shape: Shape, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
-        let (width, height) = size(shape, scale);
+    fn new(host: &Host, shape: TextBox, format: DXGI_FORMAT, language: Language, scale: u32) -> Option<Buffers> {
+        let (width, height) = shape.size(language, scale);
         let pitch = (width * colours(format)?[0].len() as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
         let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
@@ -251,12 +261,13 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { shape, format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
+        Some(Buffers { shape, extent: (width, height), format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
     }
 
-    fn write(&mut self, lines: &[String]) {
+    fn write(&mut self, lines: &[String], language: Language) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.shape, self.scale, colours, self.pitch as usize);
+        let picture = self.shape.paint(lines, language, self.scale, colours, self.pitch as usize);
+        debug_assert_eq!(picture.len(), self.pitch as usize * self.extent.1 as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -266,7 +277,7 @@ impl Buffers {
     /// Records the copy of the box onto `back` (of `width` x `height`, in the
     /// state to be copied into), its upper left corner at `at`.
     fn copy(&mut self, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, at: (u32, u32), (width, height): (u32, u32)) {
-        let (w, h) = size(self.shape, self.scale);
+        let (w, h) = self.extent;
         if at.0 >= width || at.1 >= height {
             return;
         }
@@ -313,8 +324,10 @@ pub(super) struct Panel {
     cost: Duration,
     before: Counters,
     lines: Vec<String>,
+    language: Language,
     changed: bool,
-    buffers: Option<Buffers>,
+    /// English and Unicode use different row heights.
+    buffers: [Option<Buffers>; 2],
     failed: bool,
 }
 
@@ -329,8 +342,9 @@ impl Panel {
             cost: Duration::ZERO,
             before: Counters::default(),
             lines: Vec::new(),
+            language: Language::English,
             changed: false,
-            buffers: None,
+            buffers: [const { None }; 2],
             failed: false,
         }
     }
@@ -364,7 +378,16 @@ impl Panel {
         let c = counters.since(self.before, frames);
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
-        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
+        self.language = super::menu::language();
+        self.lines = text(
+            &c,
+            elapsed.as_secs_f64() * 1e3 / frames,
+            self.worst,
+            cost,
+            process_memory(),
+            host.video_memory().unwrap_or_default(),
+            self.language,
+        );
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
@@ -388,16 +411,17 @@ impl Panel {
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
-        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+        let buffers = &mut self.buffers[usize::from(self.language.unicode())];
+        if buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
             // (What the card may still read stays: a picture's size changes once or twice in a run.)
-            std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, PANEL, format, scale);
-            self.failed = self.buffers.is_none();
+            std::mem::forget(buffers.take());
+            *buffers = Buffers::new(host, PANEL, format, self.language, scale);
+            self.failed = buffers.is_none();
             self.changed = true;
         }
-        let Some(buffers) = &mut self.buffers else { return };
+        let Some(buffers) = buffers else { return };
         if std::mem::take(&mut self.changed) {
-            buffers.write(&self.lines);
+            buffers.write(&self.lines, self.language);
         }
         buffers.copy(&list.list, back, (0, 0), (width, height));
         self.cost += began.elapsed();
@@ -406,30 +430,26 @@ impl Panel {
 
 /// How long the start's notice stays.
 const NOTICE_FOR: Duration = Duration::from_secs(30);
-/// The longest notice line, in characters.
-const NOTICE_COLUMNS: u32 = 52;
 
 /// What this card does for frame generation, said at the top of the picture
 /// for the first [`NOTICE_FOR`] of a run (`crate::streamline::notice`); in
 /// every build, nothing without a notice.
 pub(super) struct Notice {
-    lines: Vec<String>,
-    shape: Shape,
+    lines: [Vec<String>; Language::ALL.len()],
     since: Option<Instant>,
-    buffers: Option<Buffers>,
-    written: bool,
+    buffers: [Option<Buffers>; Language::ALL.len()],
     done: bool,
 }
 
 impl Notice {
     pub(super) fn new() -> Notice {
-        // The first start of a new victory.exe says first that it restarts by itself (menu.rs).
-        let warmup = super::menu::warmup_seconds().map(super::menu::warmup_notice).unwrap_or_default();
-        let lines: Vec<String> =
-            warmup.into_iter().chain(crate::streamline::notice()).map(|l| l.to_ascii_uppercase()).collect();
-        let columns = lines.iter().map(|l| l.len() as u32).max().unwrap_or(0).min(NOTICE_COLUMNS);
-        let shape = Shape { columns, lines: lines.len() as u32 };
-        Notice { done: lines.is_empty(), lines, shape, since: None, buffers: None, written: false }
+        // The first start of a new victory.exe says first that it restarts by itself.
+        let warmup = super::menu::warmup_seconds();
+        let lines = Language::ALL.map(|language| {
+            warmup.into_iter().flat_map(|seconds| super::menu::warmup_notice(seconds, language))
+                .chain(crate::streamline::notice_in(language)).collect::<Vec<_>>()
+        });
+        Notice { done: lines[Language::English.index()].is_empty(), lines, since: None, buffers: [const { None }; Language::ALL.len()] }
     }
 
     /// Records the copy of the notice onto `back` (as [`Panel::draw`]), at
@@ -441,27 +461,31 @@ impl Notice {
         let since = *self.since.get_or_insert_with(Instant::now);
         if since.elapsed() > NOTICE_FOR {
             // (Its buffers stay: the card may still read them.)
-            std::mem::forget(self.buffers.take());
+            for buffers in &mut self.buffers {
+                std::mem::forget(buffers.take());
+            }
             self.done = true;
             return;
         }
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
-        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, self.shape, format, scale);
-            self.written = false;
-            if self.buffers.is_none() {
+        let language = super::menu::language();
+        let lines = &self.lines[language.index()];
+        let buffers = &mut self.buffers[language.index()];
+        if buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+            std::mem::forget(buffers.take());
+            let columns = lines.iter().map(|l| text_width(l).div_ceil(ASCII_WIDTH)).max().unwrap_or(0).min(NOTICE_COLUMNS);
+            let shape = TextBox { columns, lines: lines.len() as u32, rim: 3 };
+            let Some(mut made) = Buffers::new(host, shape, format, language, scale) else {
                 self.done = true;
                 return;
-            }
+            };
+            made.write(lines, language);
+            *buffers = Some(made);
         }
-        let Some(buffers) = &mut self.buffers else { return };
-        if !std::mem::replace(&mut self.written, true) {
-            buffers.write(&self.lines);
-        }
-        let (w, _) = size(self.shape, scale);
+        let Some(buffers) = buffers else { return };
+        let (w, _) = buffers.extent;
         let at = (width.saturating_sub(w) / 2, 24 * scale);
         buffers.copy(&list.list, back, at, (width, height));
     }
@@ -470,6 +494,7 @@ impl Notice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::font::glyph;
 
     /// Every character the lines use has its own picture, and no two look
     /// alike.
@@ -478,7 +503,7 @@ mod tests {
         let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- ").collect();
         for (i, a) in used.iter().enumerate() {
             assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
-            assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));
+            assert!(glyph(*a).iter().all(|row| row >> 5 == 0));
             for b in &used[i + 1..] {
                 assert_ne!(glyph(*a), glyph(*b), "{} {}", *a as char, *b as char);
             }
@@ -488,30 +513,61 @@ mod tests {
     /// The frame generation line fits the box and says what is shown.
     #[test]
     fn generated_frames_are_told() {
-        assert_eq!(generated(27.5, 1), "FRAME GEN OFF");
-        assert_eq!(generated(27.5, 6), "FRAME GEN 6X  SHOWN 165.0 FPS");
-        assert!(generated(999.9, 6).len() <= COLUMNS as usize);
+        assert_eq!(generated(27.5, 1, Language::English), "FRAME GEN OFF");
+        assert_eq!(generated(27.5, 6, Language::English), "FRAME GEN 6X  SHOWN 165.0 FPS");
+        assert_eq!(generated(27.5, 6, Language::SimplifiedChinese), "帧生成 6X  显示帧率 165.0");
+        assert_eq!(generated(27.5, 6, Language::TraditionalChinese), "畫格生成 6X  顯示畫格率 165.0");
+        assert_eq!(generated(27.5, 6, Language::Spanish), "GEN. FOTOGRAMAS 6X  SALIDA 165.0 FPS");
+        let off = ["FRAME GEN OFF", "帧生成关闭", "畫格生成已關閉", "GEN. DE FOTOGRAMAS DESACTIVADA"];
+        for language in Language::ALL {
+            assert_eq!(generated(27.5, 1, language), language.text(off));
+            for per in [1, 6] {
+                let line = generated(999.9, per, language);
+                assert!(text_width(&line) <= PANEL.columns * ASCII_WIDTH, "{line}");
+            }
+        }
     }
 
     #[test]
-    fn a_box_is_painted() {
-        let lines = vec!["I".to_owned(), " i".to_owned()];
+    fn stats_fit_the_box_in_each_language() {
+        let counters = [33300.0, 500.0, 14100.0, 820.0, 256e6, 300.0, 24e6, 1234e6, 999.0, 84e6, 12345.0];
+        let maximum = [
+            "FPS 1250.0  FRAME 0.8 MS  LONGEST 1200",
+            "帧率 1250.0  帧时 0.8 MS  最长 1200",
+            "畫格率 1250.0  單格 0.8 MS  最長 1200",
+            "FPS 1250.0  0.8 MS/FOT.  MÁX. 1200",
+        ];
+        let gb = 1u64 << 30;
+        for language in Language::ALL {
+            let lines = text(&counters, 0.8, 1200.0, 140.0, (28 * gb, 32 * gb), [24 * gb, 12 * gb, 0, gb], language);
+            assert_eq!(lines[0], language.text(maximum));
+            assert_eq!(lines.len(), PANEL.lines as usize);
+            for line in lines {
+                assert!(text_width(&line) <= PANEL.columns * ASCII_WIDTH, "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_english_box_is_painted() {
+        let lines = ["I".to_owned(), " i".to_owned()];
+        let rim = PANEL.rim;
         for scale in [1, 2, 4] {
-            let (width, height) = size(PANEL, scale);
+            let (width, height) = PANEL.area(PANEL.columns * ASCII_WIDTH, lines.len() as u32, Language::English, scale);
             let pitch = (width * 4).next_multiple_of(256) as usize;
             let colours = colours(DXGI_FORMAT_R10G10B10A2_UNORM).unwrap();
-            let picture = painted(&lines, PANEL, scale, colours, pitch);
+            let picture = PANEL.paint(&lines, Language::English, scale, colours, pitch);
             assert_eq!(picture.len(), pitch * height as usize);
             let at = |x: u32, y: u32| &picture[y as usize * pitch + x as usize * 4..][..4];
             // The rim is black, the first letter's top row lit in its middle.
             assert_eq!(at(0, 0), colours[0]);
-            assert_eq!(at((RIM + 2) * scale, RIM * scale), colours[1]);
-            assert_eq!(at((RIM + 2) * scale + scale - 1, RIM * scale + scale - 1), colours[1]);
-            assert_eq!(at(RIM * scale, RIM * scale), colours[0]);
+            assert_eq!(at((rim + 2) * scale, rim * scale), colours[1]);
+            assert_eq!(at((rim + 2) * scale + scale - 1, rim * scale + scale - 1), colours[1]);
+            assert_eq!(at(rim * scale, rim * scale), colours[0]);
             // Small letters are shown as capitals, a line and a cell on.
-            assert_eq!(at((RIM + CELL.0 + 2) * scale, (RIM + CELL.1) * scale), colours[1]);
+            assert_eq!(at((rim + ASCII_WIDTH + 2) * scale, (rim + 9) * scale), colours[1]);
             // Nothing past a line's end.
-            assert_eq!(at((RIM + CELL.0 * 2 + 2) * scale, (RIM + CELL.1) * scale), colours[0]);
+            assert_eq!(at((rim + ASCII_WIDTH * 2 + 2) * scale, (rim + 9) * scale), colours[0]);
         }
     }
 

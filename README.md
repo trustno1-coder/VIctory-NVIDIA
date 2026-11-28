@@ -98,7 +98,12 @@
 **In the game**
 
 - **F1** brings up the settings menu (arrow keys pick and change, Enter does
-  it): DLSS, frame generation, frame rate cap and more.
+  it): DLSS, frame generation, frame rate cap and more. **LANGUAGE** switches
+  the menu, stats panel, FPS line and on-screen notices between English,
+  Simplified Chinese, Traditional Chinese and Spanish. The choice is saved
+  automatically. English is the default. **AUTO (WINDOWS)** follows the first
+  preferred Windows display language, with English as the fallback. Chinese
+  requires a Windows font with Chinese glyphs.
 - **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
   memory numbers).
 

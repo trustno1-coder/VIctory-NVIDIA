@@ -892,17 +892,24 @@ mod tests {
     /// The start's notice: what runs and why, in lines the picture's box and font show.
     #[test]
     fn the_notice_says_what_the_card_does() {
-        use super::super::notice_of;
-        let shown = |lines: &[String]| {
+        use super::super::{Language, NOTICE_COLUMNS, notice_of};
+        use crate::host::font::{ASCII_WIDTH, width};
+
+        let shown = |lines: &[String], language| {
             for l in lines {
-                assert!(l.len() <= 52, "{l}");
-                assert!(l.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || b" .,:()/->+!?_=*".contains(&c)), "{l}");
+                assert!(width(l) <= NOTICE_COLUMNS * ASCII_WIDTH, "{l}");
+                if language == Language::English {
+                    assert!(l.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || b" .,:()/->+!?_=*".contains(&c)), "{l}");
+                }
             }
         };
         let lines = |f, dlss_live, fsr_live| {
-            let l = notice_of(&f, dlss_live, fsr_live).into_iter().map(|l| l.to_ascii_uppercase()).collect::<Vec<_>>();
-            shown(&l);
-            l.join("|")
+            let localized = Language::ALL.map(|language| {
+                let lines = notice_of(&f, dlss_live, fsr_live, language);
+                shown(&lines, language);
+                lines
+            });
+            localized[Language::English.index()].join("|")
         };
         // RTX 40/50: DLSS frame generation.
         let mut rtx40 = facts(true, true, true, false);
@@ -925,6 +932,22 @@ mod tests {
         // RTX 20/30 on Series X with DLSS: FSR 3 instead, 2X.
         let rtx30 = lines(facts(true, false, true, false), false, true);
         assert!(rtx30.contains("NOT ON THIS CARD") && rtx30.contains("FSR 3") && rtx30.contains("2X"));
+        let fallback = [
+            "USING AMD FSR 3 FRAME GEN INSTEAD: 2X AT MOST",
+            "已改用 AMD FSR 3 帧生成，最高 2X",
+            "改用 AMD FSR 3 畫格生成，最高 2X",
+            "GEN. CON AMD FSR 3 EN SU LUGAR, HASTA 2X",
+        ];
+        for language in Language::ALL {
+            let lines = notice_of(&facts(true, false, true, false), false, true, language);
+            assert!(lines.iter().any(|line| line == language.text(fallback)), "{lines:?}");
+        }
+        // FSR 3 selected in F1, offered as an alternative, or DLSS failing to start.
+        let mut chosen = facts(true, false, true, false);
+        chosen.dlss_fg_asked = false;
+        assert!(lines(chosen, false, true).contains("CHOSEN IN F1"));
+        assert!(lines(facts(true, false, true, false), false, false).contains("FRAME GEN TYPE"));
+        assert!(lines(facts(true, true, true, false), false, false).contains("DLSS DID NOT START"));
         // No DLSS at all, either console: FSR 3 stays off, as the title stops without DLSS.
         for series_s in [false, true] {
             let amd = lines(facts(false, false, false, series_s), false, false);
@@ -943,7 +966,9 @@ mod tests {
         // Nothing asked: nothing said.
         let mut quiet = facts(true, true, true, false);
         (quiet.dlss_fg_asked, quiet.fsr_asked) = (false, false);
-        assert!(notice_of(&quiet, false, false).is_empty());
+        for language in Language::ALL {
+            assert!(notice_of(&quiet, false, false, language).is_empty());
+        }
     }
 
     #[test]

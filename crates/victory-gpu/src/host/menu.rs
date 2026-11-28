@@ -21,7 +21,7 @@
 //! that panel is: white text on a black box, copied onto the swap chain's
 //! buffer, in the middle of the picture.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -32,11 +32,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::font::{colours, glyph};
+use super::font::{ASCII_WIDTH, TextBox, colours, glyph, supports, width as text_width};
+use super::language::{Labels, Language};
 use super::{Host, HostList, transition};
 
-const GLYPH: (u32, u32) = (5, 7);
-const CELL: (u32, u32) = (6, 9);
 const COLUMNS: u32 = 60;
 /// Lines of the box: a title, a help line, a blank, the settings shown, a
 /// blank, what the line picked does (`ABOUT`, else blank), a note and the
@@ -45,37 +44,37 @@ const ROWS: usize = 20;
 const LINES: u32 = ROWS as u32 + 9;
 /// The action that preloads shaders, and what is said of it while it is picked.
 const PRELOAD: usize = 2;
-const ABOUT_PRELOAD: [&str; 3] = [
-    "MAKES EVERY SHADER AHEAD, THEN STARTS THE GAME AGAIN.",
-    "TAKES A WHILE: MAYBE A LONG TIME, DEPENDING ON HARDWARE.",
-    "A LATER UPDATE OF THIS BUILD MAY NEED A NEW PRELOAD.",
+const ABOUT_PRELOAD: [Labels; 3] = [
+    ["MAKES EVERY SHADER AHEAD, THEN STARTS THE GAME AGAIN.", "提前编译全部着色器，然后重新启动游戏。", "預先建立著色器和管線，再啟動遊戲。", "COMPILA TODOS LOS SHADERS Y REINICIA EL JUEGO."],
+    ["TAKES A WHILE: MAYBE A LONG TIME, DEPENDING ON HARDWARE.", "处理时间取决于硬件，可能需要等很久。", "處理時間取決於硬體，可能需要很久。", "PUEDE TARDAR MUCHO, SEGÚN EL EQUIPO."],
+    ["A LATER UPDATE OF THIS BUILD MAY NEED A NEW PRELOAD.", "兼容层更新后可能需要重新预加载。", "更新執行版本後，可能需要重新預熱。", "UNA ACTUALIZACIÓN PODRÍA REQUERIR OTRA PRECARGA."],
 ];
 /// The actions that export and import the game's save (`crate::save_share`), and what is said
 /// of them while they are picked.
 const EXPORT: usize = 4;
 const IMPORT: usize = 5;
-const ABOUT_EXPORT: [&str; 3] = [
-    "MAKES A ZIP OF YOUR SAVE IN SAVES, IN THE FOLDER OF",
-    "GAME_SCARLETT_MASTER.EXE. SEND THAT ZIP TO SHARE IT.",
-    "YOUR SAVE STAYS AS IT IS. GAME SETTINGS ARE LEFT OUT.",
+const ABOUT_EXPORT: [Labels; 3] = [
+    ["MAKES A ZIP OF YOUR SAVE IN SAVES, IN THE FOLDER OF", "把存档打包为 ZIP，放入游戏目录的 SAVES 文件夹。", "將存檔打包成 ZIP，放入遊戲目錄的 SAVES。", "EMPAQUETA LA PARTIDA EN UN ZIP EN SAVES, DENTRO DE"],
+    ["GAME_SCARLETT_MASTER.EXE. SEND THAT ZIP TO SHARE IT.", "可把 ZIP 发给其他人分享。", "可將 ZIP 傳給其他人分享。", "LA CARPETA DEL JUEGO. PUEDES COMPARTIR ESE ZIP."],
+    ["YOUR SAVE STAYS AS IT IS. GAME SETTINGS ARE LEFT OUT.", "原存档保持原样，ZIP 不包含游戏设置。", "原存檔維持原樣，ZIP 不含遊戲設定。", "CONSERVA TU PARTIDA. EL ZIP NO INCLUYE LOS AJUSTES."],
 ];
-const ABOUT_IMPORT: [&str; 3] = [
-    "PUT A SAVE ZIP INTO SAVES, IN THE FOLDER OF",
-    "GAME_SCARLETT_MASTER.EXE, THEN PRESS ENTER HERE AND",
-    "PICK IT FROM THE LIST. YOUR GAME SETTINGS ARE KEPT.",
+const ABOUT_IMPORT: [Labels; 3] = [
+    ["PUT A SAVE ZIP INTO SAVES, IN THE FOLDER OF", "把存档 ZIP 放入游戏目录的 SAVES 文件夹。", "將存檔 ZIP 放入遊戲目錄的 SAVES。", "PON UN ZIP DE PARTIDA EN SAVES, EN LA CARPETA DE"],
+    ["GAME_SCARLETT_MASTER.EXE, THEN PRESS ENTER HERE AND", "在此按回车，再从列表中选择存档。", "在此按 Enter，再從清單選擇存檔。", "GAME_SCARLETT_MASTER.EXE. PULSA ENTER AQUÍ Y"],
+    ["PICK IT FROM THE LIST. YOUR GAME SETTINGS ARE KEPT.", "导入时保留你的游戏设置。", "匯入時保留你的遊戲設定。", "ELÍGELO EN LA LISTA. CONSERVARÁS TUS AJUSTES."],
 ];
 /// The list IMPORT SAVE opens: the saves in `Saves`, then a line back to the settings.
-const PICK_TITLE: &str = "IMPORT SAVE                       ESC GOES BACK";
-const PICK_HELP: &str = "UP/DOWN PICK  ENTER TWICE IMPORTS IT";
-const PICK_NONE: &str = "  NONE YET: PUT A SAVE ZIP INTO SAVES IN THE GAME FOLDER";
-const PICK_BACK: &str = "BACK TO THE SETTINGS";
-const ABOUT_PICK: [&str; 3] = [
-    "THE SAVE ZIPS IN SAVES, IN THE GAME FOLDER, NEWEST FIRST.",
-    "ENTER TWICE: THE GAME RESTARTS WITH THE SAVE PICKED.",
-    "YOUR OLD SAVE IS ZIPPED INTO SAVES FIRST, SO IT IS KEPT.",
+const PICK_TITLE: Labels = ["IMPORT SAVE                       ESC GOES BACK", "导入存档                   ESC 返回", "匯入存檔                   ESC 返回", "IMPORTAR PARTIDA             ESC PARA VOLVER"];
+const PICK_HELP: Labels = ["UP/DOWN PICK  ENTER TWICE IMPORTS IT", "上下选择    按两次回车导入", "上下選擇    按兩次 Enter 匯入", "ARRIBA/ABAJO ELIGE  ENTER DOS VECES"];
+const PICK_NONE: Labels = ["  NONE YET: PUT A SAVE ZIP INTO SAVES IN THE GAME FOLDER", "  暂无存档。请把存档 ZIP 放入游戏目录的 SAVES", "  尚無存檔。請將存檔 ZIP 放入遊戲目錄的 SAVES", "  SIN PARTIDAS. PON UN ZIP EN SAVES, DENTRO DEL JUEGO"];
+const PICK_BACK: Labels = ["BACK TO THE SETTINGS", "返回设置", "返回設定", "VOLVER A LOS AJUSTES"];
+const ABOUT_PICK: [Labels; 3] = [
+    ["THE SAVE ZIPS IN SAVES, IN THE GAME FOLDER, NEWEST FIRST.", "下列 ZIP 位于游戏目录的 SAVES，最新的排在最前。", "SAVES 內的存檔 ZIP，依新到舊排列。", "ARCHIVOS ZIP EN SAVES, DEL MÁS NUEVO AL MÁS ANTIGUO."],
+    ["ENTER TWICE: THE GAME RESTARTS WITH THE SAVE PICKED.", "按两次回车后，游戏将使用所选存档重启。", "按兩次 Enter，用所選存檔重新啟動遊戲。", "ENTER DOS VECES: REINICIA CON LA PARTIDA ELEGIDA."],
+    ["YOUR OLD SAVE IS ZIPPED INTO SAVES FIRST, SO IT IS KEPT.", "旧存档会先打包备份到 SAVES。", "原存檔會先打包備份到 SAVES。", "ANTES SE GUARDA UNA COPIA DE TU PARTIDA EN SAVES."],
 ];
 /// The note after the first Enter on a save in the list: the second one imports it.
-const CONFIRM_IMPORT: &str = "ENTER AGAIN: IMPORT IT AND RESTART THE GAME";
+const CONFIRM_IMPORT: Labels = ["ENTER AGAIN: IMPORT IT AND RESTART THE GAME", "再次按回车：导入存档并重启游戏", "再按 Enter：匯入存檔並重新啟動遊戲", "PULSA ENTER OTRA VEZ PARA IMPORTAR Y REINICIAR"];
 /// The longest save name shown in the list.
 const IMPORT_NAME: usize = 56;
 
@@ -90,26 +89,27 @@ fn shown_name(name: &str) -> String {
 
 /// The setting that turns MFG Unlocker on, and what is said of it while it is picked.
 const MFG: &str = "VICTORY_MFG_UNLOCKER";
-const ABOUT_MFG: [&str; 3] = [
-    "A MOD, NOT OURS: DLSS FRAME GEN ON RTX 20 AND 30 CARDS.",
-    "ON: DOWNLOADED FROM ITS GITHUB AT THE NEXT START, THEN RUN.",
-    "NVIDIA DOES NOT SUPPORT IT. IF THE GAME FAILS, TURN IT OFF.",
+const ABOUT_MFG: [Labels; 3] = [
+    ["A MOD, NOT OURS: DLSS FRAME GEN ON RTX 20 AND 30 CARDS.", "第三方模组，可让 RTX 20 和 30 系列使用 DLSS 帧生成。", "第三方模組，讓 RTX 20 / 30 使用 DLSS 畫格生成。", "MOD DE TERCEROS: GEN. DE FOTOGRAMAS EN RTX 20 Y 30."],
+    ["ON: DOWNLOADED FROM ITS GITHUB AT THE NEXT START, THEN RUN.", "开启后会在下次启动时从其 GITHUB 下载并加载。", "開啟後，下次啟動會從 GITHUB 下載並載入。", "AL ACTIVARLO, SE DESCARGA DE GITHUB Y SE CARGA AL INICIO."],
+    ["NVIDIA DOES NOT SUPPORT IT. IF THE GAME FAILS, TURN IT OFF.", "NVIDIA 未提供支持。游戏异常时请关闭它。", "NVIDIA 未提供支援。遊戲無法啟動時請關閉。", "NVIDIA NO LO ADMITE. DESACTÍVALO SI EL JUEGO FALLA."],
 ];
 /// The DLSS setting, and what is said while it is picked on in a start without NVIDIA's files.
 const DLSS: &str = "VICTORY_MENU_DLSS";
-const ABOUT_NO_DLSS: [&str; 3] = [
-    "THE NVIDIA DLSS FILES ARE NOT ON THIS PC YET: THEY ARE",
-    "DOWNLOADED FROM NVIDIA ON GITHUB AT THE NEXT START",
-    "(ABOUT 70 MB, ONCE). SAVE AND RESTART NOW DOES IT.",
+const ABOUT_NO_DLSS: [Labels; 3] = [
+    ["THE NVIDIA DLSS FILES ARE NOT ON THIS PC YET: THEY ARE", "本机还没有 NVIDIA DLSS 文件。", "此電腦尚未安裝 NVIDIA DLSS 檔案。", "AÚN FALTAN LOS ARCHIVOS DE NVIDIA DLSS."],
+    ["DOWNLOADED FROM NVIDIA ON GITHUB AT THE NEXT START", "下次启动时会从 NVIDIA 的 GITHUB 下载。", "下次啟動時會從 NVIDIA 的 GITHUB 下載。", "SE DESCARGAN DEL GITHUB DE NVIDIA AL INICIAR."],
+    ["(ABOUT 70 MB, ONCE). SAVE AND RESTART NOW DOES IT.", "约 70 MB，只下载一次。可选保存并立即重启。", "約 70 MB，只下載一次。可儲存並立即重啟。", "APROX. 70 MB, UNA SOLA VEZ. GUARDA Y REINICIA AHORA."],
 ];
 /// Frame generation that this run did not start with: it is made ready only at a start with it
 /// on (a start with it ready but off held some PCs at 14 fps, #515, #574), so turning it on takes
 /// a restart; a run started with it on changes it, or turns it off, live.
-const ABOUT_FRAMEGEN_RESTART: [&str; 3] = [
-    "RESTART REQUIRED TO ENABLE FRAME GENERATION: THIS RUN",
-    "STARTED WITHOUT IT. SAVE AND RESTART NOW TURNS IT ON.",
-    "AFTER THAT IT CHANGES, OR TURNS OFF, LIVE.",
+const ABOUT_FRAMEGEN_RESTART: [Labels; 3] = [
+    ["RESTART REQUIRED TO ENABLE FRAME GENERATION: THIS RUN", "本次启动未启用帧生成，开启需重启游戏。", "本次啟動未開啟畫格生成，需要重新啟動遊戲。", "DEBES REINICIAR PARA ACTIVAR LA GEN. DE FOTOGRAMAS."],
+    ["STARTED WITHOUT IT. SAVE AND RESTART NOW TURNS IT ON.", "选择保存并立即重启，即可启用帧生成。", "選擇儲存並立即重新啟動，即可開啟畫格生成。", "GUARDA Y REINICIA AHORA PARA ACTIVARLA."],
+    ["AFTER THAT IT CHANGES, OR TURNS OFF, LIVE.", "重启后可即时调整或关闭帧生成。", "之後可即時調整或關閉畫格生成。", "LUEGO PUEDES AJUSTARLA O DESACTIVARLA AL INSTANTE."],
 ];
+const RESTART_FRAMEGEN: Labels = ["RESTART REQUIRED TO ENABLE FRAME GENERATION", "重启游戏后才能开启帧生成", "重新啟動遊戲後才能開啟畫格生成", "REINICIA PARA ACTIVAR LA GEN. DE FOTOGRAMAS"];
 const FRAMEGEN: &str = "VICTORY_MENU_FRAMEGEN";
 /// The console, and the picture row of each: only the one of the console picked is shown.
 const CONSOLE: &str = "VICTORY_MENU_CONSOLE";
@@ -119,86 +119,119 @@ const S_RES: &str = "VICTORY_MENU_S_RES";
 /// changes it: the title's own FidelityFX path from 540 stopped it at the start (0xc0000094,
 /// a division by zero in the title, 2026-11-28), so with DLSS off the scene stays at 720.
 const S_MODES: [(&str, &str); 4] = [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance")];
-const ABOUT_S_RES: [&str; 3] = [
-    "THE SIZE THE GAME RENDERS AT. THE PICTURE IS 1920X1080.",
-    "OTHER THAN 720 NEEDS DLSS: THIS SETS ITS MODE (1080 IS",
-    "DLAA, 720 QUALITY, 626 BALANCED, 540 PERFORMANCE).",
+const ABOUT_S_RES: [Labels; 3] = [
+    ["THE SIZE THE GAME RENDERS AT. THE PICTURE IS 1920X1080.", "游戏内部渲染分辨率。输出画面为 1920X1080。", "遊戲的內部渲染解析度。輸出為 1920X1080。", "RESOLUCIÓN INTERNA DEL JUEGO. LA SALIDA ES 1920X1080."],
+    ["OTHER THAN 720 NEEDS DLSS: THIS SETS ITS MODE (1080 IS", "除 720P 外均需 DLSS。分辨率决定 DLSS 模式。", "除 720P 外均需 DLSS。解析度決定 DLSS 模式。", "SALVO 720P, REQUIERE DLSS. ESTO FIJA SU MODO:"],
+    ["DLAA, 720 QUALITY, 626 BALANCED, 540 PERFORMANCE).", "1080P 为 DLAA，720P 质量，626P 平衡，540P 性能。", "1080P 為 DLAA，720P 畫質，626P 平衡，540P 效能。", "1080 DLAA, 720 CALIDAD, 626 EQUIL., 540 RENDIMIENTO."],
 ];
 /// The note after the first Enter on it: the second one does it.
-const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
+const CONFIRM_PRELOAD: Labels = ["ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD", "再次按回车：保存设置、退出游戏并预加载", "再按 Enter：儲存設定、關閉遊戲並預載", "PULSA ENTER OTRA VEZ PARA GUARDAR, CERRAR Y PRECARGAR"];
 /// The last line of the box: where this build comes from.
 const REPO: &str = "GITHUB.COM/TRUSTNO1-CODER/VICTORY-NVIDIA";
-const RIM: u32 = 4;
+const BOX: TextBox = TextBox { columns: COLUMNS, lines: LINES, rim: 4 };
+const FPS_BOX: TextBox = TextBox { columns: 48, lines: 1, rim: 4 };
 const UPLOADS: usize = 4;
+
+const LANGUAGE: &str = "VICTORY_MENU_LANGUAGE";
+const LANGUAGE_VALUES: &[(&str, Labels)] = &[
+    ("en", ["ENGLISH", "英语", "英語", "INGLÉS"]),
+    ("zh-CN", ["SIMPLIFIED CHINESE", "简体中文", "簡體中文", "CHINO SIMPLIFICADO"]),
+    ("zh-TW", ["TRADITIONAL CHINESE", "繁体中文", "繁體中文", "CHINO TRADICIONAL"]),
+    ("es", ["SPANISH", "西班牙语", "西班牙語", "ESPAÑOL"]),
+    ("auto", ["AUTO (WINDOWS)", "跟随 WINDOWS", "跟隨 WINDOWS", "AUTO (WINDOWS)"]),
+];
+
+const fn same(value: &'static str) -> Labels {
+    [value; Language::ALL.len()]
+}
+
+fn language_index(value: &str) -> usize {
+    if value.eq_ignore_ascii_case("auto") { Language::ALL.len() } else { Language::from_setting(value).index() }
+}
+
+fn language_choice() -> &'static AtomicUsize {
+    static CHOICE: OnceLock<AtomicUsize> = OnceLock::new();
+    CHOICE.get_or_init(|| AtomicUsize::new(language_index(&get(LANGUAGE))))
+}
+
+pub(super) fn language() -> Language {
+    let choice = language_choice().load(Ordering::Relaxed);
+    let requested = Language::ALL.get(choice).copied().unwrap_or_else(|| Language::from_setting("auto"));
+    if supports(requested) { requested } else { Language::English }
+}
 
 /// A setting: the variable, its name in the menu, the values it takes
 /// (`""`: not set, the build's own default), and whether a change applies at once.
 struct Item {
     var: &'static str,
-    label: &'static str,
-    values: &'static [(&'static str, &'static str)],
+    label: Labels,
+    values: &'static [(&'static str, Labels)],
     live: bool,
 }
 
-const ON_UNSET: &[(&str, &str)] = &[("1", "ON"), ("", "OFF")];
-const UNSET_ON: &[(&str, &str)] = &[("", "OFF"), ("1", "ON")];
-const STAGES: &[(&str, &str)] = &[("2", "2"), ("1", "1"), ("0", "0 OFF")];
+const ON: Labels = ["ON", "开启", "開啟", "SÍ"];
+const OFF: Labels = ["OFF", "关闭", "關閉", "NO"];
+const NONE: Labels = ["NONE", "无限制", "不限", "SIN LÍMITE"];
+const ON_UNSET: &[(&str, Labels)] = &[("1", ON), ("", OFF)];
+const UNSET_ON: &[(&str, Labels)] = &[("", OFF), ("1", ON)];
+const STAGES: &[(&str, Labels)] = &[("2", same("2")), ("1", same("1")), ("0", ["0 OFF", "0 关闭", "0 關閉", "0 NO"])];
 
 /// The first value of each is what the launcher starts with.
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
+    Item { var: LANGUAGE, label: ["LANGUAGE", "界面语言", "介面語言", "IDIOMA"], values: LANGUAGE_VALUES, live: true },
     // The launcher's own choices.
-    Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
-    Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
+    Item { var: DLSS, label: same("DLSS"), values: &[("quality", ["QUALITY", "质量", "畫質", "CALIDAD"]), ("balanced", ["BALANCED", "平衡", "平衡", "EQUILIBRADO"]), ("performance", ["PERFORMANCE", "性能", "效能", "RENDIMIENTO"]), ("dlaa", ["DLAA (NATIVE)", "DLAA (原生分辨率)", "DLAA (原生解析度)", "DLAA (NATIVO)"]), ("off", OFF)], live: false },
+    Item { var: FRAMEGEN, label: ["FRAME GENERATION", "帧生成", "畫格生成", "GEN. DE FOTOGRAMAS"], values: &[("0", OFF), ("2", same("2X")), ("3", same("3X")), ("4", same("4X")), ("5", same("5X")), ("6", ["6X (MOST)", "6X (最高)", "6X (最高)", "6X (MÁXIMO)"])], live: false },
     // DLSS Frame Generation where it runs (RTX 40 and later), else AMD's FSR 3 (2X only).
-    Item { var: "VICTORY_MENU_FG_TYPE", label: "FRAME GEN TYPE", values: &[("auto", "AUTO"), ("dlss", "DLSS"), ("fsr", "FSR 3 (OLDER CARDS)")], live: false },
+    Item { var: "VICTORY_MENU_FG_TYPE", label: ["FRAME GEN TYPE", "帧生成类型", "畫格生成類型", "TIPO DE GEN. DE FOTOGRAMAS"], values: &[("auto", ["AUTO", "自动", "自動", "AUTO"]), ("dlss", same("DLSS")), ("fsr", ["FSR 3 (OLDER CARDS)", "FSR 3 (旧显卡)", "FSR 3 (舊顯示卡)", "FSR 3 (GPU ANTIGUAS)"])], live: false },
     // Someone else's mod (apps\victory\src\play.rs): downloaded at the next start, then loaded.
-    Item { var: MFG, label: "MFG UNLOCKER (MOD, RTX 20/30)", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
-    Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
-    Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
-    Item { var: "VICTORY_FULLSCREEN", label: "FULLSCREEN (NO BORDER)", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
-    Item { var: X_RES, label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
+    Item { var: MFG, label: ["MFG UNLOCKER (MOD, RTX 20/30)", "MFG 解锁模组 (RTX 20/30)", "MFG 解鎖模組 (RTX 20/30)", "DESBLOQUEO MFG (MOD, RTX 20/30)"], values: UNSET_ON, live: false },
+    Item { var: "VICTORY_MENU_FPS", label: ["FRAME RATE CAP", "帧率上限", "畫格率上限", "LÍMITE DE FPS"], values: &[("1000", NONE), ("120", same("120")), ("60", same("60")), ("30", ["30 (THE GAME)", "30 (游戏默认)", "30 (遊戲預設)", "30 (DEL JUEGO)"])], live: false },
+    Item { var: "VICTORY_FPS_LINE", label: ["FPS AT THE TOP", "顶部帧率", "上方畫格率", "FPS ARRIBA"], values: &[("1", ON), ("0", OFF)], live: true },
+    Item { var: "VICTORY_PANEL", label: ["STATS PANEL (F3)", "性能统计 (F3)", "效能統計 (F3)", "PANEL DE ESTADÍSTICAS (F3)"], values: &[("0", OFF), ("1", ON)], live: true },
+    Item { var: "VICTORY_FULLSCREEN", label: ["FULLSCREEN (NO BORDER)", "无边框全屏", "無邊框全螢幕", "PANTALLA COMPLETA SIN BORDES"], values: UNSET_ON, live: false },
+    Item { var: "VICTORY_MOUSE_CAPTURE", label: ["MOUSE CAPTURE", "锁定鼠标", "鎖定滑鼠游標", "CAPTURA DEL RATÓN"], values: UNSET_ON, live: false },
+    Item { var: "VICTORY_IME_ENGLISH", label: ["ENGLISH KEYBOARD", "使用英文键盘", "使用英文鍵盤", "TECLADO INGLÉS"], values: UNSET_ON, live: false },
+    Item { var: CONSOLE, label: ["CONSOLE", "主机型号", "主機模式", "CONSOLA"], values: &[("series-x", same("SERIES X")), ("series-s", ["SERIES S (FASTER)", "SERIES S (更快)", "SERIES S (較快)", "SERIES S (MÁS RÁPIDA)"])], live: false },
+    Item { var: X_RES, label: ["SERIES X PICTURE", "SERIES X 分辨率", "SERIES X 解析度", "RESOLUCIÓN SERIES X"], values: &[("1440", same("2560X1440")), ("1080to1440", ["1080P TO 1440P", "1080P 升至 1440P", "1080P 升至 1440P", "1080P A 1440P"]), ("4k", same("3840X2160"))], live: false },
     // In place of SERIES X PICTURE when CONSOLE is Series S.
-    Item { var: S_RES, label: "SERIES S PICTURE", values: &[("1080", "1920X1080 (DLAA)"), ("720", "1280X720 (THE GAME)"), ("626", "1113X626"), ("540", "960X540 (FASTEST)")], live: false },
+    Item { var: S_RES, label: ["SERIES S PICTURE", "SERIES S 分辨率", "SERIES S 解析度", "RESOLUCIÓN SERIES S"], values: &[("1080", same("1920X1080 (DLAA)")), ("720", ["1280X720 (THE GAME)", "1280X720 (游戏默认)", "1280X720 (遊戲預設)", "1280X720 (DEL JUEGO)"]), ("626", same("1113X626")), ("540", ["960X540 (FASTEST)", "960X540 (最快)", "960X540 (最快)", "960X540 (MÁS RÁPIDA)"])], live: false },
     // The layer's switches.
-    Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
-    Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
-    Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },
-    Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_DLSS_PRESET", label: ["DLSS MODEL", "DLSS 模型", "DLSS 模型", "MODELO DLSS"], values: &[("", ["DEFAULT", "默认", "預設", "PREDETERMINADO"]), ("k", same("K")), ("j", same("J")), ("m", same("M")), ("l", same("L"))], live: false },
+    Item { var: "VICTORY_AMBIENT", label: ["LIGHT ESTIMATE", "环境光估算", "近似環境光", "ESTIMACIÓN DE LUZ"], values: &[("0.8", same("0.8")), ("1", same("1")), ("0.5", same("0.5")), ("", OFF)], live: false },
+    Item { var: "VICTORY_AMBIENT_SPECULAR", label: ["REFLECTION ESTIMATE", "反射估算", "近似反射", "ESTIMACIÓN DE REFLEJOS"], values: ON_UNSET, live: false },
+    Item { var: "VICTORY_AMBIENT_AIR", label: ["FOG CAP", "雾效强度上限", "霧效上限", "LÍMITE DE NIEBLA"], values: &[("1.5", same("1.5")), ("1", same("1")), ("2", same("2")), ("", NONE)], live: false },
+    Item { var: "VICTORY_BVH_BUILDER", label: ["RAY TRACING (SLOW, BROKEN)", "光线追踪 (慢且有故障)", "光線追蹤 (慢且有缺陷)", "TRAZADO DE RAYOS (LENTO, FALLA)"], values: UNSET_ON, live: false },
     // On unless "0": a file saved by an earlier version holds an empty value (its OFF) or "1",
     // and both start it on, so nobody keeps it off from before by accident (2026-11-27).
-    Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "ON"), ("0", "OFF")], live: false },
-    Item { var: "VICTORY_LEAVE_OUT", label: "HEAT HAZE AND DECAL DEFRAG", values: &[("02384a60fda6f2d0,731a39171b568298", "LEFT OUT"), ("", "RUN (SLOWER, SMEARS)")], live: false },
-    Item { var: "VICTORY_EARLY_DEPTH", label: "EARLY DEPTH TEST", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_SOFT_VIEWS", label: "SOFT VIEWS (NO CUT FREEZES)", values: &[("copies", "ON"), ("", "OFF")], live: false },
-    Item { var: "VICTORY_TEXTURE_NO_WAIT", label: "TEXTURE NO WAIT", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_RELAY", label: "RELAY (SPEED, TRIANGLES)", values: STAGES, live: false },
-    Item { var: "VICTORY_CARD_STEPS", label: "CARD STEPS", values: STAGES, live: false },
-    Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
-    Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: "CARD COMPARES FROM (KB)", values: &[("64", "64"), ("1024", "1024")], live: false },
-    Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_WATER_LIGHT", label: ["WATER LIGHT", "水面光照", "水面光照", "LUZ DEL AGUA"], values: &[("", ON), ("0", OFF)], live: false },
+    Item { var: "VICTORY_LEAVE_OUT", label: ["HEAT HAZE AND DECAL DEFRAG", "热浪和贴花整理", "熱浪與貼花整理", "CALOR Y CALCOMANÍAS"], values: &[("02384a60fda6f2d0,731a39171b568298", ["LEFT OUT", "跳过", "略過", "OMITIR"]), ("", ["RUN (SLOWER, SMEARS)", "开启 (慢且有拖影)", "執行 (較慢，可能拖影)", "ACTIVAR (LENTO, ESTELAS)"])], live: false },
+    Item { var: "VICTORY_EARLY_DEPTH", label: ["EARLY DEPTH TEST", "提前深度测试", "提前深度測試", "PRUEBA TEMPRANA DE PROFUNDIDAD"], values: ON_UNSET, live: false },
+    Item { var: "VICTORY_WC_NO_BACK", label: ["SKIP BIG COPY-BACKS", "跳过大块数据回拷", "略過大區塊回寫", "OMITIR COPIAS DE RETORNO GRANDES"], values: ON_UNSET, live: false },
+    Item { var: "VICTORY_SOFT_VIEWS", label: ["SOFT VIEWS (NO CUT FREEZES)", "软视图 (减少转场卡顿)", "軟體記憶體映射 (減少切鏡停頓)", "MAPEO DE MEMORIA (EVITA PAUSAS)"], values: &[("copies", ON), ("", OFF)], live: false },
+    Item { var: "VICTORY_TEXTURE_NO_WAIT", label: ["TEXTURE NO WAIT", "纹理异步加载", "紋理上傳免等待", "TEXTURAS SIN ESPERA"], values: ON_UNSET, live: false },
+    Item { var: "VICTORY_RELAY", label: ["RELAY (SPEED, TRIANGLES)", "GPU 中继 (速度、三角面)", "分批接力 (可能出現三角形)", "RELEVO (RÁPIDO, TRIÁNGULOS)"], values: STAGES, live: false },
+    Item { var: "VICTORY_CARD_STEPS", label: ["CARD STEPS", "GPU 处理阶段", "GPU 寫入分步", "PASOS DE GPU"], values: STAGES, live: false },
+    Item { var: "VICTORY_INDIRECT_BATCH", label: ["INDIRECT BATCH", "间接绘制批处理", "間接繪製批次", "LOTES DE DIBUJO INDIRECTO"], values: STAGES, live: false },
+    Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: ["CARD COMPARES FROM (KB)", "GPU 缓冲区比较阈值 (KB)", "GPU 緩衝區比較門檻 (KB)", "COMPARAR BÚFERES DESDE (KB)"], values: &[("64", same("64")), ("1024", same("1024"))], live: false },
+    Item { var: "VICTORY_PORT_CONSTANTS", label: ["CONSTANTS HEAP IN PLACE", "原地更新常量缓冲区", "常數堆積就地更新", "ACTUALIZAR CONSTANTES IN SITU"], values: UNSET_ON, live: false },
     // THIN records the title's list calls on our threads. On an RTX 5080 with a 6-core CPU heads did not
     // draw with it and frames were slower (14 a second with it, 21 to 28 without): switches for it and for
     // what goes with it. Frame generation needs the line of submissions: without THIN, ASYNC SUBMIT gives it.
-    Item { var: "VICTORY_THIN", label: "THIN LISTS (HEADS MAY BE MISSING)", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_JOIN_PARTS", label: "JOIN PARTS", values: &[("8", "8"), ("", "1 (OFF)")], live: false },
-    Item { var: "VICTORY_ASYNC_SUBMIT", label: "ASYNC SUBMIT (FRAME GEN WITHOUT THIN)", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_THIN", label: ["THIN LISTS (HEADS MAY BE MISSING)", "THIN 列表 (人物头部可能不显示)", "精簡清單 (可能缺頭)", "LISTAS THIN (PUEDEN FALTAR CABEZAS)"], values: ON_UNSET, live: false },
+    Item { var: "VICTORY_JOIN_PARTS", label: ["JOIN PARTS", "合并提交分段", "合併批次", "UNIR LOTES"], values: &[("8", same("8")), ("", ["1 (OFF)", "1 (关闭)", "1 (關閉)", "1 (NO)"])], live: false },
+    Item { var: "VICTORY_ASYNC_SUBMIT", label: ["ASYNC SUBMIT (FRAME GEN WITHOUT THIN)", "异步提交 (关闭 THIN 时用于帧生成)", "非同步提交 (停用 THIN 時用於畫格生成)", "ENVÍO ASÍNCRONO (SIN LISTAS THIN)"], values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
-const ACTIONS: [&str; 7] = [
-    "SAVE AND RESTART NOW",
-    "SAVE FOR NEXT START",
-    "PRELOAD SHADERS (RESTARTS THE GAME)",
-    "RESET ALL TO PLAY DEFAULTS",
-    "EXPORT SAVE (TO SAVES IN THE GAME FOLDER)",
-    "IMPORT SAVE (PICK FROM SAVES)",
-    "CLOSE",
+const ACTIONS: [Labels; 7] = [
+    ["SAVE AND RESTART NOW", "保存并立即重启", "儲存並立即重新啟動", "GUARDAR Y REINICIAR AHORA"],
+    ["SAVE FOR NEXT START", "保存设置", "儲存設定", "GUARDAR PARA EL PRÓXIMO INICIO"],
+    ["PRELOAD SHADERS (RESTARTS THE GAME)", "预加载着色器 (重启游戏)", "預載著色器 (重新啟動遊戲)", "PRECARGAR SHADERS (REINICIA EL JUEGO)"],
+    ["RESET ALL TO PLAY DEFAULTS", "恢复启动默认设置", "還原啟動器預設設定", "RESTABLECER AJUSTES PREDETERMINADOS"],
+    ["EXPORT SAVE (TO SAVES IN THE GAME FOLDER)", "导出存档 (到游戏目录的 SAVES)", "匯出存檔 (到遊戲目錄的 SAVES)", "EXPORTAR PARTIDA (A LA CARPETA SAVES)"],
+    ["IMPORT SAVE (PICK FROM SAVES)", "导入存档 (从 SAVES 选择)", "匯入存檔 (從 SAVES 選擇)", "IMPORTAR PARTIDA (ELEGIR EN SAVES)"],
+    ["CLOSE", "关闭", "關閉", "CERRAR"],
 ];
 
 fn get(var: &str) -> String {
@@ -243,13 +276,19 @@ fn mark_written(mark: &std::path::Path) -> bool {
 }
 
 /// The start's notice lines for the warm-up start ([`warmup_seconds`]).
-pub(crate) fn warmup_notice(seconds: u64) -> Vec<String> {
+pub(super) fn warmup_notice(seconds: u64, language: Language) -> Vec<String> {
+    let tr = |text| language.text(text).to_owned();
     vec![
-        "FIRST START OF THIS VERSION: A ONE-TIME WARM-UP".to_owned(),
-        format!("THE GAME RESTARTS BY ITSELF {seconds} SECONDS AFTER IT"),
-        "LOADS INTO THE GAME (PRESS A AT THE TITLE SCREEN)".to_owned(),
-        "THIS HAPPENS ONCE PER NEW VERSION, AND IS NEEDED:".to_owned(),
-        "WITHOUT IT THE FIRST RUN STAYS AT ABOUT 14 FPS".to_owned(),
+        tr(["FIRST START OF THIS VERSION: A ONE-TIME WARM-UP", "首次启动此版本，游戏将进行一次预热", "首次啟動此版本，遊戲將進行一次預熱", "PRIMER INICIO DE ESTA VERSIÓN: PREPARACIÓN ÚNICA"]),
+        match language {
+            Language::English => format!("RESTARTS AFTER {seconds} SECONDS IN-GAME"),
+            Language::SimplifiedChinese => format!("进入游戏 {seconds} 秒后自动重启"),
+            Language::TraditionalChinese => format!("進入遊戲 {seconds} 秒後自動重啟"),
+            Language::Spanish => format!("REINICIA TRAS {seconds} S DE JUEGO"),
+        },
+        tr(["PRESS A AT THE TITLE SCREEN TO ENTER THE GAME", "请在标题画面按 A 进入游戏", "請在標題畫面按 A 進入遊戲", "PULSA A EN LA PANTALLA DE TÍTULO PARA JUGAR"]),
+        tr(["THIS HAPPENS ONCE PER NEW VERSION, AND IS NEEDED:", "每个新版本只需预热一次", "每個新版本只需預熱一次", "SOLO OCURRE UNA VEZ POR CADA VERSIÓN NUEVA:"]),
+        tr(["WITHOUT IT THE FIRST RUN STAYS AT ABOUT 14 FPS", "预热前首次运行约为 14 帧", "預熱前首次執行約為 14 FPS", "SIN ESTO, EL PRIMER INICIO QUEDA EN UNOS 14 FPS"]),
         String::new(),
     ]
 }
@@ -307,7 +346,7 @@ fn fps_line_on() -> &'static AtomicBool {
 }
 
 /// That line: the frames rendered a second and, while frame generation shows more, those shown.
-fn fps_line() -> Option<String> {
+fn fps_line(language: Language) -> Option<String> {
     if !fps_line_on().load(Ordering::Relaxed) {
         return None;
     }
@@ -319,10 +358,17 @@ fn fps_line() -> Option<String> {
     if fps <= 0.0 {
         return None;
     }
-    Some(match crate::streamline::shown_per_frame() {
-        1 => format!("FPS: {fps:.1}"),
-        per => format!("FPS: {fps:.1}  FG: {:.1}", fps * f64::from(per)),
-    })
+    Some(format_fps(fps, crate::streamline::shown_per_frame(), language))
+}
+
+fn format_fps(fps: f64, per: u32, language: Language) -> String {
+    let rate = language.text(["FPS", "帧率", "畫格率", "FPS"]);
+    if per == 1 {
+        format!("{rate}: {fps:.1}")
+    } else {
+        let displayed = language.text(["FG", "显示帧率", "顯示畫格率", "MOSTRADOS"]);
+        format!("{rate}: {fps:.1}  {displayed}: {:.1}", fps * f64::from(per))
+    }
 }
 
 /// The index of `value` among the item's values (an unknown value: shown as
@@ -334,10 +380,10 @@ fn index_of(item: &Item, value: &str) -> Option<usize> {
 /// What the menu shows for `value`: its label, an unknown value as itself,
 /// and a value the launcher did not set (a start without play.ps1) as
 /// "NOT SET" rather than a blank.
-fn shown_value(item: &Item, value: &str) -> String {
+fn shown_value(item: &Item, value: &str, language: Language) -> String {
     match index_of(item, value) {
-        Some(i) => item.values[i].1.to_owned(),
-        None if value.is_empty() => "NOT SET".to_owned(),
+        Some(i) => language.text(item.values[i].1).to_owned(),
+        None if value.is_empty() => language.text(["NOT SET", "未设置", "未設定", "SIN AJUSTAR"]).to_owned(),
         None => value.to_ascii_uppercase(),
     }
 }
@@ -370,45 +416,8 @@ fn keys() -> &'static Mutex<Vec<u16>> {
     })
 }
 
-/// The box's size in pixels.
-const fn size(scale: u32) -> (u32, u32) {
-    ((COLUMNS * CELL.0 + 2 * RIM) * scale, (LINES * CELL.1 + 2 * RIM) * scale)
-}
-
-fn lit(lines: &[String], x: u32, y: u32) -> bool {
-    let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
-        return false;
-    };
-    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= COLUMNS {
-        return false;
-    }
-    let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
-        return false;
-    };
-    (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
-}
-
-fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
-    let (width, height) = size(scale);
-    let bytes = colours[0].len();
-    let mut out = vec![0; pitch * height as usize];
-    for y in 0..height / scale {
-        let top = pitch * (y * scale) as usize;
-        for x in 0..width / scale {
-            let colour = colours[usize::from(lit(lines, x, y))];
-            for i in 0..scale {
-                let at = top + (x * scale + i) as usize * bytes;
-                out[at..at + bytes].copy_from_slice(colour);
-            }
-        }
-        for i in 1..scale as usize {
-            out.copy_within(top..top + pitch, top + i * pitch);
-        }
-    }
-    out
-}
-
 struct Buffers {
+    shape: TextBox,
     format: DXGI_FORMAT,
     scale: u32,
     pitch: u32,
@@ -425,8 +434,8 @@ struct Buffers {
 unsafe impl Send for Buffers {}
 
 impl Buffers {
-    fn new(host: &Host, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
-        let (width, height) = size(scale);
+    fn new(host: &Host, shape: TextBox, format: DXGI_FORMAT, language: Language, scale: u32) -> Option<Buffers> {
+        let (width, height) = shape.size(language, scale);
         let pitch = (width * colours(format)?[0].len() as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
         let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
@@ -448,17 +457,22 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, used: false })
+        Some(Buffers { shape, format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, used: false })
     }
 
-    fn write(&mut self, lines: &[String]) {
+    fn write(&mut self, lines: &[String], language: Language) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.scale, colours, self.pitch as usize);
+        let picture = self.shape.paint(lines, language, self.scale, colours, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read frames ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
         self.fresh = true;
     }
+}
+
+enum Note {
+    Text(Labels),
+    Exported(String),
 }
 
 /// The menu of a presenter.
@@ -469,11 +483,13 @@ pub(super) struct Menu {
     started: Vec<String>,
     /// The line picked: an item, or an action after them.
     at: usize,
-    note: String,
+    note: Option<Note>,
     changed: bool,
     /// What the buffer holds: the frame-rate line, or (none) the menu's lines.
     painted: Option<String>,
-    buffers: Option<Buffers>,
+    painted_language: Language,
+    buffers: [Option<Buffers>; 2],
+    fps_buffers: [Option<Buffers>; 2],
     failed: bool,
     /// The saves in `Saves` that can be imported (read when the menu opens), and the line
     /// picked in their list (`imports.len()`: the line back), shown while `picking`.
@@ -490,8 +506,25 @@ impl Menu {
         if std::env::var_os("VICTORY_MENU_OPEN").is_some_and(|v| v == "1") {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
-        let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false }
+        let values: Vec<String> = ITEMS.iter().map(|i| {
+            if i.var == LANGUAGE {
+                LANGUAGE_VALUES[language_choice().load(Ordering::Relaxed)].0.to_owned()
+            } else {
+                get(i.var)
+            }
+        }).collect();
+        Menu { started: values.clone(), values, at: 0, note: None, changed: true, painted: None, painted_language: Language::English, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false }
+    }
+
+    fn say(&mut self, text: Labels) {
+        self.note = Some(Note::Text(text));
+    }
+
+    fn note_text(&self, language: Language) -> Option<String> {
+        Some(match self.note.as_ref()? {
+            Note::Text(text) => language.text(*text).to_owned(),
+            Note::Exported(name) => format!("{}: {name}.ZIP", language.text(["EXPORTED TO SAVES", "已导出到 SAVES", "已匯出到 SAVES", "EXPORTADA A SAVES"])),
+        })
     }
 
     fn open() -> bool {
@@ -524,30 +557,38 @@ impl Menu {
         }
     }
 
-    fn lines(&self) -> Vec<String> {
+    fn lines(&self, language: Language) -> Vec<String> {
         if self.picking {
-            return self.pick_lines();
+            return self.pick_lines(language);
         }
+        let tr = |labels| language.text(labels);
         let rows = self.rows();
         let total = rows.len();
         let at = rows.iter().position(|r| *r == self.at).unwrap_or(0);
         let first = at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
         let mut out = vec![
-            "SETTINGS                       F1 OR ESC CLOSES".to_owned(),
-            "UP/DOWN PICK  LEFT/RIGHT CHANGE  ENTER DOES IT".to_owned(),
+            tr(["SETTINGS                       F1 OR ESC CLOSES", "设置                     F1 / ESC 关闭", "設定                     F1 / ESC 關閉", "AJUSTES                     F1 O ESC PARA CERRAR"]).to_owned(),
+            tr(["UP/DOWN PICK  LEFT/RIGHT CHANGE  ENTER DOES IT", "上下选择    左右修改    回车确认", "上下選擇    左右調整    Enter 確認", "ARRIBA/ABAJO ELIGE  IZQ./DER. CAMBIA  ENTER CONFIRMA"]).to_owned(),
             String::new(),
         ];
         for &row in &rows[first..(first + ROWS).min(total)] {
             let cursor = if row == self.at { '>' } else { ' ' };
             let line = if let Some(item) = ITEMS.get(row) {
                 let value = &self.values[row];
-                let shown = shown_value(item, value);
-                let mark = if *value != self.started[row] { if live(item) { " *LIVE" } else { " *" } } else if live(item) { " LIVE" } else { "" };
-                format!("{cursor} {:<27} < {shown} >{mark}", item.label)
+                let shown = shown_value(item, value, language);
+                let mark = match (*value != self.started[row], live(item)) {
+                    (true, true) => tr([" *LIVE", " *即时", " *即時", " *INMED."]),
+                    (true, false) => " *",
+                    (false, true) => tr([" LIVE", " 即时", " 即時", " INMED."]),
+                    (false, false) => "",
+                };
+                let name = tr(item.label);
+                let padding = (27 * ASCII_WIDTH).saturating_sub(text_width(name)) / ASCII_WIDTH;
+                format!("{cursor} {name}{:width$} < {shown} >{mark}", "", width = padding as usize)
             } else {
-                format!("{cursor} {}", ACTIONS[row - ITEMS.len()])
+                format!("{cursor} {}", tr(ACTIONS[row - ITEMS.len()]))
             };
-            out.push(line.chars().take(COLUMNS as usize).collect());
+            out.push(line);
         }
         while out.len() < 3 + ROWS {
             out.push(String::new());
@@ -573,34 +614,49 @@ impl Menu {
         {
             ABOUT_FRAMEGEN_RESTART
         } else {
-            [""; 3]
+            [same(""); 3]
         };
-        out.extend(about.iter().map(|l| (*l).to_owned()));
-        out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
+        out.extend(about.map(|line| tr(line).to_owned()));
+        out.push(self.note_text(language).unwrap_or_else(|| {
+            if language == Language::English && Language::from_setting(self.value(LANGUAGE)) != Language::English {
+                "WINDOWS FONT UNAVAILABLE FOR THE SELECTED LANGUAGE".to_owned()
+            } else {
+                tr(["* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE", "* 已修改：即时项立即生效，其余下次启动生效", "* 已變更：即時項目立即生效，其餘下次啟動生效", "* CAMBIO: SOLO LOS AJUSTES INMED. SE APLICAN YA"]).to_owned()
+            }
+        }));
         out.push(REPO.to_owned());
         out
     }
 
     /// The list IMPORT SAVE opens, in the box's lines.
-    fn pick_lines(&self) -> Vec<String> {
-        let mut out = vec![PICK_TITLE.to_owned(), PICK_HELP.to_owned(), String::new()];
+    fn pick_lines(&self, language: Language) -> Vec<String> {
+        let tr = |text| language.text(text).to_owned();
+        let mut out = vec![tr(PICK_TITLE), tr(PICK_HELP), String::new()];
         if self.imports.is_empty() {
-            out.push(PICK_NONE.to_owned());
+            out.push(tr(PICK_NONE));
         }
         let rows = ROWS - (out.len() - 3);
         let total = self.imports.len() + 1;
         let first = self.import_at.saturating_sub(rows / 2).min(total.saturating_sub(rows));
         for row in first..(first + rows).min(total) {
             let cursor = if row == self.import_at { '>' } else { ' ' };
-            let name = self.imports.get(row).map_or_else(|| PICK_BACK.to_owned(), |n| shown_name(n));
+            let name = self.imports.get(row).map_or_else(|| tr(PICK_BACK), |n| shown_name(n));
             out.push(format!("{cursor} {name}").chars().take(COLUMNS as usize).collect());
         }
         while out.len() < 3 + ROWS {
             out.push(String::new());
         }
         out.push(String::new());
-        out.extend(ABOUT_PICK.iter().map(|l| (*l).to_owned()));
-        out.push(if self.note.is_empty() { format!("{} IN SAVES", self.imports.len()) } else { self.note.clone() });
+        out.extend(ABOUT_PICK.map(tr));
+        out.push(self.note_text(language).unwrap_or_else(|| {
+            let n = self.imports.len();
+            match language {
+                Language::English => format!("{n} IN SAVES"),
+                Language::SimplifiedChinese => format!("SAVES 中有 {n} 个存档"),
+                Language::TraditionalChinese => format!("SAVES 內有 {n} 個存檔"),
+                Language::Spanish => format!("{n} PARTIDAS EN SAVES"),
+            }
+        }));
         out.push(REPO.to_owned());
         out
     }
@@ -615,9 +671,9 @@ impl Menu {
         if live(item) {
             self.apply_live(i);
         }
-        self.note.clear();
+        self.note = None;
         if item.var == FRAMEGEN && !live(item) && !matches!(self.values[i].as_str(), "" | "0") {
-            "RESTART REQUIRED TO ENABLE FRAME GENERATION".clone_into(&mut self.note);
+            self.say(RESTART_FRAMEGEN);
         }
         self.match_series_s(item.var);
     }
@@ -646,6 +702,10 @@ impl Menu {
     /// A setting the build reads at each use: changed in this run's environment at once.
     fn apply_live(&self, i: usize) {
         let (var, value) = (ITEMS[i].var, &self.values[i]);
+        if var == LANGUAGE {
+            language_choice().store(language_index(value), Ordering::Relaxed);
+            return;
+        }
         // SAFETY: the variables changed here are read by this build with
         // std::env::var at each use; Windows' environment block is locked by
         // the process heap's routines, and std holds its own lock.
@@ -668,7 +728,7 @@ impl Menu {
     /// Writes the changed values over those in the settings file.
     fn save(&mut self) -> bool {
         let Some(path) = settings_file() else {
-            self.note = "NO FOLDER FOR THE SETTINGS FILE".to_owned();
+            self.say(["NO FOLDER FOR THE SETTINGS FILE", "找不到保存设置的目录", "找不到設定檔資料夾", "NO SE ENCUENTRA LA CARPETA DE AJUSTES"]);
             return false;
         };
         if let Some(dir) = path.parent() {
@@ -681,7 +741,8 @@ impl Menu {
             .filter(|(k, _)| k.starts_with("VICTORY_"))
             .collect();
         for (i, item) in ITEMS.iter().enumerate() {
-            if self.values[i] == self.started[i] {
+            // The live language can outlast a presenter recreated before Save.
+            if self.values[i] == self.started[i] && item.var != LANGUAGE {
                 continue;
             }
             kept.retain(|(k, _)| k != item.var);
@@ -695,19 +756,18 @@ impl Menu {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "settings menu: saved");
                 self.started = self.values.clone();
-                self.note = if std::env::var_os("VICTORY_MENU_FILE").is_some() {
-                    "SAVED. APPLIES AT THE NEXT START"
+                self.say(if std::env::var_os("VICTORY_MENU_FILE").is_some() {
+                    ["SAVED. APPLIES AT THE NEXT START", "已保存。其余设置在下次启动时生效", "已儲存，下次啟動生效", "GUARDADO. SE APLICA AL REINICIAR"]
                 } else {
-                    // Started some other way (a script, another launcher): the file `victory play`
+                    // Started some other way (a script, another launcher): the file victory play
                     // reads at every start, which this start did not.
-                    "SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME"
-                }
-                .to_owned();
+                    ["SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME", "已保存。通过 VICTORY.EXE 启动游戏时生效", "已儲存，透過 VICTORY.EXE 啟動時生效", "GUARDADO. SE APLICA AL ABRIR DESDE VICTORY.EXE"]
+                });
                 true
             }
             Err(e) => {
                 tracing::warn!(error = %e, "settings menu: not saved");
-                self.note = "COULD NOT SAVE THE SETTINGS FILE".to_owned();
+                self.say(["COULD NOT SAVE THE SETTINGS FILE", "无法写入设置文件", "無法儲存設定檔", "NO SE PUDO GUARDAR EL ARCHIVO DE AJUSTES"]);
                 false
             }
         }
@@ -717,7 +777,7 @@ impl Menu {
     /// `preload`: the launcher makes every shader first (`VICTORY_PRELOAD=1`, for that start alone).
     fn restart(&mut self, preload: bool) {
         let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
-            self.note = "SAVED. START THE LAUNCHER AGAIN YOURSELF".to_owned();
+            self.say(["SAVED. START THE LAUNCHER AGAIN YOURSELF", "已保存。请手动重新运行启动器", "已儲存，請手動重新啟動", "GUARDADO. VUELVE A ABRIR EL LANZADOR MANUALMENTE"]);
             return;
         };
         let play = play.to_string_lossy().replace('\'', "''");
@@ -744,7 +804,7 @@ impl Menu {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "settings menu: restart failed");
-                self.note = "SAVED, BUT THE RESTART FAILED".to_owned();
+                self.say(["SAVED, BUT THE RESTART FAILED", "已保存，重启失败", "已儲存，重新啟動失敗", "GUARDADO, PERO NO SE PUDO REINICIAR"]);
             }
         }
     }
@@ -783,7 +843,7 @@ impl Menu {
             // host could not write would have the game come back here for
             // ever, so this start goes on at its slow pace instead.
             tracing::warn!(mark = %mark.display(), "first start: the warmed mark could not be written; the game goes on, no restart");
-            self.note = "WARMED UP, BUT THE MARK WOULD NOT WRITE: THIS RUN GOES ON".to_owned();
+            self.say(["WARMED UP, BUT THE MARK WOULD NOT WRITE: THIS RUN GOES ON", "已预热，但无法写入标记。游戏将继续运行", "預熱完成，但無法寫入標記。遊戲將繼續執行。", "PREPARADO. NO SE PUDO GUARDAR LA MARCA. EL JUEGO SIGUE"]);
         }
     }
 
@@ -797,24 +857,23 @@ impl Menu {
     /// Writes the game's save into a new zip in `Saves`.
     fn export_save(&mut self) {
         let (Some(data), Some(share)) = (crate::save_share::data(), crate::save_share::share()) else {
-            self.note = "SAVE FOLDERS NOT KNOWN IN THIS START".to_owned();
+            self.say(["SAVE FOLDERS NOT KNOWN IN THIS START", "本次启动找不到存档文件夹", "本次啟動找不到存檔資料夾", "NO SE ENCONTRARON LAS CARPETAS DE PARTIDAS"]);
             return;
         };
         let name = format!("save {}", crate::save_share::stamp());
         match crate::save_share::export(&data, &share, &name) {
             Ok(to) => {
                 tracing::info!(to = %to.display(), "settings menu: save exported");
-                self.note = format!("EXPORTED TO SAVES: {}.ZIP", shown_name(&name));
+                self.note = Some(Note::Exported(shown_name(&name)));
                 self.read_imports();
             }
             Err(e) => {
                 tracing::warn!(error = %e, share = %share.display(), "settings menu: save not exported");
-                self.note = if e.kind() == std::io::ErrorKind::NotFound {
-                    "NOTHING TO EXPORT: THE GAME HAS NOT SAVED YET"
+                self.say(if e.kind() == std::io::ErrorKind::NotFound {
+                    ["NOTHING TO EXPORT: THE GAME HAS NOT SAVED YET", "无法导出：游戏尚未保存存档", "無法匯出：遊戲尚未儲存存檔", "NADA QUE EXPORTAR: AÚN NO HAY UNA PARTIDA GUARDADA"]
                 } else {
-                    "EXPORT FAILED: THE GAME FOLDER CANNOT BE WRITTEN"
-                }
-                .to_owned();
+                    ["EXPORT FAILED: THE GAME FOLDER CANNOT BE WRITTEN", "导出失败：无法写入游戏目录", "匯出失敗：無法寫入遊戲目錄", "ERROR AL EXPORTAR: NO SE PUEDE ESCRIBIR EN LA CARPETA"]
+                });
             }
         }
     }
@@ -822,28 +881,27 @@ impl Menu {
     /// Stages the save picked to be put in place at the next start, and starts the game again.
     fn import_save(&mut self) {
         let (Some(data), Some(share)) = (crate::save_share::data(), crate::save_share::share()) else {
-            self.note = "SAVE FOLDERS NOT KNOWN IN THIS START".to_owned();
+            self.say(["SAVE FOLDERS NOT KNOWN IN THIS START", "本次启动找不到存档文件夹", "本次啟動找不到存檔資料夾", "NO SE ENCONTRARON LAS CARPETAS DE PARTIDAS"]);
             return;
         };
         let Some(name) = self.imports.get(self.import_at).cloned() else {
-            self.note = "NO SAVE TO IMPORT: PUT ONE IN SAVES FIRST".to_owned();
+            self.say(["NO SAVE TO IMPORT: PUT ONE IN SAVES FIRST", "无可用存档，请先把存档 ZIP 放入 SAVES", "無可用存檔，請先將存檔 ZIP 放入 SAVES", "NO HAY PARTIDAS PARA IMPORTAR. PON UN ZIP EN SAVES"]);
             return;
         };
         if let Err(e) = crate::save_share::stage(&data, &share, &name) {
             tracing::warn!(error = %e, name, "settings menu: save import not staged");
-            self.note = if e.kind() == std::io::ErrorKind::NotFound {
-                "IMPORT FAILED: NO SAVE IN THAT ZIP"
+            self.say(if e.kind() == std::io::ErrorKind::NotFound {
+                ["IMPORT FAILED: NO SAVE IN THAT ZIP", "导入失败：压缩包内没有存档", "匯入失敗：ZIP 裡沒有存檔", "ERROR AL IMPORTAR: EL ZIP NO CONTIENE UNA PARTIDA"]
             } else {
-                "IMPORT FAILED: THAT ZIP IS DAMAGED OR NOT A SAVE"
-            }
-            .to_owned();
+                ["IMPORT FAILED: THAT ZIP IS DAMAGED OR NOT A SAVE", "导入失败：压缩包已损坏或不含有效存档", "匯入失敗：ZIP 已損毀或不含有效存檔", "ERROR AL IMPORTAR: ZIP DAÑADO O SIN PARTIDA VÁLIDA"]
+            });
             return;
         }
         tracing::info!(name, "settings menu: save import staged; put in place at the next start");
         if std::env::var_os("VICTORY_MENU_PLAY").is_some() {
             self.restart(false);
         } else {
-            self.note = "IMPORTED: CLOSE THE GAME AND START IT AGAIN".to_owned();
+            self.say(["IMPORTED: CLOSE THE GAME AND START IT AGAIN", "已导入。请退出游戏并重新启动", "已匯入。請關閉遊戲並重新啟動", "IMPORTADA. CIERRA Y VUELVE A ABRIR EL JUEGO"]);
         }
     }
 
@@ -852,7 +910,7 @@ impl Menu {
         if let Some(path) = settings_file() {
             let _ = std::fs::remove_file(path);
         }
-        self.note = "RESET. PLAY DEFAULTS AT THE NEXT START".to_owned();
+        self.say(["RESET. PLAY DEFAULTS AT THE NEXT START", "已重置。下次启动将使用默认设置", "已還原預設，下次啟動生效", "RESTABLECIDO. SE APLICA AL REINICIAR"]);
     }
 
     /// Changes a setting and saves it at once: many players changed settings and closed the
@@ -860,7 +918,7 @@ impl Menu {
     fn change_and_save(&mut self, i: usize, step: isize) {
         self.change(i, step);
         if self.save() && live(&ITEMS[i]) {
-            self.note = "SAVED. ON NOW".to_owned();
+            self.say(["SAVED. ON NOW", "已保存，立即生效", "設定已儲存並生效", "GUARDADO Y APLICADO"]);
         }
     }
 
@@ -876,13 +934,13 @@ impl Menu {
             // Esc in the list of saves goes back to the settings.
             if open && self.picking && vk == VK_ESCAPE {
                 self.picking = false;
-                self.note.clear();
+                self.note = None;
                 self.changed = true;
                 continue;
             }
             if vk == VK_F1 || (open && vk == VK_ESCAPE) {
                 crate::SETTINGS_MENU_OPEN.store(!open && vk == VK_F1, Ordering::Relaxed);
-                self.note.clear();
+                self.note = None;
                 self.picking = false;
                 if !open {
                     self.read_imports();
@@ -894,9 +952,9 @@ impl Menu {
                 continue;
             }
             // Only an Enter right after the first one starts a preload or an import.
-            let confirmed = self.note == CONFIRM_PRELOAD || self.note == CONFIRM_IMPORT;
+            let confirmed = matches!(&self.note, Some(Note::Text(CONFIRM_PRELOAD | CONFIRM_IMPORT)));
             if confirmed {
-                self.note.clear();
+                self.note = None;
             }
             if self.picking {
                 let (n, back) = (self.imports.len() + 1, self.import_at >= self.imports.len());
@@ -904,7 +962,7 @@ impl Menu {
                     VK_UP => self.import_at = (self.import_at + n - 1) % n,
                     VK_DOWN => self.import_at = (self.import_at + 1) % n,
                     VK_RETURN if back => self.picking = false,
-                    VK_RETURN if !confirmed => self.note = CONFIRM_IMPORT.to_owned(),
+                    VK_RETURN if !confirmed => self.say(CONFIRM_IMPORT),
                     VK_RETURN => self.import_save(),
                     _ => {}
                 }
@@ -926,7 +984,7 @@ impl Menu {
                     1 => {
                         self.save();
                     }
-                    PRELOAD if !confirmed => self.note = CONFIRM_PRELOAD.to_owned(),
+                    PRELOAD if !confirmed => self.say(CONFIRM_PRELOAD),
                     PRELOAD => {
                         if self.save() {
                             self.restart(true);
@@ -954,7 +1012,8 @@ impl Menu {
         }
         // Closed: the frame-rate line in the top left corner, if it is wanted and there is a rate.
         let open = Self::open();
-        let line = if open { None } else { fps_line() };
+        let language = language();
+        let line = if open { None } else { fps_line(language) };
         if !open && line.is_none() {
             return;
         }
@@ -962,27 +1021,33 @@ impl Menu {
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = (height / 540).max(1);
-        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, format, scale);
-            self.failed = self.buffers.is_none();
+        let shape = if open { BOX } else { FPS_BOX };
+        let mode = usize::from(language.unicode());
+        let storage = if open { &mut self.buffers } else { &mut self.fps_buffers };
+        let buffers = &mut storage[mode];
+        if buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+            std::mem::forget(buffers.take());
+            *buffers = Buffers::new(host, shape, format, language, scale);
+            self.failed = buffers.is_none();
             self.changed = true;
         }
-        if self.painted != line {
+        if self.painted != line || self.painted_language != language {
             self.painted = line.clone();
+            self.painted_language = language;
             self.changed = true;
         }
-        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(), |l| vec![l.clone()])) } else { None };
-        let Some(buffers) = &mut self.buffers else { return };
+        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(language), |l| vec![l.clone()])) } else { None };
+        let storage = if open { &mut self.buffers } else { &mut self.fps_buffers };
+        let Some(buffers) = &mut storage[mode] else { return };
         if let Some(lines) = lines {
             self.changed = false;
-            buffers.write(&lines);
+            buffers.write(&lines, language);
         }
         // The whole box in the middle, or of it the first line's part in the corner.
-        let (w, h) = match &line {
-            Some(l) => ((l.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
-            None => size(scale),
-        };
+        let (box_width, box_height) = shape.size(language, scale);
+        let (w, h) = line.as_ref().map_or((box_width, box_height), |l| {
+            shape.area(text_width(l).min(shape.columns * ASCII_WIDTH), 1, language, scale)
+        });
         let (w, h) = (w.min(width), h.min(height));
         let (x, y) = if line.is_some() { (0, 0) } else { ((width - w) / 2, (height - h) / 2) };
         let list = &list.list;
@@ -1001,7 +1066,7 @@ impl Menu {
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                         Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: size(scale).0, Height: size(scale).1, Depth: 1, RowPitch: buffers.pitch },
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: box_width, Height: box_height, Depth: 1, RowPitch: buffers.pitch },
                     },
                 },
             };
@@ -1035,122 +1100,158 @@ mod tests {
 
     #[test]
     fn a_change_is_saved_at_once_however_the_game_was_started() {
-        let home = std::env::temp_dir().join(format!("victory-menu-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
+        let home = tempfile::tempdir().unwrap();
         // SAFETY: no other test in this crate reads these two.
         unsafe {
             std::env::remove_var("VICTORY_MENU_FILE");
-            std::env::set_var("VICTORY_HOME", &home);
+            std::env::set_var("VICTORY_HOME", home.path());
         }
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, painted_language: Language::English, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
         menu.change_and_save(dlss, 1);
-        let text = std::fs::read_to_string(home.join("victory-settings.txt")).expect("saved without a save line");
+        let path = home.path().join("victory-settings.txt");
+        let text = std::fs::read_to_string(&path).expect("saved without a save line");
         assert!(text.contains("VICTORY_MENU_DLSS=quality"), "{text}");
-        assert_eq!(menu.note, "SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME");
+        assert_eq!(menu.note_text(Language::English).as_deref(), Some("SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME"));
         // Every note fits the box and has its letters.
-        for note in [menu.note.as_str(), "SAVED. ON NOW", "SAVED. APPLIES AT THE NEXT START", "NO FOLDER FOR THE SETTINGS FILE"] {
+        for note in [menu.note_text(Language::English).as_deref().expect("saved"), "SAVED. ON NOW", "SAVED. APPLIES AT THE NEXT START", "NO FOLDER FOR THE SETTINGS FILE"] {
             assert!(note.len() <= COLUMNS as usize, "{note}");
             assert!(note.bytes().all(|c| glyph(c) != glyph(b'#')), "{note}");
         }
-        let _ = std::fs::remove_dir_all(&home);
+        let language = ITEMS.iter().position(|item| item.var == LANGUAGE).expect("in the menu");
+        assert_eq!(language_index(""), Language::English.index());
+        assert_eq!(language_index("unrecognized"), Language::English.index());
+        for (index, (choice, _)) in LANGUAGE_VALUES.iter().enumerate() {
+            assert_eq!(language_index(choice), index);
+            (*choice).clone_into(&mut menu.values[language]);
+            assert!(menu.save());
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.lines().any(|line| line == format!("{LANGUAGE}={choice}")), "{text}");
+        }
+        // SAFETY: this test is the only one using these variables.
+        unsafe { std::env::remove_var("VICTORY_HOME") };
+    }
+
+    fn assert_line_fits(line: &str, columns: u32) {
+        assert!(text_width(line) <= columns * ASCII_WIDTH, "{line}");
+        for c in line.bytes().filter(u8::is_ascii) {
+            assert_ne!(glyph(c.to_ascii_uppercase()), glyph(b'#'), "{line}: {}", c as char);
+        }
     }
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, painted_language: Language::English, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
-        for at in 0..ITEMS.len() + ACTIONS.len() {
-            menu.at = at;
-            for line in menu.lines() {
-                assert!(line.len() <= COLUMNS as usize, "{line}");
-                for c in line.bytes() {
-                    assert_ne!(glyph(c.to_ascii_uppercase()), glyph(b'#'), "{line}: {}", c as char);
+        let console = ITEMS.iter().position(|item| item.var == CONSOLE).expect("in the menu");
+        for language in Language::ALL {
+            for (at, item) in ITEMS.iter().enumerate() {
+                menu.at = at;
+                match item.var {
+                    X_RES => "series-x".clone_into(&mut menu.values[console]),
+                    S_RES => "series-s".clone_into(&mut menu.values[console]),
+                    _ => {}
                 }
+                for (value, _) in item.values {
+                    (*value).clone_into(&mut menu.values[at]);
+                    for line in menu.lines(language) {
+                        assert_line_fits(&line, COLUMNS);
+                    }
+                }
+            }
+            for at in ITEMS.len()..ITEMS.len() + ACTIONS.len() {
+                menu.at = at;
+                for line in menu.lines(language) {
+                    assert_line_fits(&line, COLUMNS);
+                }
+            }
+            for per in [1, 6] {
+                let fps = f64::from(u32::MAX) / 10.0;
+                assert_line_fits(&format_fps(fps, per, language), FPS_BOX.columns);
+            }
+            for line in warmup_notice(u64::MAX, language) {
+                assert_line_fits(&line, super::super::panel::NOTICE_COLUMNS);
             }
         }
     }
 
     #[test]
     fn the_link_is_always_right_under_the_note() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, painted_language: Language::English, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
-        for note in ["", "SAVED"] {
-            menu.note = note.to_owned();
+        for note in [None, Some(same("SAVED"))] {
+            menu.note = note.map(Note::Text);
             for at in 0..ITEMS.len() + ACTIONS.len() {
                 menu.at = at;
-                let lines = menu.lines();
+                let lines = menu.lines(Language::English);
                 assert_eq!(lines.len(), LINES as usize);
                 let n = lines.len();
-                assert!(lines[n - 2].starts_with("* = CHANGED") || lines[n - 2] == note, "{}", lines[n - 2]);
+                assert!(lines[n - 2].starts_with("* = CHANGED") || note.is_some_and(|note| lines[n - 2] == Language::English.text(note)), "{}", lines[n - 2]);
                 assert_eq!(lines[n - 1], REPO);
                 // What a preload costs, and what MFG Unlocker is, is said while it is picked, and only then.
                 let about = &lines[n - 5..n - 2];
                 if at == ITEMS.len() + PRELOAD {
-                    assert_eq!(about, ABOUT_PRELOAD);
+                    assert_eq!(about, ABOUT_PRELOAD.map(|line| Language::English.text(line)));
                 } else if at == ITEMS.len() + EXPORT {
-                    assert_eq!(about, ABOUT_EXPORT);
+                    assert_eq!(about, ABOUT_EXPORT.map(|line| Language::English.text(line)));
                 } else if at == ITEMS.len() + IMPORT {
-                    assert_eq!(about, ABOUT_IMPORT);
+                    assert_eq!(about, ABOUT_IMPORT.map(|line| Language::English.text(line)));
                 } else if at < ITEMS.len() && ITEMS[at].var == MFG {
-                    assert_eq!(about, ABOUT_MFG);
+                    assert_eq!(about, ABOUT_MFG.map(|line| Language::English.text(line)));
                 } else if at < ITEMS.len() && ITEMS[at].var == S_RES {
-                    assert_eq!(about, ABOUT_S_RES);
+                    assert_eq!(about, ABOUT_S_RES.map(|line| Language::English.text(line)));
                 } else {
                     assert!(about.iter().all(String::is_empty), "{about:?}");
                 }
             }
         }
-        assert_eq!(ACTIONS[PRELOAD], "PRELOAD SHADERS (RESTARTS THE GAME)");
-        assert!(CONFIRM_PRELOAD.len() <= COLUMNS as usize);
-        assert_eq!(ACTIONS[EXPORT], "EXPORT SAVE (TO SAVES IN THE GAME FOLDER)");
-        assert_eq!(ACTIONS[IMPORT], "IMPORT SAVE (PICK FROM SAVES)");
-        let pick = [PICK_TITLE, PICK_HELP, PICK_NONE, PICK_BACK, CONFIRM_IMPORT, "IMPORT FAILED: THAT ZIP IS DAMAGED OR NOT A SAVE"];
-        for line in ABOUT_EXPORT.iter().chain(&ABOUT_IMPORT).chain(&ABOUT_PICK).chain(&pick) {
-            assert!(line.len() <= COLUMNS as usize, "{line}");
-            assert!(line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
-        }
-        assert!(ABOUT_MFG.iter().all(|l| l.len() <= COLUMNS as usize));
-        for line in ABOUT_NO_DLSS {
-            assert!(line.len() <= COLUMNS as usize && line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
+        assert_eq!(Language::English.text(ACTIONS[PRELOAD]), "PRELOAD SHADERS (RESTARTS THE GAME)");
+        assert_eq!(Language::English.text(ACTIONS[EXPORT]), "EXPORT SAVE (TO SAVES IN THE GAME FOLDER)");
+        assert_eq!(Language::English.text(ACTIONS[IMPORT]), "IMPORT SAVE (PICK FROM SAVES)");
+        let pick = [PICK_TITLE, PICK_HELP, PICK_NONE, PICK_BACK, CONFIRM_IMPORT, CONFIRM_PRELOAD,
+            ["IMPORT FAILED: THAT ZIP IS DAMAGED OR NOT A SAVE", "导入失败：压缩包已损坏或不含有效存档", "匯入失敗：ZIP 已損毀或不含有效存檔", "ERROR AL IMPORTAR: ZIP DAÑADO O SIN PARTIDA VÁLIDA"]];
+        for lines in [ABOUT_EXPORT, ABOUT_IMPORT, ABOUT_PICK, ABOUT_MFG, ABOUT_NO_DLSS, ABOUT_S_RES].iter().flatten().chain(&pick) {
+            for line in *lines {
+                assert_line_fits(line, COLUMNS);
+            }
         }
         // DLSS picked on where NVIDIA's files are missing (no VICTORY_STREAMLINE_DIR in tests): said so.
         let dlss = ITEMS.iter().position(|i| i.var == DLSS).expect("in the menu");
         menu.at = dlss;
         menu.values[dlss] = "quality".to_owned();
-        let lines = menu.lines();
-        assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_NO_DLSS);
+        for language in Language::ALL {
+            let lines = menu.lines(language);
+            assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_NO_DLSS.map(|line| language.text(line)));
+        }
         menu.values[dlss] = "off".to_owned();
-        let lines = menu.lines();
+        let lines = menu.lines(Language::English);
         assert!(lines[lines.len() - 5..lines.len() - 2].iter().all(String::is_empty));
         assert_eq!(ITEMS.iter().filter(|i| i.var == MFG).count(), 1);
-        // Frame generation turned on in a run started without it (no Streamline in tests): a
-        // restart is required, and the menu says so; OFF needs no word.
-        for line in ABOUT_FRAMEGEN_RESTART {
-            assert!(line.len() <= COLUMNS as usize && line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
-        }
+        // Frame generation turned on after a start without it requires a restart.
         let fg = ITEMS.iter().position(|i| i.var == FRAMEGEN).expect("in the menu");
         menu.at = fg;
         menu.values[fg] = "0".to_owned();
         menu.change(fg, 1);
         assert_eq!(menu.values[fg], "2");
-        assert_eq!(menu.note, "RESTART REQUIRED TO ENABLE FRAME GENERATION");
-        let lines = menu.lines();
-        assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_FRAMEGEN_RESTART);
+        for language in Language::ALL {
+            assert_eq!(menu.note_text(language).as_deref(), Some(language.text(RESTART_FRAMEGEN)));
+            let lines = menu.lines(language);
+            assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_FRAMEGEN_RESTART.map(|line| language.text(line)));
+        }
         menu.change(fg, -1);
-        assert!(menu.note.is_empty());
-        let lines = menu.lines();
+        assert!(menu.note.is_none());
+        let lines = menu.lines(Language::English);
         assert!(lines[lines.len() - 5..lines.len() - 2].iter().all(String::is_empty));
     }
 
     #[test]
     fn the_picture_line_is_the_consoles() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, painted_language: Language::English, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         let at = |var: &str| ITEMS.iter().position(|i| i.var == var).expect("in the menu");
         let (console, x, s, dlss) = (at(CONSOLE), at(X_RES), at(S_RES), at(DLSS));
-        let shown = |menu: &Menu, label: &str| menu.lines().iter().any(|l| l.contains(label));
+        let shown = |menu: &Menu, label: &str| menu.lines(Language::English).iter().any(|l| l.contains(label));
         "series-x".clone_into(&mut menu.values[console]);
         assert!(shown(&menu, "SERIES X PICTURE") && !shown(&menu, "SERIES S PICTURE"));
         // down from the console: the Series X line, never the hidden one
@@ -1182,60 +1283,62 @@ mod tests {
         menu.change(s, 2);
         assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("540", "performance"));
         menu.at = s;
-        assert_eq!(&menu.lines()[menu.lines().len() - 5..menu.lines().len() - 2], ABOUT_S_RES);
-        for line in ABOUT_S_RES {
-            assert!(line.len() <= COLUMNS as usize && line.bytes().all(|b| glyph(b) != glyph(b'#') || b == b'#'), "{line}");
+        for language in Language::ALL {
+            let lines = menu.lines(language);
+            assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_S_RES.map(|line| language.text(line)));
         }
     }
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, painted_language: Language::English, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
-        let n = ITEMS[0].values.len();
+        let i = 1; // DLSS, a setting with more than two options.
+        let n = ITEMS[i].values.len();
         for _ in 0..n {
-            menu.change(0, 1);
+            menu.change(i, 1);
         }
-        assert_eq!(menu.values[0], ITEMS[0].values[0].0);
-        menu.change(0, -1);
-        assert_eq!(menu.values[0], ITEMS[0].values[n - 1].0);
+        assert_eq!(menu.values[i], ITEMS[i].values[0].0);
+        menu.change(i, -1);
+        assert_eq!(menu.values[i], ITEMS[i].values[n - 1].0);
     }
 
     #[test]
     fn a_shared_save_name_is_shown_in_letters_the_menu_has() {
         let names = vec!["save 2026-11-27 23-45-10.zip".to_owned(), "Jason's boat ~ 100% [\u{e9}] and a very long name that goes on and on.zip".to_owned()];
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: None, changed: false, painted: None, painted_language: Language::English, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: names, import_at: 0, picking: true };
         menu.started = menu.values.clone();
         let check = |menu: &Menu| {
-            let lines = menu.lines();
-            assert_eq!(lines.len(), LINES as usize);
-            assert_eq!(lines[lines.len() - 1], REPO);
-            assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_PICK);
-            for line in &lines {
-                assert!(line.len() <= COLUMNS as usize, "{line}");
-                assert!(line.bytes().all(|c| glyph(c.to_ascii_uppercase()) != glyph(b'#')), "{line}");
+            for language in Language::ALL {
+                let lines = menu.lines(language);
+                assert_eq!(lines.len(), LINES as usize);
+                assert_eq!(lines[lines.len() - 1], REPO);
+                assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_PICK.map(|line| language.text(line)));
+                for line in &lines {
+                    assert_line_fits(line, COLUMNS);
+                }
             }
-            lines
+            menu.lines(Language::English)
         };
         let lines = check(&menu);
         assert!(lines.iter().any(|l| l == "> SAVE 2026-11-27 23-45-10.ZIP"), "{lines:?}");
-        assert!(lines.iter().any(|l| l == &format!("  {PICK_BACK}")), "{lines:?}");
+        assert!(lines.iter().any(|l| l == &format!("  {}", Language::English.text(PICK_BACK))), "{lines:?}");
         menu.import_at = 1;
         check(&menu);
         menu.import_at = 2;
-        assert!(check(&menu).iter().any(|l| l == &format!("> {PICK_BACK}")));
+        assert!(check(&menu).iter().any(|l| l == &format!("> {}", Language::English.text(PICK_BACK))));
         // Many saves: the list scrolls and the box keeps its size.
         menu.imports = (0..50).map(|i| format!("save {i}.zip")).collect();
         for at in [0, 25, 49, 50] {
             menu.import_at = at;
             let lines = check(&menu);
-            let picked = if at == 50 { format!("> {PICK_BACK}") } else { format!("> SAVE {at}.ZIP") };
+            let picked = if at == 50 { format!("> {}", Language::English.text(PICK_BACK)) } else { format!("> SAVE {at}.ZIP") };
             assert!(lines.contains(&picked), "{at}: {lines:?}");
         }
         menu.imports.clear();
         menu.import_at = 0;
         let lines = check(&menu);
-        assert!(lines.iter().any(|l| l == PICK_NONE));
-        assert!(lines.iter().any(|l| l == &format!("> {PICK_BACK}")));
+        assert!(lines.iter().any(|l| l == Language::English.text(PICK_NONE)));
+        assert!(lines.iter().any(|l| l == &format!("> {}", Language::English.text(PICK_BACK))));
     }
 }

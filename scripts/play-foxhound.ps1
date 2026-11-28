@@ -143,6 +143,7 @@ foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
 }
+if ($menu.Contains('VICTORY_MENU_LANGUAGE')) { $settings.VICTORY_MENU_LANGUAGE = $menu['VICTORY_MENU_LANGUAGE'] }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 # For the menu: what it shows as the current choices, where it saves, and how it starts the game again
