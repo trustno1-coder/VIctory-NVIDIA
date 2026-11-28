@@ -8974,10 +8974,16 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        let group = crate::texture::refresh_group_size();
+        let groups = due.len().div_ceil(group);
+        crate::shadow::wide_each(spans.len() + groups, move |i| {
             // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
+            let Some(i) = i.checked_sub(groups) else {
+                if group == 1 {
+                    due[i].refresh();
+                } else {
+                    crate::texture::refresh_group(&due[i * group..((i + 1) * group).min(due.len())]);
+                }
                 return;
             };
             let (shadow, from, to) = &spans[i];
@@ -9079,7 +9085,14 @@ impl Batch {
         let started = std::time::Instant::now();
         let before = PREPARING[2].load(Ordering::Relaxed);
         let due = std::mem::take(&mut self.due);
-        crate::shadow::wide_each(due.len(), move |i| due[i].refresh());
+        let group = crate::texture::refresh_group_size();
+        if group == 1 {
+            crate::shadow::wide_each(due.len(), move |i| due[i].refresh());
+        } else {
+            crate::shadow::wide_each(due.len().div_ceil(group), move |i| {
+                crate::texture::refresh_group(&due[i * group..((i + 1) * group).min(due.len())]);
+            });
+        }
         let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
         PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
     }

@@ -2622,7 +2622,13 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+#[allow(dead_code)]
+pub struct Remapping {
+    legacy: Option<std::sync::RwLockWriteGuard<'static, ()>>,
+    stripes: Vec<mapping::Permit>,
+}
+mod mapping;
+pub use mapping::{MappingRanges, mapping_stripes};
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -2769,6 +2775,54 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    prepare_remapping();
+    let (legacy, stripes) = if mapping_stripes() == 1 {
+        (Some(MAPPING.write().unwrap_or_else(|e| e.into_inner())), Vec::new())
+    } else {
+        (None, mapping::take(MappingRanges::all(), true, false).unwrap())
+    };
+    begin_remapping(legacy, stripes)
+}
+
+/// Field order matters. In striped mode finish the global change epoch before
+/// releasing the view table. In legacy mode release the table first, as before.
+pub struct MappingViews<T> {
+    _striped: Option<Remapping>,
+    views: T,
+    _legacy: Option<Remapping>,
+}
+impl<T> std::ops::Deref for MappingViews<T> {
+    type Target = T;
+    fn deref(&self) -> &T { &self.views }
+}
+impl<T> std::ops::DerefMut for MappingViews<T> {
+    fn deref_mut(&mut self) -> &mut T { &mut self.views }
+}
+
+/// All callers supply the same exclusive view table. Its lifetime, not a
+/// separate writer gate, serializes changes to the view map and change epoch.
+pub fn mapping_views<T>(table: impl Fn() -> T, needed: impl Fn(&T) -> MappingRanges) -> MappingViews<T> {
+    if mapping_stripes() == 1 {
+        let guard = title_memory_remapping();
+        return MappingViews { _striped: None, views: table(), _legacy: Some(guard) };
+    }
+    prepare_remapping();
+    let mut footprint = needed(&table()).nonempty();
+    loop {
+        let pins = mapping::take(footprint, true, false).unwrap();
+        let views = table();
+        let current = needed(&views).nonempty();
+        if footprint.contains(current) {
+            return MappingViews { _striped: Some(begin_remapping(None, pins)), views, _legacy: None };
+        }
+        drop(views);
+        drop(pins);
+        // At least one new bit on each retry. A racing split cannot livelock.
+        footprint.include(current);
+    }
+}
+
+fn prepare_remapping() {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -2779,32 +2833,63 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
-    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+}
+
+fn begin_remapping(legacy: Option<std::sync::RwLockWriteGuard<'static, ()>>, stripes: Vec<mapping::Permit>) -> Remapping {
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping { legacy, stripes }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading {
+    #[allow(dead_code)]
+    legacy: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    #[allow(dead_code)]
+    stripes: Vec<mapping::Permit>,
+    ranges: MappingRanges,
+}
+
+impl Reading {
+    pub(crate) fn covers(&self, at: usize, len: usize) -> bool {
+        self.legacy.is_some() || self.ranges.contains(MappingRanges::of(at, len))
+    }
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    read_mapping(MappingRanges::all(), false).unwrap()
 }
 
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
+pub(crate) fn reading_range(at: usize, len: usize) -> Reading {
+    read_mapping(MappingRanges::of(at, len), false).unwrap()
+}
+
+pub(crate) fn reading_range_now(at: usize, len: usize) -> Option<Reading> {
+    read_mapping(MappingRanges::of(at, len), true)
+}
+
 pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+    read_mapping(MappingRanges::all(), true)
+}
+
+fn read_mapping(ranges: MappingRanges, now: bool) -> Option<Reading> {
+    if mapping_stripes() != 1 {
+        return Some(Reading { stripes: mapping::take(ranges, false, now)?, legacy: None, ranges });
     }
+    let guard = if now {
+        match MAPPING.try_read() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    } else {
+        MAPPING.read().unwrap_or_else(|e| e.into_inner())
+    };
+    Some(Reading { legacy: Some(guard), stripes: Vec::new(), ranges })
 }
 
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new,
@@ -2998,6 +3083,12 @@ pub struct SoftViews {
 }
 
 static SOFT_VIEWS: std::sync::OnceLock<SoftViews> = std::sync::OnceLock::new();
+
+/// The next texture's write-watch or copy may call into the runtime to
+/// materialize a view. That takes the mapping write lock.
+pub(crate) fn refresh_may_materialize() -> bool {
+    LAZY_VIEWS.get().is_some() || SOFT_VIEWS.get().is_some()
+}
 
 /// The runtime keeps views in its books alone ([`SoftViews`]).
 pub fn use_soft_views(hooks: SoftViews) {
@@ -5280,5 +5371,56 @@ mod many_askers_tests {
         BITS.clear_all(0, usize::MAX);
         assert!(!BITS.any(0, 1 << 31));
         assert!(!BITS.swap_on(70) && BITS.swap_on(70) && BITS.all(70, 71));
+    }
+}
+
+#[cfg(test)]
+mod mapping_views_tests {
+    use super::*;
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
+    #[test]
+    fn waiting_writer_rechecks_whole_view_without_blocking_an_unrelated_writer() {
+        if mapping_stripes() < 4 { return; }
+        let chunk = 2 << 20;
+        let table = Mutex::new(false);
+        let (first_release, first_wait) = mpsc::channel();
+        let (second_release, second_wait) = mpsc::channel();
+        let (ready, pinned) = mpsc::channel();
+        let (observed, observation) = mpsc::channel();
+        let (admitted, admission) = mpsc::channel();
+        std::thread::scope(|workers| {
+            for (address, release) in [(0, first_wait), (chunk, second_wait)] {
+                let ready = ready.clone();
+                workers.spawn(move || {
+                    let _pin = reading_range(address, 1);
+                    ready.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+            }
+            for _ in 0..2 { pinned.recv_timeout(Duration::from_secs(2)).unwrap(); }
+            workers.spawn(|| {
+                let checks = std::cell::Cell::new(0);
+                let _guard = mapping_views(|| table.lock().unwrap(), |wide| {
+                    checks.set(checks.get() + 1);
+                    observed.send(checks.get()).unwrap();
+                    MappingRanges::of(0, if **wide {chunk + 1} else {1})
+                });
+                admitted.send(()).unwrap();
+            });
+            observation.recv_timeout(Duration::from_secs(2)).unwrap();
+            // A disjoint writer changes the table between discovery and acquisition.
+            {
+                let mut other = mapping_views(|| table.lock().unwrap(), |_| MappingRanges::of(2 * chunk, 1));
+                **other = true;
+            }
+            first_release.send(()).unwrap();
+            assert_eq!(observation.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+            assert!(admission.try_recv().is_err());
+            second_release.send(()).unwrap();
+            admission.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(observation.recv().unwrap(), 3);
+        });
     }
 }
