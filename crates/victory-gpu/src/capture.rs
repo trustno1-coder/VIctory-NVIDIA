@@ -120,6 +120,27 @@ fn world_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
 }
 
+/// Every how many world frames a picture is saved with
+/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, 8 unless set).
+///
+/// A saved frame is read back and written as a PNG inside the present,
+/// which makes that frame several times longer than its neighbours. At
+/// every 8th frame that is a regular dip in any frame-time measurement; a
+/// run that measures speed asks for 64 or more.
+fn world_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| parse_every(std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().as_deref()))
+}
+
+/// `VICTORY_CAPTURE_WORLD_EVERY`'s value: a positive whole number, 8 when
+/// unset, zero or not a number.
+fn parse_every(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8)
+}
+
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -147,11 +168,13 @@ pub(crate) fn wanted(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
-    // In the world: every 8th frame's picture, a timeline of the opening
-    // cutscene (its shots do not fall on the same frame numbers from run to
-    // run, so single frames cannot be compared between runs).
+    // In the world: every 8th frame's picture (`VICTORY_CAPTURE_WORLD_EVERY`
+    // changes the 8), a timeline of the opening cutscene (its shots do not
+    // fall on the same frame numbers from run to run, so single frames
+    // cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world =
+        world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
@@ -860,5 +883,17 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    /// Unset, zero or not a number keeps every 8th world frame.
+    #[test]
+    fn world_capture_interval_defaults_to_eight() {
+        assert_eq!(super::parse_every(None), 8);
+        assert_eq!(super::parse_every(Some("64")), 64);
+        assert_eq!(super::parse_every(Some(" 16 ")), 16);
+        assert_eq!(super::parse_every(Some("0")), 8);
+        assert_eq!(super::parse_every(Some("-4")), 8);
+        assert_eq!(super::parse_every(Some("")), 8);
+        assert_eq!(super::parse_every(Some("x")), 8);
     }
 }
