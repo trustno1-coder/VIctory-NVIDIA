@@ -638,9 +638,10 @@ static ASK_BIG: std::sync::Mutex<Vec<(usize, usize, u64, u64, u64)>> = std::sync
 static QUICK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Seals of large ranges (switch `seal`): askings answered by a seal that stands, seals made,
-/// seals opened (by a fault, a write of ours, a write of the kernel's, the title's free or
-/// call, the switch or a seal that did not come to stand), seals found changed at a look.
-static SEAL_COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// chunks opened by a fault, seals opened whole (by a write of ours, a write of the kernel's,
+/// the title's free or call, the switch or a seal that did not come to stand), seals found
+/// changed at a look, askings of open chunks, chunks sealed again.
+static SEAL_COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 pub(crate) fn seal(what: usize) {
     SEAL_COUNTS[what].fetch_add(1, Relaxed);
@@ -1135,11 +1136,14 @@ pub(crate) fn log(frames: f64) {
     let se: Vec<u64> = SEAL_COUNTS.iter().map(|a| a.swap(0, Relaxed)).collect();
     if se.iter().sum::<u64>() > 0 {
         tracing::info!(
-            "seals of large ranges (lab, seal): {:.1} askings a frame answered by a seal that stands; in the second {} seals made, opened: \
-             {} by a fault, {} by a write of ours, {} by a write of the kernel's, {} by the title's free or call, {} others; {} found changed",
+            "seals of large ranges (lab, seal): {:.1} askings a frame answered by a seal that stands, with {:.1} askings of their open chunks; \
+             in the second {} seals made, {} chunks opened by a fault, {} chunks sealed again, seals opened whole: {} by a write of ours, {} \
+             by a write of the kernel's, {} by the title's free or call, {} others; {} found changed",
             se[0] as f64 / frames,
+            se[8] as f64 / frames,
             se[1],
             se[2],
+            se[9],
             se[3],
             se[4],
             se[5],

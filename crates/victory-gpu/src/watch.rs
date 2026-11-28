@@ -394,8 +394,8 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         }
         return kernel_asked(first, last);
     }
-    if sealed(first, last) {
-        return Some(Vec::new());
+    if let Some(pages) = sealed(first, last) {
+        return Some(pages);
     }
     let mut pages = kernel_asked(first, last)?;
     if let Some(more) = seal(first, last, pages.len()) {
@@ -414,9 +414,14 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 
 /// (Lab, switch `seal`.) Ranges of private title memory this large that the
 /// write watch found clean for a while are made read-only ("sealed") and
-/// not asked about again: the first write into one faults, the handler
-/// makes the range writable as it was and the write watch has that write
-/// and every later one, as before the seal ([`seal_fault`]).
+/// not asked about again: a write into one faults, the handler makes the
+/// part of the range around it (a 64th, a "chunk") writable as it was, and
+/// the write watch has that write and every later one there: an asking of
+/// a sealed range asks the kernel about its open chunks alone, and a chunk
+/// found clean for two seconds is sealed again ([`seal_fault`], [`sealed`]).
+/// (Sealed and opened whole, run 71: each of the title's 64 MB buffers is
+/// written somewhere every few seconds, and after ten seconds two of
+/// twenty-three still had their seal.)
 ///
 /// With the title's ray tracing 23 ranges of 64 MB are asked 88 times a
 /// frame, 80 us each, and 15 to 19 of them have no page written in a second
@@ -448,13 +453,54 @@ const SEAL_SEALED: u32 = 2;
 const SEAL_OPENING: u32 = 3;
 const SEAL_OPEN: u32 = 4;
 
-/// A seal as the fault handler reads it: no lock, no memory taken.
+/// A seal as the fault handler reads it: no lock but the slot's own, no
+/// memory taken.
 struct SealSlot {
     state: std::sync::atomic::AtomicU32,
     start: std::sync::atomic::AtomicUsize,
     end: std::sync::atomic::AtomicUsize,
     /// Where the allocation it lies in begins.
     base: std::sync::atomic::AtomicUsize,
+    /// Bytes to a chunk (whole pages), and the chunks that are open: a bit
+    /// is set before its chunk is made writable, and cleared after it was
+    /// made read-only and asked about once more.
+    chunk: std::sync::atomic::AtomicUsize,
+    open: std::sync::atomic::AtomicU64,
+    /// Held while the protection of any of it changes: by the handler for
+    /// a chunk, by an asking that seals a chunk again, by whoever opens it
+    /// whole. Nothing that holds it writes title memory.
+    busy: std::sync::atomic::AtomicBool,
+}
+
+impl SealSlot {
+    fn hold(&self) -> SealHeld<'_> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut turns = 0u32;
+        while self.busy.compare_exchange(false, true, SeqCst, SeqCst).is_err() {
+            turns += 1;
+            if turns % 64 == 0 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        SealHeld(self)
+    }
+
+    /// Chunk `c` as addresses.
+    fn chunk_at(&self, c: usize) -> (usize, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (start, end, chunk) = (self.start.load(SeqCst), self.end.load(SeqCst), self.chunk.load(SeqCst));
+        ((start + c * chunk).min(end), (start + (c + 1) * chunk).min(end))
+    }
+}
+
+struct SealHeld<'a>(&'a SealSlot);
+
+impl Drop for SealHeld<'_> {
+    fn drop(&mut self) {
+        self.0.busy.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 static SEAL_AT: [SealSlot; SEAL_SLOTS] = [const {
@@ -463,6 +509,9 @@ static SEAL_AT: [SealSlot; SEAL_SLOTS] = [const {
         start: std::sync::atomic::AtomicUsize::new(0),
         end: std::sync::atomic::AtomicUsize::new(0),
         base: std::sync::atomic::AtomicUsize::new(0),
+        chunk: std::sync::atomic::AtomicUsize::new(0),
+        open: std::sync::atomic::AtomicU64::new(0),
+        busy: std::sync::atomic::AtomicBool::new(false),
     }
 }; SEAL_SLOTS];
 /// Seals being made or standing.
@@ -478,6 +527,8 @@ struct SealNote {
     never: bool,
     slot: Option<usize>,
     looked: Option<std::time::Instant>,
+    /// When each open chunk was last found written, or opened.
+    chunk_written: Vec<Option<std::time::Instant>>,
 }
 
 static SEAL_BOOK: Mutex<BTreeMap<(usize, usize), SealNote>> = Mutex::new(BTreeMap::new());
@@ -510,6 +561,7 @@ fn seal_open_slot(i: usize, why: usize) {
     loop {
         match slot.state.load(SeqCst) {
             state @ (SEAL_SEALING | SEAL_SEALED) => {
+                let _held = slot.hold();
                 if slot.state.compare_exchange(state, SEAL_OPENING, SeqCst, SeqCst).is_err() {
                     continue;
                 }
@@ -574,62 +626,117 @@ fn seal_fault(at: usize) -> bool {
         if state == SEAL_EMPTY || at < slot.start.load(SeqCst) || at >= slot.end.load(SeqCst) {
             continue;
         }
+        if state == SEAL_SEALED {
+            let _held = slot.hold();
+            if slot.state.load(SeqCst) == SEAL_SEALED {
+                // The chunk alone: its bit, then the protection.
+                let c = (at - slot.start.load(SeqCst)) / slot.chunk.load(SeqCst).max(1);
+                slot.open.fetch_or(1 << c.min(63), SeqCst);
+                let (from, to) = slot.chunk_at(c);
+                seal_protect(from, to, windows_sys::Win32::System::Memory::PAGE_READWRITE);
+                crate::lab::seal(2);
+                return true;
+            }
+        }
+        // Being made, or being opened whole by another thread: open whole,
+        // writable by the time that returns.
         seal_open_slot(i, 0);
-        // (Opened by another thread a moment ago: writable by now.)
         return state != SEAL_OPEN || writable(at);
     }
     false
 }
 
-/// Whether the seal of pages `[first, last)` stands: nothing was written
-/// there since the asking before it. Looked at again once a second: still
-/// read-only, the same allocation.
-fn sealed(first: usize, last: usize) -> bool {
+/// If the seal of pages `[first, last)` stands: the pages written there
+/// since the asking before, which are those of its open chunks, asked of
+/// the kernel now. A chunk found clean for two seconds is sealed again.
+/// The seal is looked at again once a second: the same allocation, still
+/// read-only where it is closed.
+fn sealed(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     use std::sync::atomic::Ordering::SeqCst;
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READONLY};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READONLY, PAGE_READWRITE};
     if SEALS.load(SeqCst) == 0 {
-        return false;
+        return None;
     }
     let mut book = SEAL_BOOK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(note) = book.get_mut(&(first, last)) else {
-        return false;
-    };
-    let Some(i) = note.slot else {
-        return false;
-    };
+    let note = book.get_mut(&(first, last))?;
+    let i = note.slot?;
     let slot = &SEAL_AT[i];
     let (start, end) = (first * PAGE, last * PAGE);
     if slot.state.load(SeqCst) != SEAL_SEALED || slot.start.load(SeqCst) != start || slot.end.load(SeqCst) != end {
-        // A write opened it: asked as before, sealed again later.
+        // Opened whole: asked as before, sealed again later.
         note.slot = None;
         note.opened += 1;
         note.clean_since = None;
         note.clean_asks = 0;
-        return false;
+        return None;
     }
+    let chunk = slot.chunk.load(SeqCst);
+    let chunks = (end - start).div_ceil(chunk);
+    let mut open = slot.open.load(SeqCst);
     if note.looked.is_none_or(|at| at.elapsed().as_millis() >= 1000) {
         note.looked = Some(std::time::Instant::now());
-        let same = seal_query(start)
-            .is_some_and(|(base, bytes, state, protect, _)| base == slot.base.load(SeqCst) && bytes >= end - start && state == MEM_COMMIT && protect == PAGE_READONLY);
+        // At its first closed chunk: read-only memory of that allocation.
+        let closed = (0..chunks).find(|c| open >> c & 1 == 0);
+        let same = closed.is_none_or(|c| {
+            seal_query(slot.chunk_at(c).0)
+                .is_some_and(|(base, _, state, protect, _)| base == slot.base.load(SeqCst) && state == MEM_COMMIT && protect == PAGE_READONLY)
+        });
         if !same {
-            // Something changed it that nothing told us of: as it is, and
-            // never sealed again. The write watch was not reset meanwhile.
-            if slot.state.compare_exchange(SEAL_SEALED, SEAL_OPEN, SeqCst, SeqCst).is_ok() {
-                SEALS.fetch_sub(1, SeqCst);
-            }
+            // Something changed it that nothing told us of: opened, and
+            // never sealed again. The write watch was not reset under what
+            // was closed.
+            seal_open_slot(i, 4);
             note.slot = None;
             note.never = true;
             crate::lab::seal(7);
-            return false;
+            return None;
         }
     }
-    // (Still sealed now: a write that opened it since the look above came
-    // after this answer.)
-    let stands = slot.state.load(SeqCst) == SEAL_SEALED;
-    if stands {
-        crate::lab::seal(0);
+    let mut pages = Vec::new();
+    let now = std::time::Instant::now();
+    note.chunk_written.resize(chunks, None);
+    for c in 0..chunks.min(64) {
+        // (Chunks opened meanwhile: asked too.)
+        open |= slot.open.load(SeqCst);
+        if open >> c & 1 == 0 {
+            continue;
+        }
+        let (from, to) = slot.chunk_at(c);
+        let Some(found) = kernel_asked(from / PAGE, to / PAGE) else {
+            // (Not one reservation's memory any more.)
+            seal_open_slot(i, 4);
+            note.slot = None;
+            note.never = true;
+            return None;
+        };
+        crate::lab::seal(8);
+        let written = note.chunk_written[c].get_or_insert(now);
+        if !found.is_empty() {
+            *written = now;
+            pages.extend(found);
+        } else if written.elapsed().as_millis() as u64 >= SEAL_AFTER_MS {
+            // Sealed again: read-only, asked once more, then its bit.
+            let _held = slot.hold();
+            if slot.state.load(SeqCst) == SEAL_SEALED && seal_protect(from, to, PAGE_READONLY) {
+                match kernel_asked(from / PAGE, to / PAGE) {
+                    Some(more) if more.is_empty() => {
+                        slot.open.fetch_and(!(1 << c), SeqCst);
+                        note.chunk_written[c] = None;
+                        crate::lab::seal(9);
+                    }
+                    more => {
+                        seal_protect(from, to, PAGE_READWRITE);
+                        note.chunk_written[c] = Some(now);
+                        pages.extend(more.unwrap_or_default());
+                    }
+                }
+            }
+        }
     }
-    stands
+    // (Opened whole meanwhile, or a chunk since it was looked at: writes
+    // after this answer, which the next asking finds.)
+    crate::lab::seal(0);
+    Some(pages)
 }
 
 /// After an asking of pages `[first, last)` that found `found` pages: the
@@ -675,6 +782,9 @@ fn seal(first: usize, last: usize, found: usize) -> Option<Vec<(usize, u16)>> {
     slot.start.store(start, SeqCst);
     slot.end.store(end, SeqCst);
     slot.base.store(base, SeqCst);
+    slot.chunk.store((end - start).div_ceil(64).div_ceil(PAGE) * PAGE, SeqCst);
+    slot.open.store(0, SeqCst);
+    note.chunk_written.clear();
     SEALS.fetch_add(1, SeqCst);
     slot.state.store(SEAL_SEALING, SeqCst);
     if !seal_protect(start, end, PAGE_READONLY) {
@@ -5869,30 +5979,37 @@ mod seal_tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(SEAL_AFTER_MS + 100));
         assert_eq!(seal(first, last, 0), None);
-        assert!(sealed(first, last), "the seal stands");
+        assert_eq!(sealed(first, last), Some(vec![]), "the seal stands");
     }
 
     #[test]
-    fn a_sealed_range_is_opened_by_its_first_write_and_the_write_watch_has_it() {
+    fn a_write_opens_its_chunk_of_a_sealed_range_and_the_write_watch_has_it() {
         let (at, first, last) = sealable();
         seal_now(first, last);
+        let chunk = SEAL_LEAST / 64;
         assert!(!writable(at) && !writable(at + SEAL_LEAST - KERNEL_PAGE));
         // Read as before.
         assert_eq!(unsafe { ((at + 3 * KERNEL_PAGE) as *const u8).read() }, 7);
-        assert!(sealed(first, last));
-        // The first write faults, opens all of it, and is made.
+        assert_eq!(sealed(first, last), Some(vec![]));
+        // A write faults, opens its chunk, and is made.
         unsafe { ((at + PAGE + 5 * KERNEL_PAGE) as *mut u8).write(9) };
         assert_eq!(unsafe { ((at + PAGE + 5 * KERNEL_PAGE) as *const u8).read() }, 9);
-        assert!(writable(at) && writable(at + SEAL_LEAST - KERNEL_PAGE));
-        assert!(!sealed(first, last), "opened by the write");
-        // A later write, with no fault.
+        assert!(writable(at) && writable(at + chunk - KERNEL_PAGE));
+        assert!(!writable(at + chunk) && !writable(at + SEAL_LEAST - KERNEL_PAGE));
+        // A later write there, with no fault; one in another chunk.
         unsafe { ((at + 2 * PAGE) as *mut u8).write(1) };
-        assert_eq!(kernel_asked(first, last), Some(vec![(first + 1, 1 << 5), (first + 2, 1)]));
-        // Not sealed again at once.
-        for _ in 0..SEAL_ASKS + 1 {
-            assert_eq!(seal(first, last, 0), None);
-        }
-        assert!(!sealed(first, last) && writable(at));
+        unsafe { ((at + 40 * chunk + KERNEL_PAGE) as *mut u8).write(2) };
+        assert_eq!(
+            sealed(first, last),
+            Some(vec![(first + 1, 1 << 5), (first + 2, 1), (first + 40 * chunk / PAGE, 1 << 1)])
+        );
+        assert_eq!(sealed(first, last), Some(vec![]));
+        // Clean for a while: sealed again, and a write opens it again.
+        std::thread::sleep(std::time::Duration::from_millis(SEAL_AFTER_MS + 100));
+        assert_eq!(sealed(first, last), Some(vec![]));
+        assert!(!writable(at) && !writable(at + 40 * chunk));
+        unsafe { ((at + 2 * PAGE) as *mut u8).write(4) };
+        assert_eq!(sealed(first, last), Some(vec![(first + 2, 1)]));
     }
 
     #[test]
@@ -5905,7 +6022,7 @@ mod seal_tests {
         // Written after the asking that found nothing, before the seal.
         unsafe { ((at + 4 * PAGE + KERNEL_PAGE) as *mut u8).write(3) };
         assert_eq!(seal(first, last, 0), Some(vec![(first + 4, 1 << 1)]));
-        assert!(!sealed(first, last) && writable(at));
+        assert!(sealed(first, last).is_none() && writable(at));
     }
 
     #[test]
@@ -5913,12 +6030,12 @@ mod seal_tests {
         let (at, first, last) = sealable();
         seal_now(first, last);
         writing(at + 100, 10);
-        assert!(writable(at) && !sealed(first, last));
+        assert!(writable(at) && sealed(first, last).is_none());
 
         let (at, first, last) = sealable();
         seal_now(first, last);
         let kernel = kernel_writing(at + PAGE, PAGE);
-        assert!(writable(at) && !sealed(first, last));
+        assert!(writable(at) && sealed(first, last).is_none());
         // None is made while the kernel writes there.
         for _ in 0..SEAL_ASKS {
             assert_eq!(seal(first, last, 0), None);
@@ -5932,6 +6049,6 @@ mod seal_tests {
         assert!(writable(at));
         // SAFETY: ours.
         assert_ne!(unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) }, 0);
-        assert!(!sealed(first, last));
+        assert!(sealed(first, last).is_none());
     }
 }
