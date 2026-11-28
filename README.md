@@ -94,6 +94,11 @@
   add `VICTORY_MFG_UNLOCKER=` to `%LOCALAPPDATA%\victory\victory-settings.txt`).
   FSR 3 frame generation (2x) is the supported way on those cards. A
   `winmm.dll` copy of the mod beside `victory.exe` still works too.
+- RTX 20 and 30 cards can also run
+  [DLSS Enabler](https://www.nexusmods.com/site/mods/757) (not ours either;
+  tried on an RTX 2080 with the script launcher): frame generation from 2x to
+  6x by Streamline's count. It takes four steps of set-up and has known faults,
+  in [docs/dlss.md](docs/dlss.md#rtx-20-and-30-cards-dlss-enabler-a-mod-not-ours).
 
 **In the game**
 

@@ -195,5 +195,16 @@ try {
 }
 finally { Pop-Location }
 Push-Location $repo
-try { & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line } }
+try {
+    # DLSS Enabler (winmm.dll beside victory.exe) stays off in a process with a console window or console output,
+    # so the layer runs without a window and its output comes through a pipe.
+    $env:VFG_BIN = $victory; $env:VFG_EXE = $Exe
+    $psi = [Diagnostics.ProcessStartInfo]::new('cmd.exe', ('/d /s /c ""%VFG_BIN%" run "%VFG_EXE%" --console {0} --execute 2>&1"' -f $console))
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardOutput = $true
+    $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false); $psi.WorkingDirectory = $repo
+    $p = [Diagnostics.Process]::Start($psi)
+    while ($null -ne ($line = $p.StandardOutput.ReadLine())) { $writer.WriteLine($line); $line }
+    $p.WaitForExit()
+    $global:LASTEXITCODE = $p.ExitCode
+}
 finally { Pop-Location; $writer.Dispose() }
