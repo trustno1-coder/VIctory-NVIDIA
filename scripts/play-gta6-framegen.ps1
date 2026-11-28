@@ -1,7 +1,8 @@
 # One-click GTA VI on trustno1-coder/VIctory-NVIDIA (foxhound base): DLSS Super Resolution + DLSS frame generation.
 # PLAY_FRAMEGEN.cmd runs this. What it does, in order:
 #   1. finds the game folder (game_dir.txt in the repository folder, else a search of every drive)
-#   2. backs up the saves (%LOCALAPPDATA%\victory\data\7952987A) and checks every file by SHA-256
+#   2. backs up the saves (%LOCALAPPDATA%\victory\data\7952987A, or the data folder VICTORY_DATA_DIR or
+#      VICTORY_HOME names) and checks every file by SHA-256
 #   3. gets NVIDIA's DLSS files once (scripts\get-nvidia-sdks.ps1, from github.com/NVIDIA-RTX/Streamline)
 #   4. starts scripts\play-foxhound.ps1, which builds the layer the first time (a few minutes)
 # Modes: 1 Series X 1440p + DLSS Quality + frame generation 2x (default)
@@ -77,7 +78,12 @@ if (Get-Process victory -ErrorAction SilentlyContinue) { Write-Host 'The game is
 
 # 2. Saves backup, verified file by file.
 if (-not $NoBackup) {
-    $src = Join-Path $env:LOCALAPPDATA 'victory\data\7952987A'
+    # Where victory.exe keeps them (victory-core's config.rs): VICTORY_DATA_DIR, else VICTORY_HOME\data, else
+    # %LOCALAPPDATA%\victory\data. With VICTORY_HOME set the backup took the old folder under %LOCALAPPDATA%
+    # (#751). A data_dir in victory.toml is not read here.
+    $data = if ($env:VICTORY_DATA_DIR) { $env:VICTORY_DATA_DIR } elseif ($env:VICTORY_HOME) { Join-Path $env:VICTORY_HOME 'data' } else { Join-Path $env:LOCALAPPDATA 'victory\data' }
+    $src = Join-Path $data '7952987A'
+    if (-not (Test-Path $src)) { Write-Host "No saves at $src yet: nothing to back up." }
     if (Test-Path $src) {
         $root = if (Test-Path 'D:\') { 'D:\victory-save-backups' } else { Join-Path $env:USERPROFILE 'victory-save-backups' }
         $dst = Join-Path $root ('7952987A-{0:yyyyMMdd-HHmmss}-before-nvidia' -f (Get-Date))
