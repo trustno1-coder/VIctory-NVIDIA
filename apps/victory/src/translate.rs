@@ -868,16 +868,11 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 unreachable!("leaves are no phis, selects or per-lane choices")
             }
         };
-        // Heaps hold dynamic resources, which no used entry lists; code
-        // tables are no root parameter.
-        if let Some(a) = a
-            && a.param != resource::CODE
-            && !matches!(
-                p.layout[a.param].root,
-                RootType::ResourceHeap | RootType::SamplerHeap
-            )
+        // Heaps have no used entry; code tables and raw memory are not root parameters.
+        if let Some(param) = a.and_then(|a| p.layout.get(a.param))
+            && !matches!(param.root, RootType::ResourceHeap | RootType::SamplerHeap)
         {
-            traced.insert(p.layout[a.param].user_data);
+            traced.insert(param.user_data);
         }
     }
     // Root constants are listed as a CBV, read straight from the SGPRs.

@@ -326,6 +326,53 @@ impl Module {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn call_args<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [V]> {
+        self.insts.iter().filter_map(move |inst| match &inst.op {
+            Op::Call(f, args) if self.funcs[*f as usize].name == name => Some(args.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// Evaluate the integer address arithmetic of a synthetic test shader with known user data.
+    #[cfg(test)]
+    pub(super) fn address_value(&self, v: V, user: &[u32]) -> Option<u32> {
+        if let Some(n) = self.int_value(v) {
+            return Some(n as u32);
+        }
+        let V::Inst(i) = v else { return None };
+        let eval = |v| self.address_value(v, user);
+        match &self.insts[i as usize].op {
+            Op::Bin(op, a, b) => {
+                let (a, b) = (eval(*a)?, eval(*b)?);
+                Some(match op {
+                    Bin::Add => a.wrapping_add(b),
+                    Bin::Shl => a.wrapping_shl(b),
+                    Bin::LShr => a.wrapping_shr(b),
+                    Bin::And => a & b,
+                    _ => return None,
+                })
+            }
+            Op::Extract(V::Inst(i), dword) => {
+                let Op::Call(f, args) = &self.insts[*i as usize].op else {
+                    return None;
+                };
+                if self.funcs[*f as usize].name != "dx.op.cbufferLoadLegacy.i32" {
+                    return None;
+                }
+                let row = self.int_value(args[2])? as usize;
+                user.get(4 * row + *dword as usize).copied()
+            }
+            Op::Call(f, args)
+                if self.funcs[*f as usize].name == "dx.op.binary.i32"
+                    && self.int_value(args[0]) == Some(40) =>
+            {
+                Some(eval(args[1])?.min(eval(args[2])?))
+            }
+            _ => None,
+        }
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {

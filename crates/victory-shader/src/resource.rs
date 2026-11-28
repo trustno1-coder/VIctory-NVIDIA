@@ -21,8 +21,8 @@ use crate::structure::{Bool, LaneExit, Meets, Structured};
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
 
-/// A byte address: a root parameter's, plus a constant and at most one
-/// value the program computes (an index times a stride, say).
+/// A byte address: a root parameter's, plus a constant and up to two
+/// values the program computes (a base index and an instruction offset).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Address {
     /// Index into the layout, or [`CODE`].
@@ -31,6 +31,8 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// Second computed term, present only when `dynamic` is present.
+    pub dynamic2: Option<Value>,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -42,7 +44,7 @@ pub const CODE: usize = usize::MAX;
 /// gives: one the code computes from root constants, reads out of a
 /// descriptor or loads from other memory (compute programs only: the
 /// ray-tracing structure builder and the programs that walk its
-/// structures). Offset and computed term are not used: lowering takes the
+/// structures). Offset and computed terms are not used: lowering takes the
 /// 64-bit address from the instruction's operands.
 pub const MEMORY: usize = usize::MAX - 1;
 
@@ -142,7 +144,7 @@ pub struct Resources {
     /// block, even if that VGPR is also used in ordinary vector operations.
     pub(crate) restored_lanes: std::collections::HashMap<Site, Moved>,
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
-    /// every global memory access (`global_*`, the dynamic term per lane).
+    /// every global memory access (`global_*`, with per-lane offsets).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
     /// Direct descriptor sources with a draw-evaluable index.
@@ -619,6 +621,9 @@ impl<'a> Tracer<'a> {
         };
         let i = scalar.binary_search_by_key(&load, |(site, _)| *site).ok()?;
         let address = scalar[i].1;
+        if address.dynamic2.is_some() {
+            return None;
+        }
         let base = self.layout.get(address.param)?;
         if base.root != RootType::Table {
             return None;
@@ -887,6 +892,7 @@ impl<'a> Tracer<'a> {
                 param: MEMORY,
                 offset: 0,
                 dynamic: None,
+                dynamic2: None,
             })
         } else {
             Err(why)
@@ -951,11 +957,15 @@ impl<'a> Tracer<'a> {
             _ => hi,
         };
         let s = self.sum(lo);
-        if s.dynamic.is_some() && extra.dynamic.is_some() {
-            return Err("an address with two computed terms");
-        }
+        let (dynamic, dynamic2) = match (s.dynamic, extra.dynamic) {
+            (Some(a), Some(b)) => (Some(a), Some(b)),
+            (a, b) => (a.or(b), None),
+        };
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
+            if dynamic2.is_some() {
+                return Err("an address with two computed terms");
+            }
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
             if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
@@ -968,7 +978,8 @@ impl<'a> Tracer<'a> {
             return Ok(Address {
                 param: CODE,
                 offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
-                dynamic: s.dynamic.or(extra.dynamic),
+                dynamic,
+                dynamic2: None,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -986,7 +997,6 @@ impl<'a> Tracer<'a> {
         };
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
-        let dynamic = s.dynamic.or(extra.dynamic);
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
@@ -995,7 +1005,8 @@ impl<'a> Tracer<'a> {
         Ok(Address {
             param,
             offset: s.offset.wrapping_add(extra.offset),
-            dynamic: s.dynamic.or(extra.dynamic),
+            dynamic,
+            dynamic2,
         })
     }
 
@@ -1557,7 +1568,8 @@ impl<'a> Tracer<'a> {
         self.read_first_lane.set(true);
         let address = self.smem_address(inst, base, *offset, soffset);
         self.read_first_lane.set(false);
-        match self.origin(address.ok()?.dynamic?) {
+        let address = address.ok().filter(|a| a.dynamic2.is_none())?;
+        match self.origin(address.dynamic?) {
             Term::Value(v) if self.first_lane_source(v).is_some() => Some(v),
             _ => None,
         }
@@ -1767,7 +1779,7 @@ impl<'a> Tracer<'a> {
             self.runs(site, known)?;
             let a = address(site)?;
             let want = a0.offset.wrapping_add(4 * (first + k) as u32);
-            if (a.param, a.dynamic) != (a0.param, a0.dynamic)
+            if (a.param, a.dynamic, a.dynamic2) != (a0.param, a0.dynamic, a0.dynamic2)
                 || a.offset.wrapping_add(4 * dword as u32) != want
             {
                 return Err("a descriptor read from the first lane of loads that do not line up");
@@ -2513,7 +2525,118 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            dynamic2: None,
         }
+    }
+
+    pub(crate) const TWO_TERM_TABLE_LOAD: [u32; 11] = [
+        0x8F06_8501, // s_lshl_b32 s6, s1, 5
+        0x8004_0600, // s_add_u32 s4, s0, s6
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x8F07_8502, // s_lshl_b32 s7, s2, 5
+        0xF408_0202,
+        0x0E00_0020, // s_load_dwordx4 s[8:11], s[4:5], s7 offset:32
+        0xE030_0000,
+        0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn a_root_indexed_view_needs_at_most_one_computed_term() {
+        let layout = [param(Table, 0, 1), param(Constants, 1, 2)];
+        let two = track_words(&TWO_TERM_TABLE_LOAD, &layout, HwStage::Cs);
+        let a = two.scalar[0].1;
+        assert_eq!((a.param, a.offset), (0, 32));
+        assert!(a.dynamic.is_some() && a.dynamic2.is_some());
+        assert_ne!(a.dynamic, a.dynamic2);
+        assert!(two.root_indexed_views.is_empty());
+
+        let mut one = TWO_TERM_TABLE_LOAD;
+        one[5] = 0xFA00_0020; // soffset omitted
+        let one = track_words(&one, &layout, HwStage::Cs);
+        assert_eq!(one.root_indexed_views.len(), 1);
+        assert_eq!(one.root_indexed_views[0].byte_offset, 32);
+        assert_eq!(one.root_indexed_views[0].shift, 5);
+    }
+
+    #[test]
+    fn a_first_lane_offset_does_not_prove_a_two_term_address() {
+        let layout = [param(Table, 0, 1), param(Constants, 1, 1)];
+        for (soffset, two) in [(0xFA00_0000, false), (0x0E00_0000, true)] {
+            let words = [
+                0x7E0C_0500u32, // v_readfirstlane_b32 s6, v0
+                0x8004_0600,    // s_add_u32 s4, s0, s6
+                0xBE85_0380,    // s_mov_b32 s5, 0
+                0x8F07_8501,    // s_lshl_b32 s7, s1, 5
+                0xF408_0202,
+                soffset, // s_load_dwordx4 s[8:11], s[4:5], null or s7
+                S_ENDPGM,
+            ];
+            let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+            let load = (0, 4);
+            let inst = t.inst(load);
+            let Fields::Smem {
+                base,
+                offset,
+                soffset,
+                ..
+            } = &inst.fields
+            else {
+                panic!("expected a scalar load");
+            };
+            let a = t.smem_address(inst, base, *offset, soffset).unwrap();
+            assert_eq!(a.dynamic2.is_some(), two);
+            assert_eq!(t.first_lane_offset(load).is_some(), !two);
+        }
+    }
+
+    #[test]
+    fn a_pc_relative_address_still_refuses_two_computed_terms() {
+        let words = [
+            0xBE84_1F00u32, // s_getpc_b64 s[4:5]
+            0x8F06_8200,    // s_lshl_b32 s6, s0, 2
+            0x8004_0604,    // s_add_u32 s4, s4, s6
+            0x8205_8005,    // s_addc_u32 s5, s5, 0
+            0x8F07_8201,    // s_lshl_b32 s7, s1, 2
+            0xF408_0202,
+            0x0E00_0000, // s_load_dwordx4 s[8:11], s[4:5], s7
+            S_ENDPGM,
+        ];
+        let layout = [param(Constants, 0, 2)];
+        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(matches!(
+            track(&p, &layout, HwStage::Cs, None),
+            Err(ShaderError::Unsupported {
+                offset: 20,
+                what: "an address with two computed terms"
+            })
+        ));
+    }
+
+    #[test]
+    fn a_scalar_load_with_no_traced_base_can_still_supply_descriptor_words() {
+        let r = track_words(
+            &[
+                0x8F04_8200, // s_lshl_b32 s4, s0, 2 (not a root address)
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0x8F07_8201, // s_lshl_b32 s7, s1, 2
+                0xF408_0202,
+                0x0E00_0000, // s_load_dwordx4 s[8:11], s[4:5], s7
+                0xE030_0000,
+                0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2)],
+            HwStage::Cs,
+        );
+        let load = (0, 3);
+        assert_eq!(r.scalar, [(load, at(MEMORY, 0))]);
+        assert_eq!(r.descriptors[0].source, Source::Loaded { load, first: 0 });
     }
 
     #[test]
