@@ -169,13 +169,72 @@ fn warp_wanted() -> bool {
     }
 }
 
+/// The capture holds the mouse (clipped, hidden, warped, its motion the
+/// title's) only while locked: from the start, until F2 (or `` ` ``/`~`)
+/// with the window in front or the window losing the front; F2 again or a
+/// left click inside the window locks it again. Unlocked, the cursor is free
+/// to move the window or to reach its title bar.
+static MOUSE_LOCKED: AtomicBool = AtomicBool::new(true);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LockEvent {
+    /// F2, or `` ` ``/`~` (VK_OEM_3), pressed (not a key repeat).
+    Toggle,
+    /// The left button inside the client area (a click on the title bar or
+    /// a border is a non-client message, and never locks).
+    ClientClick,
+    /// The window left the front.
+    FocusLost,
+}
+
+const VK_F2: usize = 0x71;
+const VK_OEM_3: usize = 0xC0;
+
+/// What a window message does to the lock.
+fn lock_event(message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LockEvent> {
+    match message {
+        // Bit 30: the key was down already (a repeat).
+        wm::WM_KEYDOWN if matches!(wparam, VK_F2 | VK_OEM_3) && lparam & (1 << 30) == 0 => {
+            Some(LockEvent::Toggle)
+        }
+        wm::WM_LBUTTONDOWN => Some(LockEvent::ClientClick),
+        wm::WM_ACTIVATE if wparam & 0xffff == wm::WA_INACTIVE as usize => Some(LockEvent::FocusLost),
+        _ => None,
+    }
+}
+
+fn next_lock(locked: bool, event: LockEvent) -> bool {
+    match event {
+        LockEvent::Toggle => !locked,
+        LockEvent::ClientClick => true,
+        LockEvent::FocusLost => false,
+    }
+}
+
+/// Applies a lock change on the window's thread (the cursor count is the thread's).
+fn change_lock(hwnd: HWND, event: LockEvent) {
+    let menu_open = victory_gpu::SETTINGS_MENU_OPEN.load(Ordering::Relaxed);
+    if !capture_wanted() || (menu_open && event == LockEvent::Toggle) {
+        return;
+    }
+    let was = MOUSE_LOCKED.load(Ordering::Relaxed);
+    let locked = next_lock(was, event);
+    if locked == was { return; }
+    MOUSE_LOCKED.store(locked, Ordering::Relaxed);
+    tracing::info!(locked, ?event, "mouse lock (F2 toggles it)");
+    // SAFETY: a window of this thread; its top-level window holds the capture.
+    let root = unsafe { wm::GetAncestor(hwnd, wm::GA_ROOT) };
+    capture_mouse(if root.is_null() { hwnd } else { root }, locked);
+}
+
 fn capture_mouse(hwnd: HWND, active: bool) {
     if !capture_wanted() { return; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: runs on the window thread; local geometry, balanced cursor count.
     unsafe {
         if active && !wm::GetParent(hwnd).is_null() { return; }
-        let active = active && wm::GetForegroundWindow() == hwnd && wm::IsIconic(hwnd) == 0;
+        let active = active && MOUSE_LOCKED.load(Ordering::Relaxed)
+            && wm::GetForegroundWindow() == hwnd && wm::IsIconic(hwnd) == 0;
         if !active {
             if state.window == hwnd as usize {
                 wm::ClipCursor(std::ptr::null());
@@ -368,6 +427,10 @@ fn hook(hwnd: HWND) {
         if wm::GetParent(hwnd).is_null() {
             fullscreen(hwnd);
             english_input();
+            if capture_wanted() {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| tracing::info!("the mouse is captured while the game is in front: F2 releases the mouse (F2 or a click inside the window takes it back)"));
+            }
             capture_mouse(hwnd, true);
         }
     }
@@ -381,6 +444,9 @@ extern "system" fn window_proc(
 ) -> LRESULT {
     if message == wm::WM_SETFOCUS {
         english_input();
+    }
+    if let Some(event) = lock_event(message, wparam, lparam) {
+        change_lock(hwnd, event);
     }
     match message {
         wm::WM_KILLFOCUS | wm::WM_NCDESTROY => capture_mouse(hwnd, false),
@@ -549,6 +615,36 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f2_a_client_click_and_focus_loss_move_the_mouse_lock() {
+        use LockEvent::*;
+        // F2 and `~` toggle; a key held down (repeat bit 30) does nothing more.
+        assert_eq!(lock_event(wm::WM_KEYDOWN, 0x71, 1), Some(Toggle));
+        assert_eq!(lock_event(wm::WM_KEYDOWN, 0xC0, 1), Some(Toggle));
+        assert_eq!(lock_event(wm::WM_KEYDOWN, 0x71, 1 | (1 << 30)), None);
+        assert_eq!(lock_event(wm::WM_KEYUP, 0x71, 1), None);
+        assert_eq!(lock_event(wm::WM_KEYDOWN, 0x70, 1), None);
+        // A left click inside the window locks; on the title bar or a border it never does.
+        assert_eq!(lock_event(wm::WM_LBUTTONDOWN, 1, 0), Some(ClientClick));
+        assert_eq!(lock_event(wm::WM_NCLBUTTONDOWN, wm::HTCAPTION as usize, 0), None);
+        assert_eq!(lock_event(wm::WM_NCLBUTTONDOWN, wm::HTBORDER as usize, 0), None);
+        assert_eq!(lock_event(wm::WM_RBUTTONDOWN, 2, 0), None);
+        // Leaving the front unlocks; coming back does not lock.
+        assert_eq!(lock_event(wm::WM_ACTIVATE, wm::WA_INACTIVE as usize, 0), Some(FocusLost));
+        assert_eq!(lock_event(wm::WM_ACTIVATE, wm::WA_ACTIVE as usize, 0), None);
+        assert_eq!(lock_event(wm::WM_ACTIVATE, wm::WA_CLICKACTIVE as usize, 0), None);
+
+        // From the start (locked): F2 frees, F2 takes back, focus loss frees,
+        // only F2 or a client click takes back.
+        let mut locked = MOUSE_LOCKED.load(Ordering::Relaxed);
+        assert!(locked, "starts locked");
+        for (event, then) in [(Toggle, false), (Toggle, true), (FocusLost, false), (FocusLost, false),
+            (ClientClick, true), (ClientClick, true), (FocusLost, false), (Toggle, true)] {
+            locked = next_lock(locked, event);
+            assert_eq!(locked, then, "after {event:?}");
+        }
+    }
 
     #[test]
     fn mouse_reference_handles_focus_reset_and_warp() {
