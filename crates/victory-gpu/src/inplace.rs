@@ -1855,6 +1855,7 @@ pub(crate) mod tests {
     /// the other ranges cannot be opened, without creating anything.
     #[test]
     fn openability_names_private_and_view_memory_and_the_refusals() {
+        let _turn = crate::indirect::tests::warp_turn();
         const K: usize = 64 << 10;
         // SAFETY: allocations of the test's own.
         unsafe {
@@ -1882,6 +1883,7 @@ pub(crate) mod tests {
     /// and not before: a heap is opened on it, so it must outlive the heap.
     #[test]
     fn our_section_view_is_unmapped_with_its_last_holder() {
+        let _turn = crate::indirect::tests::warp_turn();
         const K: usize = 64 << 10;
         // SAFETY (the whole test): the section, placeholder and views made here.
         unsafe {
@@ -2110,6 +2112,7 @@ pub(crate) mod tests {
     /// placed heap.
     #[test]
     fn our_view_keeps_the_sections_pages_after_the_title_lets_go() {
+        let _turn = crate::indirect::tests::warp_turn();
         const K: usize = 64 << 10;
         // SAFETY (the whole test): the section, placeholder and views made here.
         unsafe {
