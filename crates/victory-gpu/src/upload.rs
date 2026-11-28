@@ -130,10 +130,19 @@ fn from_early(len: usize) -> Option<usize> {
     if len != EARLY_PIECE {
         return None;
     }
-    let at = EARLY.lock().unwrap_or_else(|e| e.into_inner()).pop()?;
-    // SAFETY: a reservation of our own, not committed before.
-    let done = unsafe { VirtualAlloc(at as *const _, len, MEM_COMMIT, PAGE_READWRITE) } as usize;
-    (done == at).then_some(at)
+    commit_early_piece(&EARLY, |at| {
+        // SAFETY: a reservation of our own, not committed before.
+        (unsafe { VirtualAlloc(at as *const _, len, MEM_COMMIT, PAGE_READWRITE) } as usize) == at
+    })
+}
+
+fn commit_early_piece(pieces: &Mutex<Vec<usize>>, commit: impl FnOnce(usize) -> bool) -> Option<usize> {
+    let mut pieces = pieces.lock().unwrap_or_else(|e| e.into_inner());
+    let &at = pieces.last()?;
+    if commit(at) {
+        return pieces.pop();
+    }
+    None
 }
 
 /// The address space every run reserves first thing ([`reserve_space`]),
@@ -169,7 +178,7 @@ pub fn reserve_space() {
 fn from_pool(len: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
     static TOLD: std::sync::Once = std::sync::Once::new();
-    let len = len.div_ceil(BLOCK) * BLOCK;
+    let len = len.div_ceil(BLOCK).checked_mul(BLOCK)?;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     TOLD.call_once(|| {
         let lowest = pool.iter().map(|p| p.0).min().unwrap_or(0);
@@ -230,9 +239,16 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
 }
 
 impl Upload {
+    fn from_heap(len: usize) -> Option<Self> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).ok()?;
+        bytes.resize(len, 0);
+        Some(Upload(Kind::Heap(bytes)))
+    }
+
     pub(crate) fn new(len: usize) -> Option<Upload> {
         if !low() {
-            return Some(Upload(Kind::Heap(vec![0; len])));
+            return Self::from_heap(len);
         }
         let n = len.max(1).div_ceil(BLOCK);
         let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
@@ -241,15 +257,16 @@ impl Upload {
             Some(place) => place,
             None => {
                 let blocks = n.max(ARENA / BLOCK);
-                let Some(at) = reserve(blocks * BLOCK) else {
+                let bytes = blocks.checked_mul(BLOCK)?;
+                let Some(at) = reserve(bytes) else {
                     // Better than null, which the title throws on, ending
                     // the game: its shaders may read zeros from this.
                     static TOLD: std::sync::Once = std::sync::Once::new();
                     TOLD.call_once(|| tracing::warn!(bytes = len, "an upload from the process heap instead: ray tracing may miss some of it"));
-                    return Some(Upload(Kind::Heap(vec![0; len])));
+                    return Self::from_heap(len);
                 };
-                crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
-                tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
+                crate::shadow::register(at, at as u64, bytes as u64);
+                tracing::info!(at = format_args!("{at:#x}"), bytes, "memory for lists' uploads, where shaders reach it by address");
                 arenas.push(Arena { at, taken: vec![false; blocks] });
                 (arenas.len() - 1, 0)
             }
@@ -294,6 +311,40 @@ pub(crate) fn block(address: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_commit_can_retry_the_same_reservation() {
+        let pieces = Mutex::new(vec![0x10000, 0x20000]);
+        assert_eq!(
+            commit_early_piece(&pieces, |at| {
+                assert_eq!(at, 0x20000);
+                false
+            }),
+            None,
+        );
+        assert_eq!(commit_early_piece(&pieces, |at| at == 0x20000), Some(0x20000));
+        assert_eq!(commit_early_piece(&pieces, |_| true), Some(0x10000));
+    }
+
+    #[test]
+    fn an_unrepresentable_upload_returns_none() {
+        assert!(Upload::new(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn an_unrepresentable_pool_size_returns_none() {
+        assert!(from_pool(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn the_heap_fallback_allocates_zeroed_bytes_and_rejects_unrepresentable_capacity() {
+        let upload = Upload::from_heap(100).unwrap();
+        let Kind::Heap(bytes) = &upload.0 else {
+            panic!("expected a heap upload");
+        };
+        assert_eq!(bytes.as_slice(), [0; 100]);
+        assert!(Upload::from_heap(usize::MAX).is_none());
+    }
 
     #[test]
     fn blocks_lie_below_40_bits_and_are_used_again_zeroed() {
