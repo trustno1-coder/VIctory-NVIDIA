@@ -194,9 +194,14 @@ pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
         let mut point = POINT::default();
         if wm::GetCursorPos(&mut point) == 0 { state.reference = None; return None; }
         let point = (point.x, point.y);
-        let warp = std::env::var_os("VICTORY_MOUSE_WARP").is_some_and(|v| v == "1");
-        let warped = (warp && wm::SetCursorPos(state.center.0, state.center.1) != 0)
-            .then_some(state.center);
+        let warp = super::gameinput::mouse_warp();
+        // Measured from where the pointer is after the warp, not from where
+        // it was sent: under display scaling the two can differ by a pixel,
+        // which would be a motion at every sample.
+        let warped = (warp && wm::SetCursorPos(state.center.0, state.center.1) != 0).then(|| {
+            let mut after = POINT::default();
+            if wm::GetCursorPos(&mut after) != 0 { (after.x, after.y) } else { state.center }
+        });
         Some(mouse_motion(&mut state.reference, point, warped))
     }
 }
