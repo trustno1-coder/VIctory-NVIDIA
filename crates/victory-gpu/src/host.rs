@@ -3717,6 +3717,63 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     stale_of(spans)
 }
 
+/// (Lab, switch `cut`.) Of the spans of 8 MB and more that a submission asks
+/// the write watch about: what the refreshes inside them cover, alone and
+/// joined across gaps under 1 MB (`crate::lab::spans`). The kernel's answer
+/// costs by the memory it walks (some 1.3 us a megabyte, run 62), and a span
+/// runs from a copy's first refreshed byte to its last.
+fn span_cover(runs: &[&HostList], spans: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) {
+    const BIG: usize = 8 << 20;
+    const JOIN: usize = 1 << 20;
+    let big: std::collections::HashMap<usize, usize> = spans
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.2 - s.1 >= BIG && s.0.asked_ahead())
+        .map(|(n, s)| (std::sync::Arc::as_ptr(&s.0) as usize, n))
+        .collect();
+    if big.is_empty() {
+        return;
+    }
+    let mut inside: Vec<(usize, usize, usize)> = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step
+                && let Some(&n) = big.get(&(std::sync::Arc::as_ptr(shadow) as usize))
+            {
+                inside.push((n, *address, *address + *len));
+            }
+        }
+    }
+    inside.sort_unstable();
+    let (mut pieces, mut pieces_bytes, mut exact) = (0u64, 0u64, 0u64);
+    // The piece and the bytes covered so far, of one span.
+    let mut now: Option<(usize, usize, usize, usize)> = None;
+    for (n, from, to) in inside {
+        match &mut now {
+            Some((span, start, end, covered)) if *span == n && from <= *end + JOIN => {
+                let _ = start;
+                exact += to.saturating_sub((*covered).max(from)) as u64;
+                *covered = (*covered).max(to);
+                *end = (*end).max(to);
+            }
+            _ => {
+                if let Some((_, start, end, _)) = now {
+                    pieces += 1;
+                    pieces_bytes += (end - start) as u64;
+                }
+                exact += (to - from) as u64;
+                now = Some((n, from, to, to));
+            }
+        }
+    }
+    if let Some((_, start, end, _)) = now {
+        pieces += 1;
+        pieces_bytes += (end - start) as u64;
+    }
+    let kb: u64 = big.values().map(|&n| ((spans[n].2 - spans[n].1) >> 10) as u64).sum();
+    crate::lab::spans(big.len() as u64, kb, pieces, pieces_bytes >> 10, exact >> 10);
+}
+
 /// Of `spans` (a copy shaders may be writing, and the span of what a
 /// submission refreshes of it), those [`stale_under_flights`] answers.
 fn stale_of(
@@ -6393,6 +6450,9 @@ impl Host {
             let Batch { spans, ranges, .. } = &mut batch;
             ranges.clear();
             ranges.extend(spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
+            if crate::lab::knob(crate::lab::CUT) != 0 {
+                span_cover(runs, spans);
+            }
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
             crate::watch::ask_once(&batch.ranges);

@@ -648,6 +648,10 @@ fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
     crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, at.saturating_add(len))
 }
 
+/// Runs of pieces ([`ask_run`]) the kernel refused as one asking, and since
+/// when they are kept.
+static REFUSED: Mutex<(Option<std::time::Instant>, BTreeSet<(usize, usize)>)> = Mutex::new((None, BTreeSet::new()));
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`]. Adds what was
@@ -658,10 +662,29 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if let Some(pages) = kernel_written(first, last) {
+    // (Lab: a run the kernel refused is not asked as one again for ten
+    // seconds. The title's 64 MB buffers are reservations of their own that
+    // lie on end: a submission that refreshes sixteen of them made fifteen
+    // askings that failed, of 128 MB to 1 GiB, before the sixteen that
+    // count, in each of four submissions a frame; run 62. Switch `nf`=1: as
+    // made.)
+    let remember = crate::lab::knob(crate::lab::NF) == 0;
+    let known = remember && {
+        let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        if refused.0.is_none_or(|since| since.elapsed().as_secs() >= 10) {
+            refused.0 = Some(std::time::Instant::now());
+            refused.1.clear();
+        }
+        refused.1.contains(&(first, last))
+    };
+    if known {
+        crate::lab::run_known_refused();
+    } else if let Some(pages) = kernel_written(first, last) {
         written.extend(pages);
         asked.push((first, last));
         return;
+    } else if remember {
+        REFUSED.lock().unwrap_or_else(|e| e.into_inner()).1.insert((first, last));
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
     ask_run(a, asked, written);

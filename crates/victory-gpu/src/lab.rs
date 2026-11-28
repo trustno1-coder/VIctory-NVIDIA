@@ -80,9 +80,16 @@ pub(crate) const ONCE: usize = 21;
 /// 133 askings a frame are of 64 MB buffers that lie 64 MB and more apart, 64-88 us each,
 /// where one asking over 1 GiB takes 156 us (run 61).
 pub(crate) const GAP: usize = 22;
+/// 1: per submission, what the refreshes inside each span of 8 MB and more that the write
+/// watch is asked about really cover is counted (the lab line "spans"); 0: not counted.
+pub(crate) const CUT: usize = 23;
+/// 1: a run of ranges the kernel refused as one asking (it crosses two reservations) is
+/// asked as one again each time, as made; 0: it is remembered for ten seconds and asked by
+/// its halves at once (`crate::watch::ask_run`).
+pub(crate) const NF: usize = 24;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 23] = [
+const KNOBS: [(&str, i64); 25] = [
     ("reuse", 1),
     ("zero", 1),
     ("a", 0),
@@ -106,8 +113,10 @@ const KNOBS: [(&str, i64); 23] = [
     ("spin", 0),
     ("once", 0),
     ("gap", 0),
+    ("cut", 0),
+    ("nf", 0),
 ];
-static VALUES: [AtomicI64; 23] = [const { AtomicI64::new(0) }; 23];
+static VALUES: [AtomicI64; 25] = [const { AtomicI64::new(0) }; 25];
 
 /// Switch `p`, asked by the submitting thread before each submission: its
 /// priority is "highest" with 1 or 2, "above normal" (as made) with 0. (The
@@ -595,6 +604,21 @@ static ASK_SIZES: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 
 /// Its askings of 8 MB and more, by where they begin (MB) and their size (MB): how often, and
 /// the nanoseconds.
+/// Spans of 8 MB and more a submission asks about (switch `cut`): how many, their KiB, the
+/// pieces their refreshes make when joined across gaps under 1 MB, those pieces' KiB, and
+/// the KiB of the refreshes alone; then the runs asked by halves at once (switch `nf`).
+static SPANS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(crate) fn spans(n: u64, kb: u64, pieces: u64, pieces_kb: u64, exact_kb: u64) {
+    for (to, add) in SPANS.iter().zip([n, kb, pieces, pieces_kb, exact_kb]) {
+        to.fetch_add(add, Relaxed);
+    }
+}
+
+pub(crate) fn run_known_refused() {
+    SPANS[5].fetch_add(1, Relaxed);
+}
+
 static ASK_BIG: std::sync::Mutex<Vec<(usize, usize, u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
 /// One asking of the kernel's write watch, begun at `began`, about `kb`
@@ -1015,6 +1039,20 @@ pub(crate) fn log(frames: f64) {
             a[5] / 1024.0,
             a[6],
             a[7] / 1e6
+        );
+    }
+    let sp: Vec<f64> = SPANS.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    if sp[0] > 0.0 || sp[5] > 0.0 {
+        tracing::info!(
+            "spans of 8 MB and more the submissions ask the write watch about, per frame (lab, cut): {:.1} spans over {:.0} MB; their \
+             refreshes joined across gaps under 1 MB make {:.1} pieces over {:.0} MB, the refreshes alone are {:.1} MB; runs asked by \
+             halves at once because the kernel refused them before (nf): {:.1}",
+            sp[0],
+            sp[1] / 1024.0,
+            sp[2],
+            sp[3] / 1024.0,
+            sp[4] / 1024.0,
+            sp[5]
         );
     }
     let sizes: Vec<f64> = ASK_SIZES.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
