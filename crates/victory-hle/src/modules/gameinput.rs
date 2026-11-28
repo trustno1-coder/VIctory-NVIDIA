@@ -80,10 +80,8 @@ const DEVICES: usize = PADS + 3;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. The letters are
-/// where a US keyboard has them ([`pad_key`]): the same keys under the
-/// fingers on every layout (Z/Q/S/D on AZERTY).
+/// Scripted keys (`VICTORY_KEYS`) on a real pad: (key, button). The keyboard
+/// itself goes through the key map ([`fallback`]).
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
@@ -125,19 +123,6 @@ const LETTER_POSITIONS: [(u32, u8); 16] = [
 /// The scan code of the stand-in pad's letter `vk` on a US layout.
 fn letter_position(vk: u8) -> Option<u32> {
     LETTER_POSITIONS.iter().find(|(_, letter)| *letter == vk).map(|&(scan, _)| scan)
-}
-
-/// Which of the stand-in pad's keys `key` is. A letter key counts by where
-/// it is, not by what the layout prints on it: with the virtual key, an
-/// AZERTY keyboard had forward on the key marked W, in the bottom row. Other
-/// keys (Esc, Enter, the arrows) are the same key on every layout. 0: a
-/// letter key in none of the pad's places.
-fn pad_key(key: &KeyState) -> u8 {
-    match LETTER_POSITIONS.iter().find(|(scan, _)| *scan == key.scan_code) {
-        Some(&(_, letter)) => letter,
-        None if key.virtual_key.is_ascii_uppercase() => 0,
-        None => key.virtual_key,
-    }
 }
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
@@ -208,26 +193,55 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| pad_key(k) == vk) {
-            1.0
-        } else {
-            0.0
-        }
-    };
+/// The stand-in pad from the keys and mouse buttons held, by the key map
+/// (`victory_gpu::keymap`: PC-style defaults, changed in the F1 menu).
+fn fallback(keys: &[KeyState], mouse_buttons: u32) -> PadState {
+    // Letters by their place (`keymap::by_place`): WASD under the fingers on AZERTY too.
+    let vks: Vec<u8> = keys.iter().map(|k| victory_gpu::keymap::by_place(k.virtual_key, k.scan_code)).collect();
+    pad_of(victory_gpu::keymap::stand_in(&vks, mouse_buttons))
+}
+
+/// A pad from which controls are pressed, in `keymap::CONTROLS` order.
+fn pad_of(on: [bool; 24]) -> PadState {
+    let at = |i: usize| f32::from(u8::from(on[i]));
+    const BUTTONS: [u32; 16] =
+        [A, B, X, Y, LEFT_SHOULDER, RIGHT_SHOULDER, 0, 0, LEFT_STICK, RIGHT_STICK, VIEW, MENU, UP, DOWN, LEFT, RIGHT];
     PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        buttons: BUTTONS.iter().enumerate().filter(|&(i, _)| on[i]).fold(0, |all, (_, bit)| all | bit),
+        left_trigger: at(6),
+        right_trigger: at(7),
+        left_y: at(16) - at(17),
+        left_x: at(19) - at(18),
+        right_y: at(20) - at(21),
+        right_x: at(23) - at(22),
     }
+}
+
+/// The mouse on the stand-in pad: motion since the last poll on the right
+/// stick (camera); its buttons go through the key map. The title registers
+/// callbacks for pads and keyboards only (kinds 0x40000 and 0x10, never 0x20)
+/// and reads no mouse device, so the mouse reaches it as a pad, as the
+/// keyboard does. `scale` is stick deflection per count (0: off).
+///
+/// The stick stops at full deflection; what a fast move pushes past it is
+/// kept in `rest` and given in the next polls (up to [`LOOK_REST`] polls of
+/// full stick), so the whole move turns the camera, only over a little more time.
+const LOOK_REST: f32 = 15.0;
+
+fn mouse_pad((dx, dy): (i64, i64), scale: f32, invert: bool, rest: &mut (f32, f32)) -> PadState {
+    if scale == 0.0 {
+        *rest = (0.0, 0.0);
+        return PadState::default();
+    }
+    let stick = |d: i64, rest: &mut f32| {
+        let want = *rest + d as f32 * scale;
+        let out = want.clamp(-1.0, 1.0);
+        *rest = (want - out).clamp(-LOOK_REST, LOOK_REST);
+        out
+    };
+    // Mouse down is positive, stick up is positive.
+    let dy = if invert { dy } else { -dy };
+    PadState { right_x: stick(dx, &mut rest.0), right_y: stick(dy, &mut rest.1), ..PadState::default() }
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -447,6 +461,10 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// The mouse position of the last poll, for the stand-in pad's stick ([`mouse_pad`]).
+    last_mouse: Option<(i64, i64)>,
+    /// Stick the mouse moved past full deflection, still to give ([`mouse_pad`]).
+    look_rest: (f32, f32),
 }
 
 pub struct Hub {
@@ -494,6 +512,8 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                last_mouse: None,
+                look_rest: (0.0, 0.0),
             }),
             returned: Condvar::new(),
         }));
@@ -582,6 +602,16 @@ impl State {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
+        // The stand-in pad: the keyboard's, with the mouse's look and buttons (`mouse_pad`).
+        let position = mouse.map(|m| (m.position_x, m.position_y));
+        let moved = match (self.last_mouse, position) {
+            (Some((x, y)), Some((nx, ny))) => (nx - x, ny - y),
+            _ => (0, 0),
+        };
+        self.last_mouse = position;
+        let look = mouse_pad(moved, victory_gpu::keymap::mouse_scale(), victory_gpu::keymap::mouse_inverted(), &mut self.look_rest);
+        let buttons = mouse.map_or(0, |m| m.buttons);
+        let fallback = |keys: &[KeyState]| merged(fallback(keys, buttons), look);
         if one_pad {
             let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
@@ -1369,7 +1399,7 @@ mod host {
                 .map(|(i, vk)| KeyState {
                     // A scripted letter is the stand-in pad's key of that
                     // name, where a US layout has it (`pad_key`).
-                    scan_code: Some(vk).filter(|_| i < scripted_keys).and_then(super::letter_position).unwrap_or_else(|| {
+                    scan_code: (i < scripted_keys).then_some(vk).and_then(super::letter_position).unwrap_or_else(|| {
                         // SAFETY: plain query.
                         unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) }
                     }),
@@ -1773,6 +1803,32 @@ mod tests {
     }
 
     #[test]
+    fn mouse_looks_with_the_stand_in_pads_right_stick_and_fires_with_its_triggers() {
+        // Right and up: stick right and up (down when inverted).
+        let mut rest = (0.0, 0.0);
+        let pad = mouse_pad((5, -5), 0.1, false, &mut rest);
+        assert_eq!((pad.right_x, pad.right_y), (0.5, 0.5));
+        assert_eq!(mouse_pad((5, -5), 0.1, true, &mut rest).right_y, -0.5);
+        // A fast flick stops at full deflection, and what is past it comes in
+        // the next polls: 30 counts at 0.1, three polls of full stick.
+        let flick: Vec<f32> = [30, 0, 0, 0].iter().map(|&dx| mouse_pad((dx, 0), 0.1, false, &mut rest).right_x).collect();
+        assert!(flick[..3].iter().all(|&x| (x - 1.0).abs() < 1e-5) && flick[3].abs() < 1e-5, "{flick:?}");
+        // Only so much is kept; scale 0 leaves the pad alone and drops it.
+        mouse_pad((-500, 500), 0.1, false, &mut rest);
+        assert_eq!(rest, (-LOOK_REST, -LOOK_REST));
+        assert_eq!(mouse_pad((9, 9), 0.0, false, &mut rest), PadState::default());
+        assert_eq!(rest, (0.0, 0.0));
+        // The keyboard's stick and the mouse's together: the one pushed further.
+        let both = merged(PadState { right_x: 0.3, ..PadState::default() }, mouse_pad((-8, 0), 0.1, false, &mut rest));
+        assert_eq!(both.right_x, -0.8);
+        // The key map's controls on the pad: Y, the right trigger, W forward, D right.
+        let mut on = [false; 24];
+        (on[3], on[7], on[16], on[19]) = (true, true, true, true);
+        let pad = pad_of(on);
+        assert_eq!((pad.buttons, pad.right_trigger, pad.left_y, pad.left_x), (Y, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
     fn pads_connect_report_and_disconnect() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1840,7 +1896,8 @@ mod tests {
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
+        // The PC layout on foot: W forward, Enter A, D right, C looks behind.
+        let keys = vec![key(b'W'), key(0x0D), key(b'D'), key(b'C')];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
@@ -1857,10 +1914,9 @@ mod tests {
         assert_eq!(
             pad(r),
             PadState {
-                buttons: A,
+                buttons: A | RIGHT_STICK,
                 left_y: 1.0,
-                right_x: 1.0,
-                right_trigger: 1.0,
+                left_x: 1.0,
                 ..Default::default()
             }
         );
@@ -1873,17 +1929,15 @@ mod tests {
     fn the_stand_in_pad_reads_letters_by_their_place() {
         // An AZERTY keyboard: the key above S is marked Z, the one left of S is Q.
         let at = |scan_code, virtual_key| KeyState { scan_code, virtual_key, ..Default::default() };
-        let pad = fallback(&[at(0x11, b'Z'), at(0x1E, b'Q')]);
-        assert_eq!((pad.left_x, pad.left_y, pad.left_trigger), (-1.0, 1.0, 0.0));
-        // Its key marked W is in the bottom row, where the left trigger is; the one marked A is
-        // the left shoulder's.
-        let pad = fallback(&[at(0x2C, b'W'), at(0x10, b'A')]);
-        assert_eq!((pad.left_x, pad.left_y, pad.left_trigger), (0.0, 0.0, 1.0));
-        assert_eq!(pad.buttons, LEFT_SHOULDER);
-        // A letter in none of the pad's places presses nothing (Dvorak's S, right of L).
-        assert_eq!(fallback(&[at(0x27, b'S')]), PadState::default());
+        let pad = fallback(&[at(0x11, b'Z'), at(0x1E, b'Q')], 0);
+        assert_eq!((pad.left_x, pad.left_y), (-1.0, 1.0));
+        // Its key marked A is where Q (take cover) is; the one marked W, in the bottom row, is no key of the map.
+        assert_eq!(fallback(&[at(0x10, b'A')], 0).buttons, RIGHT_SHOULDER);
+        assert_eq!(fallback(&[at(0x2C, b'W')], 0), PadState::default());
+        // A letter in none of the US letters' places presses nothing (Dvorak's S, right of L).
+        assert_eq!(fallback(&[at(0x27, b'S')], 0), PadState::default());
         // Keys that are no letters are the same on every layout.
-        assert_eq!(fallback(&[at(0x1C, 0x0D)]).buttons, A);
+        assert_eq!(fallback(&[at(0x1C, 0x0D)], 0).buttons, A);
     }
 
     #[test]
