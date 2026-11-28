@@ -50,6 +50,111 @@ const MOST: usize = 8 << 20;
 /// out of a host copy, and texture copies out of one.
 pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Whether GPU barriers in `place.rs` and `list.rs` are narrowed to the
+/// touched buffers, textures and shader sync stages instead of emitting
+/// unconditional global `SYNC_ALL` / `UAV_BARRIER(NULL)` drains
+/// (`VICTORY_NARROW_BARRIERS=1`; off by default).
+///
+/// Off by default, every placed copy records two global `SYNC_ALL` barriers
+/// (~52 per frame), and `barrier_groups`, legacy buffer barriers and pipeline
+/// syncs record global `UAV_BARRIER(NULL)` drains even for non-UAV texture
+/// layout transitions or read-only buffer transitions.
+pub(crate) fn narrow_barriers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_NARROW_BARRIERS"))
+}
+
+/// Since the last frame-rate line (when `VICTORY_NARROW_BARRIERS=1`):
+/// `[0]` place buffer barriers narrowed,
+/// `[1..4]` enhanced barrier groups (skipped, narrowed, global fallback),
+/// `[4..7]` legacy buffer barriers (skipped, narrowed, global fallback),
+/// `[7..9]` pipeline syncs (skipped, global).
+pub(crate) static NARROW_STATS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+pub(super) fn log_narrow(frames: f64) {
+    if !narrow_barriers() {
+        return;
+    }
+    let s: Vec<f64> = NARROW_STATS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "narrow barriers per frame (VICTORY_NARROW_BARRIERS=1): place {:.1} narrowed; groups {:.1} skipped, {:.1} narrowed, {:.1} global; \
+         legacy_buf {:.1} skipped, {:.1} narrowed, {:.1} global; sync {:.1} skipped, {:.1} global",
+        s[0],
+        s[1],
+        s[2],
+        s[3],
+        s[4],
+        s[5],
+        s[6],
+        s[7],
+        s[8],
+    );
+}
+
+/// Whether the host D3D12 device supports Enhanced Barriers (`Options12`).
+pub(crate) fn enhanced_barriers(host: &Host) -> bool {
+    static ENHANCED: OnceLock<bool> = OnceLock::new();
+    *ENHANCED.get_or_init(|| {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: a feature structure of its size.
+        let known = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                (&raw mut o).cast(),
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+            )
+        };
+        known.is_ok() && o.EnhancedBarriersSupported.as_bool()
+    })
+}
+
+/// Emits enhanced buffer barriers scoped only to `barriers`.
+///
+/// # Safety
+/// `list` is open; every resource inside `barriers` is live for the list's run.
+unsafe fn buffer_barriers(list: &ID3D12GraphicsCommandList, barriers: &[D3D12_BUFFER_BARRIER]) -> bool {
+    let Ok(list7) = list.cast::<ID3D12GraphicsCommandList7>() else {
+        return false;
+    };
+    let group = [D3D12_BARRIER_GROUP {
+        Type: D3D12_BARRIER_TYPE_BUFFER,
+        NumBarriers: barriers.len() as u32,
+        Anonymous: D3D12_BARRIER_GROUP_0 {
+            pBufferBarriers: barriers.as_ptr(),
+        },
+    }];
+    // SAFETY: caller guarantees open list and live buffer resources.
+    unsafe { list7.Barrier(&group) };
+    NARROW_STATS[0].fetch_add(barriers.len() as u64, Ordering::Relaxed);
+    true
+}
+
+fn buf_barrier(
+    resource: &ID3D12Resource,
+    sync_before: D3D12_BARRIER_SYNC,
+    sync_after: D3D12_BARRIER_SYNC,
+    access_before: D3D12_BARRIER_ACCESS,
+    access_after: D3D12_BARRIER_ACCESS,
+) -> D3D12_BUFFER_BARRIER {
+    D3D12_BUFFER_BARRIER {
+        SyncBefore: sync_before,
+        SyncAfter: sync_after,
+        AccessBefore: access_before,
+        AccessAfter: access_after,
+        pResource: std::mem::ManuallyDrop::new(Some(resource.clone())),
+        Offset: 0,
+        Size: u64::MAX,
+    }
+}
+
+/// Releases the cloned COM pointers held inside `ManuallyDrop` entries of `barriers`.
+fn drop_buf_barriers(barriers: &mut [D3D12_BUFFER_BARRIER]) {
+    for b in barriers {
+        // SAFETY: each entry was created with `ManuallyDrop::new(Some(resource.clone()))` once.
+        unsafe { std::mem::ManuallyDrop::drop(&mut b.pResource) };
+    }
+}
+
 /// What the CPU does at submission for a copy at its place in a list.
 pub(super) struct Placed {
     pub(super) dst: usize,
@@ -132,19 +237,7 @@ pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bo
 /// # Safety
 /// An open list.
 unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
-    static ENHANCED: OnceLock<bool> = OnceLock::new();
-    let enhanced = *ENHANCED.get_or_init(|| {
-        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
-        // SAFETY: a feature structure of its size.
-        let known = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS12,
-                (&raw mut o).cast(),
-                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
-            )
-        };
-        known.is_ok() && o.EnhancedBarriersSupported.as_bool()
-    });
+    let enhanced = enhanced_barriers(host);
     // SAFETY: the caller's.
     unsafe {
         if enhanced && let Ok(list) = list.cast::<ID3D12GraphicsCommandList7>() {
@@ -217,9 +310,53 @@ impl HostList {
         let at = to.offset(dst as u64);
         // What the title's CPU wrote around and under it so far goes first.
         to.refresh(self, dst as u64, len as u64);
+        let narrow = narrow_barriers() && enhanced_barriers(host);
         // SAFETY (both): an open list; live buffers (the list holds the
         // copies and its scratch memory), ranges inside them.
-        unsafe { wait_for_all(host, &self.list) };
+        if narrow {
+            let mut pre = Vec::with_capacity(2);
+            if let Some(from) = &own {
+                if from.buffer.as_raw() == to.buffer.as_raw() {
+                    pre.push(buf_barrier(
+                        &to.buffer,
+                        D3D12_BARRIER_SYNC_ALL,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_ACCESS_COMMON,
+                        D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                    ));
+                } else {
+                    pre.push(buf_barrier(
+                        &from.buffer,
+                        D3D12_BARRIER_SYNC_ALL,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_ACCESS_COMMON,
+                        D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                    ));
+                    pre.push(buf_barrier(
+                        &to.buffer,
+                        D3D12_BARRIER_SYNC_ALL,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_ACCESS_COMMON,
+                        D3D12_BARRIER_ACCESS_COPY_DEST,
+                    ));
+                }
+            } else {
+                pre.push(buf_barrier(
+                    &to.buffer,
+                    D3D12_BARRIER_SYNC_ALL,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_ACCESS_COMMON,
+                    D3D12_BARRIER_ACCESS_COPY_DEST,
+                ));
+            }
+            let ok = unsafe { buffer_barriers(&self.list, &pre) };
+            drop_buf_barriers(&mut pre);
+            if !ok {
+                unsafe { wait_for_all(host, &self.list) };
+            }
+        } else {
+            unsafe { wait_for_all(host, &self.list) };
+        }
         match (&own, &scratch) {
             (Some(from), _) => {
                 from.refresh(self, src as u64, len as u64);
@@ -230,8 +367,37 @@ impl HostList {
                     };
                     unsafe {
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                        wait_for_all(host, &self.list);
+                        if narrow {
+                            let mut mid = [
+                                buf_barrier(
+                                    &between,
+                                    D3D12_BARRIER_SYNC_COPY,
+                                    D3D12_BARRIER_SYNC_COPY,
+                                    D3D12_BARRIER_ACCESS_COPY_DEST,
+                                    D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                                ),
+                                buf_barrier(
+                                    &to.buffer,
+                                    D3D12_BARRIER_SYNC_COPY,
+                                    D3D12_BARRIER_SYNC_COPY,
+                                    D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                                    D3D12_BARRIER_ACCESS_COPY_DEST,
+                                ),
+                            ];
+                            let ok = buffer_barriers(&self.list, &mid);
+                            drop_buf_barriers(&mut mid);
+                            if !ok {
+                                self.list.ResourceBarrier(&[transition(
+                                    &between,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                )]);
+                                wait_for_all(host, &self.list);
+                            }
+                        } else {
+                            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                            wait_for_all(host, &self.list);
+                        }
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
                 } else {
@@ -244,7 +410,25 @@ impl HostList {
             },
             (None, None) => return false,
         }
-        unsafe { wait_for_all(host, &self.list) };
+        if narrow {
+            let mut post = [buf_barrier(
+                &to.buffer,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_SYNC_ALL,
+                D3D12_BARRIER_ACCESS_COPY_DEST,
+                D3D12_BARRIER_ACCESS_COMMON,
+            )];
+            // SAFETY: an open list; live destination buffer.
+            let ok = unsafe { buffer_barriers(&self.list, &post) };
+            drop_buf_barriers(&mut post);
+            if !ok {
+                // SAFETY: an open list.
+                unsafe { wait_for_all(host, &self.list) };
+            }
+        } else {
+            // SAFETY: an open list.
+            unsafe { wait_for_all(host, &self.list) };
+        }
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
@@ -273,12 +457,42 @@ impl HostList {
         let between = self.between(host, len as u64)?;
         from.refresh(self, src as u64, len as u64);
         STATS[3].fetch_add(1, Ordering::Relaxed);
+        let narrow = narrow_barriers() && enhanced_barriers(host);
         // SAFETY: an open list; live buffers, ranges inside them.
         unsafe {
-            wait_for_all(host, &self.list);
-            self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
-            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            wait_for_all(host, &self.list);
+            if narrow {
+                let mut pre = [buf_barrier(
+                    &from.buffer,
+                    D3D12_BARRIER_SYNC_ALL,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_ACCESS_COMMON,
+                    D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                )];
+                let ok = buffer_barriers(&self.list, &pre);
+                drop_buf_barriers(&mut pre);
+                if !ok {
+                    wait_for_all(host, &self.list);
+                }
+                self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
+                let mut post = [buf_barrier(
+                    &between,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_ACCESS_COPY_DEST,
+                    D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                )];
+                let ok = buffer_barriers(&self.list, &post);
+                drop_buf_barriers(&mut post);
+                if !ok {
+                    self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    wait_for_all(host, &self.list);
+                }
+            } else {
+                wait_for_all(host, &self.list);
+                self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
+                self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                wait_for_all(host, &self.list);
+            }
         }
         Some(between)
     }

@@ -180,6 +180,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_TEXTURE_NO_WAIT", label: "TEXTURE NO WAIT", values: ON_UNSET, live: false },
     Item { var: "VICTORY_RELAY", label: "RELAY (SPEED, TRIANGLES)", values: STAGES, live: false },
     Item { var: "VICTORY_CARD_STEPS", label: "CARD STEPS", values: STAGES, live: false },
+    Item { var: "VICTORY_NARROW_BARRIERS", label: "NARROW GPU BARRIERS", values: UNSET_ON, live: false },
     Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
     Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: "CARD COMPARES FROM (KB)", values: &[("64", "64"), ("1024", "1024")], live: false },
     Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },

@@ -4178,6 +4178,7 @@ fn late_line(frames: f64) {
             t[3],
         );
     }
+    place::log_narrow(frames);
     card_steps::log(frames);
     crate::port::log(frames);
     crate::picked::log(frames);
@@ -4201,7 +4202,7 @@ pub(crate) mod indirects;
 mod font;
 mod menu;
 mod panel;
-mod place;
+pub(crate) mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
