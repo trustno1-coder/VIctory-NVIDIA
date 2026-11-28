@@ -73,15 +73,18 @@ impl Mode {
         }
     }
 
-    /// The mode the Series S profile can run: DLAA's scene at the output's
-    /// full size does not fit the title's Series S memory. Its allocator
-    /// fails on a render target of that size (0x882000 bytes) during
-    /// loading and stops the title at its fatal-error break
-    /// (0x80000003 at +0x2219650, #663, with or without frame generation),
-    /// so DLAA runs at Quality's scale there, the Series S title's own (2/3).
-    /// Series X is unchanged: DLAA runs there.
-    pub fn for_profile(self, series_s: bool) -> Self {
-        if series_s && self == Mode::Dlaa { Mode::Quality } else { self }
+    /// The mode the title has room for. Its memory is laid out for its own
+    /// scene size (Series S 1280x720, Series X 2560x1440: 2/3 of the output),
+    /// and a larger scene does not fit: its allocator fails on a render
+    /// target of that size during loading and stops the title at its
+    /// fatal-error break (0x80000003 at +0x2219650, #663, with or without
+    /// frame generation): 0x882000 bytes for Series S at 1080p, 0x1fe0000
+    /// (3840x2176 R11G11B10) for Series X at 2160p. DLAA's scene is the
+    /// output's full size, so it runs only where that is no larger than the
+    /// title's own (`full_size_fits`: Series X with the 1440p output), and
+    /// at Quality's scale (the title's own, 2/3) everywhere else.
+    pub fn for_scene(self, full_size_fits: bool) -> Self {
+        if !full_size_fits && self == Mode::Dlaa { Mode::Quality } else { self }
     }
 
     /// The render size the title makes of `output` at this scale (it
@@ -402,10 +405,10 @@ mod tests {
         assert_eq!(Mode::from_name("ultra-performance"), Some(Mode::UltraPerformance));
         assert_eq!(Mode::from_name("fast"), None);
         assert_eq!(Mode::Balanced.ffx_mode(), 2);
-        // #663: no DLAA on Series S; every other mode, and Series X, unchanged.
-        assert_eq!(Mode::Dlaa.for_profile(true), Mode::Quality);
-        assert_eq!(Mode::Dlaa.for_profile(false), Mode::Dlaa);
-        assert_eq!(Mode::Performance.for_profile(true), Mode::Performance);
+        // #663: DLAA only where its full-size scene fits; every other mode unchanged.
+        assert_eq!(Mode::Dlaa.for_scene(false), Mode::Quality);
+        assert_eq!(Mode::Dlaa.for_scene(true), Mode::Dlaa);
+        assert_eq!(Mode::Performance.for_scene(false), Mode::Performance);
         assert_eq!(preset("K"), Some(11));
         assert_eq!(preset("default"), Some(0));
         assert_eq!(preset("a"), None);
