@@ -192,6 +192,8 @@ struct Cli {
     command: Command,
 }
 
+// Parsed once at start: the size of its largest variant does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
@@ -300,6 +302,11 @@ enum Command {
     Preload {
         /// The title's folder (default: the configured game folder).
         paths: Vec<PathBuf>,
+        /// Threads and processes for each of its steps, to leave the rest of
+        /// the PC free (default: `VICTORY_PRELOAD_JOBS`, else each step's
+        /// own: every core to translate, two thirds of them to make).
+        #[arg(long)]
+        jobs: Option<usize>,
     },
     /// Play: the title with this fork's settings, as a start with no
     /// command at all does (a double click on the program beside the
@@ -482,7 +489,7 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         #[cfg(windows)]
-        Command::Preload { paths } => {
+        Command::Preload { paths, jobs } => {
             // F1's CLEAR SHADERS, asked of this start (the script launcher asks a preload
             // and a clear of the same start): the old caches go before the preload fills
             // the folder again. The ask is taken back with the answer, and the script
@@ -490,10 +497,17 @@ fn main() -> Result<()> {
             if play::asked_to_clear_shaders() {
                 play::clear_shader_caches();
             }
+            // The launcher and the F1 menu's restart pass it as a switch.
+            let jobs = jobs
+                .or_else(|| std::env::var("VICTORY_PRELOAD_JOBS").ok()?.trim().parse().ok())
+                .filter(|&n| n > 0);
+            if let Some(n) = jobs {
+                println!("Preloading on {n} threads at a time (VICTORY_PRELOAD_JOBS / --jobs).");
+            }
             play::explain_preload();
-            translate::precompile(paths, None)?;
-            warm::run(None, None, false, false, None)?;
-            warm::into_library(None)
+            translate::precompile(paths, jobs)?;
+            warm::run(jobs, None, false, false, None)?;
+            warm::into_library(jobs)
         }
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),
@@ -577,6 +591,20 @@ fn show_config() -> Result<()> {
     Ok(())
 }
 
+/// Paths given on the command line, or the configured game + test titles.
+pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    if !paths.is_empty() {
+        return Ok(paths);
+    }
+    let cfg = victory_core::Config::load()?;
+    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
+    anyhow::ensure!(
+        !all.is_empty(),
+        "no paths given and none configured (see victory.example.toml)"
+    );
+    Ok(all)
+}
+
 #[cfg(test)]
 mod tests {
     /// A D3D12Core.dll's VS_FIXEDFILEINFO: signature, structure version, then
@@ -606,24 +634,10 @@ mod tests {
         let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap();
         if let Ok(dll) = std::fs::read(system.join("System32").join("D3D12Core.dll")) {
             let v = super::exported_sdk_version(&dll).expect("System32's D3D12Core.dll exports D3D12SDKVersion");
-            assert!(v >= 4, "{v}");
-            assert!((4..=614).contains(&super::os_runtime()));
+            // Older Windows runtimes may export versions below 4.
+            assert_eq!(super::os_runtime(), v.min(614));
         }
         assert_eq!(super::exported_sdk_version(&[0u8; 64]), None);
         assert_eq!(super::exported_sdk_version(b"MZ"), None);
     }
-}
-
-/// Paths given on the command line, or the configured game + test titles.
-pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    if !paths.is_empty() {
-        return Ok(paths);
-    }
-    let cfg = victory_core::Config::load()?;
-    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
-    anyhow::ensure!(
-        !all.is_empty(),
-        "no paths given and none configured (see victory.example.toml)"
-    );
-    Ok(all)
 }
