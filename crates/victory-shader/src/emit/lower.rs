@@ -957,16 +957,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                     Err(why) if check => return Err((inst.machine.offset, why)),
                     Err(_) => (Wave::Mixed, false),
                 };
-                // the same test as `Lower::inst`'s `effect`
-                let effect = matches!(inst.fields, Fields::Exp { .. })
-                    || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
-                    || name.contains("store")
-                    || name.contains("atomic")
-                    || matches!(inst.fields, Fields::Ds { .. })
-                        && !(name.starts_with("ds_read")
-                            || name.starts_with("ds_swizzle")
-                            || name.contains("permute"));
-                if check && effect && !reserved && first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                if check && has_memory_or_export_side_effect(inst) && !reserved && first_mask(firsts, inst.read(Reg::S(EXEC))) {
                     return Err((inst.machine.offset, EFFECT));
                 }
                 let guarded = st.guards[b][i].is_some();
@@ -1711,15 +1702,20 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
-fn whole_wave_side_effect(inst: &Inst) -> bool {
+fn has_memory_or_export_side_effect(inst: &Inst) -> bool {
     let name = inst.name();
-    matches!(inst.fields, Fields::Exp { .. } | Fields::Buffer { lds: true, .. } | Fields::Flat { lds: true, .. })
+    matches!(inst.fields, Fields::Exp { .. })
         || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
         || name.contains("store")
         || name.contains("atomic")
-        || name == "s_barrier"
         || matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_read") || name.starts_with("ds_swizzle") || name.contains("permute"))
+}
+
+fn whole_wave_side_effect(inst: &Inst) -> bool {
+    has_memory_or_export_side_effect(inst)
+        || inst.name() == "s_barrier"
+        || matches!(inst.fields, Fields::Buffer { lds: true, .. } | Fields::Flat { lds: true, .. })
 }
 
 impl<'a> Lower<'a> {
@@ -6142,15 +6138,7 @@ impl<'a> Lower<'a> {
         if self.pairs.is_some() && self.mask_ok && reads_mask_as_data(self.x.st, inst) {
             self.exchange_first(inst);
         }
-        let effect = matches!(inst.fields, Fields::Exp { .. })
-            || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
-            || name.contains("store")
-            || name.contains("atomic")
-            || name == "s_barrier"
-            || matches!(inst.fields, Fields::Ds { .. })
-                && !(name.starts_with("ds_read")
-                    || name.starts_with("ds_swizzle")
-                    || name.contains("permute"));
+        let effect = has_memory_or_export_side_effect(inst) || name == "s_barrier";
         if self.split_lds
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
