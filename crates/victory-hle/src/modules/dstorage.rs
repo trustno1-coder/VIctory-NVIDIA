@@ -27,7 +27,8 @@ use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
 
@@ -219,11 +220,12 @@ extern "system" fn create_queue(
     let id = lanes.next_id;
     lanes.next_id += 1;
     let lane = Lane::new(desc.priority, desc.capacity);
+    let unsubmitted = lane.unsubmitted.clone();
     lanes.lanes.insert(id, lane);
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id, unsubmitted }),
     )
 }
 
@@ -513,14 +515,83 @@ static STATUS_VTABLE: Methods<5> = Methods([
 
 // Queues.
 
-/// A queue object: its lane in the scheduler.
+/// A queue object: its lane in the scheduler, and what it holds that is not
+/// submitted yet.
 struct Queue {
     id: u64,
+    unsubmitted: Arc<Unsubmitted>,
 }
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        close_lane(self.id);
+        close_lane(self.id, &self.unsubmitted);
+    }
+}
+
+/// A queue's commands enqueued and not yet submitted, under a lock of the
+/// queue's own: the title enqueues up to 4,095 requests a batch, and each
+/// took the scheduler's lock, which every worker takes to start and to
+/// finish a read (`VICTORY_DSTORAGE_QUEUE_LOCAL=0`: so it is again). They go
+/// to the scheduler at a submit, under both locks, this one first (as
+/// everywhere both are taken), so batches keep their order.
+struct Unsubmitted {
+    pending: Mutex<Pending>,
+    /// What the scheduler holds of the queue ([`Lane::held`]): stored under
+    /// the scheduler's lock whenever that changes. It grows only at a submit,
+    /// under `pending`'s lock too, so whoever holds that one and finds room
+    /// has it.
+    held: AtomicUsize,
+    capacity: usize,
+}
+
+#[derive(Default)]
+struct Pending {
+    commands: Vec<Command>,
+    closed: bool,
+}
+
+// SAFETY: as for `Lane`.
+unsafe impl Send for Pending {}
+
+impl Unsubmitted {
+    fn lock(&self) -> MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Whether a queue keeps what is not submitted under its own lock, and a
+/// submit wakes a worker for each new read and no more
+/// (`VICTORY_DSTORAGE_QUEUE_LOCAL=0`: every enqueue takes the scheduler's
+/// lock, and a submit wakes every worker, as before; [`Unsubmitted`]).
+fn queue_local() -> bool {
+    #[cfg(test)]
+    if let Some(on) = QUEUE_LOCAL_IN_TEST.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_QUEUE_LOCAL").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`queue_local`], for this thread's enqueues and submits.
+    static QUEUE_LOCAL_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The workers started ([`scheduler`]).
+static WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// After `reads` new reads were submitted: a worker for each, as many as
+/// there are ([`queue_local`]; else all of them). A worker goes on to the
+/// next read when it is done with one, so none waits for a worker that was
+/// not woken.
+fn wake(scheduler: &Scheduler, reads: usize) {
+    if !queue_local() {
+        scheduler.work.notify_all();
+        return;
+    }
+    for _ in 0..reads.min(WORKERS.load(Ordering::Relaxed).max(1)) {
+        scheduler.work.notify_one();
     }
 }
 
@@ -569,11 +640,10 @@ struct Lanes {
 /// A queue's requests in the scheduler.
 struct Lane {
     class: usize,
-    capacity: usize,
     /// Bytes started, for round robin among the lanes of a class.
     clock: u64,
-    /// Enqueued, not yet submitted.
-    unsubmitted: Vec<Command>,
+    /// Enqueued, not yet submitted (the queue's, under its own lock).
+    unsubmitted: Arc<Unsubmitted>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Read)>,
@@ -660,6 +730,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
+        WORKERS.store(started, Ordering::Relaxed);
         tracing::info!(workers = started, priority, "dstorage: workers (VICTORY_DSTORAGE_WORKERS, VICTORY_DSTORAGE_PRIORITY)");
     });
     Some(scheduler)
@@ -900,14 +971,17 @@ impl Lanes {
                 lane.failures.insert(job.seq, hr);
             }
             lane.flush();
+            lane.held_now();
         }
     }
 
-    /// Moves a queue's enqueued commands to the workers; `early` when the
-    /// title has not asked for it ([`queue`]).
-    fn submit(&mut self, id: u64, early: bool) {
+    /// Moves a queue's enqueued commands, `commands` (taken from its
+    /// [`Unsubmitted`], whose lock the caller holds), to the workers; `early`
+    /// when the title has not asked for it ([`queue`]). How many reads they
+    /// held.
+    fn submit(&mut self, id: u64, commands: Vec<Command>, early: bool) -> usize {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
-            return;
+            return 0;
         };
         // A class that had nothing waiting starts from now, not from the
         // credit it left behind.
@@ -919,24 +993,28 @@ impl Lanes {
             self.clock[class] = self.clock[class].max(self.now);
         }
         let Some(lane) = self.lanes.get_mut(&id) else {
-            return;
+            return 0;
         };
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        trace_batch(id, &lane.unsubmitted, early);
-        for command in std::mem::take(&mut lane.unsubmitted) {
+        trace_batch(id, &commands, early);
+        let mut reads = 0;
+        for command in commands {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
                 Command::Read(mut read) => {
                     read.note.submitted(&read.request, early);
                     lane.reads.push_back((seq, read));
+                    reads += 1;
                 }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
         lane.flush();
+        lane.held_now();
+        reads
     }
 }
 
@@ -944,9 +1022,12 @@ impl Lane {
     fn new(priority: i8, capacity: u16) -> Lane {
         Lane {
             class: priority.clamp(-1, 1).wrapping_add(1) as usize,
-            capacity: usize::from(capacity),
             clock: 0,
-            unsubmitted: Vec::new(),
+            unsubmitted: Arc::new(Unsubmitted {
+                pending: Mutex::default(),
+                held: AtomicUsize::new(0),
+                capacity: usize::from(capacity),
+            }),
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
@@ -955,9 +1036,15 @@ impl Lane {
         }
     }
 
-    /// Requests and status entries held, submitted or not.
-    fn entries(&self) -> usize {
-        self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
+    /// Requests and status entries submitted and held: not started, not
+    /// written, running.
+    fn held(&self) -> usize {
+        self.reads.len() + self.statuses.len() + self.running.len()
+    }
+
+    /// Tells the queue ([`Unsubmitted::held`]); after every change.
+    fn held_now(&self) {
+        self.unsubmitted.held.store(self.held(), Ordering::SeqCst);
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -1000,18 +1087,24 @@ fn staging_bytes(request: &Request) -> u64 {
 
 /// Ends a queue: what was not started is dropped, and this waits for the
 /// reads already running (they write title memory).
-fn close_lane(id: u64) {
+fn close_lane(id: u64, unsubmitted: &Unsubmitted) {
     let Some(scheduler) = scheduler() else {
         return;
     };
+    let dropped = {
+        let mut pending = unsubmitted.lock();
+        pending.closed = true;
+        std::mem::take(&mut pending.commands)
+    };
+    drop(dropped); // releases their arrays
     let mut lanes = scheduler.lock();
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
     };
     lane.closed = true;
-    lane.unsubmitted.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
+    lane.held_now();
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
             .finished
@@ -1329,44 +1422,56 @@ fn half_submits() -> bool {
 
 /// Adds a command to the queue; blocks while the queue is full. A queue
 /// that is full of commands nobody submitted submits itself, since nothing
-/// else could make room.
+/// else could make room. Takes the queue's lock alone while it has room
+/// ([`Unsubmitted`]), the scheduler's too when it is full.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
-    let id = unsafe { &*this }.state.id;
+    let queue = &unsafe { &*this }.state;
+    let (id, unsubmitted) = (queue.id, &*queue.unsubmitted);
     let Some(scheduler) = scheduler() else {
         return;
     };
-    let mut lanes = scheduler.lock();
-    loop {
-        let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
+    let local = queue_local();
+    // One slot stays free, as the console's count of empty slots says.
+    let room = |pending: &Pending, held: usize| pending.commands.len() + held + 1 < unsubmitted.capacity.max(2);
+    let mut pending = unsubmitted.lock();
+    let lanes = loop {
+        if pending.closed {
             return; // closed: dropped (a status releases its array)
-        };
-        // One slot stays free, as the console's count of empty slots says.
-        if lane.entries() + 1 < lane.capacity.max(2) {
-            break;
         }
-        if !lane.unsubmitted.is_empty() && lane.reads.is_empty() && lane.running.is_empty() {
+        if local && room(&pending, unsubmitted.held.load(Ordering::SeqCst)) {
+            break None;
+        }
+        let mut lanes = scheduler.lock();
+        let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
+            return;
+        };
+        if room(&pending, lane.held()) {
+            break Some(lanes);
+        }
+        if !pending.commands.is_empty() && lane.reads.is_empty() && lane.running.is_empty() {
             tracing::warn!(
                 queue = id,
-                commands = lane.unsubmitted.len(),
+                commands = pending.commands.len(),
                 "dstorage: a queue full of commands that are not submitted submits itself"
             );
-            lanes.submit(id, true);
-            scheduler.work.notify_all();
+            let commands = std::mem::take(&mut pending.commands);
+            let reads = lanes.submit(id, commands, true);
+            wake(scheduler, reads);
             continue;
         }
-        lanes = scheduler
-            .finished
-            .wait(lanes)
-            .unwrap_or_else(|e| e.into_inner());
-    }
-    let Some(lane) = lanes.lanes.get_mut(&id) else {
-        return;
+        // (The queue's lock let go while this waits: the title's submit
+        // takes it. Taken again first, before the scheduler's.)
+        drop(pending);
+        drop(scheduler.finished.wait(lanes).unwrap_or_else(|e| e.into_inner()));
+        pending = unsubmitted.lock();
     };
-    lane.unsubmitted.push(command);
-    if half_submits() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id, true);
-        scheduler.work.notify_all();
+    pending.commands.push(command);
+    if half_submits() && pending.commands.len() >= (unsubmitted.capacity / 2).max(1) {
+        let mut lanes = lanes.unwrap_or_else(|| scheduler.lock());
+        let commands = std::mem::take(&mut pending.commands);
+        let reads = lanes.submit(id, commands, true);
+        wake(scheduler, reads);
     }
 }
 
@@ -1376,15 +1481,16 @@ fn queue(this: QueueRef, command: Command) {
 extern "system" fn submit(this: QueueRef) {
     let _called = victory_gpu::timeline::span("the title's DirectStorage Submit");
     // SAFETY: as above.
-    let id = unsafe { &*this }.state.id;
+    let queue = &unsafe { &*this }.state;
     let Some(scheduler) = scheduler() else {
         return;
     };
-    let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
-    tracing::debug!(commands = pending, "dstorage: submit");
-    lanes.submit(id, false);
-    scheduler.work.notify_all();
+    let mut pending = queue.unsubmitted.lock();
+    let commands = std::mem::take(&mut pending.commands);
+    tracing::debug!(commands = commands.len(), "dstorage: submit");
+    let reads = scheduler.lock().submit(queue.id, commands, false);
+    drop(pending);
+    wake(scheduler, reads);
 }
 
 /// Ends the queue whatever its reference count: what was not started never
@@ -1392,7 +1498,8 @@ extern "system" fn submit(this: QueueRef) {
 /// finished. The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
-    close_lane(unsafe { &*this }.state.id);
+    let queue = &unsafe { &*this }.state;
+    close_lane(queue.id, &queue.unsubmitted);
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
@@ -2085,6 +2192,197 @@ mod tests {
         assert!(outs[..2].iter().all(|out| out[..] == pattern(64)[8..24]));
     }
 
+    /// A queue of `capacity` entries, normal priority.
+    fn queue_of(capacity: u16) -> *mut c_void {
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc { source_type: 1, capacity, priority: 0, name: c"many".as_ptr(), unknown: 1 };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        queue
+    }
+
+    /// Runs `f` with this thread's enqueues and submits keeping what is not
+    /// submitted under the queue's lock or under the scheduler's.
+    fn queue_locally<T>(on: bool, f: impl FnOnce() -> T) -> T {
+        QUEUE_LOCAL_IN_TEST.set(Some(on));
+        let out = f();
+        QUEUE_LOCAL_IN_TEST.set(None);
+        out
+    }
+
+    /// Four threads, a queue each (of 128 entries), enqueue batches of 100
+    /// copies from memory and a status entry, and submit: each batch waits
+    /// for room left by the one before. Every status entry is written once
+    /// every read before it is done (its bytes are there when it is), in
+    /// either way of keeping what is not submitted.
+    #[test]
+    fn batches_of_many_threads_complete_in_order() {
+        const THREADS: usize = 4;
+        const BATCHES: usize = 12;
+        const READS: usize = 100;
+        const SIZE: usize = 64;
+        let source = pattern(SIZE * READS * BATCHES + 251);
+        for local in [true, false] {
+            std::thread::scope(|s| {
+                for t in 0..THREADS {
+                    let source = &source;
+                    s.spawn(move || {
+                        queue_locally(local, || {
+                            let (queue, array) = (queue_of(128), status_array(BATCHES as u32));
+                            let mut out = vec![0u8; SIZE * READS * BATCHES];
+                            for batch in 0..BATCHES {
+                                for i in 0..READS {
+                                    let at = (batch * READS + i) * SIZE;
+                                    let r = request(
+                                        MEMORY_SOURCE,
+                                        out[at..].as_mut_ptr().cast(),
+                                        SIZE,
+                                        source[at + t..].as_ptr().cast(),
+                                        0,
+                                        SIZE,
+                                    );
+                                    enqueue(queue, &r);
+                                }
+                                enqueue_status(queue, array, batch as u32);
+                                void(queue, 0x30);
+                            }
+                            for batch in (0..BATCHES).rev() {
+                                assert_eq!(wait(array, batch as u32), S_OK);
+                                // Every read before it, this batch's and the
+                                // earlier ones'.
+                                let end = (batch + 1) * READS * SIZE;
+                                // SAFETY: bytes the workers wrote, all done.
+                                let landed = unsafe { std::slice::from_raw_parts(out.as_ptr(), end) };
+                                assert!(landed == &source[t..t + end], "thread {t}, batch {batch}, local {local}");
+                            }
+                            void(queue, 0x40);
+                        })
+                    });
+                }
+            });
+        }
+    }
+
+    /// What the title's enqueues cost while the workers are busy: two
+    /// threads, a queue each of the title's size (4,159 entries), enqueue
+    /// batches of 4,095 copies of 4 KiB from memory and a status entry,
+    /// submit, and wait for the status; every worker the scheduler has runs
+    /// them meanwhile, each taking the scheduler's lock to start and finish
+    /// one. With what is not submitted under each queue's lock and a worker
+    /// woken for each read (after) and under the scheduler's lock with every
+    /// worker woken (before, `VICTORY_DSTORAGE_QUEUE_LOCAL=0`), runs taking
+    /// turns. Run with `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark"]
+    fn enqueues_beside_busy_workers() {
+        const THREADS: usize = 2;
+        const READS: usize = 4095;
+        const SIZE: usize = 4096;
+        const RUNS: usize = 7;
+        const FOR: Duration = Duration::from_millis(1500);
+        let source = pattern(SIZE + 256);
+        // One queue a thread, kept from run to run.
+        let queues: Vec<usize> = (0..THREADS).map(|_| queue_of(4159) as usize).collect();
+        let mut results: [Vec<(f64, f64, f64, f64, f64)>; 2] = [Vec::new(), Vec::new()];
+        println!("workers: {}", WORKERS.load(Ordering::Relaxed));
+        for run in 0..2 * RUNS {
+            let local = run % 2 == 0;
+            let began = Instant::now();
+            let per_thread: Vec<(Vec<Duration>, Vec<Duration>, usize)> = std::thread::scope(|s| {
+                let threads: Vec<_> = queues
+                    .iter()
+                    .enumerate()
+                    .map(|(t, &queue)| {
+                        let source = &source;
+                        s.spawn(move || {
+                            queue_locally(local, || {
+                                let queue = queue as *mut c_void;
+                                let array = status_array(1);
+                                let mut out = vec![0u8; SIZE * 64];
+                                let (mut enqueues, mut batches, mut reads) = (Vec::new(), Vec::new(), 0);
+                                while began.elapsed() < FOR {
+                                    let batch = Instant::now();
+                                    for i in 0..READS {
+                                        let r = request(
+                                            MEMORY_SOURCE,
+                                            out[(i % 64) * SIZE..].as_mut_ptr().cast(),
+                                            SIZE,
+                                            source[t..].as_ptr().cast(),
+                                            0,
+                                            SIZE,
+                                        );
+                                        let one = Instant::now();
+                                        enqueue(queue, &r);
+                                        enqueues.push(one.elapsed());
+                                    }
+                                    enqueue_status(queue, array, 0);
+                                    void(queue, 0x30);
+                                    assert_eq!(wait_busy(array, 0), S_OK);
+                                    batches.push(batch.elapsed());
+                                    reads += READS;
+                                }
+                                void(array, 0x10);
+                                (enqueues, batches, reads)
+                            })
+                        })
+                    })
+                    .collect();
+                threads.into_iter().map(|t| t.join().unwrap()).collect()
+            });
+            let took = began.elapsed().as_secs_f64();
+            let mut enqueues: Vec<Duration> = per_thread.iter().flat_map(|p| p.0.iter().copied()).collect();
+            let mut batches: Vec<Duration> = per_thread.iter().flat_map(|p| p.1.iter().copied()).collect();
+            let reads: usize = per_thread.iter().map(|p| p.2).sum();
+            enqueues.sort_unstable();
+            batches.sort_unstable();
+            let q = |v: &[Duration], q: f64| v[((v.len() - 1) as f64 * q) as usize].as_secs_f64();
+            // The title's thread's time in enqueues, a batch.
+            let a_batch = enqueues.iter().sum::<Duration>().as_secs_f64() * 1e3 / batches.len() as f64;
+            let row = (q(&enqueues, 0.5) * 1e6, q(&enqueues, 0.99) * 1e6, q(&batches, 0.5) * 1e3, reads as f64 / took, a_batch);
+            results[usize::from(!local)].push(row);
+            println!(
+                "run {run} {}: enqueue median {:.2} us, 99th {:.2} us, {:.3} ms a batch; batch median {:.2} ms ({} batches); {:.0} reads/s",
+                if local { "queue's lock (after)" } else { "scheduler's lock (before)" },
+                row.0,
+                row.1,
+                row.4,
+                row.2,
+                batches.len(),
+                row.3,
+            );
+        }
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        for (i, name) in ["queue's lock (after)", "scheduler's lock (before)"].iter().enumerate() {
+            let r = &results[i];
+            println!(
+                "{name}: medians of {RUNS} runs: enqueue median {:.2} us, 99th {:.2} us, {:.3} ms a batch; batch median {:.2} ms; {:.0} reads/s",
+                median(r.iter().map(|x| x.0).collect()),
+                median(r.iter().map(|x| x.1).collect()),
+                median(r.iter().map(|x| x.4).collect()),
+                median(r.iter().map(|x| x.2).collect()),
+                median(r.iter().map(|x| x.3).collect()),
+            );
+        }
+        for queue in queues {
+            void(queue as *mut c_void, 0x40);
+        }
+    }
+
+    /// [`wait`] without the millisecond's sleep, for the benchmark.
+    fn wait_busy(array: *mut c_void, index: u32) -> HRESULT {
+        let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
+        let start = Instant::now();
+        while !done(array, index) {
+            assert!(start.elapsed() < Duration::from_secs(10), "never completed");
+            std::thread::yield_now();
+        }
+        result(array, index)
+    }
+
     #[test]
     fn a_list_that_changes_during_the_write_has_its_new_pages_written() {
         use crate::modules::xmem;
@@ -2249,7 +2547,13 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        lane.unsubmitted.lock().commands.push(Command::Read(Read { request: r, note }));
+    }
+
+    /// [`Lanes::submit`] of what [`read`] enqueued.
+    fn submit_all(lanes: &mut Lanes, id: u64) {
+        let commands = std::mem::take(&mut lanes.lanes[&id].unsubmitted.lock().commands);
+        lanes.submit(id, commands, false);
     }
 
     #[test]
@@ -2263,7 +2567,7 @@ mod tests {
                 read(&mut l, id, 0, 4096);
             }
         }
-        (0..3).for_each(|id| l.submit(id, false));
+        (0..3).for_each(|id| submit_all(&mut l, id));
         let mut started = [0u32; 3];
         for _ in 0..330 {
             let job = l.start().unwrap();
@@ -2283,7 +2587,7 @@ mod tests {
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, 0, 1000); // raw: straight to its destination
-        l.submit(0, false);
+        submit_all(&mut l, 0);
         let first = l.start().unwrap();
         assert!(l.start().is_none(), "60 + 60 > 100");
         l.finish(&first, Ok(()));
@@ -2292,7 +2596,7 @@ mod tests {
         assert_eq!((second.staging, raw.staging), (60, 0));
         // Alone, a request larger than the buffer still runs.
         read(&mut l, 0, ZLIB, 500);
-        l.submit(0, false);
+        submit_all(&mut l, 0);
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
@@ -2309,14 +2613,14 @@ mod tests {
         };
         read(&mut l, 0, 0, 16);
         read(&mut l, 0, 0, 16);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(0));
+        l.lanes[&0].unsubmitted.lock().commands.push(status(0));
         read(&mut l, 0, 0, 16);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(1));
+        l.lanes[&0].unsubmitted.lock().commands.push(status(1));
         // SAFETY: an array we created.
         for entry in unsafe { &(*array).state.entries }.iter() {
             entry.store(E_PENDING, Ordering::Release);
         }
-        l.submit(0, false);
+        submit_all(&mut l, 0);
         let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
         // The last read and the first finish; the second then fails.
         l.finish(&jobs[2], Ok(()));
