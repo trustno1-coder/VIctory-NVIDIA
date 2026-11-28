@@ -363,6 +363,15 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // A mouse and keyboard profile (`VICTORY_MNK_BINDINGS`) hides the cursor over the game window.
+    if message == wm::WM_SETCURSOR
+        && (lparam as u16) == wm::HTCLIENT as u16
+        && super::gameinput::mnk::enabled()
+        && unsafe { wm::GetForegroundWindow() } == hwnd
+    {
+        unsafe { wm::SetCursor(std::ptr::null_mut()) };
+        return 1;
+    }
     if message == wm::WM_SETFOCUS {
         english_input();
     }
