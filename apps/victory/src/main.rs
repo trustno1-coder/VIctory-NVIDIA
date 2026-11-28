@@ -507,6 +507,10 @@ fn main() -> Result<()> {
         Command::GetMfg => play::get_mfg(),
         #[cfg(windows)]
         Command::ShaderModel => {
+            // The card asked: the game's (`victory play` reads the last line, the model).
+            if let Some(card) = victory_hle::streamline::adapter_name() {
+                println!("card {card}");
+            }
             let model = victory_hle::streamline::highest_shader_model();
             if let Some(core) = victory_hle::streamline::d3d12_core_path() {
                 println!("runtime {}", core.display());

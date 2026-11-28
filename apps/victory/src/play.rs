@@ -673,10 +673,11 @@ fn d3d12_dir() -> Result<PathBuf> {
     Ok(program.parent().map(Path::to_path_buf).unwrap_or_default().join("D3D12"))
 }
 
-/// The highest shader model the default GPU runs, asked by a process of our
-/// own (`victory shader-model`: a process keeps the first Direct3D 12 runtime
-/// it loads, and this one is yet to choose). `None`: no answer.
-fn shader_model() -> Option<(u32, u32)> {
+/// The highest shader model the game's GPU runs, and that GPU's name, asked by
+/// a process of our own (`victory shader-model`: a process keeps the first
+/// Direct3D 12 runtime it loads, and this one is yet to choose). `None`: no
+/// answer.
+fn shader_model() -> Option<((u32, u32), Option<String>)> {
     let program = std::env::current_exe().ok()?;
     let out = std::process::Command::new(program)
         .arg("shader-model")
@@ -685,9 +686,15 @@ fn shader_model() -> Option<(u32, u32)> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    read_shader_model(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// What `victory shader-model` printed: the model (the last line with a dot) and the card it
+/// asked (its `card ...` line), so that a refusal names the card it measured (#1035).
+fn read_shader_model(text: &str) -> Option<((u32, u32), Option<String>)> {
     let (major, minor) = text.lines().rev().find_map(|l| l.trim().split_once('.'))?;
-    Some((major.parse().ok()?, minor.parse().ok()?))
+    let card = text.lines().find_map(|l| l.trim().strip_prefix("card ")).map(str::trim).filter(|c| !c.is_empty());
+    Some(((major.parse().ok()?, minor.parse().ok()?), card.map(str::to_owned)))
 }
 
 /// Runs the fetcher: Microsoft's D3D12Core.dll from nuget.org into `to`.
@@ -729,7 +736,8 @@ pub(crate) fn get_d3d12() -> Result<()> {
 /// #123 and discussion #186 found the same refusal).
 fn check_shader_model() -> Result<()> {
     let needed = victory_hle::streamline::SHADER_MODEL_NEEDED;
-    let Some(found) = shader_model() else { return Ok(()) };
+    let Some((found, card)) = shader_model() else { return Ok(()) };
+    let on = card.as_deref().map(|c| format!(" on {c}")).unwrap_or_default();
     let to = d3d12_dir()?;
     let had = to.join("D3D12Core.dll").is_file();
     let windows_10 = !had && crate::windows_build().is_some_and(|build| build < 22000);
@@ -738,7 +746,7 @@ fn check_shader_model() -> Result<()> {
     }
     if !had {
         if found < needed {
-            println!("This PC's Direct3D 12 runs shader model {}.{}, and the game's translated shaders need 6.6.", found.0, found.1);
+            println!("This PC's Direct3D 12 runs shader model {}.{}{on}, and the game's translated shaders need 6.6.", found.0, found.1);
             println!("Windows 10's own Direct3D 12 stops at 6.5; Microsoft's newer runtime (the D3D12 Agility SDK)");
             println!("runs 6.6.");
         } else {
@@ -762,14 +770,14 @@ fn check_shader_model() -> Result<()> {
                 Ok(()) => {
                     // This process is yet to load Direct3D 12: it asks for the file now there.
                     crate::match_d3d12_core();
-                    match shader_model() {
+                    match shader_model().map(|(model, _)| model) {
                         Some(now) if now >= needed => {
                             println!("Shader model {}.{} with Microsoft's runtime. Starting the game.", now.0, now.1);
                             return Ok(());
                         }
                         now => {
                             let now = now.unwrap_or(found);
-                            println!("With Microsoft's runtime the GPU still runs shader model {}.{}.", now.0, now.1);
+                            println!("With Microsoft's runtime the GPU{on} still runs shader model {}.{}.", now.0, now.1);
                         }
                     }
                 }
@@ -782,9 +790,9 @@ fn check_shader_model() -> Result<()> {
         println!("`victory get-d3d12` fetches Microsoft's newer runtime later.");
         return Ok(());
     }
-    let now = shader_model().unwrap_or(found);
+    let now = shader_model().map_or(found, |(model, _)| model);
     anyhow::bail!(
-        "this PC's Direct3D 12 runs shader model {}.{}, and the game needs 6.6: every shader would be \
+        "this PC's Direct3D 12 runs shader model {}.{}{on}, and the game needs 6.6: every shader would be \
          refused and the game would close at once. {}",
         now.0,
         now.1,
@@ -1188,6 +1196,19 @@ mod tests {
         assert!(!older_rtx("NVIDIA RTX A2000") && !older_rtx("AMD Radeon RX 7900 XTX") && !older_rtx(""));
     }
 
+    /// `victory shader-model`'s answer is read as the model and the card asked, so that a
+    /// refusal names the card it measured (#1035); an answer without a card line still reads.
+    #[test]
+    fn the_shader_model_answer_names_its_card() {
+        let answer = "card NVIDIA GeForce RTX 5070 Ti\r\nruntime C:\\WINDOWS\\SYSTEM32\\D3D12Core.dll\r\n6.8\r\n";
+        assert_eq!(read_shader_model(answer), Some(((6, 8), Some("NVIDIA GeForce RTX 5070 Ti".to_owned()))));
+        let older = "runtime C:\\Games\\D3D12\\D3D12Core.dll\r\n6.5\r\n";
+        assert_eq!(read_shader_model(older), Some(((6, 5), None)));
+        // no model: no answer, whatever else was printed
+        let none = "card Intel(R) UHD Graphics 630\r\nruntime C:\\WINDOWS\\SYSTEM32\\D3D12Core.dll\r\nnone\r\n";
+        assert_eq!(read_shader_model(none), None);
+        assert_eq!(read_shader_model(""), None);
+    }
     /// Settings read again after `prepare` clears the others survive it.
     #[test]
     fn paths_and_the_named_card_are_kept() {
