@@ -6,7 +6,7 @@
 //!
 //! Planned areas (driven by census results, not by completeness):
 //! `file` (package paths), `thread` (TLS callbacks for title threads),
-//! `xaudio2`, `xstore` stubs.
+//! `xstore` stubs.
 
 #[cfg(windows)]
 pub mod apu;
@@ -33,6 +33,8 @@ pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
 pub mod xasync;
+#[cfg(windows)]
+pub mod xaudio2;
 pub mod xg;
 pub mod xgame;
 pub mod xgameruntime;
@@ -75,5 +77,7 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(windows)]
+    all.push(xaudio2::module());
     all
 }
