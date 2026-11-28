@@ -1809,6 +1809,28 @@ fn v_cvt_f32_f64_matches_ieee754() {
 }
 
 #[test]
+fn whole_wave_sections_keep_rounding_mode_changes() {
+    let save = 0xBE86_3DC1; // s_or_saveexec_b32 s6, -1
+    let restore = s_mov_b32(126, 6);
+    let inputs = [[0x3F7F_FFFF, 0, 0, 0], [0xBF7F_FFFF, 0, 0, 0]];
+    let convert = vop1(0x0A, 0, sgpr(0));
+
+    let toward_zero = [save, 0xBFA4_000C, restore, convert]; // s_round_mode
+    run_cases(&build_valu_cs(&toward_zero), &inputs, |backend, i, _, got| {
+        assert_eq!(got & 0xffff, [0x3bff, 0xbbff][i], "{backend}");
+    });
+
+    let nearest = [
+        save, 0xBFA4_000C, restore,
+        save, 0xBA80_0881, 0, restore, // s_setreg_imm32_b32 HW_REG_MODE[3:2], 0
+        convert,
+    ];
+    run_cases(&build_valu_cs(&nearest), &inputs, |backend, i, _, got| {
+        assert_eq!(got & 0xffff, [0x3c00, 0xbc00][i], "{backend}");
+    });
+}
+
+#[test]
 fn whole_wave_f64_sum_and_cvt_f32_f64() {
     let s_or_saveexec_b32 =
         |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x3D << 8 | src0 as u32;
