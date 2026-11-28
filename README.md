@@ -85,7 +85,10 @@
   off by default: **F1, MFG UNLOCKER, ON**, then restart. On, the next start
   downloads it by itself from the mod's own GitHub release (v1.7.2, about 5 MB,
   checked against the SHA-256 its author published) into
-  `%LOCALAPPDATA%\victory\mfg-unlocker`, and every start loads it. Nothing is
+  `%LOCALAPPDATA%\victory\mfg-unlocker`, and every start with DLSS frame
+  generation on (or ready) loads it. With frame generation off, or FSR 3 picked,
+  it is left out: it has nothing to unlock there, and with frame generation off
+  it still gave an RTX 3060 black, glitching textures (#955). Nothing is
   renamed or copied. On an RTX 20 or 30 the first start also asks once (No unless
   you type y). `victory.exe get-mfg` downloads it by hand. The mod writes its own
   `RTXMFG-...` logs and settings beside `victory.exe`, and Backspace opens its

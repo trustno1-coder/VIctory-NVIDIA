@@ -92,7 +92,7 @@ fn shown_name(name: &str) -> String {
 const MFG: &str = "VICTORY_MFG_UNLOCKER";
 const ABOUT_MFG: [&str; 3] = [
     "A MOD, NOT OURS: DLSS FRAME GEN ON RTX 20 AND 30 CARDS.",
-    "ON: DOWNLOADED FROM ITS GITHUB AT THE NEXT START, THEN RUN.",
+    "ON: DOWNLOADED FROM ITS GITHUB, RUN WITH DLSS FRAME GEN.",
     "NVIDIA DOES NOT SUPPORT IT. IF THE GAME FAILS, TURN IT OFF.",
 ];
 /// The DLSS setting, and what is said while it is picked on in a start without NVIDIA's files.

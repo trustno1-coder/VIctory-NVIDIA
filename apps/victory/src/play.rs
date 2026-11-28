@@ -25,9 +25,9 @@
 //! MFG Unlocker, someone else's mod that unlocks DLSS Frame Generation on RTX
 //! 20 and 30 cards, is an option (F1, MFG UNLOCKER; off by default, asked once
 //! on such a card): on, it is fetched from its author's GitHub release into
-//! `%LOCALAPPDATA%\victory\mfg-unlocker` and loaded by this program at the
-//! start (`victory get-mfg` fetches it by hand). It writes its own logs and
-//! settings beside the program.
+//! `%LOCALAPPDATA%\victory\mfg-unlocker` and loaded by this program at a start
+//! with DLSS frame generation on or ready (`victory get-mfg` fetches it by
+//! hand). It writes its own logs and settings beside the program.
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
@@ -614,8 +614,9 @@ fn offer_mfg(card: &str, menu_file: &Path) -> bool {
     println!("This card ({card}) runs DLSS, but NVIDIA's DLSS frame generation only on RTX 40 and later.");
     println!("MFG Unlocker, someone else's mod (github.com/dashdogy/MFG-Unlocker, MIT licence, about 5 MB),");
     println!("unlocks it on RTX 20 and 30 cards. NVIDIA does not support that, and it was not tested with");
-    println!("this game. On, it is downloaded now and at every start loaded by victory.exe; F1, MFG UNLOCKER");
-    println!("turns it off again. Off, the game uses AMD's FSR 3 frame generation (2x) on this card.");
+    println!("this game. On, it is downloaded now and loaded by victory.exe at every start with DLSS frame");
+    println!("generation on or ready; F1, MFG UNLOCKER turns it off again. Off, the game uses AMD's FSR 3");
+    println!("frame generation (2x) on this card.");
     print!("Turn MFG Unlocker on? [y/N] ");
     let _ = std::io::stdout().flush();
     let mut answer = String::new();
@@ -650,6 +651,16 @@ fn mfg_dll() -> Option<PathBuf> {
         }
     }
     Some(dll)
+}
+
+/// Whether a start with these settings loads MFG Unlocker: on (F1, MFG UNLOCKER), with DLSS frame
+/// generation on or made ready (`VICTORY_FRAMEGEN=1`), the one thing it unlocks. Without that
+/// (off, AMD's FSR 3 picked, or no DLSS) it would only be someone else's hooks in the game's
+/// DirectX, for nothing: on an RTX 3060 with frame generation off, black and glitching textures
+/// went away once it was off (#955).
+fn mfg_loaded(s: &BTreeMap<String, String>) -> bool {
+    let on = |k: &str| s.get(k).is_some_and(|v| v.trim() == "1");
+    on("VICTORY_MFG_UNLOCKER") && on("VICTORY_FRAMEGEN")
 }
 
 /// Loads MFG Unlocker (`VICTORY_MFG_UNLOCKER_DLL`, set by [`prepare`] with the option on) into
@@ -883,10 +894,16 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     {
         s.insert("VICTORY_MFG_UNLOCKER".to_owned(), "1".to_owned());
     }
+    // Fetched once it is on, as turning it on said; loaded only where it unlocks something.
     if s.get("VICTORY_MFG_UNLOCKER").is_some_and(|v| v == "1")
         && let Some(dll) = mfg_dll()
     {
-        s.insert("VICTORY_MFG_UNLOCKER_DLL".to_owned(), dll.to_string_lossy().into_owned());
+        if mfg_loaded(&s) {
+            s.insert("VICTORY_MFG_UNLOCKER_DLL".to_owned(), dll.to_string_lossy().into_owned());
+        } else {
+            println!("MFG Unlocker is on but not loaded: this start has no DLSS frame generation (off, or");
+            println!("AMD's FSR 3 picked), the one thing it unlocks. A start with it on or ready loads it.");
+        }
     }
     // The first start of this victory.exe (no mark for its bytes yet): the game plays a little
     // and starts again by itself (crates\victory-gpu\src\host\menu.rs, `warmup`), since a new
@@ -1186,6 +1203,30 @@ mod tests {
         assert!(older_rtx("NVIDIA GeForce RTX 3080 Ti") && older_rtx("NVIDIA GeForce RTX 2060 SUPER") && older_rtx("NVIDIA GeForce RTX 3050 Laptop GPU"));
         assert!(!older_rtx("NVIDIA GeForce RTX 5070") && !older_rtx("NVIDIA GeForce RTX 4090") && !older_rtx("NVIDIA GeForce GTX 1080"));
         assert!(!older_rtx("NVIDIA RTX A2000") && !older_rtx("AMD Radeon RX 7900 XTX") && !older_rtx(""));
+    }
+
+    /// MFG Unlocker on is loaded only in a start with DLSS frame generation on or ready, the one
+    /// thing it unlocks: not with it off, as in #955's run, nor with FSR 3 picked.
+    #[test]
+    fn mfg_unlocker_is_loaded_only_with_dlss_frame_generation() {
+        let dir = Path::new(r"C:\nvidia");
+        let on = parse_menu("VICTORY_MFG_UNLOCKER=1\r\n");
+        let loaded = |o: &Play, menu: &[(String, String)]| mfg_loaded(&settings(o, menu, Some(dir)).0);
+        let mut o = options();
+        // frame generation off and not made ready, the default
+        assert!(!loaded(&o, &on));
+        o.framegen = Some(2);
+        assert!(loaded(&o, &on));
+        assert!(!loaded(&o, &parse_menu("VICTORY_MFG_UNLOCKER=1\r\nVICTORY_MENU_FG_TYPE=fsr\r\n")));
+        // the option off: never asked, or turned off in the menu
+        assert!(!loaded(&o, &[]));
+        assert!(!loaded(&o, &parse_menu("VICTORY_MFG_UNLOCKER=1\r\nVICTORY_MFG_UNLOCKER=\r\n")));
+        // ready but off: the F1 menu switches it on while playing, so the mod is there for it
+        o.framegen = None;
+        o.framegen_ready = true;
+        assert!(loaded(&o, &on));
+        // without NVIDIA's files there is no DLSS, nor its frame generation
+        assert!(!mfg_loaded(&settings(&o, &on, None).0));
     }
 
     /// Settings read again after `prepare` clears the others survive it.
