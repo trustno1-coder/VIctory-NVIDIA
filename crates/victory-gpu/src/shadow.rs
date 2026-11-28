@@ -5723,6 +5723,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // fallback would be taken on, so that a direct placement (`crate::inplace`) can replace
         // exactly the copies the policy would have kept in system memory.
         let admission = card_admission(size);
+        if admission.is_err()
+            && let Some(placed) = crate::inplace::place_fallback(key.0, len, false)
+        {
+            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+            remember_placed(&shadow);
+            entry.shadow = Some(shadow.clone());
+            return Some(shadow);
+        }
         let (staging, data) = host()?.shared_buffer(size)?;
         crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
@@ -6066,11 +6074,12 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // The device-local side is decided first, as `lookup` does for a title buffer: a direct
     // placement tries after this decision and only when it refused.
     let admission = window_admission(len);
-    // Page-pool view memory, in place, where the window would otherwise be a system-memory copy:
-    // `place_view` asks its own switch, the flight gate and the in-place byte cap; a refusal
-    // leaves the copy path as it was.
+    // Title memory in place, where the window would otherwise stay in system memory: the page
+    // pool's view memory (`VICTORY_INPLACE_VIEW`) or private memory (`VICTORY_INPLACE=3`), with
+    // the flight gate and the in-place byte cap asked inside; a refusal leaves the copy path as
+    // it was. The mirror is never made for a placement that succeeds.
     if admission.is_err()
-        && let Some(placed) = crate::inplace::place_view(start, len, true)
+        && let Some(placed) = crate::inplace::place_fallback(start, len, true)
     {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         remember_placed(&shadow);
@@ -6173,6 +6182,15 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         map.retain(|_, (shadow, used)| {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
+    }
+    // Where the bytes can be opened, the view's own copy is the title's memory itself: no
+    // staging buffer, no refresh and no copy-back. Every `exact` copy is system memory by
+    // design, so a placement never replaces a device-local side.
+    if let Some(placed) = crate::inplace::place_fallback(address, len, false) {
+        let shadow = Arc::new(Shadow::placed(placed, address, len, false));
+        remember_placed(&shadow);
+        map.insert((address, len), (shadow.clone(), now));
+        return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));

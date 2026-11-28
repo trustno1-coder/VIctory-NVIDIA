@@ -880,7 +880,9 @@ pub(crate) fn host() -> Option<&'static Host> {
 /// unsupported, with submissions in the air (level 2 and up with late waits).
 /// Values, not spellings: `inplace::level()` trims and parses a number.
 fn inplace_notes(level: u8, late: bool) -> (bool, bool) {
-    (level >= 1, level >= 2 && late)
+    // =3 and more is the fallback substitution, which is gated off while submissions are in the
+    // air (a placed copy declares no shader writes yet), so it is not the unsupported combination.
+    (level >= 1, (1..=2).contains(&level) && late)
 }
 
 /// Names the separation-relevant switches this run has set, and warns once for
@@ -903,6 +905,7 @@ fn say_separation_switches() {
         "VICTORY_WC_NO_BACK",
         "VICTORY_INPLACE",
         "VICTORY_INPLACE_MB",
+        "VICTORY_INPLACE_VIEW",
         "VICTORY_PORT_CONSTANTS",
         "VICTORY_MEMORY_CARD_MB",
         "VICTORY_RELAY_COPY",
@@ -949,6 +952,23 @@ fn say_separation_switches() {
     if one("VICTORY_PORT_CONSTANTS") {
         tracing::warn!(
             "memory separation: VICTORY_PORT_CONSTANTS puts the title's 32-bit graphics heap in place (GPU reads/writes title system memory)"
+        );
+    }
+    let view = crate::inplace::view_on();
+    if view >= 1 {
+        tracing::warn!(
+            "memory separation: VICTORY_INPLACE_VIEW={view} places page-pool windows (title buffers too at 2) over the title's own memory where the copy would stay in system memory"
+        );
+        if late_stage() > 0 {
+            tracing::info!(
+                "memory separation: direct placements are only tried with nothing in flight, so VICTORY_INPLACE_VIEW is inert while VICTORY_RELAY/VICTORY_LATE_WAIT are on"
+            );
+        }
+    }
+    if crate::inplace::level() >= 3 {
+        tracing::warn!(
+            "memory separation: VICTORY_INPLACE={} puts title memory in place for the copies the policy refuses a device-local side (no copy at all for them)",
+            crate::inplace::level()
         );
     }
     if one("VICTORY_SEND_BAR") || one("VICTORY_WC_BAR") || value("VICTORY_WINDOWS_BAR_MB").is_some_and(|v| v.trim().parse::<u64>().is_ok_and(|mb| mb != 0)) {

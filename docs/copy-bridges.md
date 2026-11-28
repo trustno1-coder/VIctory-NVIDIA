@@ -518,50 +518,66 @@ memory, at any address. It is behind its own switch, off by default.
    or a hole is refused before anything is created;
 2. `inplace::SectionView` maps **our own view** of that run of the section (the port's old
    mechanism, generalised and now owned by the Phase 2 registry);
-3. every page of the view must be committed; a reserved section maps only committed pages;
-4. `OpenExistingHeapFromAddress1` opens a heap on our view, and a placed cross-adapter UAV buffer
-   covers the run;
-5. `Shadow::placed` shapes it as a copy, so binding, descriptors and lifetime work unchanged,
-   while refresh, snapshot, write declaration and copy-back stay no-ops for it.
 
-`inplace::place_view(start, len, window)` is the policy around it: `VICTORY_INPLACE_VIEW=1`
-enables windows, `=2` also title buffers; the in-place byte cap (`VICTORY_INPLACE_MB`, default
-4 GiB, measured in whole view bytes because opening pins them) applies; and a placement is only
-tried while no submission can be in the air (`shadow::flights_air()`: the relay or the late
-wait). The flight gate is the Phase 5 prerequisite: a placed copy declares no shader writes yet,
-so the layer's own CPU reads of title memory (constant fills, the title's buffer copies, texture
-staging) cannot be ordered against a flight's writes through it. Without the gate the prototype is
-unsafe in the product path, where the launcher leaves the relay on; with it, the prototype runs
-with `VICTORY_RELAY=0` and no `VICTORY_LATE_WAIT`. Phase 5 replaces the gate with declarations.
+## 14. Phase 4 implemented: the migration of the refused copies
 
-### 13.2 Where it is used
+The copy classes the audit ranked as removable now have a policy that replaces them where the
+memory can be opened - and only there. It is one decision, in one place.
 
-The window path (`shadow::loose`) asks the direct placement **after** the device-local admission
-refused the window, so a window that would have got a VRAM side is never replaced (the
-memory-class rule of section 9). A placed window makes no staging buffer, no card side, no
-refresh/write-watch state, no compare and no copy-back; the GPU reads and writes the title's own
-pages over PCIe, which is the memory class the refused window would have stayed in anyway. Every
-refusal (not one run, not committed, cap, host refused, in flight) is counted with its reason in
-the placement ledger and leaves the old copy path in place.
+### 14.1 The policy
 
-### 13.3 Tests and checks
+`inplace::place_fallback(start, len, window)` is asked by the copy paths exactly where the
+device-local admission has already refused the copy, i.e. where it would have stayed a system
+memory mirror. It tries, in order:
 
-- `warp_a_page_pool_window_is_placed_over_our_view_of_its_run`: a placeholder above 4 GiB, a
-  reserved section, two title views that follow in memory and in the section; a 5 KiB window that
-  crosses both is placed and the card reads the title's bytes at the right offset and writes them
-  back into the title's own views; with the heap standing a title view is made read-only and then
-  another unmapped, and the placed buffer still reads the section's pages; the last holder going
-  unmaps our view and the address is free again.
-- `place_view_part_refuses_scattered_and_private_memory`: adjacent views from two sections are
-  refused as scattered, and private memory is refused (it belongs to the other opening).
-- The existing port and in-place WARP tests still cover the older mechanisms.
-- `cargo check --workspace --all-targets --locked`: PASS; clippy shows only the pre-existing
-  baseline lint.
+1. the page pool's view memory (`VICTORY_INPLACE_VIEW=1` for windows, `=2` for title buffers and
+   view-byte copies) through `place_view_checked` - our own view of the section run, a heap on it,
+   a placed buffer (Phase 3);
+2. private title memory (`VICTORY_INPLACE=3` and more) through the first mechanism's
+   `place_private` - a committed part of the allocation opened as a heap.
 
-### 13.4 What it does not do
+Both are refused while any submission can be in the air (`shadow::flights_air`), however the
+switches are set: the placed-write declarations that would make it safe under the relay are
+Phase 5. The paths are a pure function (`fallback_paths`) and unit-tested.
 
-Scattered or holed ranges (multi-run composition is unresolved), memory shown in very many views,
-title buffers until `VICTORY_INPLACE_VIEW=2` is wired and the flight gate is lifted, and any
-claim about the target driver's pinning, coherency or cost. Each placement opens its own heap and
-view (no region cache yet); that is acceptable for a prototype and is where a region registry
-would matter for the buffer class.
+`VICTORY_INPLACE=1`/`=2` keep their old meaning (place wherever the memory can be opened, before
+any admission decision) and are no longer taken for `=3` and more: from 3 on, only the refused
+copies are placed, so no copy a VRAM side would have served is replaced by system-memory access.
+
+### 14.2 Where it is wired
+
+- `shadow::lookup` (title buffers): the card admission is asked, and when it refused, the
+  fallback placement is tried before the CPU staging buffer exists. A placed buffer makes no
+  staging side, no card side, no hash twin and no send/fetch/compare state; the GPU reads and
+  writes the title's own pages, the memory class the refused copy would have been in.
+- `shadow::loose` (windows outside buffers): same, after `window_admission`.
+- `shadow::exact` (a view's own bytes, system memory by design): same policy for its copy; with
+  `VICTORY_INPLACE_VIEW=2` or `VICTORY_INPLACE=3` those copies can be the title's memory too.
+
+Every placement is counted in the in-place census and the placement ledger (Phase 2); every
+refusal is counted with its reason (`NotOpenable`, `Cap`, `HostRefused`, `HostUnavailable`,
+`InFlight`). The startup line names `VICTORY_INPLACE` and `VICTORY_INPLACE_VIEW`, and says that
+the direct placements are inert while the relay/late waits are on, so a log cannot show the
+switches set without saying why nothing was placed.
+
+### 14.3 What is not migrated, and why
+
+- Copies the card admitted: replacing a device-local side with GPU access to system memory is a
+  memory-class downgrade (section 9's rule) and is not done without hardware measurement.
+- By-address shader memory: raw-address shaders need a GPU address a title CPU address cannot be
+  (the audit's anti-candidate).
+- Textures, render targets and depth: the console's tiled sizes and layouts, the depth+UAV
+  restriction and the missing PC formats block a direct representation (sections 4.2, 10).
+- Scattered or holed title memory: multi-run composition is unresolved; those copies keep the
+  mirror.
+- The layer's own CPU-authored buffers (per-draw scratch, descriptor-stride table, indirect
+  clamp): they are not copies of title bytes.
+
+### 14.4 Tests and checks
+
+- `the_fallback_paths_follow_the_switches_and_the_flight_gate` covers the policy matrix (legacy
+  levels, 3, view 1/2, windows/buffers, flights on/off).
+- The Phase 3 WARP tests exercise both mechanisms' data paths; the Phase 2 tests exercise the
+  invalidation, the ledger and the view ownership. A run of the title is needed to measure how
+  much of the refused class is openable on a real save; no run is available here.
+- `cargo check --workspace --all-targets --locked`: PASS; clippy shows only the baseline lint.

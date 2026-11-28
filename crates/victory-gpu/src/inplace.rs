@@ -238,10 +238,23 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
+///
+/// This is the first mechanism's policy (`VICTORY_INPLACE=1`, `=2`), which places a copy
+/// wherever the memory can be opened. `=3` and more is the fallback policy
+/// ([`place_fallback`]): it places only where the copy would otherwise stay in system memory,
+/// so it must not also be taken by this path for a copy a device-local side would have served.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
+    let level = level();
+    if level >= 3 || level < if window { 1 } else { 2 } {
         return None;
     }
+    place_private(start, len, window)
+}
+
+/// Private title memory in place, if it can be opened; `None` leaves the caller to make a copy.
+/// No switch or flight gate here: the callers that ask it have done that ([`place_for`],
+/// [`place_fallback`]).
+fn place_private(start: u64, len: u64, window: bool) -> Option<Placed> {
     // What the backing is, without opening anything. Only private memory is opened by this
     // stage; view memory is turned down here (a later stage opens a view of a section run) and
     // costs nothing to classify: the view registry already knows.
@@ -329,25 +342,11 @@ fn place_view_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed
     Ok(Placed { buffer, heap, gpu, bias: start - at, keep: Some(view) })
 }
 
-/// Title memory in a view of the page pool, in place: maps our own view of the aligned run of
-/// the section that holds `[start, start + len)` and places a buffer over it, so the GPU reads
-/// and writes the title's own bytes there. Used where the copy would otherwise stay in system
-/// memory, so the memory class does not change (a carded copy is never replaced by this).
-///
-/// What it assumes: nothing can be in flight while it is called ([`crate::shadow::flights_air`],
-/// asked by the caller too) - a placed copy declares no shader writes yet, so the layer's own CPU
-/// reads of title memory cannot be ordered against a flight's writes through it.
-///
-/// `None` leaves the caller to make the copy as before; every refusal is counted with its reason.
-pub(crate) fn place_view(start: u64, len: u64, window: bool) -> Option<Placed> {
+/// [`place_fallback`]'s view-memory path, without the switch and the flight gate: our own view
+/// of the aligned run of the section that holds `[start, start + len)`, a heap on it and a buffer
+/// placed over it, with the in-place byte cap and the refusals counted.
+fn place_view_checked(start: u64, len: u64, window: bool) -> Option<Placed> {
     use crate::residency::NoDirect;
-    if view_on() < if window { 1 } else { 2 } {
-        return None;
-    }
-    if crate::shadow::flights_air() {
-        crate::residency::direct_refused(len, NoDirect::InFlight);
-        return None;
-    }
     let at = start & !(K64 as u64 - 1);
     let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + bytes > most() {
@@ -374,6 +373,42 @@ pub(crate) fn place_view(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// Which direct-placement paths a copy that was refused a device-local side may take, in order:
+/// the page pool's view memory (`VICTORY_INPLACE_VIEW`), then private memory
+/// (`VICTORY_INPLACE=3` and more, the fallback substitution). No path while a submission can be
+/// in the air (a placed copy declares no shader writes yet; see [`crate::shadow::flights_air`]).
+/// Pure, so the policy can be tested without a device or the environment.
+fn fallback_paths(level: u8, view: u8, window: bool, flights: bool) -> (bool, bool) {
+    if flights {
+        return (false, false);
+    }
+    let view = view >= if window { 1 } else { 2 };
+    let private = level >= 3;
+    (view, private)
+}
+
+/// A direct placement where the policy refused the copy a device-local side: first the page
+/// pool's view memory, then private memory. Those are exactly the copies that would otherwise
+/// stay in system memory, so the memory class does not change; a carded copy is never replaced.
+///
+/// `None` leaves the caller to make the copy as before, which is the behaviour with the switches
+/// off. Every refusal of an asked-for path is counted with its reason.
+pub(crate) fn place_fallback(start: u64, len: u64, window: bool) -> Option<Placed> {
+    let flights = crate::shadow::flights_air();
+    let (view, private) = fallback_paths(level(), view_on(), window, flights);
+    if flights {
+        crate::residency::direct_refused(len, crate::residency::NoDirect::InFlight);
+        return None;
+    }
+    if view && let Some(placed) = place_view_checked(start, len, window) {
+        return Some(placed);
+    }
+    if private && let Some(placed) = place_private(start, len, window) {
+        return Some(placed);
+    }
+    None
 }
 
 /// Something placed elsewhere (`crate::port`) in the same form: counted as
@@ -1992,6 +2027,29 @@ pub(crate) mod tests {
             for section in sections {
                 windows_sys::Win32::Foundation::CloseHandle(section);
             }
+        }
+    }
+
+    /// The fallback policy: view memory first when its switch asks, private memory when
+    /// `VICTORY_INPLACE=3` asks, neither while submissions can be in the air.
+    #[test]
+    fn the_fallback_paths_follow_the_switches_and_the_flight_gate() {
+        // Nothing asked for: no path.
+        assert_eq!(fallback_paths(0, 0, true, false), (false, false));
+        assert_eq!(fallback_paths(2, 1, false, false), (false, false));
+        // The legacy levels do not take the fallback path for a title buffer; =3 does, for both.
+        assert_eq!(fallback_paths(2, 0, true, false), (false, false));
+        assert_eq!(fallback_paths(2, 0, false, false), (false, false));
+        assert_eq!(fallback_paths(3, 0, true, false), (false, true));
+        assert_eq!(fallback_paths(3, 0, false, false), (false, true));
+        // View memory: windows from level 1, title buffers from level 2.
+        assert_eq!(fallback_paths(0, 1, true, false), (true, false));
+        assert_eq!(fallback_paths(0, 1, false, false), (false, false));
+        assert_eq!(fallback_paths(0, 2, false, false), (true, false));
+        assert_eq!(fallback_paths(3, 2, false, false), (true, true));
+        // Submissions in the air: no placement at any switch setting.
+        for (level, view, window) in [(3u8, 2u8, true), (3, 2, false), (0, 1, true), (2, 1, true)] {
+            assert_eq!(fallback_paths(level, view, window, true), (false, false));
         }
     }
 }
