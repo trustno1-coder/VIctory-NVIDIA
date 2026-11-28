@@ -92,6 +92,8 @@ after it was given them as an unordered access view.
 | variable | does |
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_BUILDER_WAIT_MS=<ms>` | per frame, all threads together, the first builder dispatch waits this long (2000; 0: not at all) for the workers to make the builder's programs; not all made: the builder is off for that frame, tried again in the next |
+| `VICTORY_BVH_BUILDER_ON_THE_SPOT=1` | the old behaviour: the dispatching thread makes the programs one by one, holding the builder's lock (a cold cache: ~30 s, and the title's watchdog ends the run) |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
