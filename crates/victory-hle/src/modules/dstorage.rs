@@ -280,6 +280,31 @@ struct File {
     files: Files,
 }
 
+/// A reference on the file a request reads, held from its enqueue until it
+/// has run or is dropped. The title may release its own reference at once:
+/// on the console the last release closes the file, which waits for the
+/// file's outstanding reads
+/// ([IDStorageFileX::Close](https://learn.microsoft.com/gaming/gdk/docs/reference/system/dstorage/interfaces/idstoragefilex/methods/idstoragefilex_close)).
+struct FileRef(*mut Instance<File>);
+
+impl FileRef {
+    /// The request's file, if it reads one.
+    fn of(request: &Request) -> Option<FileRef> {
+        let file = request.source.cast::<Instance<File>>().cast_mut();
+        if request.options & MEMORY_SOURCE != 0 || file.is_null() {
+            return None;
+        }
+        add_ref_instance(file);
+        Some(FileRef(file))
+    }
+}
+
+impl Drop for FileRef {
+    fn drop(&mut self) {
+        release(self.0);
+    }
+}
+
 /// How files are read (`VICTORY_DSTORAGE_IO`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Io {
@@ -583,9 +608,9 @@ struct Lane {
     closed: bool,
 }
 
-// SAFETY: requests point into title memory and our own objects, which stay
-// valid until the title has seen them complete; status arrays count their
-// references atomically.
+// SAFETY: requests point into title memory, which stays valid until the
+// title has seen them complete, and into our own objects, whose references
+// they hold (status arrays and files count them atomically).
 unsafe impl Send for Lane {}
 
 /// A read a worker runs.
@@ -595,6 +620,8 @@ struct Job {
     request: Request,
     note: Note,
     staging: u64,
+    /// Let go once the read is done.
+    file: Option<FileRef>,
 }
 
 // SAFETY: as for `Lane`.
@@ -697,7 +724,9 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     } else {
         let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        // The latest file opened at that address: the request holds it open,
+        // and files closed before may have had the same address.
+        files.iter().rev().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -798,7 +827,7 @@ pub(crate) mod stream_log {
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
@@ -813,6 +842,9 @@ fn work(scheduler: &'static Scheduler) {
         if let Some(traced) = traced {
             traced.end(&job, &result);
         }
+        // Before the status entry it completes is written, and outside the
+        // lock: the last reference closes the file's handles.
+        drop(job.file.take());
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -868,14 +900,13 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, Read { request, note, file }) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -889,6 +920,7 @@ impl Lanes {
             request,
             note,
             staging,
+            file,
         })
     }
 
@@ -1062,11 +1094,19 @@ enum Command {
     Status(Status),
 }
 
-/// An enqueued request, and what the trace knows of it.
-#[derive(Clone, Copy)]
+/// An enqueued request, what the trace knows of it, and a reference on its
+/// file: dropped with it wherever it goes (a closed queue, a queue's
+/// `Close` or last `Release`), or let go by the worker that ran it.
 struct Read {
     request: Request,
     note: Note,
+    file: Option<FileRef>,
+}
+
+impl Read {
+    fn new(request: Request, note: Note) -> Read {
+        Read { request, note, file: FileRef::of(&request) }
+    }
 }
 
 /// The streaming trace (`VICTORY_DSTORAGE_TRACE`): 0 or unset: off; 1: a
@@ -1293,7 +1333,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
         return;
     };
     let note = Note::enqueued(&request);
-    queue(this, Command::Read(Read { request, note }));
+    queue(this, Command::Read(Read::new(request, note)));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1339,7 +1379,7 @@ fn queue(this: QueueRef, command: Command) {
     let mut lanes = scheduler.lock();
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
-            return; // closed: dropped (a status releases its array)
+            return; // closed: dropped (a status releases its array, a read its file)
         };
         // One slot stays free, as the console's count of empty slots says.
         if lane.entries() + 1 < lane.capacity.max(2) {
@@ -1568,7 +1608,8 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
+    // SAFETY: a file object we created; the request holds a reference on it
+    // (`FileRef`).
     let files = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .files;
@@ -2249,7 +2290,7 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        lane.unsubmitted.push(Command::Read(Read::new(r, note)));
     }
 
     #[test]
@@ -2414,6 +2455,114 @@ mod tests {
         void(queue, 0x30);
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(result(array, 0), E_PENDING);
+        assert_eq!(out, [0; 16]);
+    }
+
+    /// The title's `Release` of a file or a queue (slot 0x10).
+    fn release_object(object: *mut c_void) -> u32 {
+        let f: extern "system" fn(*mut c_void) -> u32 = call(object, 0x10);
+        f(object)
+    }
+
+    /// Whether one of our file objects still holds `path` open (it shares
+    /// reading only, so nobody may open it for writing).
+    fn held_open(path: &std::path::Path) -> bool {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(_) => false,
+            Err(e) if e.raw_os_error() == Some(32) => true, // ERROR_SHARING_VIOLATION
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// A file the title releases with reads on it enqueued, or running,
+    /// stays open until they are done, as the console's last release waits
+    /// for them: the reads still give the file's bytes.
+    #[test]
+    fn a_file_released_with_reads_in_flight_stays_open_until_they_finish() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+        };
+        let plain = pattern(3 * 4096);
+        let (dir, file) = file_with(&plain);
+        let path = dir.path().join("data.bin");
+        let (queue, array) = (new_queue(0), status_array(2));
+
+        // Enqueued, then released before the submit.
+        let mut raw = vec![0u8; 1000];
+        let mut other = vec![0u8; 16];
+        enqueue(queue, &request(0, raw.as_mut_ptr().cast(), 1000, file, 100, 1000));
+        enqueue(queue, &request(0, other.as_mut_ptr().cast(), 16, file, 5000, 16));
+        enqueue_status(queue, array, 0);
+        release_object(file); // the title's last reference
+        assert!(held_open(&path), "closed with reads enqueued on it");
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(raw, plain[100..1100]);
+        assert_eq!(other, plain[5000..5016]);
+        assert!(!held_open(&path), "still open after its reads");
+
+        // Running (its destination guarded for a moment), then released.
+        let file = open(&path);
+        // SAFETY: a fresh allocation; its middle page is read-only until we
+        // open it, as a guard of the GPU side's would be.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), plain.len(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let protect = |to| {
+            let mut old = 0;
+            // SAFETY: as above.
+            unsafe { VirtualProtect((at + 4096) as *const _, 4096, to, &mut old) }
+        };
+        assert_ne!(protect(PAGE_READONLY), 0);
+        enqueue(queue, &request(0, at as *mut c_void, plain.len(), file, 0, plain.len()));
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+        // SAFETY: a queue we created.
+        let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+        let running = || scheduler().unwrap().lock().lanes.get(&id).is_some_and(|l| !l.running.is_empty());
+        let start = Instant::now();
+        while !running() {
+            assert!(start.elapsed() < Duration::from_secs(10), "never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        release_object(file); // the title's last reference
+        assert!(held_open(&path), "closed under a running read");
+        assert_ne!(protect(PAGE_READWRITE), 0);
+        assert_eq!(wait(array, 1), S_OK);
+        // SAFETY: as above, all of it readable.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, plain.len()) }, plain);
+        assert!(!held_open(&path), "still open after its read");
+        void(queue, 0x40);
+    }
+
+    /// A file released with reads enqueued is closed once they are dropped:
+    /// by the queue's `Close`, by its last `Release`, or at once on a queue
+    /// already closed.
+    #[test]
+    fn a_file_whose_enqueued_reads_are_dropped_is_closed() {
+        let (dir, file) = file_with(&pattern(64));
+        let path = dir.path().join("data.bin");
+        let mut out = [0u8; 16];
+        let mut file = file;
+        for end in [0x40, 0x10] {
+            let (queue, array) = (new_queue(0), status_array(1));
+            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
+            enqueue_status(queue, array, 0);
+            release_object(file); // the title's last reference
+            assert!(held_open(&path), "closed with a read enqueued on it");
+            if end == 0x40 {
+                void(queue, 0x40);
+            } else {
+                assert_eq!(release_object(queue), 0);
+            }
+            assert!(!held_open(&path), "still open after its read was dropped ({end:#x})");
+            assert_eq!(result(array, 0), E_PENDING);
+            file = open(&path);
+        }
+        let queue = new_queue(0);
+        void(queue, 0x40);
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
+        release_object(file);
+        assert!(!held_open(&path), "held by a read a closed queue dropped");
         assert_eq!(out, [0; 16]);
     }
 
