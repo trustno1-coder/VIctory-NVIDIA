@@ -175,26 +175,26 @@ pub fn run(
         // SAFETY: nothing else runs yet; the title and the display mode list
         // read these later.
         unsafe {
-            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
+            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::width(), native_1440p::HEIGHT));
             std::env::set_var("VICTORY_NATIVE_1440P", "1");
         }
         match upscaler.map(|mode| (mode, native_1440p::prepare_upscaler(&mut prepared, mode))) {
             Some((mode, Ok(()))) => {
-                let [rw, rh] = mode.render_size([native_1440p::WIDTH, native_1440p::HEIGHT]);
+                let [rw, rh] = mode.render_size([native_1440p::width(), native_1440p::HEIGHT]);
                 println!(
                     "display        {}x{} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
-                    native_1440p::WIDTH,
+                    native_1440p::width(),
                     native_1440p::HEIGHT,
                     mode.name()
                 );
-                cfg.cache_subdir(&format!("images/native-1440p-upscaler-{}-sdr", mode.name()))?
+                cfg.cache_subdir(&format!("images/native-1440p{}-upscaler-{}-sdr", wide_suffix(), mode.name()))?
             }
             other => {
                 if let Some((_, Err(e))) = other {
                     println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
                 }
-                println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
-                cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+                println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::width(), native_1440p::HEIGHT);
+                cfg.cache_subdir(&format!("images/{}{}-sdr", if render_1080p { "1080p-to-1440p" } else { "native-1440p" }, wide_suffix()))?
             }
         }
     } else if let Some(mode) = upscaler {
@@ -760,4 +760,9 @@ mod cpu_check_tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// The patched image's cache folder suffix for a 21:9 output.
+fn wide_suffix() -> &'static str {
+    if native_1440p::ultrawide() { "-3440" } else { "" }
 }
