@@ -412,13 +412,25 @@ fn card_all() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"))
 }
 
+fn card_copy_size_allowed(size: u64, least: u64) -> bool {
+    size >= least && size < 1 << 30
+}
+
+fn reserve_card_copy_bytes(bytes: &AtomicU64, size: u64, most: u64) -> bool {
+    if bytes.fetch_add(size, Ordering::Relaxed) + size > most {
+        bytes.fetch_sub(size, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
 /// [`card_for`] in the card's own memory.
 fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
     let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
+    if !card_copy_size_allowed(size, least) {
         return None;
     }
     let host = host()?;
@@ -460,8 +472,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         }
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    if !reserve_card_copy_bytes(&CARD_BYTES[0], size, most) {
         return None;
     }
     // (one made ahead, if it is of that size and one is in store: `crate::ahead`)
@@ -5966,6 +5977,28 @@ mod window_tests {
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
         tail_of, window_of,
     };
+
+    #[test]
+    fn small_card_copy_burst_can_displace_a_large_buffer() {
+        use super::{AtomicU64, card_copy_size_allowed, reserve_card_copy_bytes};
+        const MIB: u64 = 1 << 20;
+        const LARGE: u64 = 64 * MIB;
+        // Use the RTX 4060's reported DXGI budget from #946, with synthetic requests.
+        let (default_min, limit) = resolve_card_limits(Some(7189 * MIB), None, None);
+        let run = |minimum| {
+            let bytes = AtomicU64::new(0);
+            let admit = |size| {
+                card_copy_size_allowed(size, minimum) && reserve_card_copy_bytes(&bytes, size, limit)
+            };
+            let small_copies = (0..1536).filter(|_| admit(MIB)).count();
+            let large_admitted = admit(LARGE);
+            (small_copies, large_admitted, bytes.into_inner())
+        };
+
+        // The launcher's 64 KiB minimum spends the allowance before the large copy arrives.
+        assert_eq!(run(64 << 10), (1294, false, 1294 * MIB));
+        assert_eq!(run(default_min), (0, true, LARGE));
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {
