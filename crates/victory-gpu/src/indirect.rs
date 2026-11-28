@@ -2718,12 +2718,16 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                     12,
                 );
             }
-            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
+            std::ptr::copy_nonoverlapping([33u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
             std::ptr::write_bytes(hits_ptr, 0, 256);
         }
         // SAFETY: a live buffer.
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
+            // SAFETY: mapped buffer; nothing runs yet.
+            unsafe {
+                std::ptr::write_bytes(hits_ptr, 0, 256);
+            }
             // Spends the budget (clamped, not executed), then one group.
             bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
             let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
@@ -2747,6 +2751,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         }
         // A recording with only the small record: the budget is empty
         // again, so it runs.
+        unsafe { std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12); }
         let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
         // SAFETY: as above.
         unsafe {
@@ -3163,7 +3168,6 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let (back, back_ptr, _) = warp.shared_buffer(1024);
             let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
             let dst = warp.default_uav(64 << 10);
-            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
             // SAFETY: mapped buffers, which the list has not read yet.
             let mut table = unsafe {
                 std::ptr::write_bytes(budget_ptr, 0, 256);
@@ -3179,16 +3183,22 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                     assert_eq!(table.place(1, r * 16, 0), Some(r * u64::from(batch::SLOT)));
                 }
             }
+            unsafe { warp.list.ResourceBarrier(&[transition(&_budget, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]); }
+            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
             // SAFETY: an open list; the records are readable as arguments.
             unsafe {
-                warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                warp.list.ResourceBarrier(&[
+                    transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(&_budget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                ]);
                 warp.list.CopyBufferRegion(&back, 0, &dst, 0, 256);
+                warp.list.CopyBufferRegion(&back, 512, &_budget, 0, 4);
             }
             warp.submit_and_wait();
             // SAFETY: the list has run; mapped words.
             let (spent, out): (u32, Vec<u32>) = unsafe {
                 (
-                    budget_ptr.cast::<u32>().read_volatile(),
+                    back_ptr.byte_add(512).cast::<u32>().read_volatile(),
                     (0..records as usize).map(|r| back_ptr.cast::<u32>().add(r * batch::SLOT as usize / 4).read_volatile()).collect(),
                 )
             };
