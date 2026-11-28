@@ -486,11 +486,10 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 /// unless a shader does declare a write to it one day.
 ///
 /// A window goes to the card while there is room under this number and
-/// while a fifth of the card's budget is free, as title buffers do
-/// (`card_for`): textures keep their room, and once they have filled the
-/// card later windows stay where they are. The CPU's side stays in the PC's
-/// memory, so the memory shared with the card does not shrink by this
-/// alone; what moves is what shaders read.
+/// while the card's use is under [`window_line`]: textures keep their room,
+/// and once they have filled the card later windows stay where they are.
+/// The CPU's side stays in the PC's memory, so the memory shared with the
+/// card does not shrink by this alone; what moves is what shaders read.
 ///
 /// Unset, it follows the card's budget ([`default_window_card_mb`]).
 fn window_card_most() -> u64 {
@@ -510,11 +509,62 @@ fn window_card_most() -> u64 {
 /// buffers at 2048 ([`default_card_limits_mb`]), moved the reads of the
 /// title's allocator off the bus: the release build's gameplay went from
 /// 3 to 21-25 fps (2026-11-26, log coolfox-20261126-140546).
+///
+/// Above 12 GiB, in the bands of [`default_card_limits_mb`], 2560 MiB (16 GB
+/// cards) and from 20 GiB 5120 MiB (24 GB and more), as the 16 and 24 GB
+/// tiers of crossducking/RAZDA4A-XEN (76b5813) have them. The windows came
+/// to 3,552 MB in run 104, and the pages of title memory by address count
+/// under this number too ([`by_address`]), so 1024 left most windows of a
+/// 16 GB card in the PC's memory.
 fn default_window_card_mb(local_vram_budget: Option<u64>) -> u64 {
     match local_vram_budget.map(|b| b >> 20) {
+        Some(mb) if mb >= 20 * 1024 => 5120,
+        Some(mb) if mb > 12 * 1024 => 2560,
         Some(mb) if mb >= 8 * 1024 => (mb * 9 / 100).min(1024),
         _ => 0,
     }
+}
+
+/// The share of the card's budget, in percent, that [`window_line`] starts
+/// from: `VICTORY_CARD_WINDOWS_PERCENT` (50 to 97) if set, else
+/// [`default_window_card_percent`] of `budget`.
+fn window_card_percent(budget: u64) -> u64 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|percent| percent.clamp(50, 97))
+    })
+    .unwrap_or_else(|| default_window_card_percent(budget))
+}
+
+/// The default of [`window_card_percent`] for a budget of `budget` bytes:
+/// 80 up to 12 GiB, as before; 89 above that and 91 from 20 GiB, as the 16
+/// and 24 GB tiers of crossducking/RAZDA4A-XEN (76b5813) have them.
+fn default_window_card_percent(budget: u64) -> u64 {
+    match budget >> 20 {
+        mb if mb >= 20 * 1024 => 91,
+        mb if mb > 12 * 1024 => 89,
+        _ => 80,
+    }
+}
+
+/// The card's use, in bytes of a budget of `budget`, up to which a window
+/// goes to the card: `percent` of the budget less `kept`, what the texture
+/// queue keeps free for card copies of title buffers and for render targets
+/// not made yet ([`card_room_kept`], `resource::targets_room_kept`), and
+/// not over `cap`, the texture queue's own line (`resource::room_line`);
+/// never under four fifths of the budget (or `percent` of it, if less), the
+/// line windows had before. A line of 89 % with nothing kept takes the room
+/// of the targets the world makes in its first frame, which are made with
+/// no room test; once they are made and that room is given up, windows have
+/// all of it. The cap keeps what play leaves free for frame generation
+/// (`VICTORY_TEXTURE_ROOM_PERCENT` 86 or 80, 1.5 to 2 GB) free of windows
+/// too.
+fn window_line(budget: u64, percent: u64, kept: u64, cap: u64) -> u64 {
+    let share = |percent: u64| budget / 100 * percent;
+    share(percent).saturating_sub(kept).min(cap).max(share(percent.min(80)))
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
@@ -603,7 +653,13 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size
+            > window_line(
+                budget,
+                window_card_percent(budget),
+                card_room_kept() + crate::resource::targets_room_kept(),
+                crate::resource::room_line(budget),
+            )
     {
         return None;
     }
@@ -5979,7 +6035,43 @@ mod window_tests {
         assert_eq!(super::default_window_card_mb(Some(6 * GIB)), 0);
         assert_eq!(super::default_window_card_mb(Some(8 * GIB)), 737);
         assert_eq!(super::default_window_card_mb(Some(11229 << 20)), 1010);
-        assert_eq!(super::default_window_card_mb(Some(24 * GIB)), 1024);
+        assert_eq!(super::default_window_card_mb(Some(12 * GIB)), 1024);
+        // 16 GB cards (an RX 9060 XT's budget: 15,450 MB), and 24 GB and more.
+        assert_eq!(super::default_window_card_mb(Some(13 * GIB)), 2560);
+        assert_eq!(super::default_window_card_mb(Some(15450 << 20)), 2560);
+        assert_eq!(super::default_window_card_mb(Some(20 * GIB)), 5120);
+        assert_eq!(super::default_window_card_mb(Some(24 * GIB)), 5120);
+    }
+
+    #[test]
+    fn window_line_keeps_the_room_held_for_targets() {
+        use super::{default_window_card_percent, window_line};
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(default_window_card_percent(7400 * MIB), 80);
+        assert_eq!(default_window_card_percent(11229 * MIB), 80);
+        assert_eq!(default_window_card_percent(12 * GIB), 80);
+        assert_eq!(default_window_card_percent(15450 * MIB), 89);
+        assert_eq!(default_window_card_percent(24 * GIB), 91);
+        const ANY: u64 = u64::MAX;
+        // Up to 12 GiB: four fifths, whatever is kept, as before.
+        let b = 11229 * MIB;
+        assert_eq!(window_line(b, 80, 0, ANY), b / 100 * 80);
+        assert_eq!(window_line(b, 80, 3 * GIB, ANY), b / 100 * 80);
+        // A 16 GB card: 89 % once nothing is kept, four fifths while the
+        // targets' 3,072 MiB are.
+        let b = 15450 * MIB;
+        assert_eq!(window_line(b, 89, 0, ANY), b / 100 * 89);
+        assert_eq!(window_line(b, 89, 3072 * MIB, ANY), b / 100 * 80);
+        assert_eq!(window_line(b, 89, 512 * MIB, ANY), b / 100 * 89 - 512 * MIB);
+        // Not over the texture queue's line (play with frame generation
+        // ready: 86; on: 80), nor under four fifths for a lower one.
+        assert_eq!(window_line(b, 89, 0, b / 100 * 86), b / 100 * 86);
+        assert_eq!(window_line(b, 89, 0, b / 100 * 80), b / 100 * 80);
+        assert_eq!(window_line(b, 89, 0, b / 100 * 60), b / 100 * 80);
+        // A lower share asked for is kept to.
+        assert_eq!(window_line(b, 60, 0, ANY), b / 100 * 60);
+        assert_eq!(window_line(b, 60, GIB, ANY), b / 100 * 60);
     }
 
     /// An ask that may take any window takes the longest that holds all of
