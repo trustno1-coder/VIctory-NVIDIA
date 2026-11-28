@@ -923,6 +923,7 @@ mod library;
 mod make;
 #[cfg(windows)]
 pub(crate) mod pieces;
+pub(crate) mod samplers;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

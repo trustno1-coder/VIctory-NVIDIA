@@ -188,7 +188,7 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && asked & 0x400 != 0 {
         victory_gpu::title_memory_write_combined(at as usize, size);
     }
-    // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
+    // (the game asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
     if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
@@ -547,6 +547,48 @@ struct Pages {
     pages: HashMap<usize, Slice>,
 }
 
+/// The first page number given out; 0 stays unused.
+const FIRST_PAGE: usize = 0x10_0000;
+/// Numbers from here on do not survive the title's 21-bit `number >> 4`
+/// ([`FRAMES`]).
+const PAGE_LIMIT: usize = 1 << 25;
+
+impl Pages {
+    /// The first of `n` numbers, [`FRAMES`] apart, for new pages: after the
+    /// last given while they fit the title's 21 bits (as before), then the
+    /// lowest run of `n` freed ones. `None` if there is no such run.
+    fn take(&mut self, n: usize) -> Option<usize> {
+        let len = n.checked_mul(FRAMES)?;
+        let end = self.next_page.checked_add(len);
+        if let Some(end) = end.filter(|&end| end <= PAGE_LIMIT) {
+            let first = self.next_page;
+            self.next_page = end;
+            return Some(first);
+        }
+        static REUSING: std::sync::Once = std::sync::Once::new();
+        REUSING.call_once(|| {
+            tracing::info!("page numbers reach the title's 21 bits: freed ones given again");
+        });
+        let mut used: Vec<usize> = self.pages.keys().copied().collect();
+        used.sort_unstable();
+        free_run(used, len)
+    }
+}
+
+/// The lowest `start` from [`FIRST_PAGE`] where `len` (a multiple of
+/// [`FRAMES`]) numbers up to [`PAGE_LIMIT`] are all outside `used`
+/// (sorted).
+fn free_run(used: impl IntoIterator<Item = usize>, len: usize) -> Option<usize> {
+    let mut start = FIRST_PAGE;
+    for at in used.into_iter().chain([PAGE_LIMIT]) {
+        if at.checked_sub(start).is_some_and(|gap| gap >= len) {
+            return Some(start);
+        }
+        start = start.max(at.checked_add(FRAMES)?);
+    }
+    None
+}
+
 /// Where the title sees its pages: [`Physical::views`] the other way.
 /// Locked apart from them, and only for a moment ([`PAGES`]).
 #[derive(Default)]
@@ -663,8 +705,8 @@ impl Drop for Held {
 /// where both are.
 static PAGES: LazyLock<RwLock<Pages>> = LazyLock::new(|| {
     RwLock::new(Pages {
-        // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        // Page numbers are opaque to titles.
+        next_page: FIRST_PAGE,
         pages: HashMap::new(),
     })
 });
@@ -731,8 +773,14 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
     let mut table = page_table_mut();
-    let first = table.next_page;
-    table.next_page += n * FRAMES;
+    let Some(first) = table.take(n) else {
+        drop(table);
+        // The title keeps 21 bits of a number (`FRAMES`).
+        tracing::warn!(n, "XMemAllocatePhysicalPages: out of page numbers");
+        // SAFETY: checked non-null. The section goes with `section`.
+        unsafe { count.write(0) };
+        return 0;
+    };
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -1151,7 +1199,7 @@ fn port_on() -> bool {
 }
 
 /// The title's reservations of 64 KiB pages for 32-bit graphics memory:
-/// base and bytes (one, of 185 MB, in Grand Theft Auto VI).
+/// base and bytes (one, of 185 MB, in the game).
 static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Pages given another place in their section so far by [`arrange`], and
@@ -1165,7 +1213,7 @@ static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// reservation), so that the reservation becomes one stretch of the section
 /// and the GPU side can open it as one heap.
 ///
-/// Grand Theft Auto VI takes all the pages of its 185 MB heap in one call
+/// The game takes all the pages of its 185 MB heap in one call
 /// and maps its five pieces in another order than their addresses (run
 /// port1-1: "Scattered"). Only fresh slices are exchanged: never mapped,
 /// never written (no commit bit), so every page still reads as zeros and
@@ -2956,6 +3004,28 @@ mod tests {
     }
 
     #[test]
+    fn page_numbers_freed_are_given_again_past_the_title_s_21_bits() {
+        let mut table = Pages {
+            next_page: PAGE_LIMIT - 2 * FRAMES,
+            pages: HashMap::new(),
+        };
+        // The last numbers that fit, as before.
+        assert_eq!(table.take(2), Some(PAGE_LIMIT - 2 * FRAMES));
+        assert_eq!(table.next_page, PAGE_LIMIT);
+        // Then the lowest free run, still packed into 21 bits.
+        assert_eq!(table.take(3), Some(FIRST_PAGE));
+        assert_eq!(table.take(usize::MAX), None);
+        let f = |k: usize| FIRST_PAGE + k * FRAMES;
+        assert_eq!(free_run([f(0), f(1), f(3)], FRAMES), Some(f(2)));
+        assert_eq!(free_run([f(0), f(1), f(3)], 2 * FRAMES), Some(f(4)));
+        assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE), Some(FIRST_PAGE));
+        assert_eq!(free_run([f(0)], PAGE_LIMIT - FIRST_PAGE), None);
+        assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE + FRAMES), None);
+        let p = free_run([PAGE_LIMIT - FRAMES], FRAMES).unwrap();
+        assert_eq!((p >> 4 & 0x1f_ffff) << 4, p);
+    }
+
+    #[test]
     fn physical_pages_map_alias_and_unmap() {
         let mut pages = [0usize; 3];
         let mut n = 3;
@@ -3085,7 +3155,7 @@ mod tests {
         assert!(lazy(c));
         assert_eq!(map_pages(c, 3, std::ptr::null(), true), c);
         assert!(!lazy(c));
-        assert!(physical().views.get(&(c as usize)).is_none());
+        assert!(!physical().views.contains_key(&(c as usize)));
         assert_eq!(host(c), MEM_RESERVE);
         assert_eq!(map_pages(c, 3, pages.as_ptr(), false), c);
         // SAFETY: mapped.
@@ -3096,7 +3166,7 @@ mod tests {
         assert_eq!(map_pages(d, 3, pages.as_ptr(), true), d);
         assert_eq!(map_pages(at(d, 1), 1, std::ptr::null(), true), at(d, 1));
         assert!(lazy(d) && lazy(at(d, 2)));
-        assert!(physical().views.get(&(at(d, 1) as usize)).is_none());
+        assert!(!physical().views.contains_key(&(at(d, 1) as usize)));
         assert!(materialize(at(d, 2) as usize, 1));
         assert!(!lazy(at(d, 2)) && lazy(d));
         // SAFETY: mapped now.
@@ -3189,7 +3259,7 @@ mod tests {
         assert_eq!(read(heap, 1), ((true, 1), vec![2]));
         // Unmapped: gone, with no view of the host's ever there.
         assert!(alias_as((heap + PAGE) as u64, 0, PAGE as u64, false, true));
-        assert!(!lazy(heap + PAGE) && physical().views.get(&(heap + PAGE)).is_none());
+        assert!(!lazy(heap + PAGE) && !physical().views.contains_key(&(heap + PAGE)));
         assert_eq!(soft_runs(heap, 4 * PAGE), [(heap, PAGE), (heap + 2 * PAGE, PAGE)]);
         assert_eq!(read(heap + PAGE, 2 * PAGE).0, (false, PAGE));
         // The CPU touches one: the handler maps it with its page's bytes,

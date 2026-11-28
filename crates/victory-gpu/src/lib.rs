@@ -16,6 +16,7 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod ahead;
 mod ambient;
 #[cfg(windows)]
 mod aspect;
@@ -79,6 +80,7 @@ pub mod replay;
 #[cfg(windows)]
 mod residency;
 pub mod resource;
+pub mod save_share;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;

@@ -109,3 +109,154 @@ each commit naming its source. In short:
 - Belobug: pipeline workers for screen passes, the ambient stand-in's idea, pipeline and
   constant buffer bookkeeping (romainhedouin).
 - ZJOU: render targets not set again; some shader corrections are being looked at.
+
+# What was learned on an RTX 5070 Ti Laptop (2026-11-27 to 2026-11-28)
+
+One PC: i9-14900HX, 32 GB, RTX 5070 Ti Laptop 12 GB, Windows 11 26100, Series X profile
+(and Series S for the DLSS runs), release and diagnostics builds. Windows are aligned by
+index and kept only where `draws/frame` agrees within 5 %, and medians are used, never
+means — the same run's own fps average has read 7.76 where its median read 2.44.
+
+## Where a frame goes here
+
+Series X, in the world: **383-410 ms median**. Of it, `preparing` on the submitting thread
+161-375 ms, the card 177-290 ms, copying back 57-85 ms, and the three overlap.
+
+Inside `preparing`, the largest single item is a settle waiting for the card — **226-326 ms**
+— and a microsecond breakdown by what was read (added while measuring this) shows it is
+**all one thing: a fill of upload memory**. The blame line then names the blocker: a fill of
+`0x20` bytes waits for shader writes declared over `0x11600000+0xae00000` — 174 MB. That
+range is the view's own extent (`descriptor/host.rs` `buffer_copy`), not an over-wide guess,
+so tightening it is not available; `VICTORY_ROOT_UAV_MB` only bounds the root path and
+changes nothing here (310.5 / 334.5 / 341.8 ms at default / 4 MB / 1 MB).
+
+`card_steps.rs` describes the same phenomenon from the AMD side (a 480-byte constant buffer
+waiting on eleven skinning dispatches that write through one 174 MB heap view).
+`VICTORY_FILL_TITLE=1` moves the wait — read-wait 310 -> 226 ms and preparing 236 -> 117 ms
+— but the frame median stays at 404 ms: the buckets trade places.
+
+## Five things that did not move this frame, and the numbers
+
+Each of these shortens work the frame does not wait on here. Reporting them so the next
+person does not spend the days again:
+
+| What was tried | What it changed | Frame |
+|---|---|---|
+| Leaving both shadow masks out | GPU -44 ms, fps 5.02 -> 6.46 | interiors and hair go dark, so not a fix |
+| Halving the non-hair mask's dispatch | nothing measurable | the switch was not reaching that pass (indirect), retracted |
+| Another branch's pipeline group (`-Fast`) | GPU -21 % (389 -> 308 ms) | 2.40 -> 2.40 fps |
+| Striping the mapping lock, 4 stripes | GPU -24 %, and submit lock wait 202 -> 23 ms | 2.44 -> 2.36 fps; the win is only in **loading** frames: 499 -> 258 ms |
+| DLSS Super Resolution, once the files were complete | 1.00 upscalings a frame, 375 done, none failed | 400 ms against 399 without it |
+| The title's own upscaler set lower (`fsrQuality` 2 -> 4) | internal resolution clearly lower | 406 ms against 400 |
+
+The last two make the point best: **lowering what the card renders changes nothing**, so
+this frame is not limited by pixel work, and the `on the GPU` figure is not pure execution
+time either — it moves with the queue.
+
+## Faults found
+
+- **No DLSS at all, for days, without a word.** `victory.exe upscaler-check` said
+  "DLSS NOT supported ... feature missing" against a Streamline folder that had
+  `sl.dlss_g.dll` but no `sl.dlss.dll` or `nvngx_dlss.dll`. `victory.exe get-dlss` fixed it
+  and the same check then said "DLSS supported, frame generation supported". Worth having
+  the check say which file is missing, not just which feature.
+- **A MiB count that wrapped.** `VICTORY_UPLOAD_QUEUE` parsed a MiB count with
+  `mebibytes << 20`, so a large enough setting became a small gate. `checked_mul` now, with a
+  test, found by ANDREANIADS reading the pull request.
+- **A pad that was never there.** The title's XInput slot asked the system `XInputGetState`,
+  which answers 1167 on all four slots for a GameInput synthetic pad; loading
+  `Microsoft GameInput\x64\XInput1_3.dll` first makes the pad appear.
+
+## The one lever left
+
+Since neither GPU work nor internal resolution moves the frame, what is left is the
+submission pipeline itself: every submission is prepared, sent, waited for and copied back
+before the next is looked at (`VICTORY_LATE_WAIT` off by default, and its two stages moved
+preparing 105 -> 69 ms while the frame stayed put). Two frames in flight end to end —
+`settle`, the relay that lands flights, `copied_read`, the queue behind — is the next thing
+worth measuring, and the only one of these that can plausibly reach 15 fps at Series X.
+
+# What was learned on an RTX 5080 (2026-11-27)
+
+One PC: Ryzen 9 9950X3D (16 cores, 32 threads), 64 GB, RTX 5080 16 GB (driver 621.24),
+Windows 11 26300, NVMe SSD. Series X profile, 2560x1440 output, DLSS Performance, frame
+generation off, diagnostics build at `df2daaf`, pipelines made ahead with `victory warm`.
+Two runs over the same stretch of the title, from the same save: the cutscenes of Lucia's
+arrest, the café and the prison interview, then Jason's introduction on the boat and a
+minute standing still on it. Run A with the launcher's settings, run B the same plus
+`VICTORY_BVH_BUILDER=1` (and `VICTORY_BVH_TRACE=1`). Figures are the log's ten-second lines;
+"steady" is the last 70 s of each run, on the boat, where `draws/frame` agrees within 5 %.
+
+## Without the builder: the card waits for us
+
+| Run A | Median of the run | Steady (boat) |
+|---|---|---|
+| Frames a second | 35.2 (p10 26.1, p90 45.2) | 34-38 |
+| Frame | 28.4 ms | 26-29 ms |
+| `preparing` | 21.1 ms | 20-22 ms |
+| The card busy, by its own clock | 71 % | 68-87 % |
+| Draws dropped without a host pipeline | 127 a frame | 80-90 |
+
+The card is idle 8-9 ms of a frame, and the log names that time as "while the submitting
+thread was working (the card idle behind us)". On this card the frame is the submitting
+thread's, as on the 7900 XTX.
+
+## With the builder: the cost is on the CPU here, not on the card
+
+| Steady, on the boat | A | B (`VICTORY_BVH_BUILDER=1`) |
+|---|---|---|
+| Frames a second | ~35 | ~23.5 |
+| Frame | ~28 ms | ~42 ms |
+| `preparing` | 20.5 ms | 31 ms |
+| The submitting thread worked | 26.5 ms | 44.4 ms |
+| The card busy | 68-87 % | 62-84 % |
+| The card idle behind us | ~8 ms | 8-15 ms |
+| Copies (frame line) | 10.0 ms, 37 MB | 15.1 ms, 41 MB |
+| Copying back (relay) | 5.2 ms | 9.1 ms |
+| Landing: merging what was fetched | 1.6 ms | 4.9 ms |
+| Landing threads waiting for the title's bytes going in | 1.1 ms | 9.5 ms |
+| Draws dropped without a host pipeline | 80-90 a frame | 1 |
+
+On the 7900 XTX the builder cost some 40 ms of the card a frame (`fork-ray-tracing.md`).
+On the RTX 5080 the card keeps its headroom and is still idle behind the submitting thread;
+what grows is our side of title memory by address (23,810 pages, 1.5 GB in 25 arenas, about
+24 pages a frame touched with no copy): copies, copying back and landing. So here 30 fps
+with the title's ray tracing is the same problem as 30 fps without it, the submitting
+thread, plus about 10 ms of landing and copies.
+
+The 127 draws a frame dropped in run A are 1 in run B: they are passes that need the
+builder's pipelines.
+
+## The first minutes with the builder
+
+Run B was made twice; the second time after a `victory warm` that found nothing left to
+make (88,605 pipelines known, all made before). Both times the first three minutes of the
+cutscenes ran at 1-4 frames a second (frames of 270-930 ms), and both times the boat settled
+at the same figures (second run: 21-25 fps, 39-47 ms, `preparing` 27-31 ms). So the slow
+start is not pipelines missing from the driver's cache. What the log shows in it:
+
+- The builder unpacking the shipped static structures: 700-1,040 builder dispatches a
+  frame, 30-75 MB of packed structures arriving every ten seconds, 500-1,050 pages a frame
+  touched that had no copy yet. After about two minutes it falls to 180-280 dispatches.
+- Pipelines still being made: about 1,100 in flight at the start, drained after 3.5 min
+  (run A, same build and book: about 830, drained in one minute).
+- The card 6-20 % busy and, of a 270 ms frame, about 190 ms "while the title had not
+  submitted": the title itself is not giving us work then. What it waits for is not shown
+  by these lines.
+
+Cutscene audio ran on meanwhile while the picture stood still for seconds (for less time in
+the second run). The picture, both times: blown-out light and black patches, more broken
+than without the builder; milder in the second run.
+## The structures' sizes
+
+Of the copies of dynamic structures `VICTORY_BVH_TRACE` recorded, 175 of 2,972 (first run)
+and 63 of 2,967 (second) were of a structure whose compacted size it had seen arrive; it saw
+each size arrive one frame after it was asked (`0x0 -> 0x21300`). Whether the other copies
+used a stale size, or the trace does not tie them to their ask, is not settled by these runs.
+
+## Shaders on 32-lane waves
+
+`victory shaders` with `VICTORY_HOST_WAVE=32`: 25,760 in the cache, 225 do not translate:
+198 containers without a vertex, pixel, compute or mesh program, 22 wave64 programs with no
+wave32 lowering, 5 with a descriptor read only as data. Two of the 22 were created in these
+runs (`6b82bc7d22016cb5`, `a10179ab7eda0dc3`, both compute).

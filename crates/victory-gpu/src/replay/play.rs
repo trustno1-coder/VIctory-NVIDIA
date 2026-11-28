@@ -631,15 +631,25 @@ impl Player {
             *at = Instant::now();
         };
         let mut at = Instant::now();
-        player.make_resources(options.buffers, &options.only_buffers)?;
+        player.make_resources(options.buffers, &options.only_buffers).context("creating replay resources")?;
         step("resources", &mut at);
-        player.make_pipelines(options.shaders.as_deref())?;
+        player.make_pipelines(options.shaders.as_deref()).context("creating replay pipelines")?;
         step("pipelines", &mut at);
-        player.make_descriptors()?;
+        player.make_descriptors().context("creating replay descriptor heaps")?;
         step("descriptors", &mut at);
-        player.load_contents()?;
+        if let Err(error) = player.load_contents() {
+            if let Some(queue) = &player.info {
+                for message in debug_messages(queue) {
+                    tracing::error!("{message}");
+                }
+            }
+            if options.breadcrumbs {
+                log_replay_breadcrumbs(&player.device);
+            }
+            return Err(error).context("loading the frame's initial contents");
+        }
         step("contents", &mut at);
-        player.make_masters(options.buffers, options.restore)?;
+        player.make_masters(options.buffers, options.restore).context("preparing replay restore copies")?;
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps
             .iter()
@@ -738,6 +748,15 @@ impl Player {
                 Type: D3D12_HEAP_TYPE_DEFAULT,
                 ..Default::default()
             };
+            // (Another vendor's card, `VICTORY_REPLAY_VENDOR`: a card with no memory of its
+            // own has no pool L1, so custom heaps there become plain ones.)
+            let made = gpu::to_props(p);
+            if std::env::var_os("VICTORY_REPLAY_VENDOR").is_some()
+                && made.Type == D3D12_HEAP_TYPE_CUSTOM
+                && made.MemoryPoolPreference == D3D12_MEMORY_POOL_L1
+            {
+                return card;
+            }
             match (gpu::seen(p), buffers) {
                 (Seen::ReadBack, _) => gpu::to_props(p),
                 (_, Buffers::Card) if buffer => card,
@@ -747,8 +766,16 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // The title makes its non-resident allocations resident separately.
+        // Replay does not record residency calls and needs them from its first copy.
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT.0
+            | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.0;
+        let nonresident = |flags: i32| flags & D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT.0 != 0;
+        let heaps = self.frame.heaps.iter().filter(|h| nonresident(h.flags)).count();
+        let resources = self.frame.resources.iter().filter(|r| {
+            matches!(r.place, Place::Committed { flags, .. } if nonresident(flags))
+        }).count();
+        tracing::debug!(heaps, resources, "recreating non-resident allocations as resident");
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -765,7 +792,32 @@ impl Player {
                 .filter(|id| !textures.contains(id))
                 .collect()
         };
+        // `VICTORY_REPLAY_KEEP=<file>` with `VICTORY_REPLAY_LEAN=1`: only the resources the
+        // file lists are made at all (a few commands on another vendor's card).
+        let lean: Option<HashSet<u32>> = std::env::var("VICTORY_REPLAY_LEAN")
+            .is_ok_and(|v| v.trim() == "1")
+            .then(|| std::env::var_os("VICTORY_REPLAY_KEEP"))
+            .flatten()
+            .and_then(|f| {
+                let text = std::fs::read_to_string(f).ok()?;
+                Some(text.split(|c: char| !c.is_ascii_digit()).filter_map(|w| w.parse().ok()).collect())
+            });
+        // (and only the heaps they lie in)
+        let lean_heaps: Option<HashSet<u32>> = lean.as_ref().map(|k| {
+            self.frame
+                .resources
+                .iter()
+                .filter(|r| k.contains(&r.id))
+                .filter_map(|r| match r.place {
+                    Place::Placed { heap, .. } => Some(heap),
+                    _ => None,
+                })
+                .collect()
+        });
         for h in &self.frame.heaps {
+            if lean_heaps.as_ref().is_some_and(|k| !k.contains(&h.id)) {
+                continue;
+            }
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: h.size,
                 Properties: props(&h.props, only.is_empty() && used_by_buffers_only.contains(&h.id)),
@@ -781,6 +833,9 @@ impl Player {
         let mut failed = 0;
         let mut moves: BTreeMap<String, (u32, u64)> = BTreeMap::new();
         for (index, r) in self.frame.resources.iter().enumerate() {
+            if lean.as_ref().is_some_and(|k| !k.contains(&r.id)) {
+                continue;
+            }
             let is_buffer = r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
             let moved = is_buffer && chosen(r, only);
             if moved && let Place::Committed { props, .. } = &r.place {
@@ -888,9 +943,15 @@ impl Player {
                 continue;
             }
             // SAFETY: a blob the host took.
-            let root = unsafe { self.device.CreateRootSignature(0, &blob.0) }
-                .with_context(|| format!("root signature {id}"))?;
-            self.roots.insert(*id, root);
+            let made: windows::core::Result<ID3D12RootSignature> = unsafe { self.device.CreateRootSignature(0, &blob.0) };
+            match made {
+                Ok(root) => {
+                    self.roots.insert(*id, root);
+                }
+                // (Another vendor's card than the one recorded on may refuse one: what
+                // uses it is then not made.)
+                Err(e) => tracing::warn!("root signature {id} not made ({} bytes): {e}", blob.0.len()),
+            }
         }
         for s in &self.frame.signatures {
             if self.signatures.contains_key(&s.id) {
@@ -1274,8 +1335,8 @@ impl Player {
                 "{full} versions of descriptor heaps had no room: earlier lists see later views"
             ));
         }
-        // Render target and depth views.
-        let mut views: [HashSet<Slot>; 2] = Default::default();
+        // CPU-only views for render targets, depth, and UAV clears.
+        let mut views: [HashSet<Slot>; 3] = Default::default();
         for c in self.commands.iter().flatten() {
             match c {
                 Cmd::Targets { colors, depth } => {
@@ -1284,6 +1345,7 @@ impl Player {
                 }
                 Cmd::ClearTarget { view, .. } => _ = views[0].insert(*view),
                 Cmd::ClearDepth { view, .. } => _ = views[1].insert(*view),
+                Cmd::ClearUavFloat { view, .. } => _ = views[2].insert(*view),
                 _ => {}
             }
         }
@@ -1294,6 +1356,7 @@ impl Player {
             let kind = [
                 D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                 D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             ][i];
             let d = D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: kind,
@@ -1327,7 +1390,7 @@ impl Player {
                             None
                         };
                         self.device.CreateRenderTargetView(res, d, at);
-                    } else {
+                    } else if i == 1 {
                         let d = s
                             .desc
                             .as_ptr()
@@ -1346,6 +1409,8 @@ impl Player {
                             None
                         };
                         self.device.CreateDepthStencilView(res, d, at);
+                    } else {
+                        self.view(s, at, false);
                     }
                     self.targets.insert(*s, at);
                     at.ptr += step;
@@ -1367,9 +1432,11 @@ impl Player {
         // Batches of parts with their place in the buffer.
         let mut batches: Vec<Vec<(usize, u64)>> = vec![Vec::new()];
         let (mut at, mut most) = (0u64, 0u64);
+        // (`VICTORY_REPLAY_STEPS`: each part alone and waited for.)
+        let stepped = std::env::var_os("VICTORY_REPLAY_STEPS").is_some();
         for (i, (_, len, _)) in parts.iter().enumerate() {
             at = at.next_multiple_of(512);
-            if at + len > STAGING && at > 0 {
+            if (at + len > STAGING || stepped) && at > 0 {
                 batches.push(Vec::new());
                 at = 0;
             }
@@ -1394,7 +1461,8 @@ impl Player {
         }
         for (n, batch) in batches.iter().enumerate() {
             let k = n % stagings.len();
-            self.worker.wait(stagings[k].2)?;
+            self.worker.wait(stagings[k].2)
+                .with_context(|| format!("waiting to reuse staging for upload batch {n}"))?;
             let map = stagings[k].1;
             let next = AtomicUsize::new(0);
             let failed: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::default();
@@ -1436,6 +1504,9 @@ impl Player {
             let sent = worker.send(|l| copy(self, l, &list, &buffer));
             self.worker = worker;
             stagings[k].2 = sent?;
+            if stepped {
+                self.worker.idle().with_context(|| format!("upload batch {n}"))?;
+            }
         }
         self.worker.idle()?;
         Ok(())
@@ -1459,26 +1530,49 @@ impl Player {
                 if loaded { &mut into } else { &mut early },
             );
         }
+        // `VICTORY_REPLAY_KEEP=<file>`: contents only of the resources whose numbers the
+        // file lists (what a few commands read, from `--flow`): the others stay as made.
+        let keep: Option<HashSet<u32>> = std::env::var_os("VICTORY_REPLAY_KEEP").and_then(|f| {
+            let text = std::fs::read_to_string(f).ok()?;
+            Some(text.split(|c: char| !c.is_ascii_digit()).filter_map(|w| w.parse().ok()).collect())
+        });
         let textures: Vec<(Content, u64, u64)> = self
             .frame
             .contents
             .iter()
             .filter(|c| self.objects.contains_key(&c.res))
+            .filter(|c| keep.as_ref().is_none_or(|k| k.contains(&c.res)))
             .map(|c| (c.clone(), c.len, c.file))
             .collect();
         let missing = self.frame.contents.len() - textures.len();
-        self.worker.run(|list| {
-            // SAFETY: an open list; live resources.
-            unsafe {
-                for all in early.chunks(1000) {
-                    list.ResourceBarrier(all);
-                }
-                list.ResourceBarrier(&[alias()]);
-                for all in into.chunks(1000) {
-                    list.ResourceBarrier(all);
-                }
+        // `VICTORY_REPLAY_STEPS=<n>`: the state changes in lists of n, each waited for and
+        // counted in the log (to find the one another vendor's card stops at).
+        if let Some(n) = std::env::var("VICTORY_REPLAY_STEPS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0) {
+            for (k, all) in early.chunks(n).enumerate() {
+                // SAFETY: an open list; live resources.
+                self.worker.run(|list| unsafe { list.ResourceBarrier(all) }).with_context(|| format!("state changes of idle resources, step {k} of {n}"))?;
             }
-        })?;
+            // SAFETY: as above.
+            self.worker.run(|list| unsafe { list.ResourceBarrier(&[alias()]) }).context("the alias barrier")?;
+            for (k, all) in into.chunks(n).enumerate() {
+                // SAFETY: as above.
+                self.worker.run(|list| unsafe { list.ResourceBarrier(all) }).with_context(|| format!("state changes of loaded resources, step {k} of {n}"))?;
+            }
+            tracing::info!("state changes done: {} idle, {} loaded", early.len(), into.len());
+        } else {
+            self.worker.run(|list| {
+                // SAFETY: an open list; live resources.
+                unsafe {
+                    for all in early.chunks(1000) {
+                        list.ResourceBarrier(all);
+                    }
+                    list.ResourceBarrier(&[alias()]);
+                    for all in into.chunks(1000) {
+                        list.ResourceBarrier(all);
+                    }
+                }
+            })?;
+        }
         let file = File::open(self.folder.join("contents.bin"))?;
         self.upload(&textures, &file, |player, list, parts, staging| {
             for (c, len, at) in parts {
@@ -1486,6 +1580,9 @@ impl Player {
                     continue;
                 };
                 let r = &player.frame.resources[o.index];
+                if std::env::var_os("VICTORY_REPLAY_STEPS").is_some() {
+                    tracing::info!("contents of {} ({}): first {} count {} bytes {}", r.id, r.name, c.first, c.count, len);
+                }
                 // SAFETY: an open list; live resources.
                 unsafe {
                     if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
@@ -1512,7 +1609,7 @@ impl Player {
                     }
                 }
             }
-        })?;
+        }).context("uploading the recorded resource contents")?;
         // To the states of the frame's start.
         let mut back = Vec::new();
         for r in &self.frame.resources {
@@ -1528,7 +1625,7 @@ impl Player {
                 // SAFETY: an open list; live resources.
                 unsafe { list.ResourceBarrier(all) };
             }
-        })?;
+        }).context("restoring initial resource states after upload")?;
         if missing > 0 {
             self.note(format!(
                 "contents of {missing} parts of resources that could not be made are left out"
@@ -1582,7 +1679,7 @@ impl Player {
                     unsafe { list.CopyBufferRegion(&o.res, d.at, staging, *at, *len) };
                 }
             }
-        })?;
+        }).context("uploading initial CPU writes")?;
         // The later ones wait in a buffer of their own.
         let mut later: Vec<((u64, Delta), u64, u64)> = Vec::new();
         let mut total = 0u64;
@@ -1607,7 +1704,7 @@ impl Player {
                     // SAFETY: an open list; live buffers.
                     unsafe { list.CopyBufferRegion(&buffer, *to, staging, *at, *len) };
                 }
-            })?;
+            }).context("uploading later CPU writes")?;
         }
         Ok(())
     }
@@ -1646,6 +1743,7 @@ impl Player {
                 }
                 Cmd::Indirect { args, count, .. } => named.extend([*args, *count]),
                 Cmd::ResolveQuery { dst, .. } => _ = named.insert(*dst),
+                Cmd::ClearUavFloat { view, .. } => _ = named.insert(view.res),
                 _ => {}
             }
         }
@@ -1715,6 +1813,7 @@ impl Player {
                         Cmd::CopyBuffer { dst, .. }
                         | Cmd::CopyResource { dst, .. }
                         | Cmd::ResolveQuery { dst, .. } => _ = written.insert(*dst),
+                        Cmd::ClearUavFloat { view, .. } => _ = written.insert(view.res),
                         Cmd::CopyTexture {
                             dst: Loc::Sub { res, .. } | Loc::Placed { res, .. },
                             ..
@@ -2215,7 +2314,7 @@ impl Player {
             .map(|c| {
                 2 + if o.detailed {
                     c.iter()
-                        .filter(|c| c.works() || matches!(c, Cmd::Barriers { .. }))
+                        .filter(|c| c.works() || c.is_barrier())
                         .count()
                 } else {
                     0
@@ -2500,12 +2599,12 @@ impl Player {
                 // SAFETY: an open list.
                 unsafe { self.wait_for_all(list) };
             }
-            let timed = c.works() || matches!(c, Cmd::Barriers { .. });
+            let timed = c.works() || c.is_barrier();
             if timed && let Some((heap, next)) = &mut stamp {
                 // SAFETY: as above.
                 unsafe { list.EndQuery(*heap, D3D12_QUERY_TYPE_TIMESTAMP, **next) };
                 let category = match c {
-                    Cmd::Barriers { .. } => "barriers",
+                    Cmd::Barriers { .. } | Cmd::GlobalSync {} => "barriers",
                     Cmd::Dispatch { .. } if clamps.contains(&bound) => "argument clamps (ours)",
                     Cmd::Dispatch { .. } if compares.contains(&bound) => {
                         "hash and compare passes (ours)"
@@ -2519,7 +2618,7 @@ impl Player {
                     Cmd::Draw { .. } | Cmd::DrawIndexed { .. } | Cmd::DispatchMesh { .. } => {
                         "draws"
                     }
-                    Cmd::ClearDepth { .. } | Cmd::ClearTarget { .. } | Cmd::Discard { .. } => {
+                    Cmd::ClearDepth { .. } | Cmd::ClearTarget { .. } | Cmd::ClearUavFloat { .. } | Cmd::Discard { .. } => {
                         "clears"
                     }
                     Cmd::Resolve { .. } | Cmd::ResolveRegion { .. } => "resolves",
@@ -2732,6 +2831,7 @@ impl Player {
                         all.iter().filter_map(|b| self.barrier(b)).collect();
                     barriers(l, &all);
                 }
+                Cmd::GlobalSync {} => self.wait_for_all(l),
                 Cmd::Heaps { heaps } => {
                     let all: Vec<Option<ID3D12DescriptorHeap>> = heaps
                         .iter()
@@ -2867,6 +2967,18 @@ impl Player {
                     let rects = (!rects.is_empty()).then_some(&rects[..]);
                     if self.objects.contains_key(&v.res) {
                         l.ClearRenderTargetView(view(v), color, rects);
+                    }
+                }
+                Cmd::ClearUavFloat { heap, index, view: v, color, rects } => {
+                    if let Some((versions, step)) = self.descriptors.get(heap)
+                        && let Some(version) = versions.get(version)
+                        && let (Some(resource), Some(cpu)) = (res(v.res), self.targets.get(v))
+                    {
+                        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                            ptr: version.gpu + u64::from(*index) * step,
+                        };
+                        let rects: Vec<RECT> = rects.iter().map(|r| to_rect(*r)).collect();
+                        l.ClearUnorderedAccessViewFloat(gpu, *cpu, resource, color, &rects);
                     }
                 }
                 Cmd::Discard {
@@ -3042,7 +3154,7 @@ impl Player {
                     continue;
                 }
                 for l in all {
-                    self.worker.queue.ExecuteCommandLists(&[l.clone()]);
+                    self.worker.queue.ExecuteCommandLists(std::slice::from_ref(l));
                     self.worker.idle()?;
                 }
             }
@@ -3086,10 +3198,10 @@ impl Player {
 
     /// One run of the frame, noted in the report; its timestamps.
     fn once(&mut self, o: &Options, (built, report): &mut (Sends, Report)) -> Result<Vec<u64>> {
-        self.restore(o.restore)?;
+        self.restore(o.restore).context("restoring the recorded frame")?;
         self.fresh = false;
-        let stamps = self.send(built, o)?;
-        if let Some((db, _, hash, _)) = self.picture_now()? {
+        let stamps = self.send(built, o).context("executing recorded command lists")?;
+        if let Some((db, _, hash, _)) = self.picture_now().context("reading the replayed picture")? {
             report.pictures.push((db, hash));
         }
         let ms = |a: u32, b: u32| {
@@ -3443,7 +3555,13 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
                 break;
             };
             let d = a.GetDesc1()?;
-            if (d.VendorId, d.DeviceId) == (frame.vendor, frame.device) {
+            // `VICTORY_REPLAY_VENDOR=<hex>`: the first adapter of that vendor instead of
+            // the one recorded on (1002: AMD, whose waves can be the console's 64 lanes).
+            let wanted = match std::env::var("VICTORY_REPLAY_VENDOR").ok().and_then(|v| u32::from_str_radix(v.trim(), 16).ok()) {
+                Some(vendor) => d.VendorId == vendor,
+                None => (d.VendorId, d.DeviceId) == (frame.vendor, frame.device),
+            };
+            if wanted {
                 adapter = Some(a);
                 break;
             }
@@ -3462,6 +3580,30 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
         let device = device.context("no device")?;
         let info = device.cast::<ID3D12InfoQueue>().ok();
         Ok((device, info))
+    }
+}
+
+fn log_replay_breadcrumbs(device: &ID3D12Device) {
+    let Ok(dred) = device.cast::<ID3D12DeviceRemovedExtendedData1>() else { return };
+    // SAFETY: DRED's arrays and linked nodes live as long as the device.
+    unsafe {
+        if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+            && fault.PageFaultVA != 0
+        {
+            tracing::error!(va = format_args!("{:#x}", fault.PageFaultVA), "replay GPU page fault");
+        }
+        if let Ok(crumbs) = dred.GetAutoBreadcrumbsOutput() {
+            let mut node = crumbs.pHeadAutoBreadcrumbNode;
+            for _ in 0..32 {
+                let Some(crumb) = node.as_ref() else { break };
+                let done = crumb.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                if done < crumb.BreadcrumbCount && !crumb.pCommandHistory.is_null() {
+                    let op = *crumb.pCommandHistory.add(done as usize);
+                    tracing::error!(done, total = crumb.BreadcrumbCount, op = op.0, "incomplete replay command list");
+                }
+                node = crumb.pNext;
+            }
+        }
     }
 }
 
