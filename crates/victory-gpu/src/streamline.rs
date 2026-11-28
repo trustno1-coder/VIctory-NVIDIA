@@ -132,6 +132,24 @@ impl Asked {
     pub fn any(&self) -> bool {
         self.dlss || self.framegen
     }
+
+    /// The mode set to the one this console's title takes ([`Mode::on_console`]:
+    /// on Series S, quality for DLAA), said in the log; true if it changed. The
+    /// caller sets [`Asked::series_s`] first, and calls it before [`init`] and
+    /// before patching the title's renderer to the mode's scale.
+    pub fn fit_console(&mut self) -> bool {
+        let mode = self.mode.on_console(self.series_s);
+        if mode == self.mode {
+            return false;
+        }
+        tracing::warn!(
+            asked = self.mode.name(),
+            mode = mode.name(),
+            "Series S: no DLAA, its 1920x1080 scene stops the title during the boot screens (0x80000003 at +0x2219650); the scene stays at the title's own 1280x720"
+        );
+        self.mode = mode;
+        true
+    }
 }
 
 /// What [`init`] made available: the upscaling (the title's renderer may be
@@ -388,7 +406,10 @@ pub fn init(asked: &Asked) -> Available {
     // title's own FidelityFX takes the Series S sizes only and the title fails without DLSS; on
     // Series S, with its own FidelityFX upscaler running beside our frame generation, the title
     // stopped on a check (0x80000003 at +0x2219650) seconds into the start (2026-11-27: muted
-    // runs here, issues #272, #308 and #331; with DLSS on, both consoles ran).
+    // runs here, issues #272, #308 and #331; with DLSS on, both consoles ran). Those Series S
+    // starts had the scene at DLAA's scale (frame generation alone keeps it at the picture's
+    // size, #308's logs: `images/upscaler-dlaa`), which stops that title with or without FSR 3:
+    // `Asked::fit_console` keeps Series S at quality.
     let fsr_needs_dlss = asked.fsr_framegen && !available.dlss;
     if fsr_needs_dlss {
         tracing::warn!(

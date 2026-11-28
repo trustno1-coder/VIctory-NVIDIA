@@ -144,8 +144,11 @@ const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performanc
 /// The Series S scene heights the F1 menu offers and the DLSS mode of each: the picture
 /// is 1920x1080, the scene that mode's share of it (720: the game's own size, and what
 /// it stays at without DLSS: the title's own FidelityFX path from 540 stopped it at the
-/// start, 0xc0000094, a division by zero in the title, 2026-11-28).
-const S_SIZES: [(&str, &str); 4] = [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance")];
+/// start, 0xc0000094, a division by zero in the title, 2026-11-28). No 1080: with its
+/// scene at DLAA's 1920x1080 the Series S title stops during the boot screens
+/// (`Mode::on_console`, #707, #710), so DLAA asked on Series S (the DLSS line, `--dlss
+/// dlaa`, a 1080 saved before) is 720's quality.
+const S_SIZES: [(&str, &str); 3] = [("720", "quality"), ("626", "balanced"), ("540", "performance")];
 
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct Play {
@@ -159,7 +162,8 @@ pub(crate) struct Play {
     /// upscaled by the title; 4k: the stock 3840x2160 output.
     #[arg(long, default_value = "1440", value_parser = RESOLUTIONS)]
     res: String,
-    /// DLSS in place of the title's upscaling (needs NVIDIA's files).
+    /// DLSS in place of the title's upscaling (needs NVIDIA's files); dlaa is
+    /// quality on Series S, whose game stops at DLAA's scene size.
     #[arg(long, default_value = "quality", value_parser = DLSS_MODES)]
     dlss: String,
     /// DLSS frame generation on from the start: frames shown for each one
@@ -293,7 +297,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     let res = saved("VICTORY_MENU_RES").filter(|r| RESOLUTIONS.contains(r)).unwrap_or(&o.res);
     let mut dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
     // Series S picture: the scene's size, which with DLSS on is its mode (the menu keeps the
-    // two matched); not saved yet, it is the DLSS mode's.
+    // two matched); not saved yet, it is the DLSS mode's. DLAA has none (`S_SIZES`): 720.
     let s_res = saved("VICTORY_MENU_S_RES")
         .and_then(|r| S_SIZES.iter().find(|(h, _)| *h == r))
         .or_else(|| S_SIZES.iter().find(|(_, m)| *m == dlss))
@@ -1136,9 +1140,21 @@ mod tests {
         assert_eq!(get(&s, "VICTORY_DLSS_MODE").as_deref(), Some("performance"));
         assert_eq!(get(&s, "VICTORY_MENU_DLSS").as_deref(), Some("performance"));
         assert_eq!(get(&s, "VICTORY_FSR_PATH"), None);
-        // DLAA is 1080
-        let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=dlaa\r\n"), Some(Path::new("x")));
-        assert_eq!((get(&s, "VICTORY_DLSS_MODE").as_deref(), get(&s, "VICTORY_MENU_S_RES").as_deref()), (Some("dlaa"), Some("1080")));
+        // no DLAA on Series S (its game stops at that scene size): 720 at quality, from the
+        // DLSS line, a 1080 saved before, or --dlss dlaa
+        for more in ["VICTORY_MENU_DLSS=dlaa\r\n", "VICTORY_MENU_DLSS=dlaa\r\nVICTORY_MENU_S_RES=1080\r\n"] {
+            let (s, _) = settings(&options(), &s_menu(more), Some(Path::new("x")));
+            assert_eq!(get(&s, "VICTORY_DLSS_MODE").as_deref(), Some("quality"), "{more}");
+            assert_eq!((get(&s, "VICTORY_MENU_S_RES").as_deref(), get(&s, "VICTORY_MENU_DLSS").as_deref()), (Some("720"), Some("quality")));
+        }
+        let mut o = options();
+        (o.series_s, o.dlss) = (true, "dlaa".to_owned());
+        let (s, series_s) = settings(&o, &[], Some(Path::new("x")));
+        assert!(series_s);
+        assert_eq!(get(&s, "VICTORY_DLSS_MODE").as_deref(), Some("quality"));
+        // Series X keeps it
+        let (s, _) = settings(&options(), &parse_menu("VICTORY_MENU_DLSS=dlaa\r\n"), Some(Path::new("x")));
+        assert_eq!(get(&s, "VICTORY_DLSS_MODE").as_deref(), Some("dlaa"));
         // without DLSS (off, or no NVIDIA files): the game's 720, never the title's FidelityFX path
         for (more, dir) in [("VICTORY_MENU_DLSS=off\r\nVICTORY_MENU_S_RES=540\r\n", Some(Path::new("x"))), ("VICTORY_MENU_S_RES=540\r\n", None)] {
             let (s, _) = settings(&options(), &s_menu(more), dir);
