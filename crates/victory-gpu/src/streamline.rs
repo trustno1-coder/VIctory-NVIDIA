@@ -307,6 +307,44 @@ static FG_ON: AtomicU64 = AtomicU64::new(0);
 static FG_OFF: AtomicU64 = AtomicU64::new(0);
 static FG_SHOWN: AtomicU64 = AtomicU64::new(0);
 static EVALUATED_ALL: AtomicU64 = AtomicU64::new(0);
+
+/// The driver's DLSS refused the evaluations Streamline gave it ("NGX
+/// evaluate feature failed", reported through [`log_message`]), and how
+/// many. Once nearly every one fails ([`dlss_failing`]), DLSS is left alone
+/// for the run and the title's own FidelityFX upscales again: a refused
+/// evaluation leaves the output as it was, so the screen stayed black with
+/// the sound and subtitles running (#449: an RTX 5060 Ti with the NVIDIA
+/// App's DLSS override, which loads its own Streamline plugins and asked
+/// every DLSS mode for a 2560x1440 render while the title rendered
+/// 1280x720; 599 of about 600 evaluations failed with 0xbad00005).
+static NGX_FAILED: AtomicU64 = AtomicU64::new(0);
+static DLSS_GIVEN_UP: AtomicBool = AtomicBool::new(false);
+
+/// Failed evaluations from which DLSS is given up, if they are nine in
+/// ten of the evaluations recorded.
+const NGX_FAILED_ENOUGH: u64 = 90;
+
+/// Whether DLSS is given up for the run (see [`NGX_FAILED`]).
+fn dlss_failing(failed: u64, evaluated: u64) -> bool {
+    failed >= NGX_FAILED_ENOUGH && failed * 10 >= evaluated * 9
+}
+
+fn ngx_evaluate_failed(text: &str) {
+    let failed = NGX_FAILED.fetch_add(1, Relaxed) + 1;
+    if !DLSS_GIVEN_UP.load(Relaxed)
+        && dlss_failing(failed, EVALUATED_ALL.load(Relaxed))
+        && !DLSS_GIVEN_UP.swap(true, Relaxed)
+    {
+        tracing::error!(
+            failed,
+            evaluated = EVALUATED_ALL.load(Relaxed),
+            last = text,
+            "DLSS: the driver refused nearly every upscaling, which leaves the picture black; DLSS and frame generation are off for this run and the game's own FSR upscales.              If the NVIDIA App has a DLSS override on for this game (Graphics > the program > DLSS Override), turn it off"
+        );
+        // Frame generation stops too (see `upscale`): with nothing noted it would show stale frames.
+        FG_WANTED.store(0, Relaxed);
+    }
+}
 static FG_STATUS: AtomicU32 = AtomicU32::new(0);
 /// Presents with frame generation on, and frames it showed, in all.
 static FG_ON_ALL: AtomicU64 = AtomicU64::new(0);
@@ -346,25 +384,27 @@ pub fn init(asked: &Asked) -> Available {
     } else {
         Some(NoDlss::Card)
     };
-    // FSR 3 frame generation needs the title's upscaling to run: on Series X that is DLSS's
-    // (the title's own FidelityFX takes the Series S sizes only, and the title fails without it).
-    let fsr_needs_series_s = asked.fsr_framegen && !asked.series_s && !available.dlss;
-    if fsr_needs_series_s {
+    // FSR 3 frame generation needs DLSS for the upscaling, on either console. On Series X the
+    // title's own FidelityFX takes the Series S sizes only and the title fails without DLSS; on
+    // Series S, with its own FidelityFX upscaler running beside our frame generation, the title
+    // stopped on a check (0x80000003 at +0x2219650) seconds into the start (2026-11-27: muted
+    // runs here, issues #272, #308 and #331; with DLSS on, both consoles ran).
+    let fsr_needs_dlss = asked.fsr_framegen && !available.dlss;
+    if fsr_needs_dlss {
         tracing::warn!(
-            "FSR 3 frame generation stays off: on Series X it needs DLSS for the upscaling, which this card or these files do not give; the Series S profile runs it"
+            "FSR 3 frame generation stays off: it needs DLSS for the upscaling, which is off, or this card or these files do not give; without it the title stops at the start"
         );
     }
-    let fsr_framegen = asked.fsr_framegen && !fsr_needs_series_s && fsr::init(&asked.fidelityfx_dir);
+    let fsr_framegen = asked.fsr_framegen && !fsr_needs_dlss && fsr::init(&asked.fidelityfx_dir);
     let _ = FACTS.set(Facts {
         adapter: default_adapter().map(|a| a.0).unwrap_or_default(),
-        series_s: asked.series_s,
         no_dlss,
         files_missing,
         dlss_fg_asked: asked.framegen,
         dlss_fg_supported: available.framegen,
         fsr_asked: asked.fsr_framegen,
         fsr_loaded: fsr_framegen,
-        fsr_needs_series_s,
+        fsr_needs_dlss,
     });
     Available { fsr_framegen, ..available }
 }
@@ -372,7 +412,6 @@ pub fn init(asked: &Asked) -> Available {
 /// What the start found out about frame generation on this card ([`notice`]).
 struct Facts {
     adapter: String,
-    series_s: bool,
     /// Why DLSS upscaling is not running (`None`: it runs).
     no_dlss: Option<NoDlss>,
     /// Streamline's files did not load (nothing is known of the card).
@@ -381,7 +420,8 @@ struct Facts {
     dlss_fg_supported: bool,
     fsr_asked: bool,
     fsr_loaded: bool,
-    fsr_needs_series_s: bool,
+    /// FSR 3 frame generation was asked and stays off: DLSS upscaling is not running.
+    fsr_needs_dlss: bool,
 }
 
 /// Why DLSS upscaling is not running: the notice must not blame a card that
@@ -430,6 +470,8 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
     if no_dlss_fg {
         lines.push(if f.files_missing {
             "DLSS FRAME GEN: NVIDIA DLSS FILES NOT FOUND"
+        } else if dlss_framegen_card(&f.adapter) {
+            "DLSS FRAME GEN: UNAVAILABLE (CHECK HAGS AND LOG)"
         } else {
             "DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)"
         }.into());
@@ -448,22 +490,13 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
         } else {
             "FRAME GEN: AMD FSR 3 (CHOSEN IN F1), 2X AT MOST".into()
         });
-        if !f.series_s {
-            lines.push("SERIES X WITH FSR 3 NEEDS DLSS UPSCALING (ON)".into());
-        } else if f.no_dlss.is_some() {
-            lines.push("SERIES S MODE: FSR 3 RUNS WITHOUT DLSS".into());
-        }
-    } else if f.fsr_needs_series_s {
-        lines.push("FRAME GEN OFF: FSR 3 ON SERIES X NEEDS DLSS ON".into());
+        lines.push("FSR 3 FRAME GEN NEEDS DLSS UPSCALING (ON)".into());
+    } else if f.fsr_needs_dlss {
+        lines.push("FRAME GEN OFF: FSR 3 NEEDS DLSS UPSCALING ON".into());
         lines.push(match f.no_dlss {
             Some(NoDlss::FilesMissing) => "NVIDIA DLSS FILES NOT FOUND (VICTORY_STREAMLINE_DIR)",
             Some(NoDlss::Card) => "THIS CARD HAS NO DLSS UPSCALING",
             _ => "DLSS UPSCALING IS OFF: TURN IT ON IN F1 > DLSS",
-        }.into());
-        lines.push(if f.no_dlss == Some(NoDlss::Card) {
-            "USE F1 > CONSOLE > SERIES S (THE GAME RESTARTS)"
-        } else {
-            "OR F1 > CONSOLE > SERIES S (THE GAME RESTARTS)"
         }.into());
     } else if f.fsr_asked && !f.fsr_loaded {
         lines.push("FRAME GEN OFF: AMD FSR 3 FILES NOT FOUND".into());
@@ -617,7 +650,12 @@ unsafe extern "C" fn log_message(kind: u32, message: *const c_char) {
     // (Every plugin in the folder that was not asked for says so.)
     let noise = text.contains("since it is was not requested by the host");
     match kind {
-        abi::LOG_ERROR => tracing::error!(target: "streamline", "{text}"),
+        abi::LOG_ERROR => {
+            tracing::error!(target: "streamline", "{text}");
+            if text.contains("NGX evaluate feature failed") {
+                ngx_evaluate_failed(text);
+            }
+        }
         abi::LOG_WARN if !noise => tracing::warn!(target: "streamline", "{text}"),
         _ => tracing::debug!(target: "streamline", "{text}"),
     }
@@ -635,17 +673,30 @@ pub fn adapter_name() -> Option<String> {
 }
 
 /// Whether a card of this name runs DLSS Frame Generation: a GeForce RTX of
-/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU").
+/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU"),
+/// or a workstation card of those generations ("NVIDIA RTX 2000 Ada Generation",
+/// "NVIDIA RTX PRO 4000 Blackwell SFF Edition", #312). Not the older Quadro RTX
+/// 4000 to 8000 (Turing) or RTX A2000 to A6000 (Ampere).
 pub fn dlss_framegen_card(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
+    if name.contains("QUADRO") {
+        return false;
+    }
+    if name.contains(" ADA") || name.contains("BLACKWELL") || name.contains("RTX PRO") {
+        return true;
+    }
     let Some(at) = name.find("RTX") else { return false };
     let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
     model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
 }
 
-/// The adapter a device made with no adapter named is on (the first), its
-/// name and LUID.
+/// The card the host device is made on (`hardware_adapter`; else the first
+/// adapter, where a device made with no adapter named is), its name and LUID.
 fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
+    if let Some((adapter, name, _)) = victory_shader::emit::host::hardware_adapter() {
+        // SAFETY: a plain DXGI query.
+        return unsafe { adapter.GetDesc1() }.ok().map(|d| (name, d.AdapterLuid));
+    }
     // SAFETY: plain DXGI queries.
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
@@ -1034,6 +1085,12 @@ fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
 /// its inputs are noted there for the present); the title's own runs
 /// otherwise.
 pub fn upscale(up: &Upscale) -> Taken {
+    // DLSS given up: the title's own upscaling alone, as in a start without NVIDIA's files.
+    // Nothing is noted for frame generation (turned off with it, `ngx_evaluate_failed`): the
+    // title's FidelityFX beside our frame generation stops the title on a check (+0x2219650).
+    if DLSS_GIVEN_UP.load(Relaxed) {
+        return Taken::No("the driver refused DLSS's upscalings (DLSS and frame generation are off for the run)");
+    }
     let plan = PLAN.get();
     let dlss = plan.is_some_and(|p| p.dlss) && DLSS_READY.load(Acquire);
     // (FSR 3 frame generation reads the same inputs at the present.)
@@ -1745,7 +1802,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     if every > 0 {
         static PRESENTS: AtomicU32 = AtomicU32::new(0);
         let n = PRESENTS.fetch_add(1, Relaxed);
-        if n % every == 0 {
+        if n.is_multiple_of(every) {
             set_framegen([2, 4, 0, 6][(n / every % 4) as usize]);
         }
     }
@@ -2274,5 +2331,21 @@ pub(crate) fn line(frames: f64) {
                 "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod failing_tests {
+    use super::dlss_failing;
+
+    #[test]
+    fn dlss_is_given_up_only_when_nearly_every_upscaling_fails() {
+        // #449: 599 failed of about 600.
+        assert!(dlss_failing(599, 600));
+        assert!(dlss_failing(90, 100));
+        // Too few to tell yet, or a few refusals among working upscalings.
+        assert!(!dlss_failing(89, 89));
+        assert!(!dlss_failing(120, 1000));
+        assert!(!dlss_failing(500, 600));
     }
 }

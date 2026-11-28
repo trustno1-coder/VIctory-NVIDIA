@@ -111,6 +111,32 @@ fn os_runtime() -> u32 {
         .map_or(4, |v| v.min(614))
 }
 
+/// Windows' build number (19045 is Windows 10 22H2, 22000 and up Windows
+/// 11), from `RtlGetVersion`, which no compatibility shim changes.
+/// `VICTORY_WINDOWS_BUILD` stands in for it (to try Windows 10's path).
+#[cfg(windows)]
+pub(crate) fn windows_build() -> Option<u32> {
+    if let Some(build) = std::env::var("VICTORY_WINDOWS_BUILD").ok().and_then(|v| v.trim().parse().ok()) {
+        return Some(build);
+    }
+    #[repr(C)]
+    struct OsVersionInfo {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        service_pack: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
+    }
+    let mut info = OsVersionInfo { size: size_of::<OsVersionInfo>() as u32, major: 0, minor: 0, build: 0, platform: 0, service_pack: [0; 128] };
+    // SAFETY: `info` is an OSVERSIONINFOW with its size set, as RtlGetVersion takes.
+    (unsafe { RtlGetVersion(&mut info) } == 0).then_some(info.build)
+}
+
 /// Asks Windows for the Agility SDK version of the `D3D12\D3D12Core.dll`
 /// beside this program, or for its own runtime where there is none. First
 /// thing in `main`, and again after `victory play` fetched the file: Windows
@@ -166,6 +192,8 @@ struct Cli {
     command: Command,
 }
 
+// Parsed once at start: the size of its largest variant does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
@@ -274,6 +302,11 @@ enum Command {
     Preload {
         /// The title's folder (default: the configured game folder).
         paths: Vec<PathBuf>,
+        /// Threads and processes for each of its steps, to leave the rest of
+        /// the PC free (default: `VICTORY_PRELOAD_JOBS`, else each step's
+        /// own: every core to translate, two thirds of them to make).
+        #[arg(long)]
+        jobs: Option<usize>,
     },
     /// Play: the title with this fork's settings, as a start with no
     /// command at all does (a double click on the program beside the
@@ -449,11 +482,18 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         #[cfg(windows)]
-        Command::Preload { paths } => {
+        Command::Preload { paths, jobs } => {
+            // The launcher and the F1 menu's restart pass it as a switch.
+            let jobs = jobs
+                .or_else(|| std::env::var("VICTORY_PRELOAD_JOBS").ok()?.trim().parse().ok())
+                .filter(|&n| n > 0);
+            if let Some(n) = jobs {
+                println!("Preloading on {n} threads at a time (VICTORY_PRELOAD_JOBS / --jobs).");
+            }
             play::explain_preload();
-            translate::precompile(paths, None)?;
-            warm::run(None, None, false, false, None)?;
-            warm::into_library(None)
+            translate::precompile(paths, jobs)?;
+            warm::run(jobs, None, false, false, None)?;
+            warm::into_library(jobs)
         }
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),
@@ -537,6 +577,20 @@ fn show_config() -> Result<()> {
     Ok(())
 }
 
+/// Paths given on the command line, or the configured game + test titles.
+pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    if !paths.is_empty() {
+        return Ok(paths);
+    }
+    let cfg = victory_core::Config::load()?;
+    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
+    anyhow::ensure!(
+        !all.is_empty(),
+        "no paths given and none configured (see victory.example.toml)"
+    );
+    Ok(all)
+}
+
 #[cfg(test)]
 mod tests {
     /// A D3D12Core.dll's VS_FIXEDFILEINFO: signature, structure version, then
@@ -566,24 +620,10 @@ mod tests {
         let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap();
         if let Ok(dll) = std::fs::read(system.join("System32").join("D3D12Core.dll")) {
             let v = super::exported_sdk_version(&dll).expect("System32's D3D12Core.dll exports D3D12SDKVersion");
-            assert!(v >= 4, "{v}");
-            assert!((4..=614).contains(&super::os_runtime()));
+            // Older Windows runtimes may export versions below 4.
+            assert_eq!(super::os_runtime(), v.min(614));
         }
         assert_eq!(super::exported_sdk_version(&[0u8; 64]), None);
         assert_eq!(super::exported_sdk_version(b"MZ"), None);
     }
-}
-
-/// Paths given on the command line, or the configured game + test titles.
-pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    if !paths.is_empty() {
-        return Ok(paths);
-    }
-    let cfg = victory_core::Config::load()?;
-    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
-    anyhow::ensure!(
-        !all.is_empty(),
-        "no paths given and none configured (see victory.example.toml)"
-    );
-    Ok(all)
 }
