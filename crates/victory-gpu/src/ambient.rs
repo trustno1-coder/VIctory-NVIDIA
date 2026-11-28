@@ -460,7 +460,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    found = (isnan(found) || isinf(found)) ? 0.0 : max(found, 0.0);
     float3 was = unpack(light[p]);
+    was = (isnan(was) || isinf(was)) ? 0.0 : max(was, 0.0);
     // Magenta/violet garbage the probes' memory held (green far under red and
     // blue): dropped, as VIctory-Belobug-AMD does (ambient.rs, "Filter magenta
     // garbage probes"). Seen on an RTX 5080 as a purple-blue glow on a lit
@@ -848,6 +850,18 @@ mod tests {
         }
         // Where the title's light is above the estimate nothing changes.
         assert_eq!(settle(0.8, 0.6, &[1.0, 1.0], true), vec![1.0, 1.0]);
+    }
+
+    /// A single NaN, Inf, or negative channel is scrubbed without zeroing
+    /// the remaining valid channels.
+    #[test]
+    fn scrub_channel_keeps_valid_channels() {
+        let scrub = |v: [f32; 3]| -> [f32; 3] {
+            v.map(|c| if c.is_nan() || c.is_infinite() { 0.0 } else { c.max(0.0) })
+        };
+        assert_eq!(scrub([f32::NAN, 0.4, 0.8]), [0.0, 0.4, 0.8]);
+        assert_eq!(scrub([0.3, f32::INFINITY, 0.7]), [0.3, 0.0, 0.7]);
+        assert_eq!(scrub([0.2, -0.5, 0.9]), [0.2, 0.0, 0.9]);
     }
 
     /// The passes compile with the system's compiler and the host takes them.
