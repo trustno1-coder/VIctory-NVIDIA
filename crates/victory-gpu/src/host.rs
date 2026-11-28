@@ -1279,7 +1279,8 @@ mod tests {
         let ahead = std::thread::Builder::new()
             .name("victory-ahead".into())
             .spawn(|| {
-                super::note_waits(super::Made::Twin, 0, 1234, 3);
+                super::note_wait(super::Made::Twin, 0, 1234);
+                super::note_wait(super::Made::Twin, 0, 1000);
                 super::ahead_thread()
             })
             .unwrap()
@@ -1288,7 +1289,7 @@ mod tests {
         assert!(ahead);
         // (Depth twins: no other test makes one.)
         let w = super::waited(super::Made::Twin as usize, 1, 0);
-        assert_eq!([w[0].load(Relaxed), w[1].load(Relaxed), w[2].load(Relaxed)], [3, 1234, 1234]);
+        assert_eq!([w[0].load(Relaxed), w[1].load(Relaxed), w[2].load(Relaxed)], [2, 2234, 1234]);
         assert_eq!(super::waited(super::Made::Twin as usize, 0, 0)[0].load(Relaxed), 0);
         super::log_waits();
         assert_eq!(w[0].load(Relaxed), 0, "taken by the lines");
