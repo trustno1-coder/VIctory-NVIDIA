@@ -101,6 +101,15 @@ const ABOUT_MFG: [&str; 3] = [
     "ON: DOWNLOADED FROM ITS GITHUB AT THE NEXT START, THEN RUN.",
     "NVIDIA DOES NOT SUPPORT IT. IF THE GAME FAILS, TURN IT OFF.",
 ];
+/// Copia +gerenc xbox: DLSS 5 Neural Rendering through the OptiScaler DLSS5 mod (Skynizz's
+/// fork, loaded by `victory` at the start: apps/victory/src/play.rs, `load_neural`); its own
+/// menu opens with Insert.
+const NEURAL: &str = "VICTORY_NEURAL";
+const ABOUT_NEURAL: [&str; 3] = [
+    "DLSS 5 (OPTISCALER MOD, NOT OURS). INSERT OPENS ITS MENU:",
+    "DETAIL, PASSES, CACHE, PRE-SR. FRAME GEN STAYS AS IT IS.",
+    "APPLIES AT THE NEXT START. IF THE GAME FAILS, TURN IT OFF.",
+];
 /// The DLSS setting, and what is said while it is picked on in a start without NVIDIA's files.
 const DLSS: &str = "VICTORY_MENU_DLSS";
 const ABOUT_NO_DLSS: [&str; 3] = [
@@ -179,6 +188,8 @@ const ITEMS: &[Item] = &[
     // key and the runner's default stands (16x9 is what the runner exports, so it shows the same); 0 is read by compose::ui_aspect as no letterbox.
     Item { var: "VICTORY_UI_LETTERBOX", label: "INTERFACE ON A WIDE PICTURE", values: &[("", "16:9 IN THE MIDDLE"), ("0", "STRETCHED"), ("16x9", "16:9 IN THE MIDDLE")], live: false },
     Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
+    // Copia +gerenc xbox: DLSS 5 Neural Rendering (OptiScaler DLSS5 as a mod; Insert: its menu).
+    Item { var: NEURAL, label: "NEURAL RENDERING (INSERT)", values: UNSET_ON, live: false },
     // DLSS Ray Reconstruction (`streamline`, `VICTORY_DLSS_RR`): its plugin loads and reports beside DLSS; it does not draw yet
     // (the title's guide buffers are not identified), so Super Resolution still does the upscaling. Needs DLSS on.
     Item { var: "VICTORY_DLSS_RR", label: "RAY RECONSTRUCTION (LOADS ONLY)", values: UNSET_ON, live: false },
@@ -645,6 +656,8 @@ impl Menu {
             ABOUT_IMPORT
         } else if ITEMS.get(self.at).is_some_and(|i| i.var == MFG) {
             ABOUT_MFG
+        } else if ITEMS.get(self.at).is_some_and(|i| i.var == NEURAL) {
+            ABOUT_NEURAL
         } else if ITEMS.get(self.at).is_some_and(|i| i.var == S_RES) {
             ABOUT_S_RES
         } else if ITEMS.get(self.at).is_some_and(|i| i.var == DLSS)
@@ -1260,6 +1273,8 @@ mod tests {
                     assert_eq!(about, ABOUT_IMPORT);
                 } else if at < ITEMS.len() && ITEMS[at].var == MFG {
                     assert_eq!(about, ABOUT_MFG);
+                } else if at < ITEMS.len() && ITEMS[at].var == NEURAL {
+                    assert_eq!(about, ABOUT_NEURAL);
                 } else if at < ITEMS.len() && ITEMS[at].var == S_RES {
                     assert_eq!(about, ABOUT_S_RES);
                 } else {
@@ -1290,6 +1305,11 @@ mod tests {
         let lines = menu.lines();
         assert!(lines[lines.len() - 5..lines.len() - 2].iter().all(String::is_empty));
         assert_eq!(ITEMS.iter().filter(|i| i.var == MFG).count(), 1);
+        assert_eq!(ITEMS.iter().filter(|i| i.var == NEURAL).count(), 1);
+        for line in ABOUT_NEURAL {
+            assert!(line.len() <= COLUMNS as usize, "{line}");
+            assert!(line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
+        }
         // Frame generation turned on in a run started without it (no Streamline in tests): a
         // restart is required, and the menu says so; OFF needs no word.
         for line in ABOUT_FRAMEGEN_RESTART {

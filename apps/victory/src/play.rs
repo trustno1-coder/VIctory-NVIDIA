@@ -678,6 +678,44 @@ pub(crate) fn load_mfg() {
     }
 }
 
+/// Copia +gerenc xbox: F1's NEURAL RENDERING (`VICTORY_NEURAL=1`): NVIDIA's DLSS 5 Neural
+/// Rendering through the OptiScaler DLSS5 mod (github.com/Skynizz/optiscaler-dlss5, GPL-3.0, not
+/// ours; undocumented by NVIDIA), loaded as MFG Unlocker is, before the layer makes its device
+/// or loads Streamline: it then sees the DLSS evaluations Streamline makes and runs the model
+/// after (or before) them, before the interface is drawn. Its folder (`VICTORY_NEURAL_DIR`, else
+/// an `optiscaler-dlss5` folder beside this program or up to five folders above it) holds it as
+/// `winmm.dll` with its `OptiScaler.ini`, the forwarder `nvngx.dll_dlssnr.dll` and NVIDIA's model
+/// `nvngx_dlssnr.dll`. Its own frame generation is off in that ini (`FGInput`/`FGOutput=nofg`):
+/// NVIDIA's, through our Streamline, stays as it is. Insert opens its menu (the DLSS 5 tab).
+pub(crate) fn load_neural() {
+    if std::env::var_os("VICTORY_NEURAL").is_none_or(|v| v != "1") {
+        return;
+    }
+    const DLL: &str = "winmm.dll";
+    let dir = std::env::var_os("VICTORY_NEURAL_DIR").filter(|v| !v.is_empty()).map(PathBuf::from).or_else(|| {
+        let program = std::env::current_exe().ok()?;
+        program.ancestors().skip(1).take(6).map(|d| d.join("optiscaler-dlss5")).find(|d| d.join(DLL).is_file())
+    });
+    let Some(dir) = dir else {
+        eprintln!("NEURAL RENDERING (VICTORY_NEURAL=1): no optiscaler-dlss5 folder beside victory.exe or above it, nor VICTORY_NEURAL_DIR: running without it");
+        return;
+    };
+    let missing: Vec<&str> = [DLL, "OptiScaler.ini", "nvngx.dll_dlssnr.dll", "nvngx_dlssnr.dll"]
+        .into_iter()
+        .filter(|f| !dir.join(f).is_file())
+        .collect();
+    if !missing.is_empty() {
+        eprintln!("NEURAL RENDERING: missing in {}: {}", dir.display(), missing.join(", "));
+        if missing.contains(&DLL) {
+            return;
+        }
+    }
+    match victory_hle::streamline::load_mod("DLSS 5 neural rendering (OptiScaler DLSS5, F1 NEURAL RENDERING)", &dir.join(DLL)) {
+        Ok(()) => eprintln!("DLSS 5 neural rendering loaded ({}). Insert opens its menu.", dir.display()),
+        Err(code) => eprintln!("DLSS 5 neural rendering did not load (Windows error {code}): running without it."),
+    }
+}
+
 /// `D3D12` beside this program: where Windows looks for Microsoft's newer
 /// Direct3D 12 runtime (main.rs's `D3D12SDKPath`).
 fn d3d12_dir() -> Result<PathBuf> {

@@ -428,6 +428,8 @@ fn main() -> Result<()> {
             victory_core::logging::init("info");
             // F1's MFG UNLOCKER: the mod, before the layer makes its device or loads Streamline.
             play::load_mfg();
+            // F1's NEURAL RENDERING (Copia +gerenc xbox): DLSS 5 through OptiScaler, also before.
+            play::load_neural();
             let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
             run::run(&ready.exe, Unimplemented::Trap, false, true, console)
         });
@@ -526,6 +528,10 @@ fn main() -> Result<()> {
             title_args,
         } => {
             victory_hle::runtime::set_title_args(title_args);
+            // F1's NEURAL RENDERING (Copia +gerenc xbox): `victory run` is what the launch scripts
+            // start, so the mod is loaded here as well, before the device and Streamline.
+            #[cfg(windows)]
+            play::load_neural();
             run::run(&exe, unimplemented, strict, execute, console)
         }
         #[cfg(all(windows, feature = "diagnostics"))]
