@@ -445,6 +445,7 @@ struct Queue {
     /// being made ([`slow_limit`]).
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
+    promotions_since_sweep: usize,
     requested: VecDeque<Arc<Pending>>,
 }
 
@@ -455,6 +456,7 @@ impl Queue {
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
+            promotions_since_sweep: 0,
             requested: VecDeque::new(),
         }
     }
@@ -480,10 +482,22 @@ impl Queue {
         } else {
             self.early.push_back(p.clone());
         }
+        if prev == EARLY {
+            self.promotions_since_sweep += 1;
+        }
         Some(prev == NOT_QUEUED)
     }
 
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
+        // Requested work can keep stale early entries behind an unclaimed one.
+        // Sweep on a worker, only after enough promotions to pay for this scan.
+        let early_slots = self.early.len() + self.slow.len();
+        if self.promotions_since_sweep != 0 && self.promotions_since_sweep >= early_slots.div_ceil(2) {
+            let early = |p: &Arc<Pending>| p.queue_state.load(Ordering::Relaxed) == EARLY;
+            self.early.retain(early);
+            self.slow.retain(early);
+            self.promotions_since_sweep = 0;
+        }
         // An early entry can have been promoted and claimed already.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
@@ -736,6 +750,28 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &earlier));
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn promoted_work_releases_its_early_references_while_requests_continue() {
+        let mut queue = Queue::new();
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (regular, slow) = (new(), new());
+        queue.push_as(&regular, EARLY, false);
+        queue.push_as(&slow, EARLY, true);
+        let mut completed = Vec::new();
+        for i in 0..128 {
+            let p = new();
+            completed.push(Arc::downgrade(&p));
+            assert_eq!(queue.push_as(&p, EARLY, i % 2 == 0), Some(true));
+            assert_eq!(queue.push_as(&p, REQUESTED, false), Some(false));
+            assert!(Arc::ptr_eq(&p, &queue.pop(false, 1).unwrap()));
+        }
+        let held = completed.iter().filter(|p| p.strong_count() != 0).count();
+        assert!(held <= 2, "{held} completed jobs still held by early queues");
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &regular));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &slow));
         assert!(queue.pop(false, 1).is_none());
     }
 
