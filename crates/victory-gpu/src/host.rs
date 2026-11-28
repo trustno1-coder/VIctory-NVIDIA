@@ -3601,6 +3601,22 @@ fn split<T>(lists: Vec<T>, order: Vec<usize>, cut: usize) -> Result<[Run<T>; 2],
     Ok([(a, x), (b, y)])
 }
 
+/// Prepends `count` worker upload lists (stored at `first..first + count` in
+/// `lists`) ahead of `order` and shifts every joined-part split boundary in
+/// `parts` by `+count` so submission part cuts preserve title split points.
+fn prepend_ahead_order(
+    order: &mut Vec<usize>,
+    parts: &[usize],
+    first: usize,
+    count: usize,
+) -> Vec<usize> {
+    if count == 0 {
+        return parts.to_vec();
+    }
+    order.splice(0..0, first..first + count);
+    parts.iter().map(|&p| p + count).collect()
+}
+
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
@@ -4218,7 +4234,7 @@ pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{continues, join_ranges, prepend_ahead_order, touches};
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -4265,6 +4281,36 @@ mod late_tests {
             assert_eq!(touches(&ranges, from, to), hit, "{from}..{to}");
         }
         assert!(!touches(&[], 0, usize::MAX));
+    }
+
+    #[test]
+    fn prepend_ahead_lists_shifts_join_parts() {
+        let mut order = vec![0, 1, 2];
+        let parts = [1, 2];
+        let shifted = prepend_ahead_order(&mut order, &parts, 3, 2);
+        assert_eq!(order, [3, 4, 0, 1, 2]);
+        assert_eq!(shifted, [3, 4]);
+
+        let lists = ["ahead0", "ahead1", "title0", "title1", "title2"];
+        let firsts = [0, 1, 2, 3, 4];
+        let cuts: Vec<usize> = shifted
+            .iter()
+            .filter_map(|&n| firsts.get(n).copied())
+            .collect();
+        let mut batches = Vec::new();
+        let mut from = 0;
+        for to in cuts.into_iter().chain([lists.len()]) {
+            batches.push(&lists[from..to]);
+            from = to;
+        }
+        assert_eq!(
+            batches,
+            [
+                &["ahead0", "ahead1", "title0"][..],
+                &["title1"][..],
+                &["title2"][..],
+            ]
+        );
     }
 }
 
@@ -5663,6 +5709,14 @@ impl Host {
         let _ = self.submit(&[list], &[], false);
     }
 
+    /// Runs closed internal upload-only host lists synchronously in one
+    /// submission without draining title queues (`queue::before_sync`).
+    pub(crate) fn execute_sync_internal_many(&self, runs: &[&HostList]) {
+        if !runs.is_empty() {
+            let _ = self.submit(runs, &[], false);
+        }
+    }
+
     /// A queue's submission with [`late`]: the host lists `lists`, taken
     /// from the title's, go to the card in `order` and are not waited for.
     /// They join the line of flights and are settled, with the others in
@@ -5699,7 +5753,26 @@ impl Host {
         self.send_late(lists, order, parts);
     }
 
-    fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+    fn send_late(
+        &self,
+        mut lists: Vec<crate::list::Detached>,
+        mut order: Vec<usize>,
+        parts: &[usize],
+    ) {
+        // Textures uploaded ahead (`crate::heap_worker`): their lists run
+        // before the title's, and joined-part split boundaries shift by their
+        // count so submission part cuts preserve title split points.
+        let ahead = crate::heap_worker::take_ready_for_late();
+        let shifted_parts: Vec<usize>;
+        let parts = if !ahead.is_empty() {
+            let first = lists.len();
+            let count = ahead.len();
+            lists.extend(ahead.into_iter().map(crate::list::Detached::ours));
+            shifted_parts = prepend_ahead_order(&mut order, parts, first, count);
+            &shifted_parts[..]
+        } else {
+            parts
+        };
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, parts, true)
@@ -8065,6 +8138,24 @@ impl HostList {
         deferred.prelude_uploads.push(upload);
     }
 
+    /// Detiles the textures the list uploads now, ahead of its submission
+    /// ([`crate::texture::Staging::refresh_ahead`]); how many were left.
+    pub(crate) fn refresh_textures_ahead(&self) -> u64 {
+        let textures: Vec<_> = self
+            .deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::Texture(staging) => Some(staging.clone()),
+                _ => None,
+            })
+            .collect();
+        textures
+            .iter()
+            .filter(|staging| !staging.refresh_ahead())
+            .count() as u64
+    }
+
     /// At submission, after the list's steps: the textures whose upload its
     /// prelude records, each with whether it is the first upload into its
     /// host copy. Their staging buffers are refreshed first (those the
@@ -9861,6 +9952,20 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        {
+            let [busy, detiling, lists, shown, again, left] =
+                std::array::from_fn::<f64, 6, _>(|i| {
+                    crate::heap_worker::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames
+                });
+            if busy > 0.0 {
+                tracing::info!(
+                    "textures picked by index, their own thread (VICTORY_HEAP_WORKER), per frame: {:.1} ms at work, of them {:.1} detiling; \
+                     {lists:.1} lists, {shown:.0} slots shown, {again:.1} written again before, {left:.1} textures left to the submission",
+                    busy / 1e6,
+                    detiling / 1e6
+                );
+            }
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
