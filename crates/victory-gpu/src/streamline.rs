@@ -358,6 +358,15 @@ static CHECKING: AtomicBool = AtomicBool::new(false);
 /// once, before the host device is made (`crate::host::host`) and before the
 /// title's imports are bound. Fails soft: what is not there is logged and
 /// left off.
+///
+/// FSR 3 frame generation needs DLSS *upscaling*, not just DLSS loaded. DLAA
+/// runs DLSS as anti-aliasing at scale 1.0, so it is not upscaling and leaves
+/// the title on its own FidelityFX path, which breaks at victory-image+0x2219650
+/// (issue #663). Count it as "no DLSS upscaling" for the frame-generation guard.
+fn fsr_needs_dlss(fsr_framegen: bool, mode: Mode, available_dlss: bool) -> bool {
+    fsr_framegen && (!available_dlss || mode == Mode::Dlaa)
+}
+
 pub fn init(asked: &Asked) -> Available {
     let mut files_missing = false;
     let available = if !asked.any() {
@@ -389,7 +398,7 @@ pub fn init(asked: &Asked) -> Available {
     // Series S, with its own FidelityFX upscaler running beside our frame generation, the title
     // stopped on a check (0x80000003 at +0x2219650) seconds into the start (2026-11-27: muted
     // runs here, issues #272, #308 and #331; with DLSS on, both consoles ran).
-    let fsr_needs_dlss = asked.fsr_framegen && !available.dlss;
+    let fsr_needs_dlss = fsr_needs_dlss(asked.fsr_framegen, asked.mode, available.dlss);
     if fsr_needs_dlss {
         tracing::warn!(
             "FSR 3 frame generation stays off: it needs DLSS for the upscaling, which is off, or this card or these files do not give; without it the title stops at the start"
@@ -2336,7 +2345,7 @@ pub(crate) fn line(frames: f64) {
 
 #[cfg(test)]
 mod failing_tests {
-    use super::dlss_failing;
+    use super::{Mode, dlss_failing, fsr_needs_dlss};
 
     #[test]
     fn dlss_is_given_up_only_when_nearly_every_upscaling_fails() {
@@ -2347,5 +2356,18 @@ mod failing_tests {
         assert!(!dlss_failing(89, 89));
         assert!(!dlss_failing(120, 1000));
         assert!(!dlss_failing(500, 600));
+    }
+
+    #[test]
+    fn fsr_framegen_needs_dlss_upscaling_not_dlaa() {
+        // #663: DLAA is anti-aliasing at scale 1.0, not upscaling, so FSR 3
+        // frame generation must stay off even though DLSS itself loaded.
+        assert!(fsr_needs_dlss(true, Mode::Dlaa, true));
+        assert!(fsr_needs_dlss(true, Mode::Dlaa, false));
+        // Real upscaling modes with DLSS loaded are fine.
+        assert!(!fsr_needs_dlss(true, Mode::Quality, true));
+        // Without the request, or with DLSS truly absent, the old rule holds.
+        assert!(!fsr_needs_dlss(false, Mode::Dlaa, true));
+        assert!(fsr_needs_dlss(true, Mode::Quality, false));
     }
 }
