@@ -18,7 +18,7 @@ jobs:
             1. The play log, in `%LOCALAPPDATA%\victory\logs\`: the newest `victory-nvidia-play-<date>-<time>-<number>.log` (from `victory.exe`) or `victory-nvidia-<date>-<time>.log` (from the script launcher). The window shows its path at the start, on the line `Log: ...`.
             2. The crash log: `%LOCALAPPDATA%\VIctory\data\7952987A\crashes.log`, and, if there is one from that run, the newest `victory-<date>-<time>-<number>.crash.log` in `%LOCALAPPDATA%\VIctory\data\7952987A\temp\`.
 
-            Also say which GPU, Windows version (10 or 11)
+            Also say which GPU, Windows version (10 or 11) and release you used.
         with:
           script: |
             const body = context.payload.issue.body || '';
