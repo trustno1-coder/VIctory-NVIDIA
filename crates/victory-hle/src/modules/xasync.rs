@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -86,9 +86,39 @@ impl Task {
     }
 }
 
+/// What a port runs. Each entry names the queue that put it there and which
+/// of that queue's ports this is: queues share ports (a composite queue uses
+/// another's), and a port may be both ports of one composite.
+enum Entry {
+    /// A title callback the queue submitted.
+    Callback {
+        queue: Arc<Queue>,
+        port: u32,
+        task: Task,
+    },
+    /// The queue's last callback on this port has run since it began
+    /// terminating there: the next step of its termination.
+    Terminate { queue: Arc<Queue>, port: u32 },
+}
+
+impl Entry {
+    fn run(self) {
+        match self {
+            Entry::Callback { queue, port, task } => {
+                // As in the public implementation (libHttpClient's
+                // TaskQueue.cpp), whether a callback is canceled is decided
+                // when it runs: canceled once its queue is terminating.
+                task.run(queue.status(port) != Status::Active);
+                queue.finished(port);
+            }
+            Entry::Terminate { queue, port } => queue.terminated(port),
+        }
+    }
+}
+
 struct Port {
     mode: Mode,
-    tasks: Mutex<VecDeque<Task>>,
+    entries: Mutex<VecDeque<Entry>>,
     ready: Condvar,
 }
 
@@ -96,7 +126,7 @@ impl Port {
     fn new(mode: Mode) -> Arc<Port> {
         let port = Arc::new(Port {
             mode,
-            tasks: Mutex::default(),
+            entries: Mutex::default(),
             ready: Condvar::new(),
         });
         if mode == Mode::Serialized {
@@ -106,7 +136,7 @@ impl Port {
             std::thread::spawn(move || {
                 loop {
                     match worker.take(1000, || false) {
-                        Some(task) => task.run(false),
+                        Some(entry) => entry.run(),
                         None if Arc::strong_count(&worker) == 1 => break,
                         None => {}
                     }
@@ -116,43 +146,65 @@ impl Port {
         port
     }
 
-    fn submit(&self, task: Task) {
+    /// Queues `entry` for this port's dispatcher: the title's dispatch, the
+    /// port's serial worker or a pool worker. An immediate port runs it now.
+    fn push(self: &Arc<Self>, entry: Entry) {
         match self.mode {
-            Mode::Immediate => task.run(false),
-            Mode::ThreadPool => POOL.submit(task),
+            Mode::Immediate => entry.run(),
+            Mode::ThreadPool => {
+                lock(&self.entries).push_back(entry);
+                POOL.submit(self.clone());
+            }
             Mode::Manual | Mode::Serialized => {
-                lock(&self.tasks).push_back(task);
+                lock(&self.entries).push_back(entry);
                 self.ready.notify_one();
             }
         }
     }
 
-    /// The next queued task, waiting up to `timeout_ms`, or until `ended`
-    /// (checked whenever the port is woken) says no task will come.
-    fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Task> {
-        let waiting = |t: &mut VecDeque<Task>| t.is_empty() && !ended();
-        let tasks = lock(&self.tasks);
-        let mut tasks = if timeout_ms == INFINITE {
+    /// Wakes every dispatch waiting on the port, to look again at whether
+    /// its queue has ended.
+    fn wake_all(&self) {
+        // Taken first so no dispatch is between its check and its wait.
+        drop(lock(&self.entries));
+        self.ready.notify_all();
+    }
+
+    /// The next queued entry, waiting up to `timeout_ms`, or until `ended`
+    /// (checked whenever the port is woken) says nothing will come.
+    fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Entry> {
+        let waiting = |e: &mut VecDeque<Entry>| e.is_empty() && !ended();
+        let entries = lock(&self.entries);
+        let mut entries = if timeout_ms == INFINITE {
             self.ready
-                .wait_while(tasks, waiting)
+                .wait_while(entries, waiting)
                 .unwrap_or_else(|e| e.into_inner())
         } else {
             let timeout = Duration::from_millis(timeout_ms.into());
             self.ready
-                .wait_timeout_while(tasks, timeout, waiting)
+                .wait_timeout_while(entries, timeout, waiting)
                 .unwrap_or_else(|e| e.into_inner())
                 .0
         };
-        tasks.pop_front()
+        entries.pop_front()
+    }
+
+    /// Runs the next entry, if any (a pool worker's turn).
+    fn run_one(&self) {
+        let entry = lock(&self.entries).pop_front();
+        if let Some(entry) = entry {
+            entry.run();
+        }
     }
 }
 
-/// The thread pool behind thread-pool ports: idle workers are reused, and a
-/// new one starts whenever more tasks wait than workers idle, so a callback
+/// The thread pool behind thread-pool ports: each entry pushed on such a
+/// port gives the pool one turn on it. Idle workers are reused, and a new
+/// one starts whenever more turns wait than workers idle, so a callback
 /// that blocks on another never starves it. Workers stay for reuse.
 struct Pool {
-    /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
+    /// Ports owed a turn, and the number of idle workers.
+    state: Mutex<(VecDeque<Arc<Port>>, usize)>,
     ready: Condvar,
 }
 
@@ -162,9 +214,9 @@ static POOL: Pool = Pool {
 };
 
 impl Pool {
-    fn submit(&'static self, task: Task) {
+    fn submit(&'static self, port: Arc<Port>) {
         let mut state = lock(&self.state);
-        state.0.push_back(task);
+        state.0.push_back(port);
         if state.0.len() > state.1 {
             std::thread::spawn(move || self.work());
         } else {
@@ -180,14 +232,43 @@ impl Pool {
                 state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
                 state.1 -= 1;
             }
-            let task = state.0.pop_front();
+            let port = state.0.pop_front();
             drop(state);
-            if let Some(task) = task {
-                task.run(false);
+            if let Some(port) = port {
+                port.run_one();
             }
             state = lock(&self.state);
         }
     }
+}
+
+/// A queue's state on one of its ports, in order. Terminate cancels both
+/// ports (callbacks still run, told so) and starts terminating the work
+/// port, which refuses new callbacks. Once this queue's last callback there
+/// has run, the port's dispatcher marks it terminated and the completion
+/// port goes the same way; its end runs the termination callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Status {
+    Active,
+    Canceled,
+    Terminating,
+    Terminated,
+}
+
+/// What a queue knows of itself, under one lock. Never held while a port's
+/// lock is taken: a port's dispatch looks at it under the port's lock.
+struct State {
+    status: [Status; 2],
+    /// Callbacks this queue submitted per port that have not returned yet:
+    /// queued, running, or waiting out a delay.
+    outstanding: [usize; 2],
+    /// Delayed callbacks still waiting out their delay, by submission order,
+    /// with their port: a port that starts terminating queues its own.
+    delayed: BTreeMap<u64, (u32, Task)>,
+    /// Termination callbacks (context, callback) to run at the end.
+    on_terminated: Vec<(usize, usize)>,
+    /// Termination has finished: the callbacks above have returned.
+    ended: bool,
 }
 
 /// A queue handle is `Arc::into_raw` of this; duplicating and closing a
@@ -195,10 +276,9 @@ impl Pool {
 pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
-    terminated: AtomicBool,
-    /// Delayed callbacks still waiting out their delay, in submission
-    /// order: terminating the queue cancels them with the queued ones.
-    delayed: Mutex<BTreeMap<u64, Task>>,
+    state: Mutex<State>,
+    /// Signalled when termination has finished.
+    ended: Condvar,
 }
 
 impl Queue {
@@ -206,9 +286,19 @@ impl Queue {
         Arc::new(Queue {
             ports,
             monitors: Mutex::default(),
-            terminated: AtomicBool::new(false),
-            delayed: Mutex::default(),
+            state: Mutex::new(State {
+                status: [Status::Active; 2],
+                outstanding: [0; 2],
+                delayed: BTreeMap::new(),
+                on_terminated: Vec::new(),
+                ended: false,
+            }),
+            ended: Condvar::new(),
         })
+    }
+
+    fn status(&self, port: u32) -> Status {
+        lock(&self.state).status[port as usize]
     }
 
     fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, task: Task) -> HRESULT {
@@ -216,29 +306,28 @@ impl Queue {
         if port > COMPLETION {
             return E_INVALIDARG;
         }
-        if self.terminated.load(Ordering::Acquire) {
+        let mut state = lock(&self.state);
+        // Canceled ports still take callbacks (a canceled work callback may
+        // queue its completion); they run canceled.
+        if state.status[port as usize] >= Status::Terminating {
             return E_ABORT;
         }
+        state.outstanding[port as usize] += 1;
         if delay_ms == 0 {
+            drop(state);
             self.deliver(port, task);
             return S_OK;
         }
         let id = NEXT_DELAYED.fetch_add(1, Ordering::Relaxed);
-        {
-            // Checked again under the lock termination drains: the callback
-            // is either canceled with the others or refused.
-            let mut delayed = lock(&self.delayed);
-            if self.terminated.load(Ordering::Acquire) {
-                return E_ABORT;
-            }
-            delayed.insert(id, task);
-        }
+        state.delayed.insert(id, (port, task));
+        drop(state);
         let queue = self.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(delay_ms.into()));
-            // Gone if the queue was terminated meanwhile, which canceled it.
-            let task = lock(&queue.delayed).remove(&id);
-            if let Some(task) = task {
+            // Gone if its port started terminating meanwhile, which queued
+            // it at once.
+            let delayed = lock(&queue.state).delayed.remove(&id);
+            if let Some((port, task)) = delayed {
                 queue.deliver(port, task);
             }
         });
@@ -246,7 +335,11 @@ impl Queue {
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        self.ports[port as usize].submit(task);
+        self.ports[port as usize].push(Entry::Callback {
+            queue: self.clone(),
+            port,
+            task,
+        });
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
@@ -254,6 +347,77 @@ impl Queue {
             let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
             callback(context as *mut c_void, Arc::as_ptr(self), port);
         }
+    }
+
+    /// One of this queue's callbacks on `port` has returned.
+    fn finished(self: &Arc<Self>, port: u32) {
+        let last = {
+            let mut state = lock(&self.state);
+            let left = &mut state.outstanding[port as usize];
+            *left -= 1;
+            *left == 0 && state.status[port as usize] == Status::Terminating
+        };
+        if last {
+            self.ports[port as usize].push(Entry::Terminate {
+                queue: self.clone(),
+                port,
+            });
+        }
+    }
+
+    /// Stops `port` taking callbacks and queues those waiting out a delay;
+    /// once none of this queue's callbacks is left there, its dispatcher
+    /// takes the next step.
+    fn terminate_port(self: &Arc<Self>, port: u32) {
+        let (delayed, last) = {
+            let mut state = lock(&self.state);
+            state.status[port as usize] = Status::Terminating;
+            let (mine, others) = std::mem::take(&mut state.delayed)
+                .into_iter()
+                .partition::<BTreeMap<_, _>, _>(|(_, (p, _))| *p == port);
+            state.delayed = others;
+            // Delayed callbacks still count as outstanding: none is last.
+            (mine, state.outstanding[port as usize] == 0)
+        };
+        for (_, (port, task)) in delayed {
+            self.deliver(port, task);
+        }
+        if last {
+            self.ports[port as usize].push(Entry::Terminate {
+                queue: self.clone(),
+                port,
+            });
+        }
+    }
+
+    /// On `port`'s dispatcher, after this queue's last callback there: the
+    /// work port's end starts the completion port's; the completion port's
+    /// end runs the termination callbacks and lets waiters go.
+    fn terminated(self: &Arc<Self>, port: u32) {
+        lock(&self.state).status[port as usize] = Status::Terminated;
+        // Dispatches waiting on this queue end: nothing more will come.
+        self.ports[port as usize].wake_all();
+        if port == WORK {
+            self.terminate_port(COMPLETION);
+            return;
+        }
+        loop {
+            // Until none is left: a second Terminate may add one meanwhile.
+            let callbacks = {
+                let mut state = lock(&self.state);
+                if state.on_terminated.is_empty() {
+                    state.ended = true;
+                    break;
+                }
+                std::mem::take(&mut state.on_terminated)
+            };
+            for (context, callback) in callbacks {
+                // SAFETY: stored from a `TerminatedCallback` in `XTaskQueueTerminate`.
+                let callback: TerminatedCallback = unsafe { std::mem::transmute(callback) };
+                callback(context as *mut c_void);
+            }
+        }
+        self.ended.notify_all();
     }
 }
 
@@ -354,24 +518,41 @@ pub fn XTaskQueueCloseHandle(handle: *const Queue) {
 }
 
 /// Runs one queued callback of a manual port; false if none came in time,
-/// or none can come: the queue was terminated (which ends a wait under way,
-/// as a dispatcher thread's loop expects).
+/// or none can come: the queue has finished terminating on this port (which
+/// ends a wait under way, as a dispatcher thread's loop expects). Until
+/// then a terminated queue's canceled callbacks and termination steps run
+/// here, as they must on a manual port. A termination step is not a
+/// callback: the dispatch goes on to the next entry.
+///
+/// Thread-pool and serialized ports are left to their workers (false), as
+/// before.
 pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> bool {
     let Some(queue) = queue(handle) else {
         return false;
     };
-    let Some(port) = queue.ports.get(port as usize) else {
+    if port > COMPLETION {
         return false;
-    };
+    }
+    let index = port;
+    let port = &queue.ports[index as usize];
     if port.mode != Mode::Manual {
         return false;
     }
-    match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
-        Some(task) => {
-            task.run(false);
-            true
+    let deadline = (timeout_ms != INFINITE)
+        .then(|| std::time::Instant::now() + Duration::from_millis(timeout_ms.into()));
+    loop {
+        let left = deadline.map_or(INFINITE, |d| {
+            let left = d.saturating_duration_since(std::time::Instant::now());
+            left.as_millis().min(u128::from(INFINITE - 1)) as u32
+        });
+        match port.take(left, || queue.status(index) == Status::Terminated) {
+            Some(entry @ Entry::Callback { .. }) => {
+                entry.run();
+                return true;
+            }
+            Some(step) => step.run(),
+            None => return false,
         }
-        None => false,
     }
 }
 
@@ -388,34 +569,51 @@ pub fn XTaskQueueSubmitDelayedCallback(
     }
 }
 
-/// Cancels what is still queued or waiting out a delay (callbacks see
-/// `canceled`), refuses new work, then calls `callback`.
+/// Cancels the queue's callbacks, queued or waiting out a delay, and
+/// refuses new ones. As documented, the callbacks still run through their
+/// ports, told they were canceled (so a manual port must still be
+/// dispatched); the work port's run first, then the completion port's, and
+/// `callback` runs on the completion port after the queue's last callback.
+/// Other queues on the same ports (a composite and its source) carry on.
+/// With `wait`, returns once `callback` has returned.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
-    _wait: bool,
+    wait: bool,
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
     let Some(queue) = queue(handle) else {
         return E_INVALIDARG;
     };
-    queue.terminated.store(true, Ordering::Release);
-    for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
-        // Dispatches waiting on this queue end: nothing more will come.
-        // (Those of other queues on the port see theirs is open and wait
-        // on.) After the lock above, so none misses both flag and wake.
-        port.ready.notify_all();
-        for task in pending {
-            task.run(true);
+    let (first, ended) = {
+        let mut state = lock(&queue.state);
+        // Only Terminate moves a port on from active.
+        let first = state.status[WORK as usize] == Status::Active;
+        for status in &mut state.status {
+            *status = (*status).max(Status::Canceled);
         }
+        if !state.ended
+            && let Some(callback) = callback
+        {
+            state
+                .on_terminated
+                .push((context as usize, callback as usize));
+        }
+        (first, state.ended)
+    };
+    if ended {
+        // Terminated before: no port runs anything for it any more.
+        if let Some(callback) = callback {
+            callback(context);
+        }
+        return S_OK;
     }
-    let delayed = std::mem::take(&mut *lock(&queue.delayed));
-    for task in delayed.into_values() {
-        task.run(true);
+    if first {
+        queue.terminate_port(WORK);
     }
-    if let Some(callback) = callback {
-        callback(context);
+    if wait {
+        let state = lock(&queue.state);
+        drop(queue.ended.wait_while(state, |s| !s.ended));
     }
     S_OK
 }
@@ -1121,7 +1319,7 @@ static VTABLE: Methods<31> = Methods([
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
 
     fn slot<F: Copy>(offset: usize) -> F {
         crate::modules::xgameruntime::method(&OBJECT, offset)
@@ -1725,10 +1923,15 @@ mod tests {
             XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)),
             S_OK
         );
+        // Manual ports: the canceled callback and the termination callback
+        // run when the title dispatches them.
         assert_eq!(
-            XTaskQueueTerminate(q, true, std::ptr::null_mut(), Some(terminated)),
+            XTaskQueueTerminate(q, false, std::ptr::null_mut(), Some(terminated)),
             S_OK
         );
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert!(!XTaskQueueDispatch(q, WORK, 0));
+        assert!(!XTaskQueueDispatch(q, COMPLETION, 0));
         assert!(canceled && TERMINATED.load(Ordering::SeqCst));
         assert_eq!(
             XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)),
@@ -1757,5 +1960,231 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
         XTaskQueueCloseHandle(q);
+    }
+
+    /// Records `<tag>:canceled` or `<tag>:ran`; the context is a `&'static
+    /// str` tag behind a pointer.
+    fn tagged(tag: &'static &'static str) -> *mut c_void {
+        (tag as *const &str).cast_mut().cast()
+    }
+
+    fn tag_of(context: *mut c_void) -> &'static str {
+        // SAFETY: built by `tagged`.
+        unsafe { *context.cast::<&'static str>() }
+    }
+
+    /// A manual queue terminated without waiting runs nothing by itself:
+    /// the title's dispatches run its callbacks, canceled, work port first,
+    /// and the termination callback last, from a completion dispatch.
+    #[test]
+    fn terminate_on_manual_ports_runs_canceled_callbacks_when_dispatched() {
+        static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            let what = if canceled { "canceled" } else { "ran" };
+            lock(&EVENTS).push(format!("{}:{what}", tag_of(context)));
+        }
+        extern "system" fn terminated(context: *mut c_void) {
+            lock(&EVENTS).push(format!("terminated:{}", tag_of(context)));
+        }
+        let events = || lock(&EVENTS).join(" ");
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        for (port, tag) in [(WORK, &"w1"), (COMPLETION, &"c1"), (WORK, &"w2")] {
+            let hr = XTaskQueueSubmitDelayedCallback(q, port, 0, tagged(tag), Some(note));
+            assert_eq!(hr, S_OK);
+        }
+        let hr = XTaskQueueTerminate(q, false, tagged(&"q"), Some(terminated));
+        assert_eq!(hr, S_OK);
+        assert_eq!(events(), "", "ran before any dispatch");
+        let late = XTaskQueueSubmitDelayedCallback(q, WORK, 0, tagged(&"late"), Some(note));
+        assert_eq!(late, E_ABORT);
+
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert!(!XTaskQueueDispatch(q, WORK, 0));
+        assert_eq!(events(), "w1:canceled w2:canceled");
+        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert_eq!(events(), "w1:canceled w2:canceled c1:canceled");
+        // The termination callback runs within this dispatch, which then
+        // finds the queue terminated.
+        assert!(!XTaskQueueDispatch(q, COMPLETION, INFINITE));
+        assert_eq!(events(), "w1:canceled w2:canceled c1:canceled terminated:q");
+        assert!(!XTaskQueueDispatch(q, WORK, INFINITE));
+        assert!(!XTaskQueueDispatch(q, COMPLETION, INFINITE));
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// On thread-pool ports a queued callback is canceled too, and with
+    /// `wait` Terminate returns after the termination callback, which comes
+    /// after every callback, on a pool thread.
+    #[test]
+    fn terminate_with_wait_on_pool_ports_follows_every_callback() {
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        static CANCELED: AtomicU32 = AtomicU32::new(0);
+        static LATE: AtomicU32 = AtomicU32::new(0);
+        static SEEN_AT_END: AtomicU32 = AtomicU32::new(u32::MAX);
+        static ENDED: AtomicBool = AtomicBool::new(false);
+        static END_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+        extern "system" fn slow(_: *mut c_void, canceled: bool) {
+            std::thread::sleep(Duration::from_millis(20));
+            if ENDED.load(Ordering::SeqCst) {
+                LATE.fetch_add(1, Ordering::SeqCst);
+            }
+            if canceled {
+                CANCELED.fetch_add(1, Ordering::SeqCst);
+            }
+            SEEN.fetch_add(1, Ordering::SeqCst);
+        }
+        extern "system" fn terminated(_: *mut c_void) {
+            SEEN_AT_END.store(SEEN.load(Ordering::SeqCst), Ordering::SeqCst);
+            *lock(&END_THREAD) = Some(std::thread::current().id());
+            ENDED.store(true, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let none = std::ptr::null_mut();
+        // Many more than run at once: the pool starts a worker per waiting
+        // callback, but they take time to start.
+        for i in 0..64u32 {
+            let port = if i.is_multiple_of(2) {
+                WORK
+            } else {
+                COMPLETION
+            };
+            let hr = XTaskQueueSubmitDelayedCallback(q, port, 0, none, Some(slow));
+            assert_eq!(hr, S_OK);
+        }
+        assert_eq!(XTaskQueueTerminate(q, true, none, Some(terminated)), S_OK);
+        assert!(ENDED.load(Ordering::SeqCst), "returned before termination");
+        assert_eq!(SEEN_AT_END.load(Ordering::SeqCst), 64);
+        assert_ne!(*lock(&END_THREAD), Some(std::thread::current().id()));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            (SEEN.load(Ordering::SeqCst), LATE.load(Ordering::SeqCst)),
+            (64, 0)
+        );
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// With `wait`, a callback already running when Terminate is called
+    /// has returned before the termination callback runs.
+    #[test]
+    fn terminate_with_wait_waits_for_a_running_callback() {
+        static EVENTS: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        extern "system" fn running(_: *mut c_void, _: bool) {
+            STARTED.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            lock(&EVENTS).push("returned");
+        }
+        extern "system" fn terminated(_: *mut c_void) {
+            lock(&EVENTS).push("terminated");
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let none = std::ptr::null_mut();
+        let hr = XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(running));
+        assert_eq!(hr, S_OK);
+        let start = std::time::Instant::now();
+        while !STARTED.load(Ordering::SeqCst) && start.elapsed().as_secs() < 10 {
+            std::thread::yield_now();
+        }
+        assert_eq!(XTaskQueueTerminate(q, true, none, Some(terminated)), S_OK);
+        assert_eq!(*lock(&EVENTS), ["returned", "terminated"]);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// A serialized port's canceled callbacks run on its worker, in order,
+    /// not on the thread that terminates.
+    #[test]
+    fn terminate_on_serialized_ports_runs_callbacks_on_the_worker() {
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        static RAN: Mutex<Vec<(&str, bool, std::thread::ThreadId)>> = Mutex::new(Vec::new());
+        extern "system" fn blocks(_: *mut c_void, _: bool) {
+            let start = std::time::Instant::now();
+            while !RELEASE.load(Ordering::SeqCst) && start.elapsed().as_secs() < 10 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            lock(&RAN).push((tag_of(context), canceled, std::thread::current().id()));
+        }
+        extern "system" fn terminated(_: *mut c_void) {
+            let me = std::thread::current().id();
+            lock(&RAN).push(("terminated", true, me));
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(2, 2, &mut q), S_OK);
+        let none = std::ptr::null_mut();
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(blocks)),
+            S_OK
+        );
+        for tag in [&"a", &"b"] {
+            let hr = XTaskQueueSubmitDelayedCallback(q, WORK, 0, tagged(tag), Some(note));
+            assert_eq!(hr, S_OK);
+        }
+        assert_eq!(XTaskQueueTerminate(q, false, none, Some(terminated)), S_OK);
+        assert!(lock(&RAN).is_empty(), "ran on the terminating thread");
+        RELEASE.store(true, Ordering::SeqCst);
+        assert_eq!(XTaskQueueTerminate(q, true, none, None), S_OK);
+        let ran = lock(&RAN).clone();
+        let me = std::thread::current().id();
+        let tags: Vec<_> = ran.iter().map(|r| (r.0, r.1)).collect();
+        assert_eq!(tags, [("a", true), ("b", true), ("terminated", true)]);
+        assert!(
+            ran.iter().all(|r| r.2 != me),
+            "ran on the terminating thread"
+        );
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// Terminating a composite queue cancels only what it submitted: the
+    /// queue whose ports it shares runs its callbacks as before, and stays
+    /// open.
+    #[test]
+    fn terminating_a_composite_queue_leaves_its_source_running() {
+        static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            let what = if canceled { "canceled" } else { "ran" };
+            lock(&EVENTS).push(format!("{}:{what}", tag_of(context)));
+        }
+        extern "system" fn terminated(context: *mut c_void) {
+            lock(&EVENTS).push(format!("terminated:{}", tag_of(context)));
+        }
+        let events = || lock(&EVENTS).join(" ");
+        let (mut source, mut composite) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueCreate(0, 0, &mut source), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(source, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(source, COMPLETION, &mut completion), S_OK);
+        assert_eq!(
+            XTaskQueueCreateComposite(work, completion, &mut composite),
+            S_OK
+        );
+        let submit = |q, tag| XTaskQueueSubmitDelayedCallback(q, WORK, 0, tagged(tag), Some(note));
+        assert_eq!(submit(source, &"source"), S_OK);
+        assert_eq!(submit(composite, &"composite"), S_OK);
+        let hr = XTaskQueueTerminate(composite, false, tagged(&"composite"), Some(terminated));
+        assert_eq!(hr, S_OK);
+        while XTaskQueueDispatch(source, WORK, 0) {}
+        while XTaskQueueDispatch(source, COMPLETION, 0) {}
+        assert_eq!(
+            events(),
+            "source:ran composite:canceled terminated:composite"
+        );
+        lock(&EVENTS).clear();
+        assert_eq!(submit(source, &"source"), S_OK);
+        assert!(XTaskQueueDispatch(source, WORK, 0));
+        assert_eq!(events(), "source:ran");
+        assert_eq!(XTaskQueueTerminate(source, false, none(), None), S_OK);
+        while XTaskQueueDispatch(source, WORK, 0) {}
+        while XTaskQueueDispatch(source, COMPLETION, 0) {}
+        XTaskQueueCloseHandle(composite);
+        XTaskQueueCloseHandle(source);
+    }
+
+    fn none() -> *mut c_void {
+        std::ptr::null_mut()
     }
 }
