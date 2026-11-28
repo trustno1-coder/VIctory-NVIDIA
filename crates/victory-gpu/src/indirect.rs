@@ -441,6 +441,8 @@ fn clamp_into(
     let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
     if recorded {
         list.indirect_readable(dst);
+        #[cfg(feature = "diagnostics")]
+        list.mark_between(crate::host::between::CLAMP);
     }
     recorded
 }
@@ -602,6 +604,8 @@ pub(crate) fn open_batch(
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    #[cfg(feature = "diagnostics")]
+    list.mark_between(crate::host::between::CLAMP);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))

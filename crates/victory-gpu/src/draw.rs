@@ -560,6 +560,15 @@ pub(crate) struct State {
     recording: u64,
     /// See [`State::rebinds`].
     rebinds: [u64; 2],
+    /// The longest copy this list made of each table: its address in the
+    /// title's heap -> slots, first dynamic slot, the hash of its records.
+    fresh_longest: std::collections::HashMap<u64, (u32, u32, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// For `crate::host::slot_stats`: the dynamic slots held, where the list
+    /// is (0: not submitted yet, 1: submitted, 2: sent to the card), and
+    /// when it took its first.
+    slots_held: u32,
+    slots_stage: u8,
+    slots_since: Option<std::time::Instant>,
 }
 
 impl Drop for State {
@@ -567,6 +576,7 @@ impl Drop for State {
         for &(heap, id, first, n) in &self.dynamic {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
+        self.slots_back();
     }
 }
 
@@ -589,11 +599,41 @@ impl State {
         for (heap, id, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
+        self.slots_back();
         self.fresh_tables.clear();
+        self.fresh_longest.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+    }
+
+    /// For `crate::host::slot_stats`: a list at `stage` took `n` dynamic
+    /// slots (`since`, `held`: its `slots_since` and `slots_held`; by field,
+    /// for callers that hold other fields of the list).
+    fn slots_taken(since: &mut Option<std::time::Instant>, held: &mut u32, stage: u8, n: u32) {
+        since.get_or_insert_with(std::time::Instant::now);
+        *held += n;
+        crate::host::slot_stats::held(stage, i64::from(n));
+    }
+
+    /// The list is at `stage` now (1: submitted, 2: sent to the card).
+    pub(crate) fn slots_at(&mut self, stage: u8) {
+        if self.slots_held > 0 {
+            crate::host::slot_stats::held(self.slots_stage, -i64::from(self.slots_held));
+            crate::host::slot_stats::held(stage, i64::from(self.slots_held));
+        }
+        self.slots_stage = stage;
+    }
+
+    /// The list gave its dynamic slots back.
+    fn slots_back(&mut self) {
+        let held = std::mem::take(&mut self.slots_held);
+        let since = self.slots_since.take();
+        if held > 0 {
+            crate::host::slot_stats::held(self.slots_stage, -i64::from(held));
+            crate::host::slot_stats::back(held, since.map_or(0, |s| s.elapsed().as_millis() as u64));
+        }
     }
 }
 
@@ -1516,6 +1556,8 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        list.mark_between(crate::host::between::TARGETS);
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -1916,6 +1958,8 @@ impl State {
             if !heaps.is_empty() {
                 // SAFETY: an open list and shader-visible heaps.
                 unsafe { l.SetDescriptorHeaps(&heaps) };
+                #[cfg(feature = "diagnostics")]
+                list.mark_between(crate::host::between::HEAPS);
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
@@ -1940,15 +1984,33 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            #[cfg(feature = "diagnostics")]
+            list.mark_between(crate::host::between::ROOT);
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
         if self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
+            #[cfg(feature = "diagnostics")]
+            list.mark_between(crate::host::between::PIPELINE);
             self.host_pipeline = p.pso.as_raw() as usize;
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
+        }
+        // A table two stages read through the same root parameter is one
+        // table: the first stage copies it as far as any of them reads, and
+        // the others find that copy ([`State::tables`]).
+        let mut reach: Few<(u8, u32), 16> = Few::default();
+        if p.stages.len() > 1 {
+            for stage in &p.stages {
+                for group in stage.translated().tables.groups.iter().filter(|g| g.has_cbv) {
+                    match reach.iter_mut().find(|r| r.0 == group.slot) {
+                        Some(r) => r.1 = r.1.max(group.max_dword),
+                        None => reach.push((group.slot, group.max_dword)),
+                    }
+                }
+            }
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1956,7 +2018,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, compute, &reach);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2044,6 +2106,8 @@ impl State {
                         continue;
                     }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
+                        #[cfg(feature = "diagnostics")]
+                        list.mark_own(crate::host::between::PICKS);
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
                         match self.heap_buffers(list) {
@@ -2240,6 +2304,8 @@ impl State {
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
+                Self::slots_taken(&mut self.slots_since, &mut self.slots_held, self.slots_stage, 1);
+                crate::host::slot_stats::root_view();
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2311,6 +2377,8 @@ impl State {
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
+                Self::slots_taken(&mut self.slots_since, &mut self.slots_held, self.slots_stage, 1);
+                crate::host::slot_stats::root_view();
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -4483,11 +4551,21 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// With `VICTORY_TABLES_ONCE=1`, once, whatever length it is read to: a copy is as long as any stage
+    /// of the pipeline reads the table (`reach`: root parameter, highest
+    /// dword), and a shorter reading of a table the list has a longer copy
+    /// of, with the title's records as they were, reads that copy. Each
+    /// length took slots of its own before: 7,500 to 28,000 of a frame's
+    /// 180,000 to 260,000 in four frames looked at (shots 1265, 2461, 2651,
+    /// 2851: the fixed tables around title slot 330,000 read to 179 and 181
+    /// slots, to 191, 193 and 197, by one list).
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
+        reach: &[(u8, u32)],
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
@@ -4546,7 +4624,15 @@ impl State {
                 .collect();
             selected.sort_unstable();
             selected.dedup();
-            let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            // As far as this stage reads it, and as far as the pipeline's
+            // others do if that lies inside the heap too.
+            let own = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            let wide = reach.iter().find(|r| r.0 == slot).map_or(own, |r| own.max(r.1 / 8 + 1));
+            let inside = |n: u32| {
+                n <= crate::descriptor::host::DYNAMIC
+                    && table.checked_add(u64::from(n - 1) * 32).and_then(|handle| heap.index(handle)).is_some()
+            };
+            let n = if tables_once() && wide > own && inside(wide) { wide } else { own };
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -4555,18 +4641,30 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
-                let mut h = RecordHash::default();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
-                }
-                (table, n, h.0)
-            };
+            let key = (table, n, records_hash(table, n));
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            // The title's own slots of this table, if the host has them.
+            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // A longer copy of this table made in this list, whose records
+            // are the title's still: its first `n` slots are this table.
+            // The same list holds them, so they live as long as this
+            // reading; its constants are copied at submission as the copy's.
+            if tables_once()
+                && !self.fresh_tables.contains_key(&key)
+                && let Some(&(longest, first, hashed)) = self.fresh_longest.get(&table)
+                && longest > n
+                && records_hash(table, longest) == hashed
+            {
+                self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), told: [0; 3] });
+                if let Some(title) = title_first {
+                    for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
+                        host.slot_tabled(title + k);
+                    }
+                }
+            }
             if let Some(known) = self.fresh_tables.get_mut(&key) {
+                crate::host::slot_stats::cache(crate::host::slot_stats::HAD, n);
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
@@ -4581,12 +4679,29 @@ impl State {
                     made.push((slot, first * 32));
                     continue;
                 }
+                // A stage that did not make the copy tells of the textures
+                // it reads, once, as the maker did of its own (below): the
+                // copy was made for it too.
+                let tells = match known.told.iter().position(|&t| t == reader.0 || t == 0) {
+                    Some(i) if known.told[i] == 0 => {
+                        known.told[i] = reader.0;
+                        title_first
+                    }
+                    _ => None,
+                };
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        if let Some(title) = tells
+                            && crate::descriptor::host::is_texture_view(&view)
+                        {
+                            let k = u.table_offset_dwords / 8;
+                            host.texture_slot_tabled(title + k, true);
+                            host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                        }
                     }
                 }
                 for k in selected {
@@ -4623,17 +4738,20 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), told: [reader.0, 0, 0] });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
-            // The title's own slots of this table: what the draw reads of
-            // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            Self::slots_taken(&mut self.slots_since, &mut self.slots_held, self.slots_stage, n);
+            self.count_made(key, first, compute);
+            // The title's own slots of this table (`title_first`): what the
+            // draw reads of them it brings up to date here, in the dynamic
+            // slots.
             // They are such a table's, whatever they hold. (Of a big one,
             // which may lie over slots shaders pick by index, only the ones
-            // the shader names.)
+            // the shader names; of one made longer for another stage, also
+            // all this stage's own if those are few.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
+                for k in (0..n).filter(|&k| n <= 64 || (k < own && own <= 64) || group.entry(k).is_some()) {
                     host.slot_tabled(title + k);
                 }
             }
@@ -4740,6 +4858,38 @@ impl State {
             made.push((slot, first * 32));
         }
         made
+    }
+
+    /// For `crate::host::slot_stats`: a copy of `n` slots of the table at
+    /// `table` with the records `hash` was made at dynamic slot `first`.
+    /// Counts it, and whether the list had another length of that table, or
+    /// another list made the same copy this frame.
+    fn count_made(&mut self, (table, n, hash): (u64, u32, u64), first: u32, compute: bool) {
+        use crate::host::slot_stats::{self, ELSEWHERE, LONGER, SHORTER};
+        slot_stats::made(n, compute);
+        match self.fresh_longest.get(&table).copied() {
+            Some((longest, _, hashed)) if longest > n => {
+                // (Only if the longer copy's records are the title's still.)
+                if records_hash(table, longest) == hashed {
+                    slot_stats::cache(LONGER, n);
+                }
+            }
+            Some((shorter, _, _)) => {
+                slot_stats::cache(SHORTER, shorter);
+                self.fresh_longest.insert(table, (n, first, hash));
+            }
+            None => {
+                self.fresh_longest.insert(table, (n, first, hash));
+            }
+        }
+        // One entry a key, the frame in its low byte: the same list finds its
+        // own copies in `fresh_tables`, so a key met again is another list's.
+        static SEEN: [AtomicU64; 1 << 14] = [const { AtomicU64::new(0) }; 1 << 14];
+        let mixed = (hash ^ table.rotate_left(29) ^ u64::from(n).rotate_left(51)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let tag = mixed & !0xff | crate::frame::current() & 0xff;
+        if SEEN[(mixed >> 50) as usize].swap(tag, Ordering::Relaxed) == tag {
+            slot_stats::cache(ELSEWHERE, n);
+        }
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -5600,12 +5750,24 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
 struct FreshTable {
     first: u32,
+    /// The stages (their plans) that told of the textures they read through
+    /// it: the one that made it, and the first two others.
+    told: [usize; 3],
     /// The list's epoch ([`HostList::epoch`]) at which all its entries that
     /// these readers (a stage's list of what it reads, whether it stores, the
     /// tested depth target) read were brought up to date, and whether that read the
     /// tested depth target.
     epoch: u64,
     ready: Vec<((usize, usize, bool, usize), bool)>,
+}
+
+/// Whether a table a list reads to different lengths is copied once, as long
+/// as any stage reads it, and the shorter readings use that copy
+/// (`VICTORY_TABLES_ONCE=1`; off by default: each length takes slots of its
+/// own, as before).
+fn tables_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLES_ONCE").is_some_and(|v| v == "1"))
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
@@ -5630,6 +5792,18 @@ impl RecordHash {
         let first = fold(self.0 ^ words ^ 0x2d35_8dcc_aa6c_78a5, 0x8bb8_4b93_962e_acc9 ^ u64::from(c));
         self.0 = fold(first ^ 0x4b33_a62e_d433_d4a3, 0x4d5a_2da5_1de1_aa47 ^ self.0.rotate_left(23)) ^ first;
     }
+}
+
+/// The hash of the `n` records of the table at `table` in the title's heap
+/// (all `n` lie inside the heap).
+fn records_hash(table: u64, n: u32) -> u64 {
+    let mut h = RecordHash::default();
+    for k in 0..n {
+        let at = table + u64::from(k) * 32;
+        // SAFETY: a descriptor slot in title memory.
+        h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+    }
+    h.0
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
