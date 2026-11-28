@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: How to run it
+    url: https://github.com/trustno1-coder/VIctory-NVIDIA#quick-start-how-to-run-it
+    about: Downloads, the launcher, DLSS and frame generation, step by step.
+  - name: Questions and help running it
+    url: https://github.com/trustno1-coder/VIctory-NVIDIA/discussions/categories/q-a
+    about: Ask here when nothing crashed and you are not sure what to do.
+  - name: Ideas
+    url: https://github.com/trustno1-coder/VIctory-NVIDIA/discussions/categories/ideas
+    about: Features and changes you would like.
