@@ -43,6 +43,10 @@ walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
+# The graphical launcher (apps/launcher): a window with a local web page, and the native file picker.
+tauri = { version = "2", features = ["custom-protocol"] }
+tauri-build = "2"
+tauri-plugin-dialog = "2"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

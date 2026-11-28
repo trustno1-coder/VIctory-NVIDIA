@@ -1,0 +1,342 @@
+:root {
+  --text: #fff4fd;
+  --muted: #d6b8e8;
+  --pink: #ff3fb0;
+  --hot: #ff7ad6;
+  --orange: #ffa45c;
+  --violet: #8a2be2;
+  --ok: #3ef08a;
+  --warn: #ffc15c;
+  --bad: #ff5c7a;
+  --glass: rgba(34, 8, 52, 0.62);
+  --glass-strong: rgba(24, 5, 38, 0.9);
+  --line: rgba(255, 140, 225, 0.28);
+  font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+/* `hidden` wins over the display the classes give. */
+[hidden] { display: none !important; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+  color: var(--text);
+  user-select: none;
+}
+
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; outline: none; padding: 0; }
+svg { display: block; }
+
+/* The window: a rounded frame with a thin edge. */
+
+.frame {
+  position: fixed;
+  inset: 0;
+  border-radius: 18px;
+  overflow: hidden;
+  background: #12031f;
+  border: 1px solid rgba(255, 140, 225, 0.35);
+}
+
+.scene { position: absolute; inset: 0; z-index: 0; }
+.slides { position: absolute; inset: 0; overflow: hidden; z-index: 0; }
+
+/* One picture of the slideshow; two layers take turns to fade in. */
+.slide {
+  position: absolute;
+  inset: 0;
+  background: center / cover no-repeat;
+  opacity: 0;
+  transition: opacity 1.8s ease-in-out;
+  will-change: transform, opacity;
+}
+
+.slide.visible { opacity: 1; }
+
+/* Keeps the menu, the title and the status bar readable over any picture. */
+.slides::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(90deg, rgba(10, 2, 20, 0.55) 0%, transparent 35%),
+    linear-gradient(0deg, rgba(10, 2, 20, 0.7) 0%, transparent 30%),
+    linear-gradient(180deg, rgba(10, 2, 20, 0.45) 0%, transparent 25%);
+  pointer-events: none;
+}
+
+/* Everything over the background is drawn above it, whatever it animates. */
+.titlebar, .sidebar, .stage, .statusbar, .credit { z-index: 1; isolation: isolate; }
+
+.scene svg { width: 100%; height: 100%; }
+.stars circle { animation: twinkle 5s ease-in-out infinite alternate; }
+.clouds { animation: drift 60s linear infinite alternate; }
+.ripples { animation: shimmer 3s ease-in-out infinite alternate; }
+.lamp { animation: twinkle 2.4s ease-in-out infinite alternate; }
+
+/* Title bar: badge, wordmark, window buttons. It moves the window. */
+
+.titlebar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 150px;
+}
+
+.badge {
+  position: absolute;
+  top: 18px;
+  left: 24px;
+  width: 58px;
+  filter: drop-shadow(0 0 12px rgba(255, 70, 190, 0.8));
+}
+
+.wordmark {
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  height: 140px;
+  filter: drop-shadow(0 0 22px rgba(255, 60, 190, 0.75));
+  animation: breathe 5s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.wordmark-text {
+  position: absolute;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%) skewX(-12deg);
+  font-size: 76px;
+  font-weight: 800;
+  background: linear-gradient(180deg, #fff 25%, #ffc2ec 55%, var(--pink));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 18px rgba(255, 60, 190, 0.8));
+  pointer-events: none;
+}
+
+.window-buttons { position: absolute; top: 18px; right: 22px; display: flex; gap: 10px; }
+
+.window-button {
+  width: 64px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: rgba(60, 14, 82, 0.55);
+  border: 1px solid var(--line);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(8px);
+  transition: background 0.15s;
+}
+
+.window-button svg { width: 20px; height: 20px; fill: none; stroke: #fff; stroke-width: 2.4; stroke-linecap: round; }
+.window-button:hover { background: rgba(255, 63, 176, 0.45); }
+#music .speaker { fill: #fff; stroke-linejoin: round; }
+#music .cross, #music.muted .waves { display: none; }
+#music.muted .cross { display: inline; }
+#close:hover { background: rgba(255, 60, 100, 0.7); }
+
+/* Sidebar */
+
+.sidebar {
+  position: absolute;
+  top: 150px;
+  left: 26px;
+  width: 250px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 22px;
+  background: var(--glass);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.side-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 48px;
+  padding: 0 18px;
+  border-radius: 16px;
+  font-size: 18px;
+  font-weight: 500;
+  color: #f4dcff;
+  transition: background 0.15s, box-shadow 0.15s, color 0.15s;
+}
+
+.side-item svg {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  fill: none;
+  stroke: var(--hot);
+  stroke-width: 1.8;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.side-item.current {
+  color: #fff;
+  background: linear-gradient(135deg, rgba(255, 63, 176, 0.85), rgba(138, 43, 226, 0.75));
+  box-shadow: 0 0 18px rgba(255, 63, 176, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+
+.side-item.current svg { stroke: #fff; }
+
+.badge-count {
+  margin-left: auto;
+  min-width: 24px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  text-align: center;
+  color: #fff;
+  background: var(--orange);
+  box-shadow: 0 0 10px rgba(255, 164, 92, 0.8);
+}
+
+.side-item.focus:not(.current) { background: rgba(255, 120, 220, 0.16); }
+.side-item.focus { outline: 2px solid rgba(255, 255, 255, 0.55); outline-offset: -2px; }
+
+/* The stage: where the views show. */
+
+.stage { position: absolute; top: 150px; left: 300px; right: 26px; bottom: 92px; }
+.view { display: none; }
+.view.active { display: flex; }
+
+.home { position: absolute; inset: 0; align-items: flex-end; justify-content: center; padding-bottom: 18px; }
+
+.play {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  width: 300px;
+  height: 78px;
+  border-radius: 999px;
+  font-size: 36px;
+  font-weight: 800;
+  font-style: italic;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: #fff;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.35) 0%, transparent 45%),
+    linear-gradient(100deg, #ff3fb0 0%, #e0369e 45%, #ff8a5c 100%);
+  border: 2px solid rgba(255, 220, 245, 0.85);
+  box-shadow: 0 0 0 3px rgba(255, 63, 176, 0.3), 0 0 26px rgba(255, 63, 176, 0.7), 0 12px 30px rgba(0, 0, 0, 0.45);
+  text-shadow: 0 2px 8px rgba(120, 0, 80, 0.6);
+  transition: transform 0.15s, box-shadow 0.15s, filter 0.15s;
+}
+
+.play svg { width: 32px; height: 32px; fill: #fff; filter: drop-shadow(0 2px 6px rgba(120, 0, 80, 0.6)); }
+.play.focus, .play:hover { transform: scale(1.04); filter: brightness(1.08); }
+.play.focus { box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.4), 0 0 40px rgba(255, 63, 176, 0.95), 0 12px 30px rgba(0, 0, 0, 0.45); }
+.play.disabled { filter: saturate(0.35) brightness(0.8); }
+
+/* Status bar */
+
+.statusbar {
+  position: absolute;
+  left: 300px;
+  right: 26px;
+  bottom: 20px;
+  height: 58px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 0 22px;
+  border-radius: 999px;
+  background: var(--glass);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(14px);
+  font-size: 15px;
+}
+
+/* The designer's credit, under the menu, level with the status bar. */
+.credit {
+  position: absolute;
+  left: 26px;
+  bottom: 20px;
+  width: 250px;
+  height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border-radius: 999px;
+  font-size: 15px;
+  color: var(--muted);
+  background: var(--glass);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(14px);
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+
+.credit svg { width: 20px; height: 20px; fill: currentColor; }
+.credit b { color: var(--hot); font-weight: 700; }
+.credit:hover { color: #fff; background: rgba(255, 120, 220, 0.22); }
+
+.status-ready { display: flex; align-items: center; gap: 10px; font-weight: 600; white-space: nowrap; }
+.message { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--muted); }
+.message.error { color: var(--bad); }
+.keys { display: flex; gap: 14px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.keys span { display: flex; align-items: center; gap: 3px; }
+
+.chip {
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.chip.ok { color: var(--ok); }
+.chip.warn { color: var(--warn); }
+.version { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+
+.dot { width: 11px; height: 11px; border-radius: 50%; background: var(--muted); flex: none; }
+.ok > .dot, .dot.live { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+.warn > .dot { background: var(--warn); box-shadow: 0 0 8px rgba(255, 193, 92, 0.7); }
+.bad > .dot { background: var(--bad); box-shadow: 0 0 8px rgba(255, 92, 122, 0.7); }
+
+kbd {
+  min-width: 22px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-bottom-width: 3px;
+  background: rgba(255, 255, 255, 0.07);
+  font: 600 11px "Segoe UI", sans-serif;
+  text-align: center;
+  color: #fff;
+}
+
+@keyframes twinkle { from { opacity: 0.25; } to { opacity: 1; } }
+@keyframes drift { from { transform: translateX(-40px); } to { transform: translateX(40px); } }
+@keyframes shimmer { from { opacity: 0.6; transform: translateX(-4px); } to { opacity: 1; transform: translateX(4px); } }
+@keyframes breathe { 0%, 100% { filter: drop-shadow(0 0 18px rgba(255, 60, 190, 0.6)); } 50% { filter: drop-shadow(0 0 30px rgba(255, 60, 190, 0.95)); } }
+
+/* A narrow window drops the key hints so the status bar keeps its chips. */
+@media (max-width: 1080px) {
+  .keys { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before { animation: none !important; }
+}

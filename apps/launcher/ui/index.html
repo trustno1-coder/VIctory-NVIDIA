@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>VIctory Launcher</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="panels.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div class="frame">
+    <div id="scene" class="scene" aria-hidden="true"></div>
+    <div id="slides" class="slides" aria-hidden="true"></div>
+
+    <header id="titlebar" class="titlebar">
+      <img id="badge" class="badge" src="assets/logo.png" alt="" hidden>
+      <img id="wordmark" class="wordmark" src="assets/VIctory.png" alt="VIctory" hidden>
+      <div id="wordmark-text" class="wordmark-text">VIctory</div>
+      <div class="window-buttons">
+        <button id="music" class="window-button" aria-label="Mute the music" hidden>
+          <svg viewBox="0 0 24 24"><path class="speaker" d="M4 9h4l5-4v14l-5-4H4z"/><path class="waves" d="M16 9a4 4 0 0 1 0 6M18.5 6.5a7.5 7.5 0 0 1 0 11"/><path class="cross" d="M16 9l5 6M21 9l-5 6"/></svg>
+        </button>
+        <button id="minimize" class="window-button" aria-label="Minimize">
+          <svg viewBox="0 0 24 24"><path d="M6 12h12"/></svg>
+        </button>
+        <button id="close" class="window-button" aria-label="Close">
+          <svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7L7 17"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <nav id="sidebar" class="sidebar">
+      <button data-nav data-view="home" class="side-item">
+        <svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>
+        <span>Home</span>
+      </button>
+      <button data-nav data-view="settings" class="side-item">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></svg>
+        <span>Settings</span>
+      </button>
+      <button data-nav data-view="controller" class="side-item">
+        <svg viewBox="0 0 24 24"><path d="M7 7h10a5 5 0 0 1 4.9 6l-.8 4a2.5 2.5 0 0 1-4.3 1.2L14.5 16h-5l-2.3 2.2A2.5 2.5 0 0 1 2.9 17l-.8-4A5 5 0 0 1 7 7z"/><path d="M7.5 10v4M5.5 12h4"/><circle cx="16" cy="11" r=".6"/><circle cx="18" cy="13" r=".6"/></svg>
+        <span>Controller</span>
+      </button>
+      <button data-nav data-view="setup" class="side-item">
+        <svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3.5 17.5a2 2 0 0 0 3 3l5.8-5.8a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.5-.5-.5-2.5z"/></svg>
+        <span>Setup</span>
+      </button>
+      <button data-nav data-view="updates" class="side-item">
+        <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 0 1-14.3 4.9M4 12a8 8 0 0 1 14.3-4.9"/><path d="M18.5 3v4.2h-4.2M5.5 21v-4.2h4.2"/></svg>
+        <span>Updates</span>
+        <span id="update-badge" class="badge-count" hidden></span>
+      </button>
+      <button data-nav data-action="logs" class="side-item">
+        <svg viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/></svg>
+        <span>Logs</span>
+      </button>
+      <button data-nav data-view="about" class="side-item">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg>
+        <span>About</span>
+      </button>
+    </nav>
+
+    <main class="stage">
+      <section id="home" class="view home">
+        <button data-nav data-action="play" class="play">
+          <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+          <span>Play</span>
+        </button>
+      </section>
+
+      <section id="settings" class="view panel">
+        <header class="panel-head">
+          <kbd>Q</kbd><div id="tabs" class="tabs"></div><kbd>E</kbd>
+        </header>
+        <div id="rows" class="rows"></div>
+        <p id="help" class="help"></p>
+      </section>
+
+      <section id="controller" class="view panel">
+        <header class="panel-head"><h2>Keyboard as a controller</h2></header>
+        <div id="bindings" class="rows"></div>
+        <p id="bind-help" class="help">Choose a control, then press the key that should do it. The keyboard drives the
+          pad while no real controller is connected.</p>
+      </section>
+
+      <section id="setup" class="view panel">
+        <header class="panel-head"><h2>Setup</h2></header>
+        <div class="rows">
+          <button data-nav data-action="pick" class="row">
+            <span class="row-label">Your dump</span>
+            <span id="exe" class="row-value path">Not chosen</span>
+          </button>
+          <div class="row" data-check="exe"><span class="dot"></span><span class="row-label"></span></div>
+          <div class="row" data-check="built"><span class="dot"></span><span class="row-label"></span></div>
+          <button data-nav data-fetch="dlss" class="row" data-check="dlss">
+            <span class="dot"></span><span class="row-label"></span><span class="row-action">Download</span>
+          </button>
+          <button data-nav data-fetch="fsr" class="row" data-check="fsr">
+            <span class="dot"></span><span class="row-label"></span><span class="row-action">Download</span>
+          </button>
+        </div>
+        <p class="help">Your dump stays outside the repository. Downloads come from NVIDIA's and AMD's own GitHub.</p>
+      </section>
+
+      <section id="updates" class="view panel">
+        <header class="panel-head"><h2>Updates</h2></header>
+        <div class="rows">
+          <div class="row" id="update-state"><span class="dot"></span><span class="row-label">Not checked yet</span></div>
+          <ul id="update-commits" class="commits"></ul>
+          <button data-nav data-action="apply-update" id="apply-update" class="row" hidden>
+            <span class="row-label">Update now</span><span class="row-action">Pull, rebuild and restart</span>
+          </button>
+          <button data-nav data-action="check-updates" class="row">
+            <span class="row-label">Check again</span><span class="row-action">Check</span>
+          </button>
+        </div>
+        <p id="update-help" class="help">Updates come from the official repository. The launcher closes, the new code is
+          pulled and built in a console window, and the launcher starts again.</p>
+      </section>
+
+      <section id="about" class="view panel">
+        <header class="panel-head"><h2>About</h2></header>
+        <div class="about">
+          <p>VIctory runs your own copy of an Xbox Series title on Windows. It contains no game files: you supply
+            your own legally obtained dump.</p>
+          <p>Free software under the GPL 3.0 or later, built by many contributors. DLSS and FSR 3 files are NVIDIA's
+            and AMD's, downloaded from their own GitHub under their licences.</p>
+          <p class="muted">Launcher <span id="about-version"></span></p>
+        </div>
+        <div class="rows links">
+          <button data-nav data-link="official" class="row">
+            <span class="row-label">Official repository</span><span class="row-value">trustno1-coder/VIctory-NVIDIA</span>
+            <span class="row-action">Open</span>
+          </button>
+          <button data-nav data-link="original" class="row">
+            <span class="row-label">The original VIctory</span><span class="row-value">Marvisak/VIctory</span>
+            <span class="row-action">Open</span>
+          </button>
+        </div>
+      </section>
+    </main>
+
+    <button data-link="author" class="credit" title="github.com/alexx307/VIctory-NVIDIA">
+      <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 0 0-3.2 19.5c.5.1.7-.2.7-.5v-1.7c-2.8.6-3.4-1.3-3.4-1.3-.5-1.2-1.1-1.5-1.1-1.5-.9-.6.1-.6.1-.6 1 .1 1.5 1 1.5 1 .9 1.5 2.4 1.1 2.9.8.1-.6.4-1.1.6-1.3-2.2-.3-4.6-1.1-4.6-5a3.9 3.9 0 0 1 1-2.7 3.6 3.6 0 0 1 .1-2.7s.8-.3 2.8 1a9.6 9.6 0 0 1 5 0c1.9-1.3 2.8-1 2.8-1 .5 1.4.2 2.4.1 2.7a3.9 3.9 0 0 1 1 2.7c0 3.9-2.4 4.7-4.6 5 .4.3.7.9.7 1.9V21c0 .3.2.6.7.5A10 10 0 0 0 12 2z"/></svg>
+      <span>Designer <b>Alexx307</b></span>
+    </button>
+
+    <footer class="statusbar">
+      <span id="ready" class="status-ready"><span class="dot"></span><span class="text">Checking…</span></span>
+      <span id="message" class="message" role="status"></span>
+      <span class="keys">
+        <span><kbd>↑</kbd><kbd>↓</kbd> Select</span>
+        <span><kbd>Enter</kbd> Confirm</span>
+        <span><kbd>Esc</kbd> Back</span>
+      </span>
+      <span id="dlss-chip" class="chip"></span>
+      <span class="version"><span id="version"></span><span class="dot live"></span></span>
+    </footer>
+  </div>
+</body>
+</html>
