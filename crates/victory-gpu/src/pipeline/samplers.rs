@@ -106,7 +106,7 @@ pub(crate) fn know(samplers: &[StaticSampler]) {
     }
     // Not `host()`: a translation must not open the device.
     let Some(host) = crate::host::host_made() else { return };
-    let supported = aniso_point_mip(&host.device);
+    let supported = crate::sampler::aniso_point_mip(&host.device);
     let words: Vec<Words> = samplers.iter().map(|s| words(s, supported)).collect();
     {
         let seen = SEEN.read().unwrap_or_else(|e| e.into_inner());
@@ -115,24 +115,6 @@ pub(crate) fn know(samplers: &[StaticSampler]) {
         }
     }
     sync(&host.device, &words);
-}
-
-fn aniso_point_mip(device: &ID3D12Device) -> bool {
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        // SAFETY: the feature query writes the structure of the given size
-        // (as `host::HostPipeline::new` asks it).
-        unsafe {
-            device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS19,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }
-        .is_ok()
-            && options.AnisoFilterWithPointMipSupported.as_bool()
-    })
 }
 
 fn words(s: &StaticSampler, aniso_point_mip_supported: bool) -> Words {
