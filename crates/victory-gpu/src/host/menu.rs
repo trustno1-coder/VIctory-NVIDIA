@@ -7,7 +7,8 @@
 //! shown the title sees no keyboard (`crate::SETTINGS_MENU_OPEN`, read by the
 //! input module); a pad still works.
 //!
-//! The settings are read once at start, so a change is saved to the file
+//! The settings are read once at start, so a change is saved at once (as well as by the save
+//! lines) to the file
 //! `VICTORY_MENU_FILE` names (`scripts\play-foxhound.ps1` sets it to
 //! `victory-settings.txt` in the repository's folder and applies it at every
 //! start) and takes effect at the next start; "SAVE AND RESTART" starts the
@@ -31,7 +32,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::font::{ASCII_WIDTH, TextBox, colours, supports_chinese, width as text_width};
+use super::font::{ASCII_WIDTH, TextBox, colours, glyph, supports_chinese, width as text_width};
 use super::{Host, HostList, transition};
 
 const COLUMNS: u32 = 60;
@@ -46,6 +47,58 @@ const ABOUT_PRELOAD: [Labels; 3] = [
     ("MAKES EVERY SHADER AHEAD, THEN STARTS THE GAME AGAIN.", "提前编译全部着色器，然后重新启动游戏。"),
     ("TAKES A WHILE: MAYBE A LONG TIME, DEPENDING ON HARDWARE.", "处理时间取决于硬件，可能需要等很久。"),
     ("A LATER UPDATE OF THIS BUILD MAY NEED A NEW PRELOAD.", "兼容层更新后可能需要重新预加载。"),
+];
+/// The actions that export and import the game's save (`crate::save_share`), and what is said
+/// of them while they are picked.
+const EXPORT: usize = 4;
+const IMPORT: usize = 5;
+const ABOUT_EXPORT: [Labels; 3] = [
+    ("MAKES A ZIP OF YOUR SAVE IN SAVES, IN THE FOLDER OF", "把存档打包为 ZIP，放入游戏目录的 SAVES 文件夹。"),
+    ("GAME_SCARLETT_MASTER.EXE. SEND THAT ZIP TO SHARE IT.", "可把 ZIP 发给其他人分享。"),
+    ("YOUR SAVE STAYS AS IT IS. GAME SETTINGS ARE LEFT OUT.", "原存档保持原样，ZIP 不包含游戏设置。"),
+];
+const ABOUT_IMPORT: [Labels; 3] = [
+    ("PUT A SAVE ZIP INTO SAVES, IN THE FOLDER OF", "把存档 ZIP 放入游戏目录的 SAVES 文件夹。"),
+    ("GAME_SCARLETT_MASTER.EXE, THEN PRESS ENTER HERE AND", "在此按回车，再从列表中选择存档。"),
+    ("PICK IT FROM THE LIST. YOUR GAME SETTINGS ARE KEPT.", "导入时保留你的游戏设置。"),
+];
+/// The list IMPORT SAVE opens: the saves in `Saves`, then a line back to the settings.
+const PICK_TITLE: Labels = ("IMPORT SAVE                       ESC GOES BACK", "导入存档                   ESC 返回");
+const PICK_HELP: Labels = ("UP/DOWN PICK  ENTER TWICE IMPORTS IT", "上下选择    按两次回车导入");
+const PICK_NONE: Labels = ("  NONE YET: PUT A SAVE ZIP INTO SAVES IN THE GAME FOLDER", "  暂无存档。请把存档 ZIP 放入游戏目录的 SAVES");
+const PICK_BACK: Labels = ("BACK TO THE SETTINGS", "返回设置");
+const ABOUT_PICK: [Labels; 3] = [
+    ("THE SAVE ZIPS IN SAVES, IN THE GAME FOLDER, NEWEST FIRST.", "下列 ZIP 位于游戏目录的 SAVES，最新的排在最前。"),
+    ("ENTER TWICE: THE GAME RESTARTS WITH THE SAVE PICKED.", "按两次回车后，游戏将使用所选存档重启。"),
+    ("YOUR OLD SAVE IS ZIPPED INTO SAVES FIRST, SO IT IS KEPT.", "旧存档会先打包备份到 SAVES。"),
+];
+/// The note after the first Enter on a save in the list: the second one imports it.
+const CONFIRM_IMPORT: Labels = ("ENTER AGAIN: IMPORT IT AND RESTART THE GAME", "再次按回车：导入存档并重启游戏");
+/// The longest save name shown in the list.
+const IMPORT_NAME: usize = 56;
+
+/// A save's file name as the menu's letters can show it.
+fn shown_name(name: &str) -> String {
+    name.chars()
+        .map(|c| c.to_ascii_uppercase())
+        .map(|c| if c.is_ascii() && glyph(c as u8) != glyph(b'#') { c } else { '-' })
+        .take(IMPORT_NAME)
+        .collect()
+}
+
+/// The setting that turns MFG Unlocker on, and what is said of it while it is picked.
+const MFG: &str = "VICTORY_MFG_UNLOCKER";
+const ABOUT_MFG: [Labels; 3] = [
+    ("A MOD, NOT OURS: DLSS FRAME GEN ON RTX 20 AND 30 CARDS.", "第三方模组，可让 RTX 20 和 30 系列使用 DLSS 帧生成。"),
+    ("ON: DOWNLOADED FROM ITS GITHUB AT THE NEXT START, THEN RUN.", "开启后会在下次启动时从其 GITHUB 下载并加载。"),
+    ("NVIDIA DOES NOT SUPPORT IT. IF THE GAME FAILS, TURN IT OFF.", "NVIDIA 未提供支持。游戏异常时请关闭它。"),
+];
+/// The DLSS setting, and what is said while it is picked on in a start without NVIDIA's files.
+const DLSS: &str = "VICTORY_MENU_DLSS";
+const ABOUT_NO_DLSS: [Labels; 3] = [
+    ("THE NVIDIA DLSS FILES ARE NOT ON THIS PC YET: THEY ARE", "本机还没有 NVIDIA DLSS 文件。"),
+    ("DOWNLOADED FROM NVIDIA ON GITHUB AT THE NEXT START", "下次启动时会从 NVIDIA 的 GITHUB 下载。"),
+    ("(ABOUT 70 MB, ONCE). SAVE AND RESTART NOW DOES IT.", "约 70 MB，只下载一次。可选保存并立即重启。"),
 ];
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: Labels = ("ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD", "再次按回车：保存设置、退出游戏并预加载");
@@ -96,10 +149,12 @@ const STAGES: &[(&str, Labels)] = &[("2", same("2")), ("1", same("1")), ("0", ("
 const ITEMS: &[Item] = &[
     Item { var: LANGUAGE, label: ("LANGUAGE", "界面语言"), values: &[("en", same("ENGLISH")), ("zh-CN", ("SIMPLIFIED CHINESE", "简体中文"))], live: true },
     // The launcher's own choices.
-    Item { var: "VICTORY_MENU_DLSS", label: same("DLSS"), values: &[("quality", ("QUALITY", "质量")), ("balanced", ("BALANCED", "平衡")), ("performance", ("PERFORMANCE", "性能")), ("dlaa", ("DLAA (NATIVE)", "DLAA (原生分辨率)")), ("off", OFF)], live: false },
+    Item { var: DLSS, label: same("DLSS"), values: &[("quality", ("QUALITY", "质量")), ("balanced", ("BALANCED", "平衡")), ("performance", ("PERFORMANCE", "性能")), ("dlaa", ("DLAA (NATIVE)", "DLAA (原生分辨率)")), ("off", OFF)], live: false },
     Item { var: "VICTORY_MENU_FRAMEGEN", label: ("FRAME GENERATION", "帧生成"), values: &[("0", OFF), ("2", same("2X")), ("3", same("3X")), ("4", same("4X")), ("5", same("5X")), ("6", ("6X (MOST)", "6X (最高)"))], live: false },
     // DLSS Frame Generation where it runs (RTX 40 and later), else AMD's FSR 3 (2X only).
     Item { var: "VICTORY_MENU_FG_TYPE", label: ("FRAME GEN TYPE", "帧生成类型"), values: &[("auto", ("AUTO", "自动")), ("dlss", same("DLSS")), ("fsr", ("FSR 3 (OLDER CARDS)", "FSR 3 (旧显卡)"))], live: false },
+    // Someone else's mod (apps\victory\src\play.rs): downloaded at the next start, then loaded.
+    Item { var: MFG, label: ("MFG UNLOCKER (MOD, RTX 20/30)", "MFG 解锁模组 (RTX 20/30)"), values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_FPS", label: ("FRAME RATE CAP", "帧率上限"), values: &[("1000", NONE), ("120", same("120")), ("60", same("60")), ("30", ("30 (THE GAME)", "30 (游戏默认)"))], live: false },
     Item { var: "VICTORY_FPS_LINE", label: ("FPS AT THE TOP", "顶部帧率"), values: &[("1", ON), ("0", OFF)], live: true },
     Item { var: "VICTORY_PANEL", label: ("STATS PANEL (F3)", "性能统计 (F3)"), values: &[("0", OFF), ("1", ON)], live: true },
@@ -114,7 +169,9 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_AMBIENT_SPECULAR", label: ("REFLECTION ESTIMATE", "反射估算"), values: ON_UNSET, live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: ("FOG CAP", "雾效强度上限"), values: &[("1.5", same("1.5")), ("1", same("1")), ("2", same("2")), ("", NONE)], live: false },
     Item { var: "VICTORY_BVH_BUILDER", label: ("RAY TRACING (SLOW, BROKEN)", "光线追踪 (慢且有故障)"), values: UNSET_ON, live: false },
-    Item { var: "VICTORY_WATER_LIGHT", label: ("WATER LIGHT", "水面光照"), values: &[("", ("OFF (NO DARK BLOCKS)", "关闭 (无黑块)")), ("1", ("ON (GREEN, DARK BLOCKS)", "开启 (偏绿和黑块)"))], live: false },
+    // On unless "0": a file saved by an earlier version holds an empty value (its OFF) or "1",
+    // and both start it on, so nobody keeps it off from before by accident (2026-11-27).
+    Item { var: "VICTORY_WATER_LIGHT", label: ("WATER LIGHT", "水面光照"), values: &[("", ON), ("0", OFF)], live: false },
     Item { var: "VICTORY_LEAVE_OUT", label: ("HEAT HAZE AND DECAL DEFRAG", "热浪和贴花整理"), values: &[("02384a60fda6f2d0,731a39171b568298", ("LEFT OUT", "跳过")), ("", ("RUN (SLOWER, SMEARS)", "开启 (慢且有拖影)"))], live: false },
     Item { var: "VICTORY_EARLY_DEPTH", label: ("EARLY DEPTH TEST", "提前深度测试"), values: ON_UNSET, live: false },
     Item { var: "VICTORY_WC_NO_BACK", label: ("SKIP BIG COPY-BACKS", "跳过大块数据回拷"), values: ON_UNSET, live: false },
@@ -127,16 +184,57 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_PORT_CONSTANTS", label: ("CONSTANTS HEAP IN PLACE", "原地更新常量缓冲区"), values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
-const ACTIONS: [Labels; 5] = [
+const ACTIONS: [Labels; 7] = [
     ("SAVE AND RESTART NOW", "保存并立即重启"),
     ("SAVE FOR NEXT START", "保存设置"),
     ("PRELOAD SHADERS (RESTARTS THE GAME)", "预加载着色器 (重启游戏)"),
     ("RESET ALL TO PLAY DEFAULTS", "恢复启动默认设置"),
+    ("EXPORT SAVE (TO SAVES IN THE GAME FOLDER)", "导出存档 (到游戏目录的 SAVES)"),
+    ("IMPORT SAVE (PICK FROM SAVES)", "导入存档 (从 SAVES 选择)"),
     ("CLOSE", "关闭"),
 ];
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
+}
+
+/// Where the menu saves: the file `VICTORY_MENU_FILE` names (`victory play` sets it); else,
+/// however the game was started (a script, another launcher), the one `victory play` reads at
+/// every start, `victory-settings.txt` in `VICTORY_HOME` or `%LOCALAPPDATA%\victory`.
+fn settings_file() -> Option<std::path::PathBuf> {
+    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    set("VICTORY_MENU_FILE")
+        .or_else(|| set("VICTORY_HOME").map(|home| home.join("victory-settings.txt")))
+        .or_else(|| set("LOCALAPPDATA").map(|base| base.join("victory").join("victory-settings.txt")))
+}
+
+/// The first start of a new victory.exe: the seconds it plays before it starts
+/// again by itself (`VICTORY_WARMUP_RESTART`, set by the launcher while the exe
+/// has no mark under `%LOCALAPPDATA%\victory\warmed`). On the RTX 5070, every
+/// new build's first run stayed at a flat 14 fps (Present ~40 ms) for as long as
+/// it ran, and every later run was normal (27-29 fps), even after a first run of
+/// 45 seconds; a copy of an exe already run was fast at once (2026-11-27). Likely
+/// the driver's cache of the program; not ours to fix, so it is run through once.
+/// Draws in a frame from which the warm-up's time counts: the game's scenes
+/// (loading into the world: about 300, in the world: thousands), not its
+/// title screen and menus (about 10).
+const SCENE_DRAWS: u64 = 100;
+
+pub(crate) fn warmup_seconds() -> Option<u64> {
+    get("VICTORY_WARMUP_RESTART").parse().ok().filter(|s| *s > 0)
+}
+
+/// The start's notice lines for the warm-up start ([`warmup_seconds`]).
+pub(super) fn warmup_notice(seconds: u64, chinese: bool) -> Vec<String> {
+    let tr = |text| label(text, chinese).to_owned();
+    vec![
+        tr(("FIRST START OF THIS VERSION: A ONE-TIME WARM-UP", "首次启动此版本，游戏将进行一次预热")),
+        if chinese { format!("进入游戏 {seconds} 秒后，游戏将自动重启") } else { format!("THE GAME RESTARTS BY ITSELF {seconds} SECONDS AFTER IT") },
+        tr(("LOADS INTO THE GAME (PRESS A AT THE TITLE SCREEN)", "请在标题画面按 A 进入游戏")),
+        tr(("THIS HAPPENS ONCE PER NEW VERSION, AND IS NEEDED:", "每个新版本只需预热一次")),
+        tr(("WITHOUT IT THE FIRST RUN STAYS AT ABOUT 14 FPS", "预热前首次运行约为 14 帧")),
+        String::new(),
+    ]
 }
 
 /// Starts `command_line` in a console window of its own, with that console's input and output.
@@ -313,6 +411,11 @@ impl Buffers {
     }
 }
 
+enum Note {
+    Text(Labels),
+    Exported(String),
+}
+
 /// The menu of a presenter.
 pub(super) struct Menu {
     /// The values chosen, by item (as at start until changed).
@@ -321,13 +424,18 @@ pub(super) struct Menu {
     started: Vec<String>,
     /// The line picked: an item, or an action after them.
     at: usize,
-    note: Option<Labels>,
+    note: Option<Note>,
     changed: bool,
     /// What the buffer holds: the frame-rate line, or (none) the menu's lines.
     painted: Option<String>,
     buffers: [Option<Buffers>; 2],
     fps_buffers: [Option<Buffers>; 2],
     failed: bool,
+    /// The saves in `Saves` that can be imported (read when the menu opens), and the line
+    /// picked in their list (`imports.len()`: the line back), shown while `picking`.
+    imports: Vec<String>,
+    import_at: usize,
+    picking: bool,
 }
 
 impl Menu {
@@ -345,7 +453,18 @@ impl Menu {
                 get(i.var)
             }
         }).collect();
-        Menu { started: values.clone(), values, at: 0, note: None, changed: true, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false }
+        Menu { started: values.clone(), values, at: 0, note: None, changed: true, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false }
+    }
+
+    fn say(&mut self, text: Labels) {
+        self.note = Some(Note::Text(text));
+    }
+
+    fn note_text(&self, chinese: bool) -> Option<String> {
+        Some(match self.note.as_ref()? {
+            Note::Text(text) => label(*text, chinese).to_owned(),
+            Note::Exported(name) => format!("{}: {name}.ZIP", label(("EXPORTED TO SAVES", "已导出到 SAVES"), chinese)),
+        })
     }
 
     fn open() -> bool {
@@ -353,6 +472,9 @@ impl Menu {
     }
 
     fn lines(&self, chinese: bool) -> Vec<String> {
+        if self.picking {
+            return self.pick_lines(chinese);
+        }
         let tr = |labels| label(labels, chinese);
         let total = ITEMS.len() + ACTIONS.len();
         let first = self.at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
@@ -384,15 +506,59 @@ impl Menu {
             out.push(String::new());
         }
         out.push(String::new());
-        let about = if self.at == ITEMS.len() + PRELOAD { ABOUT_PRELOAD } else { [same(""); 3] };
+        let about = if self.at == ITEMS.len() + PRELOAD {
+            ABOUT_PRELOAD
+        } else if self.at == ITEMS.len() + EXPORT {
+            ABOUT_EXPORT
+        } else if self.at == ITEMS.len() + IMPORT {
+            ABOUT_IMPORT
+        } else if ITEMS.get(self.at).is_some_and(|i| i.var == MFG) {
+            ABOUT_MFG
+        } else if ITEMS.get(self.at).is_some_and(|i| i.var == DLSS)
+            && !matches!(self.values[self.at].as_str(), "" | "off")
+            && std::env::var_os("VICTORY_STREAMLINE_DIR").is_none()
+        {
+            ABOUT_NO_DLSS
+        } else {
+            [same(""); 3]
+        };
         out.extend(about.map(|line| tr(line).to_owned()));
-        let note = self.note.or_else(|| {
-            (!chinese && chinese_requested().load(Ordering::Relaxed)).then_some(same("CHINESE FONTS NOT FOUND IN WINDOWS"))
-        });
-        out.push(tr(note.unwrap_or((
-            "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE",
-            "* 已修改：即时项立即生效，其余下次启动生效",
-        ))).to_owned());
+        out.push(self.note_text(chinese).unwrap_or_else(|| {
+            if !chinese && chinese_requested().load(Ordering::Relaxed) {
+                "CHINESE FONTS NOT FOUND IN WINDOWS".to_owned()
+            } else {
+                tr(("* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE",
+                    "* 已修改：即时项立即生效，其余下次启动生效")).to_owned()
+            }
+        }));
+        out.push(REPO.to_owned());
+        out
+    }
+
+    /// The list IMPORT SAVE opens, in the box's lines.
+    fn pick_lines(&self, chinese: bool) -> Vec<String> {
+        let tr = |text| label(text, chinese).to_owned();
+        let mut out = vec![tr(PICK_TITLE), tr(PICK_HELP), String::new()];
+        if self.imports.is_empty() {
+            out.push(tr(PICK_NONE));
+        }
+        let rows = ROWS - (out.len() - 3);
+        let total = self.imports.len() + 1;
+        let first = self.import_at.saturating_sub(rows / 2).min(total.saturating_sub(rows));
+        for row in first..(first + rows).min(total) {
+            let cursor = if row == self.import_at { '>' } else { ' ' };
+            let name = self.imports.get(row).map_or_else(|| tr(PICK_BACK), |n| shown_name(n));
+            out.push(format!("{cursor} {name}").chars().take(COLUMNS as usize).collect());
+        }
+        while out.len() < 3 + ROWS {
+            out.push(String::new());
+        }
+        out.push(String::new());
+        out.extend(ABOUT_PICK.map(tr));
+        out.push(self.note_text(chinese).unwrap_or_else(|| {
+            let n = self.imports.len();
+            if chinese { format!("SAVES 中有 {n} 个存档") } else { format!("{n} IN SAVES") }
+        }));
         out.push(REPO.to_owned());
         out
     }
@@ -438,10 +604,13 @@ impl Menu {
 
     /// Writes the changed values over those in the settings file.
     fn save(&mut self) -> bool {
-        let Some(path) = std::env::var_os("VICTORY_MENU_FILE") else {
-            self.note = Some(("NO SETTINGS FILE: START WITH VICTORY PLAY", "找不到设置文件，请通过 VICTORY PLAY 启动"));
+        let Some(path) = settings_file() else {
+            self.say(("NO FOLDER FOR THE SETTINGS FILE", "找不到保存设置的目录"));
             return false;
         };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let mut kept: Vec<(String, String)> = std::fs::read_to_string(&path)
             .unwrap_or_default()
             .lines()
@@ -462,29 +631,42 @@ impl Menu {
         }
         match std::fs::write(&path, text) {
             Ok(()) => {
-                tracing::info!(path = %std::path::Path::new(&path).display(), "settings menu: saved");
+                tracing::info!(path = %path.display(), "settings menu: saved");
                 self.started = self.values.clone();
-                self.note = Some(("SAVED. APPLIES AT THE NEXT START", "已保存。其余设置在下次启动时生效"));
+                self.say(if std::env::var_os("VICTORY_MENU_FILE").is_some() {
+                    ("SAVED. APPLIES AT THE NEXT START", "已保存。其余设置在下次启动时生效")
+                } else {
+                    // Started some other way (a script, another launcher): the file victory play
+                    // reads at every start, which this start did not.
+                    ("SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME", "已保存。通过 VICTORY.EXE 启动游戏时生效")
+                });
                 true
             }
             Err(e) => {
                 tracing::warn!(error = %e, "settings menu: not saved");
-                self.note = Some(("COULD NOT SAVE THE SETTINGS FILE", "无法写入设置文件"));
+                self.say(("COULD NOT SAVE THE SETTINGS FILE", "无法写入设置文件"));
                 false
             }
         }
     }
 
     /// Starts the launcher again in a new console, a few seconds on, and ends this run.
-    /// `preload`: the launcher makes every shader first (its `-Preload`, for that start alone).
+    /// `preload`: the launcher makes every shader first (`VICTORY_PRELOAD=1`, for that start alone).
     fn restart(&mut self, preload: bool) {
         let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
-            self.note = Some(("SAVED. START THE LAUNCHER AGAIN YOURSELF", "已保存。请手动重新运行启动器"));
+            self.say(("SAVED. START THE LAUNCHER AGAIN YOURSELF", "已保存。请手动重新运行启动器"));
             return;
         };
         let play = play.to_string_lossy().replace('\'', "''");
         let args = get("VICTORY_MENU_ARGS");
-        let command = format!("Start-Sleep 3; & '{play}' {args}{}", if preload { " -Preload" } else { "" });
+        // The preload is asked by VICTORY_PRELOAD=1, which both launchers read (victory.exe's is
+        // `--preload`, the script's `-Preload`: the script's flag given to victory.exe was refused,
+        // and the window closed before it could be read, 2026-11-27). A launcher that fails keeps
+        // its window until Enter.
+        let command = format!(
+            "Start-Sleep 3; {}& '{play}' {args}; if ($LASTEXITCODE) {{ Read-Host 'The start failed (see above). Press Enter to close this window' }}",
+            if preload { "$env:VICTORY_PRELOAD='1'; " } else { "" }
+        );
         match new_console(&format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{}\"", command.replace('"', "\\\""))) {
             Ok(()) => {
                 tracing::info!(command, preload, "settings menu: restarting");
@@ -499,21 +681,124 @@ impl Menu {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "settings menu: restart failed");
-                self.note = Some(("SAVED, BUT THE RESTART FAILED", "已保存，重启失败"));
+                self.say(("SAVED, BUT THE RESTART FAILED", "已保存，重启失败"));
             }
+        }
+    }
+
+    /// The warm-up start ([`warmup_seconds`]): once the game has drawn whole
+    /// scenes for that long, this exe is marked as warmed up
+    /// (`VICTORY_WARMUP_MARK`) and the game starts again. The time counts
+    /// from the first frame of [`SCENE_DRAWS`] draws or more, not from the
+    /// start: a player who waited on the title screen ("press A", about ten
+    /// draws a frame) was restarted after 20 seconds and still had the 14 fps
+    /// first run after it (2026-11-27).
+    fn warmup(&mut self) {
+        static BEGAN: OnceLock<std::time::Instant> = OnceLock::new();
+        static DONE: AtomicBool = AtomicBool::new(false);
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let Some(seconds) = warmup_seconds() else { return };
+        if DONE.load(Ordering::Relaxed) {
+            return;
+        }
+        let ever = crate::list::draws_ever();
+        let this_frame = ever.saturating_sub(LAST.swap(ever, Ordering::Relaxed));
+        if BEGAN.get().is_none() && this_frame < SCENE_DRAWS {
+            return;
+        }
+        if BEGAN.get_or_init(std::time::Instant::now).elapsed() < Duration::from_secs(seconds) {
+            return;
+        }
+        DONE.store(true, Ordering::Relaxed);
+        let mark = std::path::PathBuf::from(get("VICTORY_WARMUP_MARK"));
+        if !mark.as_os_str().is_empty() {
+            if let Some(dir) = mark.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&mark, "this victory.exe was warmed up (its first start, then a restart)\r\n");
+        }
+        tracing::info!(seconds, mark = %mark.display(), "first start of this victory.exe: warmed up; the game starts again");
+        self.restart(false);
+    }
+
+    /// Reads which saves `Saves` holds, keeping the one picked if it is still there.
+    fn read_imports(&mut self) {
+        let picked = self.imports.get(self.import_at).cloned();
+        self.imports = crate::save_share::share().map(|s| crate::save_share::exports(&s)).unwrap_or_default();
+        self.import_at = picked.and_then(|p| self.imports.iter().position(|n| *n == p)).unwrap_or(0);
+    }
+
+    /// Writes the game's save into a new zip in `Saves`.
+    fn export_save(&mut self) {
+        let (Some(data), Some(share)) = (crate::save_share::data(), crate::save_share::share()) else {
+            self.say(("SAVE FOLDERS NOT KNOWN IN THIS START", "本次启动找不到存档文件夹"));
+            return;
+        };
+        let name = format!("save {}", crate::save_share::stamp());
+        match crate::save_share::export(&data, &share, &name) {
+            Ok(to) => {
+                tracing::info!(to = %to.display(), "settings menu: save exported");
+                self.note = Some(Note::Exported(shown_name(&name)));
+                self.read_imports();
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, share = %share.display(), "settings menu: save not exported");
+                self.say(if e.kind() == std::io::ErrorKind::NotFound {
+                    ("NOTHING TO EXPORT: THE GAME HAS NOT SAVED YET", "无法导出：游戏尚未保存存档")
+                } else {
+                    ("EXPORT FAILED: THE GAME FOLDER CANNOT BE WRITTEN", "导出失败：无法写入游戏目录")
+                });
+            }
+        }
+    }
+
+    /// Stages the save picked to be put in place at the next start, and starts the game again.
+    fn import_save(&mut self) {
+        let (Some(data), Some(share)) = (crate::save_share::data(), crate::save_share::share()) else {
+            self.say(("SAVE FOLDERS NOT KNOWN IN THIS START", "本次启动找不到存档文件夹"));
+            return;
+        };
+        let Some(name) = self.imports.get(self.import_at).cloned() else {
+            self.say(("NO SAVE TO IMPORT: PUT ONE IN SAVES FIRST", "无可用存档，请先把存档 ZIP 放入 SAVES"));
+            return;
+        };
+        if let Err(e) = crate::save_share::stage(&data, &share, &name) {
+            tracing::warn!(error = %e, name, "settings menu: save import not staged");
+            self.say(if e.kind() == std::io::ErrorKind::NotFound {
+                ("IMPORT FAILED: NO SAVE IN THAT ZIP", "导入失败：压缩包内没有存档")
+            } else {
+                ("IMPORT FAILED: THAT ZIP IS DAMAGED OR NOT A SAVE", "导入失败：压缩包已损坏或不含有效存档")
+            });
+            return;
+        }
+        tracing::info!(name, "settings menu: save import staged; put in place at the next start");
+        if std::env::var_os("VICTORY_MENU_PLAY").is_some() {
+            self.restart(false);
+        } else {
+            self.say(("IMPORTED: CLOSE THE GAME AND START IT AGAIN", "已导入。请退出游戏并重新启动"));
         }
     }
 
     /// Removes the settings file: the launcher's own settings at the next start.
     fn reset(&mut self) {
-        if let Some(path) = std::env::var_os("VICTORY_MENU_FILE") {
+        if let Some(path) = settings_file() {
             let _ = std::fs::remove_file(path);
         }
-        self.note = Some(("RESET. PLAY DEFAULTS AT THE NEXT START", "已重置。下次启动将使用默认设置"));
+        self.say(("RESET. PLAY DEFAULTS AT THE NEXT START", "已重置。下次启动将使用默认设置"));
+    }
+
+    /// Changes a setting and saves it at once: many players changed settings and closed the
+    /// menu without the save lines, and lost them. The save lines stay (and restart, preload).
+    fn change_and_save(&mut self, i: usize, step: isize) {
+        self.change(i, step);
+        if self.save() && live(&ITEMS[i]) {
+            self.say(("SAVED. ON NOW", "已保存，立即生效"));
+        }
     }
 
     /// A frame was presented: the keys pressed since the last one.
     pub(super) fn frame(&mut self) {
+        self.warmup();
         let pressed = std::mem::take(&mut *keys().lock().unwrap_or_else(|e| e.into_inner()));
         if pressed.is_empty() {
             return;
@@ -521,26 +806,50 @@ impl Menu {
         let total = ITEMS.len() + ACTIONS.len();
         for vk in pressed {
             let open = Self::open();
+            // Esc in the list of saves goes back to the settings.
+            if open && self.picking && vk == VK_ESCAPE {
+                self.picking = false;
+                self.note = None;
+                self.changed = true;
+                continue;
+            }
             if vk == VK_F1 || (open && vk == VK_ESCAPE) {
                 crate::SETTINGS_MENU_OPEN.store(!open && vk == VK_F1, Ordering::Relaxed);
                 self.note = None;
+                self.picking = false;
+                if !open {
+                    self.read_imports();
+                }
                 self.changed = true;
                 continue;
             }
             if !open {
                 continue;
             }
-            // Only an Enter right after the first one starts a preload.
-            let confirmed = self.note == Some(CONFIRM_PRELOAD);
+            // Only an Enter right after the first one starts a preload or an import.
+            let confirmed = matches!(&self.note, Some(Note::Text(CONFIRM_PRELOAD | CONFIRM_IMPORT)));
             if confirmed {
                 self.note = None;
+            }
+            if self.picking {
+                let (n, back) = (self.imports.len() + 1, self.import_at >= self.imports.len());
+                match vk {
+                    VK_UP => self.import_at = (self.import_at + n - 1) % n,
+                    VK_DOWN => self.import_at = (self.import_at + 1) % n,
+                    VK_RETURN if back => self.picking = false,
+                    VK_RETURN if !confirmed => self.say(CONFIRM_IMPORT),
+                    VK_RETURN => self.import_save(),
+                    _ => {}
+                }
+                self.changed = true;
+                continue;
             }
             match vk {
                 VK_UP => self.at = (self.at + total - 1) % total,
                 VK_DOWN => self.at = (self.at + 1) % total,
-                VK_LEFT if self.at < ITEMS.len() => self.change(self.at, -1),
-                VK_RIGHT if self.at < ITEMS.len() => self.change(self.at, 1),
-                VK_RETURN if self.at < ITEMS.len() => self.change(self.at, 1),
+                VK_LEFT if self.at < ITEMS.len() => self.change_and_save(self.at, -1),
+                VK_RIGHT if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
+                VK_RETURN if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
                 VK_RETURN => match self.at - ITEMS.len() {
                     0 => {
                         if self.save() {
@@ -550,13 +859,19 @@ impl Menu {
                     1 => {
                         self.save();
                     }
-                    PRELOAD if !confirmed => self.note = Some(CONFIRM_PRELOAD),
+                    PRELOAD if !confirmed => self.say(CONFIRM_PRELOAD),
                     PRELOAD => {
                         if self.save() {
                             self.restart(true);
                         }
                     }
                     3 => self.reset(),
+                    EXPORT => self.export_save(),
+                    IMPORT => {
+                        self.read_imports();
+                        self.import_at = 0;
+                        self.picking = true;
+                    }
                     _ => crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed),
                 },
                 _ => {}
@@ -643,11 +958,34 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::font::glyph;
+
+    #[test]
+    fn a_change_is_saved_at_once_however_the_game_was_started() {
+        let home = std::env::temp_dir().join(format!("victory-menu-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        // SAFETY: no other test in this crate reads these two.
+        unsafe {
+            std::env::remove_var("VICTORY_MENU_FILE");
+            std::env::set_var("VICTORY_HOME", &home);
+        }
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        menu.started = menu.values.clone();
+        let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
+        menu.change_and_save(dlss, 1);
+        let text = std::fs::read_to_string(home.join("victory-settings.txt")).expect("saved without a save line");
+        assert!(text.contains("VICTORY_MENU_DLSS=quality"), "{text}");
+        assert_eq!(menu.note_text(false).as_deref(), Some("SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME"));
+        // Every note fits the box and has its letters.
+        for note in [menu.note_text(false).as_deref().expect("saved"), "SAVED. ON NOW", "SAVED. APPLIES AT THE NEXT START", "NO FOLDER FOR THE SETTINGS FILE"] {
+            assert!(note.len() <= COLUMNS as usize, "{note}");
+            assert!(note.bytes().all(|c| glyph(c) != glyph(b'#')), "{note}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         for chinese in [false, true] {
             for (at, item) in ITEMS.iter().enumerate() {
@@ -667,10 +1005,10 @@ mod tests {
 
     #[test]
     fn the_link_is_always_right_under_the_note() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         for note in [None, Some(same("SAVED"))] {
-            menu.note = note;
+            menu.note = note.map(Note::Text);
             for at in 0..ITEMS.len() + ACTIONS.len() {
                 menu.at = at;
                 let lines = menu.lines(false);
@@ -678,23 +1016,49 @@ mod tests {
                 let n = lines.len();
                 assert!(lines[n - 2].starts_with("* = CHANGED") || note.is_some_and(|note| lines[n - 2] == note.0), "{}", lines[n - 2]);
                 assert_eq!(lines[n - 1], REPO);
-                // What a preload costs is said while it is picked, and only then.
+                // What a preload costs, and what MFG Unlocker is, is said while it is picked, and only then.
                 let about = &lines[n - 5..n - 2];
                 if at == ITEMS.len() + PRELOAD {
                     assert_eq!(about, ABOUT_PRELOAD.map(|line| line.0));
+                } else if at == ITEMS.len() + EXPORT {
+                    assert_eq!(about, ABOUT_EXPORT.map(|line| line.0));
+                } else if at == ITEMS.len() + IMPORT {
+                    assert_eq!(about, ABOUT_IMPORT.map(|line| line.0));
+                } else if at < ITEMS.len() && ITEMS[at].var == MFG {
+                    assert_eq!(about, ABOUT_MFG.map(|line| line.0));
                 } else {
                     assert!(about.iter().all(String::is_empty), "{about:?}");
                 }
             }
         }
         assert_eq!(ACTIONS[PRELOAD].0, "PRELOAD SHADERS (RESTARTS THE GAME)");
-        assert!(text_width(CONFIRM_PRELOAD.0) <= COLUMNS * ASCII_WIDTH);
-        assert!(text_width(CONFIRM_PRELOAD.1) <= COLUMNS * ASCII_WIDTH);
+        assert_eq!(ACTIONS[EXPORT].0, "EXPORT SAVE (TO SAVES IN THE GAME FOLDER)");
+        assert_eq!(ACTIONS[IMPORT].0, "IMPORT SAVE (PICK FROM SAVES)");
+        let pick = [PICK_TITLE, PICK_HELP, PICK_NONE, PICK_BACK, CONFIRM_IMPORT, CONFIRM_PRELOAD,
+            ("IMPORT FAILED: THAT ZIP IS DAMAGED OR NOT A SAVE", "导入失败：压缩包已损坏或不含有效存档")];
+        for lines in [ABOUT_EXPORT, ABOUT_IMPORT, ABOUT_PICK, ABOUT_MFG, ABOUT_NO_DLSS].iter().flatten().chain(&pick) {
+            for line in [lines.0, lines.1] {
+                assert!(text_width(line) <= COLUMNS * ASCII_WIDTH, "{line}");
+                assert!(line.bytes().filter(u8::is_ascii).all(|c| glyph(c) != glyph(b'#')), "{line}");
+            }
+        }
+        // DLSS picked on where NVIDIA's files are missing (no VICTORY_STREAMLINE_DIR in tests): said so.
+        let dlss = ITEMS.iter().position(|i| i.var == DLSS).expect("in the menu");
+        menu.at = dlss;
+        menu.values[dlss] = "quality".to_owned();
+        for chinese in [false, true] {
+            let lines = menu.lines(chinese);
+            assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_NO_DLSS.map(|line| label(line, chinese)));
+        }
+        menu.values[dlss] = "off".to_owned();
+        let lines = menu.lines(false);
+        assert!(lines[lines.len() - 5..lines.len() - 2].iter().all(String::is_empty));
+        assert_eq!(ITEMS.iter().filter(|i| i.var == MFG).count(), 1);
     }
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         let i = 1; // DLSS, a setting with more than two options.
         let n = ITEMS[i].values.len();
@@ -704,5 +1068,43 @@ mod tests {
         assert_eq!(menu.values[i], ITEMS[i].values[0].0);
         menu.change(i, -1);
         assert_eq!(menu.values[i], ITEMS[i].values[n - 1].0);
+    }
+
+    #[test]
+    fn a_shared_save_name_is_shown_in_letters_the_menu_has() {
+        let names = vec!["save 2026-11-27 23-45-10.zip".to_owned(), "Jason's boat ~ 100% [\u{e9}] and a very long name that goes on and on.zip".to_owned()];
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false, imports: names, import_at: 0, picking: true };
+        menu.started = menu.values.clone();
+        let check = |menu: &Menu| {
+            let lines = menu.lines(false);
+            assert_eq!(lines.len(), LINES as usize);
+            assert_eq!(lines[lines.len() - 1], REPO);
+            assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_PICK.map(|line| line.0));
+            for line in &lines {
+                assert!(line.len() <= COLUMNS as usize, "{line}");
+                assert!(line.bytes().all(|c| glyph(c.to_ascii_uppercase()) != glyph(b'#')), "{line}");
+            }
+            lines
+        };
+        let lines = check(&menu);
+        assert!(lines.iter().any(|l| l == "> SAVE 2026-11-27 23-45-10.ZIP"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == &format!("  {}", PICK_BACK.0)), "{lines:?}");
+        menu.import_at = 1;
+        check(&menu);
+        menu.import_at = 2;
+        assert!(check(&menu).iter().any(|l| l == &format!("> {}", PICK_BACK.0)));
+        // Many saves: the list scrolls and the box keeps its size.
+        menu.imports = (0..50).map(|i| format!("save {i}.zip")).collect();
+        for at in [0, 25, 49, 50] {
+            menu.import_at = at;
+            let lines = check(&menu);
+            let picked = if at == 50 { format!("> {}", PICK_BACK.0) } else { format!("> SAVE {at}.ZIP") };
+            assert!(lines.contains(&picked), "{at}: {lines:?}");
+        }
+        menu.imports.clear();
+        menu.import_at = 0;
+        let lines = check(&menu);
+        assert!(lines.iter().any(|l| l == PICK_NONE.0));
+        assert!(lines.iter().any(|l| l == &format!("> {}", PICK_BACK.0)));
     }
 }

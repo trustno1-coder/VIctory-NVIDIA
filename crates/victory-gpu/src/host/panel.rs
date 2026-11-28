@@ -391,9 +391,13 @@ pub(super) struct Notice {
 
 impl Notice {
     pub(super) fn new() -> Notice {
-        let english = crate::streamline::notice();
-        let chinese = crate::streamline::notice_in(true);
-        Notice { done: english.is_empty(), lines: [english, chinese], since: None, buffers: [None, None] }
+        // The first start of a new victory.exe says first that it restarts by itself.
+        let warmup = super::menu::warmup_seconds();
+        let lines = [false, true].map(|chinese| {
+            warmup.into_iter().flat_map(|seconds| super::menu::warmup_notice(seconds, chinese))
+                .chain(crate::streamline::notice_in(chinese)).collect::<Vec<_>>()
+        });
+        Notice { done: lines[0].is_empty(), lines, since: None, buffers: [None, None] }
     }
 
     /// Records the copy of the notice onto `back` (as [`Panel::draw`]), at

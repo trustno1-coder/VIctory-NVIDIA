@@ -307,6 +307,44 @@ static FG_ON: AtomicU64 = AtomicU64::new(0);
 static FG_OFF: AtomicU64 = AtomicU64::new(0);
 static FG_SHOWN: AtomicU64 = AtomicU64::new(0);
 static EVALUATED_ALL: AtomicU64 = AtomicU64::new(0);
+
+/// The driver's DLSS refused the evaluations Streamline gave it ("NGX
+/// evaluate feature failed", reported through [`log_message`]), and how
+/// many. Once nearly every one fails ([`dlss_failing`]), DLSS is left alone
+/// for the run and the title's own FidelityFX upscales again: a refused
+/// evaluation leaves the output as it was, so the screen stayed black with
+/// the sound and subtitles running (#449: an RTX 5060 Ti with the NVIDIA
+/// App's DLSS override, which loads its own Streamline plugins and asked
+/// every DLSS mode for a 2560x1440 render while the title rendered
+/// 1280x720; 599 of about 600 evaluations failed with 0xbad00005).
+static NGX_FAILED: AtomicU64 = AtomicU64::new(0);
+static DLSS_GIVEN_UP: AtomicBool = AtomicBool::new(false);
+
+/// Failed evaluations from which DLSS is given up, if they are nine in
+/// ten of the evaluations recorded.
+const NGX_FAILED_ENOUGH: u64 = 90;
+
+/// Whether DLSS is given up for the run (see [`NGX_FAILED`]).
+fn dlss_failing(failed: u64, evaluated: u64) -> bool {
+    failed >= NGX_FAILED_ENOUGH && failed * 10 >= evaluated * 9
+}
+
+fn ngx_evaluate_failed(text: &str) {
+    let failed = NGX_FAILED.fetch_add(1, Relaxed) + 1;
+    if !DLSS_GIVEN_UP.load(Relaxed)
+        && dlss_failing(failed, EVALUATED_ALL.load(Relaxed))
+        && !DLSS_GIVEN_UP.swap(true, Relaxed)
+    {
+        tracing::error!(
+            failed,
+            evaluated = EVALUATED_ALL.load(Relaxed),
+            last = text,
+            "DLSS: the driver refused nearly every upscaling, which leaves the picture black; DLSS and frame generation are off for this run and the game's own FSR upscales.              If the NVIDIA App has a DLSS override on for this game (Graphics > the program > DLSS Override), turn it off"
+        );
+        // Frame generation stops too (see `upscale`): with nothing noted it would show stale frames.
+        FG_WANTED.store(0, Relaxed);
+    }
+}
 static FG_STATUS: AtomicU32 = AtomicU32::new(0);
 /// Presents with frame generation on, and frames it showed, in all.
 static FG_ON_ALL: AtomicU64 = AtomicU64::new(0);
@@ -346,25 +384,27 @@ pub fn init(asked: &Asked) -> Available {
     } else {
         Some(NoDlss::Card)
     };
-    // FSR 3 frame generation needs the title's upscaling to run: on Series X that is DLSS's
-    // (the title's own FidelityFX takes the Series S sizes only, and the title fails without it).
-    let fsr_needs_series_s = asked.fsr_framegen && !asked.series_s && !available.dlss;
-    if fsr_needs_series_s {
+    // FSR 3 frame generation needs DLSS for the upscaling, on either console. On Series X the
+    // title's own FidelityFX takes the Series S sizes only and the title fails without DLSS; on
+    // Series S, with its own FidelityFX upscaler running beside our frame generation, the title
+    // stopped on a check (0x80000003 at +0x2219650) seconds into the start (2026-11-27: muted
+    // runs here, issues #272, #308 and #331; with DLSS on, both consoles ran).
+    let fsr_needs_dlss = asked.fsr_framegen && !available.dlss;
+    if fsr_needs_dlss {
         tracing::warn!(
-            "FSR 3 frame generation stays off: on Series X it needs DLSS for the upscaling, which this card or these files do not give; the Series S profile runs it"
+            "FSR 3 frame generation stays off: it needs DLSS for the upscaling, which is off, or this card or these files do not give; without it the title stops at the start"
         );
     }
-    let fsr_framegen = asked.fsr_framegen && !fsr_needs_series_s && fsr::init(&asked.fidelityfx_dir);
+    let fsr_framegen = asked.fsr_framegen && !fsr_needs_dlss && fsr::init(&asked.fidelityfx_dir);
     let _ = FACTS.set(Facts {
         adapter: default_adapter().map(|a| a.0).unwrap_or_default(),
-        series_s: asked.series_s,
         no_dlss,
         files_missing,
         dlss_fg_asked: asked.framegen,
         dlss_fg_supported: available.framegen,
         fsr_asked: asked.fsr_framegen,
         fsr_loaded: fsr_framegen,
-        fsr_needs_series_s,
+        fsr_needs_dlss,
     });
     Available { fsr_framegen, ..available }
 }
@@ -372,7 +412,6 @@ pub fn init(asked: &Asked) -> Available {
 /// What the start found out about frame generation on this card ([`notice`]).
 struct Facts {
     adapter: String,
-    series_s: bool,
     /// Why DLSS upscaling is not running (`None`: it runs).
     no_dlss: Option<NoDlss>,
     /// Streamline's files did not load (nothing is known of the card).
@@ -381,7 +420,8 @@ struct Facts {
     dlss_fg_supported: bool,
     fsr_asked: bool,
     fsr_loaded: bool,
-    fsr_needs_series_s: bool,
+    /// FSR 3 frame generation was asked and stays off: DLSS upscaling is not running.
+    fsr_needs_dlss: bool,
 }
 
 /// Why DLSS upscaling is not running: the notice must not blame a card that
@@ -439,7 +479,12 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool, chinese: bool) -> Vec<S
             tr("DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)", "DLSS 帧生成需要 RTX 40 或更新显卡")
         }.into());
     }
-    if dlss_live {
+    if dlss_live && !f.adapter.is_empty() && !dlss_framegen_card(&f.adapter) {
+        // An RTX 20 or 30 with DLSS Frame Generation: a mod beside victory.exe (MFG Unlocker,
+        // as winmm.dll) answers for the card; how many frames it gives, Streamline says.
+        lines.push(tr("FRAME GEN: DLSS, UNLOCKED BY A MOD (F1 MENU: 2X-6X)", "模组已解锁 DLSS 帧生成 (F1：2X-6X)").into());
+        lines.push(tr("NVIDIA DOES NOT SUPPORT IT: IF IT FAILS, REMOVE IT", "NVIDIA 未提供支持。出现问题时请移除模组").into());
+    } else if dlss_live {
         lines.push(tr("FRAME GEN: DLSS, SUPPORTED HERE (F1 MENU: 2X-6X)", "此显卡支持 DLSS 帧生成 (F1：2X-6X)").into());
         lines.push(tr("MORE THAN 2X NEEDS AN RTX 50 CARD", "高于 2X 需要 RTX 50 显卡").into());
     } else if fsr_live {
@@ -448,22 +493,13 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool, chinese: bool) -> Vec<S
         } else {
             tr("FRAME GEN: AMD FSR 3 (CHOSEN IN F1), 2X AT MOST", "AMD FSR 3 帧生成 (F1 设置)，最高 2X").into()
         });
-        if !f.series_s {
-            lines.push(tr("SERIES X WITH FSR 3 NEEDS DLSS UPSCALING (ON)", "SERIES X 的 FSR 3 需要开启 DLSS 超分").into());
-        } else if f.no_dlss.is_some() {
-            lines.push(tr("SERIES S MODE: FSR 3 RUNS WITHOUT DLSS", "SERIES S 模式下 FSR 3 无需 DLSS").into());
-        }
-    } else if f.fsr_needs_series_s {
-        lines.push(tr("FRAME GEN OFF: FSR 3 ON SERIES X NEEDS DLSS ON", "帧生成关闭：SERIES X 的 FSR 3 需要 DLSS").into());
+        lines.push(tr("FSR 3 FRAME GEN NEEDS DLSS UPSCALING (ON)", "FSR 3 帧生成需要开启 DLSS 超分").into());
+    } else if f.fsr_needs_dlss {
+        lines.push(tr("FRAME GEN OFF: FSR 3 NEEDS DLSS UPSCALING ON", "帧生成关闭：FSR 3 需要开启 DLSS 超分").into());
         lines.push(match f.no_dlss {
             Some(NoDlss::FilesMissing) => tr("NVIDIA DLSS FILES NOT FOUND (VICTORY_STREAMLINE_DIR)", "缺少 DLSS 文件 (VICTORY_STREAMLINE_DIR)"),
             Some(NoDlss::Card) => tr("THIS CARD HAS NO DLSS UPSCALING", "此显卡不支持 DLSS 超分"),
             _ => tr("DLSS UPSCALING IS OFF: TURN IT ON IN F1 > DLSS", "DLSS 超分已关闭，请在 F1 > DLSS 开启"),
-        }.into());
-        lines.push(if f.no_dlss == Some(NoDlss::Card) {
-            tr("USE F1 > CONSOLE > SERIES S (THE GAME RESTARTS)", "请选 F1 > 主机型号 > SERIES S (重启游戏)")
-        } else {
-            tr("OR F1 > CONSOLE > SERIES S (THE GAME RESTARTS)", "或选 F1 > 主机型号 > SERIES S (重启游戏)")
         }.into());
     } else if f.fsr_asked && !f.fsr_loaded {
         lines.push(tr("FRAME GEN OFF: AMD FSR 3 FILES NOT FOUND", "帧生成关闭：找不到 AMD FSR 3 文件").into());
@@ -617,7 +653,12 @@ unsafe extern "C" fn log_message(kind: u32, message: *const c_char) {
     // (Every plugin in the folder that was not asked for says so.)
     let noise = text.contains("since it is was not requested by the host");
     match kind {
-        abi::LOG_ERROR => tracing::error!(target: "streamline", "{text}"),
+        abi::LOG_ERROR => {
+            tracing::error!(target: "streamline", "{text}");
+            if text.contains("NGX evaluate feature failed") {
+                ngx_evaluate_failed(text);
+            }
+        }
         abi::LOG_WARN if !noise => tracing::warn!(target: "streamline", "{text}"),
         _ => tracing::debug!(target: "streamline", "{text}"),
     }
@@ -628,9 +669,37 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
-/// The adapter a device made with no adapter named is on (the first), its
-/// name and LUID.
+/// The name of the card the title will run on (the launcher asks whether to
+/// fetch AMD's FSR 3 files only where DLSS Frame Generation will not run).
+pub fn adapter_name() -> Option<String> {
+    default_adapter().map(|a| a.0)
+}
+
+/// Whether a card of this name runs DLSS Frame Generation: a GeForce RTX of
+/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU"),
+/// or a workstation card of those generations ("NVIDIA RTX 2000 Ada Generation",
+/// "NVIDIA RTX PRO 4000 Blackwell SFF Edition", #312). Not the older Quadro RTX
+/// 4000 to 8000 (Turing) or RTX A2000 to A6000 (Ampere).
+pub fn dlss_framegen_card(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    if name.contains("QUADRO") {
+        return false;
+    }
+    if name.contains(" ADA") || name.contains("BLACKWELL") || name.contains("RTX PRO") {
+        return true;
+    }
+    let Some(at) = name.find("RTX") else { return false };
+    let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
+    model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
+}
+
+/// The card the host device is made on (`hardware_adapter`; else the first
+/// adapter, where a device made with no adapter named is), its name and LUID.
 fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
+    if let Some((adapter, name, _)) = victory_shader::emit::host::hardware_adapter() {
+        // SAFETY: a plain DXGI query.
+        return unsafe { adapter.GetDesc1() }.ok().map(|d| (name, d.AdapterLuid));
+    }
     // SAFETY: plain DXGI queries.
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
@@ -638,6 +707,82 @@ fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
         let desc = adapter.GetDesc1().ok()?;
         let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
         Some((String::from_utf16_lossy(&desc.Description[..len]), desc.AdapterLuid))
+    }
+}
+
+/// The translated shaders' shader model (6.6, `ResourceDescriptorHeap[]`).
+pub const SHADER_MODEL_NEEDED: (u32, u32) = (6, 6);
+
+/// The highest shader model `device` runs, as (major, minor). Asked from 6.9
+/// down: a runtime that does not know a model refuses the question.
+pub fn device_shader_model(device: &ID3D12Device) -> Option<(u32, u32)> {
+    (0x60..=0x69).rev().find_map(|v| {
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL(v) };
+        // SAFETY: writes `model` of the given size.
+        let ok = unsafe {
+            device.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32)
+        }
+        .is_ok();
+        let m = model.HighestShaderModel.0 as u32;
+        ok.then_some((m >> 4, m & 0xF))
+    })
+    .or(Some((5, 1)))
+}
+
+/// The highest shader model of the default adapter (the one the title's device is
+/// on), from a device made for the question; `None` without one. Windows 10's own
+/// Direct3D 12 stops at 6.5; Microsoft's newer runtime (`D3D12\D3D12Core.dll`
+/// beside the program, which victory.exe asks for) runs 6.6. Made in a process of
+/// its own (`victory shader-model`), since a process keeps the first runtime it loads.
+pub fn highest_shader_model() -> Option<(u32, u32)> {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    // SAFETY: plain DXGI and D3D12 calls with owned results.
+    let device = unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let adapter = factory.EnumAdapters1(0).ok()?;
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
+        device?
+    };
+    device_shader_model(&device)
+}
+
+/// The file of the Direct3D 12 runtime this process loaded (`D3D12Core.dll`:
+/// Windows' own in System32, or Microsoft's newer one from `D3D12\` beside the
+/// program); `None` before a device is made.
+pub fn d3d12_core_path() -> Option<PathBuf> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+    let name = wide(Path::new("D3D12Core.dll"));
+    // SAFETY: a module of this process by name, its file name into a buffer of the given size.
+    unsafe {
+        let module = GetModuleHandleW(name.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let len = GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) as usize;
+        (len > 0).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+    }
+}
+
+/// Loads a mod's DLL into this process for good, logged as `what` (MFG Unlocker: it wraps
+/// NVIDIA's frame generation, so it is loaded before a device is made or Streamline loaded).
+/// `Err`: Windows' error code.
+pub fn load_mod(what: &str, path: &Path) -> Result<(), u32> {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+    let name = wide(path);
+    // SAFETY: a NUL-terminated path; the module stays loaded for the life of the process.
+    let (module, code) = unsafe {
+        let module = LoadLibraryW(name.as_ptr());
+        (module, if module.is_null() { GetLastError() } else { 0 })
+    };
+    if module.is_null() {
+        tracing::warn!(dll = %path.display(), code, "{what}: did not load");
+        Err(code)
+    } else {
+        tracing::info!(dll = %path.display(), "{what}: loaded");
+        Ok(())
     }
 }
 
@@ -943,6 +1088,12 @@ fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
 /// its inputs are noted there for the present); the title's own runs
 /// otherwise.
 pub fn upscale(up: &Upscale) -> Taken {
+    // DLSS given up: the title's own upscaling alone, as in a start without NVIDIA's files.
+    // Nothing is noted for frame generation (turned off with it, `ngx_evaluate_failed`): the
+    // title's FidelityFX beside our frame generation stops the title on a check (+0x2219650).
+    if DLSS_GIVEN_UP.load(Relaxed) {
+        return Taken::No("the driver refused DLSS's upscalings (DLSS and frame generation are off for the run)");
+    }
     let plan = PLAN.get();
     let dlss = plan.is_some_and(|p| p.dlss) && DLSS_READY.load(Acquire);
     // (FSR 3 frame generation reads the same inputs at the present.)
@@ -2183,5 +2334,21 @@ pub(crate) fn line(frames: f64) {
                 "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod failing_tests {
+    use super::dlss_failing;
+
+    #[test]
+    fn dlss_is_given_up_only_when_nearly_every_upscaling_fails() {
+        // #449: 599 failed of about 600.
+        assert!(dlss_failing(599, 600));
+        assert!(dlss_failing(90, 100));
+        // Too few to tell yet, or a few refusals among working upscalings.
+        assert!(!dlss_failing(89, 89));
+        assert!(!dlss_failing(120, 1000));
+        assert!(!dlss_failing(500, 600));
     }
 }
