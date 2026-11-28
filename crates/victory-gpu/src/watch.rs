@@ -626,10 +626,21 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// The blocks of `[at, at + len)` whose pages the title shows at other
 /// addresses too, and there.
 fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
-    if !view_guard() || len == 0 {
+    elsewhere_in([(at, len)])
+}
+
+fn elsewhere_in(spans: impl IntoIterator<Item = (usize, usize)>) -> Vec<(usize, Vec<usize>)> {
+    if !view_guard() {
         return Vec::new();
     }
-    crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, at.saturating_add(len))
+    let mut spans = spans.into_iter()
+        .filter(|&(_, len)| len != 0)
+        .map(|(at, len)| (at / BLOCK * BLOCK, at.saturating_add(len)))
+        .peekable();
+    if spans.peek().is_none() {
+        return Vec::new();
+    }
+    crate::inplace::shown_elsewhere_in(spans)
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -1889,7 +1900,7 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
     let noted;
     // The same pages at other addresses: copies of the memory there have not
     // what was put in either.
-    let elsewhere: Vec<(usize, Vec<usize>)> = spans.iter().flat_map(|&(at, len)| elsewhere(at, len)).collect();
+    let elsewhere = elsewhere_in(spans.iter().copied());
     {
         let frame = crate::frame::current();
         for &page in pages {
@@ -1923,13 +1934,9 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
             }
         }
     }
-    for &(at, len) in spans {
-        // A placed texture there changes with no descriptor written.
-        crate::descriptor::host::remapped(at, len);
-    }
-    for other in elsewhere.into_iter().flat_map(|(_, others)| others) {
-        crate::descriptor::host::remapped(other, BLOCK);
-    }
+    // A placed texture there changes with no descriptor written.
+    let aliases = elsewhere.into_iter().flat_map(|(_, others)| others).map(|other| (other, BLOCK));
+    crate::descriptor::host::remapped_ranges(spans.iter().copied().chain(aliases));
     (noted, before)
 }
 

@@ -941,29 +941,46 @@ fn stale_rule() -> Rule {
 /// ([`HostHeap::texture_slots_remapped`]). Called with the runtime's own
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
+    remapped_ranges([(at, len)]);
+}
+
+/// Notes ranges in order while holding the texture invalidation queue once.
+pub(crate) fn remapped_ranges(spans: impl IntoIterator<Item = (usize, usize)>) {
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
-    let (start, end) = (at as u64, at.saturating_add(len) as u64);
-    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+    let mut live = spans.into_iter()
+        .filter_map(|(at, len)| {
+            let (start, end) = (at as u64, at.saturating_add(len) as u64);
+            (end > SPANNED[0].load(Relaxed) && start < SPANNED[1].load(Relaxed)).then_some((start, end))
+        })
+        .peekable();
+    if live.peek().is_none() {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
-    STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let (mut noted, mut dropped) = (0, 0);
+    for (start, end) in live {
+        noted += 1;
+        // Pages are mapped one after the other.
+        if let Some(last) = ranges.last_mut()
+            && last.1 == start
+        {
+            last.1 = end;
+            continue;
+        }
+        if ranges.len() >= MOST {
+            // No pass runs (no shader that picks textures by index is bound):
+            // the slots there are looked at when they are due, as before.
+            dropped += ranges.len() as u64;
+            ranges.clear();
+        }
+        ranges.push((start, end));
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+    STALE[1].fetch_add(noted, Relaxed);
+    if dropped > 0 {
+        STALE[2].fetch_add(dropped, Relaxed);
     }
-    ranges.push((start, end));
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -6557,8 +6574,7 @@ mod tests {
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
         // Memory elsewhere: nothing. Under the texture: due from the next frame.
-        remapped((at + 2 * len) as usize, 0x1000);
-        remapped(at as usize, 0x1000);
+        remapped_ranges([((at + 2 * len) as usize, 0x1000), (at as usize, 0x1000)]);
         assert_eq!(heap.texture_slots_remapped(50), 1);
         assert_eq!(slots(50), []);
         assert_eq!(slots(51), [1]);
