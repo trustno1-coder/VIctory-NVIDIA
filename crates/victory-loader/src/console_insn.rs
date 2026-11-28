@@ -124,6 +124,38 @@ pub(crate) fn near(at: usize) -> Option<usize> {
     })
 }
 
+/// Zeroes the 64-byte line at `line` with ordinary stores, for a line [`writable`] refused that
+/// is committed or reserved all the same: write-protected on purpose, as the write-watch guards
+/// over title memory make it (`victory-gpu`'s `watch`), whose vectored handler opens a guarded
+/// block for the title's own stores. The console's `clzero` faults into such a handler as any
+/// store does; here it is an illegal instruction that handler never sees, so refusing the line
+/// left that exception unhandled and ended the run (`0xc000001d` 22 minutes into the opening on
+/// an Intel CPU, the 12-byte loop). These stores fault inside this handler instead, the guard
+/// opens the block and they complete, as [`writable_to`]'s remembered regions already rely on;
+/// a fault nothing resolves ends the run, as the title's own store would. False, with nothing
+/// written, for free memory: the exception stays the title's.
+///
+/// # Safety
+/// The title owns the line, as it owns the line of the instruction being emulated.
+unsafe fn zero_through_fault(line: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let found = unsafe { VirtualQuery(line as *const _, &mut m, size_of_val(&m)) } != 0;
+    ASKED.fetch_add(1, Relaxed);
+    if !found || (m.State != MEM_COMMIT && m.State != MEM_RESERVE) {
+        return false;
+    }
+    let words = line as *mut u64;
+    for i in 0..8 {
+        // SAFETY: see the function's contract; a fault here is resolved by the runtime's
+        // handlers or ends the run, as the title's own store would.
+        unsafe { words.add(i).write_volatile(0) };
+    }
+    true
+}
+
 /// Replaces the `clzero` loop at `at`, whose 12 bytes are `code`: whether it did.
 ///
 /// No thread is ever inside the loop's other instructions (the emulation does the whole loop
@@ -425,11 +457,12 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
             let a32 = code[..len - 3].contains(&0x67);
             let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
-            if !writable(line, 64) {
-                return 0; // the real instruction faults there too
+            if writable(line, 64) {
+                // SAFETY: the 64-byte line is committed and writable.
+                unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
+            } else if !unsafe { zero_through_fault(line) } {
+                return 0; // free memory: the real instruction faults there too
             }
-            // SAFETY: the 64-byte line is committed and writable.
-            unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
         }
         ConsoleOnly::ClzeroLoop { end_reg } => {
             // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
@@ -466,9 +499,15 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
                 at = to;
             }
-            let done = (at - first) / 64;
+            let mut done = (at - first) / 64;
             if done == 0 {
-                return 0;
+                // Its first line is not writable: that line through a fault
+                // ([`zero_through_fault`]), and the loop goes on after it.
+                // SAFETY: the line the loop's instruction zeroes.
+                if !unsafe { zero_through_fault(first) } {
+                    return 0;
+                }
+                done = 1;
             }
             ZEROED.fetch_add((done * 64) as u64, Relaxed);
             ctx.Rax = ctx.Rax.wrapping_add((done * 64) as u64);
@@ -589,6 +628,92 @@ mod tests {
             VirtualQuery(page.cast(), &mut m, size_of_val(&m));
             assert_eq!(m.Protect, PAGE_EXECUTE_READ);
             VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    /// A `clzero` on a line that is committed but write-protected, as the write watch guards
+    /// title memory, zeroes it through a fault the guard resolves ([`zero_through_fault`]),
+    /// alone and as the first line of the 12-byte loop; before, the emulation refused the line
+    /// and the illegal instruction ended the run. On free memory it is still the title's.
+    #[test]
+    fn clzero_on_a_guarded_line_goes_through_the_guard() {
+        use std::sync::atomic::AtomicUsize;
+        use windows_sys::Win32::Foundation::STATUS_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS, RemoveVectoredExceptionHandler};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        /// The page the stand-in guard opens, and how often it did.
+        static GUARDED: AtomicUsize = AtomicUsize::new(0);
+        static OPENED: AtomicUsize = AtomicUsize::new(0);
+        /// As the write watch's handler: a write to the guarded page opens it.
+        unsafe extern "system" fn guard(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: Windows hands the handler a valid record.
+            let record = unsafe { &*(*info).ExceptionRecord };
+            let page = GUARDED.load(Relaxed);
+            let at = record.ExceptionInformation[1];
+            if record.ExceptionCode == STATUS_ACCESS_VIOLATION && page != 0 && (page..page + 4096).contains(&at) {
+                let mut old = 0;
+                // SAFETY: the test's own page.
+                unsafe { VirtualProtect(page as *const _, 4096, PAGE_READWRITE, &mut old) };
+                OPENED.fetch_add(1, Relaxed);
+                return CONTINUE_EXECUTION;
+            }
+            0
+        }
+        // SAFETY: memory and code of our own; the handler only acts on the guarded page.
+        unsafe {
+            let code = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(code != 0 && page != 0);
+            let guard_on = |page: usize| {
+                std::ptr::write_bytes(page as *mut u8, 0xaa, 4096);
+                let mut old = 0;
+                assert_ne!(VirtualProtect(page as *const _, 4096, PAGE_READONLY, &mut old), 0);
+                GUARDED.store(page, Relaxed);
+            };
+            let handler = AddVectoredExceptionHandler(1, Some(guard));
+            assert!(!handler.is_null());
+            let bytes = |at: usize, n: usize| std::slice::from_raw_parts(at as *const u8, n).to_vec();
+
+            // Alone: the line `rax` is in.
+            std::ptr::copy_nonoverlapping([0x0f, 0x01, 0xfc, 0xc3].as_ptr(), (code + 16) as *mut u8, 4);
+            guard_on(page);
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = code as u64 + 16;
+            context.Rax = page as u64 + 64 + 8;
+            let opened = OPENED.load(Relaxed);
+            assert_eq!(emulate(&mut context), CONTINUE_EXECUTION, "a clzero on a guarded line");
+            assert_eq!(context.Rip, code as u64 + 19);
+            assert!(OPENED.load(Relaxed) > opened, "through the guard");
+            assert!(bytes(page + 64, 64).iter().all(|&b| b == 0));
+            assert!(bytes(page, 64).iter().chain(&bytes(page + 128, 4096 - 128)).all(|&b| b == 0xaa));
+
+            // The 12-byte loop against rdx, its first line guarded: that line, then the loop
+            // goes on at the next one (the same instruction again).
+            std::ptr::copy_nonoverlapping(
+                [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xd0, 0x72, 0xf4, 0xc3].as_ptr(),
+                (code + 32) as *mut u8,
+                13,
+            );
+            guard_on(page);
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = code as u64 + 32;
+            context.Rax = page as u64;
+            context.Rdx = page as u64 + 192;
+            assert_eq!(emulate(&mut context), CONTINUE_EXECUTION, "a clzero loop whose first line is guarded");
+            assert_eq!(context.Rax, page as u64 + 64, "the first line, then the loop goes on");
+            assert!(bytes(page, 64).iter().all(|&b| b == 0));
+
+            RemoveVectoredExceptionHandler(handler);
+            GUARDED.store(0, Relaxed);
+            // Free memory: the exception stays the title's.
+            VirtualFree(page as *mut _, 0, MEM_RELEASE);
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = code as u64 + 16;
+            context.Rax = page as u64;
+            assert_eq!(emulate(&mut context), 0, "a clzero on free memory");
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
         }
     }
 
