@@ -1010,3 +1010,110 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+/// One console wave (64 threads) run as two host waves of 32: a per-lane loop (lane t adds 1
+/// to its sum (t >> 4) + 1 times), then `if ((t & 31) < s1)` the lane writes its sum to LDS
+/// and adds that of lane t ^ 32, in the other host wave. Per lane, that exchange stands where
+/// not every lane runs: the lowering asks for 64-lane waves and names the `if`, whose branch
+/// [`super::widen`] then takes wave-wide, for waves of 32.
+/// The retry of [`super::emit_program`] that takes the loop's branches by each host wave
+/// together still asks for 64 lanes here (the loop is not what needs them). It took the
+/// first lowering's named blocks with it, so `widen` saw none and gave up at waves of 64,
+/// which a 32-lane host refuses ("no wave32 lowering for this wave64 program").
+#[test]
+fn a_loop_retry_that_still_needs_64_lanes_leaves_the_widening_its_blocks() {
+    let words = [
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0: this lane's LDS dword
+        0x3A06_00A0, // v_xor_b32 v3, 32, v0
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3: the partner lane's (other host wave)
+        0x4A04_0000, // v_add_nc_u32 v2, s0, v0: the sum starts at s0 + t
+        0x2C0E_0084, // v_lshrrev_b32 v7, 4, v0
+        0x4A0E_0E81, // v_add_nc_u32 v7, 1, v7: rounds (t >> 4) + 1
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0x4A04_0481, // loop: v_add_nc_u32 v2, 1, v2
+        0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+        0x7DA8_0B07, // v_cmpx_gt_u32 exec, v7, v5: the lanes with rounds left
+        0xBF89_FFFC, // s_cbranch_execnz loop
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0x3610_009F, // v_and_b32 v8, 31, v0
+        0x7D88_1001, // v_cmp_gt_u32 vcc, s1, v8
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0006, // s_cbranch_execz past
+        0xD834_0000,
+        0x0000_0201, // ds_write_b32 v1, v2
+        0xD8D8_0000,
+        0x0400_0003, // ds_read_b32 v4, v3
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A04_0902, // v_add_nc_u32 v2, v2, v4
+        0xBEFE_040C, // past: s_mov_b64 exec, s[12:13]
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, true, 64);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    assert!(!lower::loop_branches(&p, &st).is_empty(), "a per-lane loop for the retry to take");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("an empty container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    lower::take_needs();
+    let widened = super::widen(&c, &native, &p, false, false, false);
+    lower::take_needs();
+    lower::TEST_HOST_WAVE.set(was);
+    let (shader, wave) = widened.expect("widened");
+    assert_eq!(wave, Some(32), "the `if` taken wave-wide: waves of 32");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    // the console: the wave's lanes in step, writes before reads
+    let console = |s0: u32, s1: u32| {
+        let looped: Vec<u32> = (0..64u32).map(|t| s0.wrapping_add(t).wrapping_add((t >> 4) + 1)).collect();
+        (0..64u32)
+            .map(|t| {
+                let mine = looped[t as usize];
+                if (t & 31) < s1 { mine.wrapping_add(looped[(t ^ 32) as usize]) } else { mine }
+            })
+            .collect::<Vec<u32>>()
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    for (s0, s1) in [(0u32, 32u32), (1000, 0), (7, 20), (0xFFFF_FF00, 1)] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            match (u.root, u.slot, u.dword) {
+                (RootType::Constants, 0, 0) => ud[u.index as usize] = s0,
+                (RootType::Constants, 0, 1) => ud[u.index as usize] = s1,
+                _ => {}
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!(&out[0][..64], &console(s0, s1)[..], "s0 = {s0:#x}, s1 = {s1}");
+    }
+    eprintln!("ran on the hardware device: the loop, then both halves' exchange, as the console runs them");
+}
