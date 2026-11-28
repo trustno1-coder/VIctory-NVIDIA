@@ -163,24 +163,41 @@ builder's pipelines.
 
 ## The first minutes with the builder
 
-Run B was made twice; the second time after a `victory warm` that found nothing left to
-make (88,605 pipelines known, all made before). Both times the first three minutes of the
-cutscenes ran at 1-4 frames a second (frames of 270-930 ms), and both times the boat settled
-at the same figures (second run: 21-25 fps, 39-47 ms, `preparing` 27-31 ms). So the slow
-start is not pipelines missing from the driver's cache. What the log shows in it:
+Run B was made twice on `df2daaf`, the second time after a `victory warm` that reported
+nothing left to make (88,605 pipelines known, all made before). Both times the first three
+minutes of the cutscenes ran at 1-4 frames a second (frames of 270-930 ms), and both times
+the boat settled at the same figures (second run: 21-25 fps, 39-47 ms, `preparing` 27-31 ms).
+In that stretch:
 
+- The title's recording threads waited **450-500 ms a frame for pipelines**, the whole of
+  `VICTORY_PIPELINE_WAIT_MS` (500), for about two and a half minutes ("recording per frame"
+  lines), and the title's threads stood 250 ms a frame at presents (19.6 ms on the boat).
+  This is the "while the title had not submitted" time of the card's clock line.
+- About 1,100 pipelines in flight at the start, drained after 3.5 min (run A, same build and
+  book: about 830, drained in one minute). Every run makes some 1,600-2,000 pipelines rather
+  than loading them, with or without the builder: those with static samplers skip the
+  library on purpose (`library.rs`, `with_static_samplers`) and rely on the driver's cache.
 - The builder unpacking the shipped static structures: 700-1,040 builder dispatches a
-  frame, 30-75 MB of packed structures arriving every ten seconds, 500-1,050 pages a frame
-  touched that had no copy yet. After about two minutes it falls to 180-280 dispatches.
-- Pipelines still being made: about 1,100 in flight at the start, drained after 3.5 min
-  (run A, same build and book: about 830, drained in one minute).
-- The card 6-20 % busy and, of a 270 ms frame, about 190 ms "while the title had not
-  submitted": the title itself is not giving us work then. What it waits for is not shown
-  by these lines.
+  frame, 30-75 MB of packed structures arriving every ten seconds.
+
+A third run, on `64d4931`, came after a full `victory warm` of the new translator, whose book
+by then held the pipelines runs with the builder had written down. Its recording threads
+waited for pipelines for about **25 s** (314 ms a frame at most), not two and a half
+minutes; a local log of every pipeline that took 0.5 s or more to come (loaded, made, or
+made past the library for its static samplers) found **none**. Then, on the boat, **28.4
+fps** (35 ms, `preparing` 28 ms), and 27.8 fps over the steady stretches of the cutscenes.
+So the slow start was pipelines after all: made ahead, it goes. What did not fit: the
+`warm` before the second run said every pipeline was made, and that run still waited as
+long; why is not known.
+
+What stays with the builder, in the third run too: at scene cuts, 30-40 s at 2-7 fps with no
+waiting for pipelines, while 35-112 MB of packed structures arrive every ten seconds, the
+builder's dispatches go up to 866 a frame and `preparing` to 90-200 ms.
 
 Cutscene audio ran on meanwhile while the picture stood still for seconds (for less time in
-the second run). The picture, both times: blown-out light and black patches, more broken
+the second run). The picture, every time: blown-out light and black patches, more broken
 than without the builder; milder in the second run.
+
 ## The structures' sizes
 
 Of the copies of dynamic structures `VICTORY_BVH_TRACE` recorded, 175 of 2,972 (first run)
