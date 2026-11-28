@@ -12,6 +12,9 @@ The project's rule: **system RAM holds CPU-owned state; GPU VRAM holds GPU-owned
 crossing the boundary goes through an explicit transfer.** Lower memory use or higher frame
 rate do not by themselves show separation and are not claimed here.
 
+The focused follow-up audit of the window/texture VRAM budget and of the separation exception
+paths is [memory-separation-window-budget.md](memory-separation-window-budget.md).
+
 ## 1. The platform model this layer works in
 
 The host is Windows with Direct3D 12 on a discrete GPU. The title is an Xbox Series title whose
@@ -81,8 +84,12 @@ Two consequences shape everything below:
 
 - GPU→CPU channels the CPU polls once a frame, kept in small system-memory UAV buffers because a
   readback would add a submission and a fence wait each frame: the by-address faults buffer (16 KiB:
-  `MEMORY_FAULTS` is 4096 dwords, `memory.rs:230`), the card-compare results area (1 MiB, `host.rs:4728-4732`), and the indirect
-  work budgets (256-byte slots, `host.rs:2054-2112`).
+  `MEMORY_FAULTS` is 4096 dwords, `memory.rs:230`) and the card-compare results area (1 MiB,
+  `host.rs:4728-4732`). The indirect work budgets are the other way round by default: the
+  clamp atomics live in a 256-byte device-local `DEFAULT` buffer (`host.rs:7946-7953`;
+  `VICTORY_INDIRECT_CARD_BUDGET` on) and only 16 bytes of notes are copied into a CPU-mapped
+  buffer at list close (`host.rs:7989-8007`). `VICTORY_INDIRECT_CARD_BUDGET=0` is the
+  opt-in that keeps those atomics in system memory.
 - CPU-authored buffers the shaders read directly from UPLOAD memory, following D3D12's standard
   CPU-written staging pattern: the descriptor-stride table (an 8 MiB root SRV,
   `descriptor/host.rs:2056-2068`, `descriptor/host.rs:3479-3491`) and per-draw
@@ -184,11 +191,13 @@ swap chain are not in that ledger, and `MADE[4]/[5]` still conflates CPU-mapped 
 device-local buffers (`host.rs:10941-10942`/`host.rs:10997-10998` in the audit; line numbers have
 shifted).
 
-6.5 **GPU→CPU channels in system memory.** The faults buffer, compare results and indirect budgets
-of 3.4 are GPU-written system memory. They are small and one-way and their design trade is
-explicit, but they are unreported and were kept as they are: moving them to VRAM would have to
-add a submission and a fence wait per frame, and the audit did not establish that as safe without
-hardware.
+6.5 **GPU→CPU channels in system memory. Partly fixed by 7.1's placement ledger; the indirect
+budget's default was corrected in the Phase 2 follow-up.** The faults buffer and the card-compare
+results of 3.4 are GPU-written system memory (16 KiB and 1 MiB). They are small and one-way, and
+their design trade is explicit: moving them to VRAM would add a submission and a fence wait per
+frame. The indirect budgets are device-local by default (3.4); only
+`VICTORY_INDIRECT_CARD_BUDGET=0` moves their clamp atomics to system memory, and the startup
+line of the final Phase 2 commit names that switch.
 
 6.6 **Device-removal waits. Addressed in 7.3 for the three named sites.** `card_back`,
 `relay_card_back` and `settle` waited with `WaitForSingleObject(INFINITE)` without re-checking
@@ -213,11 +222,11 @@ transient `E_OUTOFMEMORY` can leave a texture black for the whole session.
 resources, and driver behaviour of the opt-in shared paths can only be bounded, not proven, from
 source.
 
-6.10 **Documentation drift.** Several comments state the opposite of the code: the window-budget
-default ("0, the default, none" vs budget-derived, `shadow.rs:476-477` against `shadow.rs:495-518`),
-the relay default ("off by default" vs on outside tests, `shadow.rs:966-969` against
-`shadow.rs:982-990`), and `Card::before` described as a byte twin where the code allocates 16
-bytes of hashes per 64 KiB piece (`shadow.rs:110-121` against `shadow.rs:4664-4682`).
+6.10 **Documentation drift. Fixed in the Phase 2 follow-up commit.** The window-budget default
+("0, the default, none" vs budget-derived), the relay default ("off by default" vs on outside
+tests) and `Card::before` (described as a byte twin where the code keeps 16 bytes of hashes per
+64 KiB piece) were corrected with the code, together with the in-place and window accounting
+comments.
 
 ## 7. Minimum safe changes made on this branch
 
@@ -306,9 +315,10 @@ product path already asks for VRAM on every copy (the launcher sets
 `VICTORY_CARD_BUFFERS_MIN_KB=64`); their effect on target hardware is unmeasured here, and
 `VICTORY_CARD_ALL` remains off. The window default below an 8 GiB budget stays 0 because window
 VRAM is not reserved in the texture queue's accounting, so changing it without hardware would risk
-texture starvation. The GPU→CPU channels of 6.5 stay in system memory (small, one-way, polled once
-a frame) and are documented as the justified exception; the audit did not establish that moving
-them to VRAM plus a readback is safe without hardware. No room test is added for render targets,
+texture starvation. The GPU→CPU channels of 6.5 (the faults buffer and the compare results) stay in system memory
+(small, one-way, polled once a frame) and are documented as the justified exception; the audit did
+not establish that moving them to VRAM plus a readback is safe without hardware. The indirect
+budget is device-local by default and its weakening switch is named at startup. No room test is added for render targets,
 depth and twins (6.7): refusing them changes what the title renders; whether the whole process (textures, render
 targets and driver memory included) stays inside its budget is observable through DXGI usage and,
 on hardware, GPUView/ETW, not from this ledger's class totals. No Evict,
@@ -323,8 +333,64 @@ paging under pressure, the real cost of the PCIe fallback, and the correctness/p
 changing the copy budget are not established here. `GetHeapProperties` proves the heap class the
 API reports for a resource, not its current physical location.
 
-Phase 3 verification plan: local `cargo check` (default and `--all-features`), `clippy` compared
-with the baseline, the workspace tests through the fork's GitHub Actions workflow on
-windows-latest, and — on a real NVIDIA machine — the placement report over a full session with
-`VICTORY_MEMORY_REPORT=1`, compared with DXGI local/non-local usage and with GPUView/ETW or
-NSight Graphics residency events.
+### 8.1 Checks run
+
+Environment: a VMware VM without a discrete NVIDIA GPU. Local checks used Rust 1.98.1
+(`x86_64-pc-windows-gnu`); the tests ran on GitHub Actions `windows-latest`, whose adapter is
+WARP. The run is of the branch's source tip (the Phase 2 commit; the temporary CI branch adds
+only the test workflow file).
+
+| Check | Baseline 63b902f | This branch |
+|---|---|---|
+| `cargo check --workspace --all-targets --locked` | PASS | PASS |
+| `cargo check --workspace --all-targets --all-features --locked` | PASS | PASS |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | FAIL: pre-existing `clippy::manual_is_multiple_of` in `shadow.rs` (`turns % 16 == 0`) | FAIL: the same pre-existing lint only; the changed lines add no warning |
+| `cargo test` locally | not runnable: GNU raw-dylib linking needs a working `dlltool`, absent on this host | same |
+| GitHub Actions: `cargo check --workspace --all-targets --all-features` | PASS | PASS |
+| GitHub Actions: `cargo test --workspace` | **452 passed, 1 failed, 36 ignored** (run 46122898345 on the temporary `ci/probe-memory` branch) | **460 passed, 1 failed, 36 ignored** (the run of this branch's source tip; its run number is recorded in the pull request) |
+
+The one failure is identical at baseline and at HEAD:
+`pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws` fails with
+`depth 0.5 outside [0.6, 1.0] must be rejected` because WARP does not implement depth bounds.
+The eight tests added on this branch all pass on WARP (452 + 8 = 460):
+`host::placement_tests::host_buffers_land_in_the_heap_the_api_reports`,
+`host::separation_switch_tests::inplace_warnings_use_the_parsed_level`,
+`residency::tests::heap_classes_come_from_the_heap_the_api_reports`,
+`residency::tests::fallback_bytes_are_printed_in_mib`,
+`residency::tests::a_fallback_copy_is_counted_while_it_lives_and_after`,
+`shadow::window_tests::the_by_address_cap_takes_only_what_fits`,
+`shadow::window_tests::the_by_address_cap_is_given_back_when_a_copy_goes`,
+`shadow::window_tests::a_window_side_is_given_back_when_the_copy_goes`.
+
+The CI runs used temporary `ci/**` branches in the authorized fork whose only difference from
+the feature branch is the test workflow file; that workflow is not part of this branch or of the
+pull request. Independent reviews of the complete diff (code, claims, window budget, exception
+paths and a final pass over the six review dimensions) found no blockers; their confirmed majors
+- the startup warning comparing INPLACE spellings instead of the parsed level, and the indirect
+budget heap class in sections 3.4/6.5 - are fixed in the final Phase 2 commit.
+
+### 8.2 What the checks prove, and what they do not
+
+Proven here: the source's allocation and transfer paths compile in both feature configurations;
+the API reports the intended creation heap class for every buffer made through the five
+instrumented constructors (asserted through `GetHeapProperties` on a real D3D12 device, WARP;
+buffers created directly are listed in 7.1 and not tracked); the accounting
+units and release paths behave as their tests say; the workspace test suite has no new failure
+against the recorded baseline; and no default allocation policy (thresholds, caps, window
+defaults, `VICTORY_CARD_ALL`) changed.
+
+Not proven here, and requiring real NVIDIA hardware: whether a `DEFAULT` resource is
+physically resident at a given moment (WDDM may page it); the actual PCIe cost of the copies
+that remain in system memory; how the DXGI budget's movement affects the once-computed caps;
+the target driver's GPU_UPLOAD (resizable BAR) and opened-heap behaviour; the torn-fetch rate
+when the copy-queue fetch runs without its check; and device-removal wait behaviour. WARP is
+not equivalent hardware and `GetHeapProperties` reports the heap a resource was created in,
+not where its pages currently are.
+
+A hardware validation session should run with
+`victory play --set VICTORY_MEMORY_REPORT=1 --set VICTORY_LOG=info`, read the
+`memory placement` line against DXGI local/non-local usage over the world-load burst and a long
+gameplay segment, and capture GPUView/ETW (`DxgKrnl`) or NSight Graphics residency events; the
+in-place driver questions are answered by `VICTORY_INPLACE_PROBE`/the in-place census. The
+concrete runs and the falsification table are in
+[memory-separation-window-budget.md](memory-separation-window-budget.md) sections 5-7.
