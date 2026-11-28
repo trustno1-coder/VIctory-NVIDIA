@@ -470,6 +470,8 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
     if no_dlss_fg {
         lines.push(if f.files_missing {
             "DLSS FRAME GEN: NVIDIA DLSS FILES NOT FOUND"
+        } else if dlss_framegen_card(&f.adapter) {
+            "DLSS FRAME GEN: UNAVAILABLE (CHECK HAGS AND LOG)"
         } else {
             "DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)"
         }.into());
@@ -1800,7 +1802,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     if every > 0 {
         static PRESENTS: AtomicU32 = AtomicU32::new(0);
         let n = PRESENTS.fetch_add(1, Relaxed);
-        if n % every == 0 {
+        if n.is_multiple_of(every) {
             set_framegen([2, 4, 0, 6][(n / every % 4) as usize]);
         }
     }

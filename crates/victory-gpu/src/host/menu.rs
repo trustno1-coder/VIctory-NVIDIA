@@ -102,6 +102,15 @@ const ABOUT_NO_DLSS: [&str; 3] = [
     "DOWNLOADED FROM NVIDIA ON GITHUB AT THE NEXT START",
     "(ABOUT 70 MB, ONCE). SAVE AND RESTART NOW DOES IT.",
 ];
+/// Frame generation that this run did not start with: it is made ready only at a start with it
+/// on (a start with it ready but off held some PCs at 14 fps, #515, #574), so turning it on takes
+/// a restart; a run started with it on changes it, or turns it off, live.
+const ABOUT_FRAMEGEN_RESTART: [&str; 3] = [
+    "RESTART REQUIRED TO ENABLE FRAME GENERATION: THIS RUN",
+    "STARTED WITHOUT IT. SAVE AND RESTART NOW TURNS IT ON.",
+    "AFTER THAT IT CHANGES, OR TURNS OFF, LIVE.",
+];
+const FRAMEGEN: &str = "VICTORY_MENU_FRAMEGEN";
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
 /// The last line of the box: where this build comes from.
@@ -159,6 +168,12 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
     Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: "CARD COMPARES FROM (KB)", values: &[("64", "64"), ("1024", "1024")], live: false },
     Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
+    // THIN records the title's list calls on our threads. On an RTX 5080 with a 6-core CPU heads did not
+    // draw with it and frames were slower (14 a second with it, 21 to 28 without): switches for it and for
+    // what goes with it. Frame generation needs the line of submissions: without THIN, ASYNC SUBMIT gives it.
+    Item { var: "VICTORY_THIN", label: "THIN LISTS (HEADS MAY BE MISSING)", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_JOIN_PARTS", label: "JOIN PARTS", values: &[("8", "8"), ("", "1 (OFF)")], live: false },
+    Item { var: "VICTORY_ASYNC_SUBMIT", label: "ASYNC SUBMIT (FRAME GEN WITHOUT THIN)", values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
 const ACTIONS: [&str; 7] = [
@@ -199,6 +214,17 @@ const SCENE_DRAWS: u64 = 100;
 
 pub(crate) fn warmup_seconds() -> Option<u64> {
     get("VICTORY_WARMUP_RESTART").parse().ok().filter(|s| *s > 0)
+}
+
+/// Marks this victory.exe as warmed up, whether it went down. Only a
+/// written mark can end the warm-up: the launcher arms a new one whenever
+/// none exists (`apps/victory/src/play.rs`, `warmup_mark`), so the write's
+/// result is what decides whether the restart is safe to do.
+fn mark_written(mark: &std::path::Path) -> bool {
+    if let Some(dir) = mark.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(mark, "this victory.exe was warmed up (its first start, then a restart)\r\n").is_ok()
 }
 
 /// The start's notice lines for the warm-up start ([`warmup_seconds`]).
@@ -497,6 +523,10 @@ impl Menu {
             && std::env::var_os("VICTORY_STREAMLINE_DIR").is_none()
         {
             ABOUT_NO_DLSS
+        } else if ITEMS.get(self.at).is_some_and(|i| i.var == FRAMEGEN && !live(i))
+            && !matches!(self.values[self.at].as_str(), "" | "0")
+        {
+            ABOUT_FRAMEGEN_RESTART
         } else {
             [""; 3]
         };
@@ -541,6 +571,9 @@ impl Menu {
             self.apply_live(i);
         }
         self.note.clear();
+        if item.var == FRAMEGEN && !live(item) && !matches!(self.values[i].as_str(), "" | "0") {
+            "RESTART REQUIRED TO ENABLE FRAME GENERATION".clone_into(&mut self.note);
+        }
     }
 
     /// A setting the build reads at each use: changed in this run's environment at once.
@@ -674,14 +707,17 @@ impl Menu {
         }
         DONE.store(true, Ordering::Relaxed);
         let mark = std::path::PathBuf::from(get("VICTORY_WARMUP_MARK"));
-        if !mark.as_os_str().is_empty() {
-            if let Some(dir) = mark.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&mark, "this victory.exe was warmed up (its first start, then a restart)\r\n");
+        let marked = mark.as_os_str().is_empty() || mark_written(&mark);
+        if marked {
+            tracing::info!(seconds, mark = %mark.display(), "first start of this victory.exe: warmed up; the game starts again");
+            self.restart(false);
+        } else {
+            // The launcher arms a warm-up whenever no mark exists: one the
+            // host could not write would have the game come back here for
+            // ever, so this start goes on at its slow pace instead.
+            tracing::warn!(mark = %mark.display(), "first start: the warmed mark could not be written; the game goes on, no restart");
+            self.note = "WARMED UP, BUT THE MARK WOULD NOT WRITE: THIS RUN GOES ON".to_owned();
         }
-        tracing::info!(seconds, mark = %mark.display(), "first start of this victory.exe: warmed up; the game starts again");
-        self.restart(false);
     }
 
     /// Reads which saves `Saves` holds, keeping the one picked if it is still there.
@@ -918,6 +954,19 @@ impl Menu {
 mod tests {
     use super::*;
 
+    /// A mark that lands ends the warm-up; one that cannot (here, beside a
+    /// file of the same name) does not: the launcher arms a new warm-up
+    /// whenever no mark exists, and a restart without one would come back
+    /// here for ever.
+    #[test]
+    fn a_mark_that_cannot_be_written_does_not_end_the_warm_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("a file");
+        std::fs::write(&blocked, b"not a folder").unwrap();
+        assert!(mark_written(&dir.path().join("warmed").join("mark")));
+        assert!(!mark_written(&blocked.join("mark")));
+    }
+
     #[test]
     fn a_change_is_saved_at_once_however_the_game_was_started() {
         let home = std::env::temp_dir().join(format!("victory-menu-test-{}", std::process::id()));
@@ -1008,6 +1057,23 @@ mod tests {
         let lines = menu.lines();
         assert!(lines[lines.len() - 5..lines.len() - 2].iter().all(String::is_empty));
         assert_eq!(ITEMS.iter().filter(|i| i.var == MFG).count(), 1);
+        // Frame generation turned on in a run started without it (no Streamline in tests): a
+        // restart is required, and the menu says so; OFF needs no word.
+        for line in ABOUT_FRAMEGEN_RESTART {
+            assert!(line.len() <= COLUMNS as usize && line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
+        }
+        let fg = ITEMS.iter().position(|i| i.var == FRAMEGEN).expect("in the menu");
+        menu.at = fg;
+        menu.values[fg] = "0".to_owned();
+        menu.change(fg, 1);
+        assert_eq!(menu.values[fg], "2");
+        assert_eq!(menu.note, "RESTART REQUIRED TO ENABLE FRAME GENERATION");
+        let lines = menu.lines();
+        assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_FRAMEGEN_RESTART);
+        menu.change(fg, -1);
+        assert!(menu.note.is_empty());
+        let lines = menu.lines();
+        assert!(lines[lines.len() - 5..lines.len() - 2].iter().all(String::is_empty));
     }
 
     #[test]
