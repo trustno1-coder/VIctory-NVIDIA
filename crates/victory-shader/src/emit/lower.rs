@@ -1541,6 +1541,19 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// A select (`v_cndmask_b32`) on a mask the code holds as a number, not one it
+/// tracks as lanes (a constant bit pattern, one loaded from memory): the
+/// lowering takes this lane's bit of it, which is the console's bit only where
+/// host lanes are the console's.
+pub(super) fn selects_on_mask_data(st: &Structured, i: &Inst) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    i.name() == "v_cndmask_b32"
+        && matches!(v.src.get(2), Some(&Operand::Scalar { code, .. })
+            if i.read(Reg::S(code)).is_some_and(|m| !st.masks.contains_key(&m)))
+}
+
 /// The parameters packing 16-bit rows two per dword and where each lays
 /// its elements out: (first row, [(dword, register, column, columns)]).
 ///
@@ -1777,6 +1790,7 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
+                    || selects_on_mask_data(x.st, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
