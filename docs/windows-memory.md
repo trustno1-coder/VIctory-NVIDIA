@@ -38,6 +38,10 @@ F1 preferences can override launcher options.
 .\target\release\victory.exe play 'D:\Games\MyDump\game_scarlett_master.exe' --series-s --dlss off --no-framegen-ready --fps 30
 ```
 
+On a card with 4 GB or less, also set `VICTORY_CARD_ROOM_FOR_TARGETS_MB=768`:
+the 3,072 MiB default is never released on Series S, where the targets stay
+under 1.5 GiB (see *On a 4 GB card* below).
+
 ## Reproduction on 32 GB RAM and an 8 GB RTX 3060 Ti
 
 On Windows 11 with NVIDIA driver 617.14, the Series S configuration above
@@ -84,6 +88,35 @@ candidate for reproducing visible output; the test does not isolate it from
 that cache history. The Windows commit peak in the visible run was about
 32 GiB. The texture queue still reported pressure and later gameplay remains
 unverified.
+
+## On a 4 GB card
+
+Measured on a laptop RTX 3050 (4 GB of local memory), 24 GB of RAM, Windows 11,
+NVIDIA driver 621.24, the panel on the discrete GPU, with the released build:
+Series S, DLSS Performance, frame generation off, ray tracing off, and no
+setting changed but the two below.
+
+The targets hold 1,170 to 1,418 MB here, and the release test is
+`targets >= most / 2`. At the 3,072 MiB default half is 1,536 MiB, so the test
+never passes and the reserve stays at 1,654 to 1,902 MB of a 2,624 MB texture
+budget. With `VICTORY_CARD_ROOM_FOR_TARGETS_MB=768` and
+`VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS=8000` it reads 0 MB once the targets
+settle, and the line moves to the textures.
+
+That does not empty the queue on this card. About 19,500 slots waited either
+way, "in use" ran about 500 MB above the DXGI budget (3,516 MB against
+3,015 MB, 143 MB free), and the frame took 272 ms on the GPU at 5,060 draws,
+about 2.3 frames a second. Late in the run, sunlit surfaces washed out to
+white, as in the 8 GB session on
+[report #609](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/609).
+The two runs saw different scenes, so their pictures are not an A/B of the
+reserve; the room lines are.
+
+A black cutscene has two causes worth telling apart. While 935 host pipelines
+were still being made, the log reported 400 to 1,685 draws a frame dropped for
+want of one, and the picture was black with subtitles; at 0 pending, about five
+minutes later, the geometry drew. That resolves itself. A texture queue with no
+room draws the geometry untextured, and needs the reserve released.
 
 ## Related work
 
