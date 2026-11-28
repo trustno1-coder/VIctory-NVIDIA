@@ -126,6 +126,19 @@ pub fn run(
     // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
     let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
     asked.series_s = matches!(console, Console::SeriesS);
+    // A full-size scene fits only where it is no larger than the title's own:
+    // Series X with the 1440p output (below), not its 2160p one nor Series S.
+    let output_1440p = ["VICTORY_RENDER_1080P", "VICTORY_NATIVE_1440P"].iter().any(|v| std::env::var(v).as_deref() == Ok("1"));
+    let full_size_fits = matches!(console, Console::SeriesX) && output_1440p;
+    let mode = asked.mode.for_scene(full_size_fits);
+    if mode != asked.mode {
+        println!(
+            "upscaling      {} needs a scene the size of the output, which the title has no room for here (only Series X with the 1440p output): {} instead",
+            asked.mode.name(),
+            mode.name()
+        );
+        asked.mode = mode;
+    }
     let available = victory_hle::streamline::init(&asked);
     // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
     // scale with its own FidelityFX upscaling (no Streamline): DLSS's
