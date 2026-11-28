@@ -691,11 +691,10 @@ pub fn dlss_framegen_card(name: &str) -> bool {
 }
 
 /// The card the host device is made on (`hardware_adapter`; else the first
-/// adapter, where a device made with no adapter named is), its name and LUID.
-fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
+/// adapter, where a device made with no adapter named is), and its name.
+fn game_adapter() -> Option<(IDXGIAdapter1, String)> {
     if let Some((adapter, name, _)) = victory_shader::emit::host::hardware_adapter() {
-        // SAFETY: a plain DXGI query.
-        return unsafe { adapter.GetDesc1() }.ok().map(|d| (name, d.AdapterLuid));
+        return Some((adapter, name));
     }
     // SAFETY: plain DXGI queries.
     unsafe {
@@ -703,8 +702,15 @@ fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
         let adapter = factory.EnumAdapters1(0).ok()?;
         let desc = adapter.GetDesc1().ok()?;
         let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-        Some((String::from_utf16_lossy(&desc.Description[..len]), desc.AdapterLuid))
+        Some((adapter, String::from_utf16_lossy(&desc.Description[..len])))
     }
+}
+
+/// [`game_adapter`]'s name and LUID.
+fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
+    let (adapter, name) = game_adapter()?;
+    // SAFETY: a plain DXGI query.
+    unsafe { adapter.GetDesc1() }.ok().map(|d| (name, d.AdapterLuid))
 }
 
 /// The translated shaders' shader model (6.6, `ResourceDescriptorHeap[]`).
@@ -733,10 +739,13 @@ pub fn device_shader_model(device: &ID3D12Device) -> Option<(u32, u32)> {
 /// its own (`victory shader-model`), since a process keeps the first runtime it loads.
 pub fn highest_shader_model() -> Option<(u32, u32)> {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-    // SAFETY: plain DXGI and D3D12 calls with owned results.
+    // The card the title's device is made on ([`game_adapter`]), not Windows' first adapter:
+    // on a laptop, or with the monitor on the board's outputs, that one is the integrated GPU,
+    // and its answer stopped `victory play` before a card that runs 6.6 was ever asked (#1035:
+    // 6.5 with Microsoft's runtime in place, on Windows 11 and an RTX 5060).
+    let (adapter, _) = game_adapter()?;
+    // SAFETY: a plain D3D12 call with an owned result.
     let device = unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let adapter = factory.EnumAdapters1(0).ok()?;
         let mut device: Option<ID3D12Device> = None;
         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
         device?
