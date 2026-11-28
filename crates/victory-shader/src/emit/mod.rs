@@ -682,7 +682,13 @@ fn emit_once(
             )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        // The preferred build validates this one additional 64-thread water
+        // lighting program with its wave-wide route. Keep it isolated for a
+        // matched trial on this renderer, where the lowering has diverged.
+        let water_portals = std::env::var_os("VICTORY_WATER_VOLUME_PORTALS").is_some_and(|v| v == "1")
+            && c.digest == [0x4f, 0xa5, 0x83, 0x20, 0xd7, 0x61, 0xbf, 0x55, 0x81, 0x20, 0xf9, 0x2c, 0x19, 0xd3, 0x84, 0xaa]
+            && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64);
+        let wide_on = wide_option.as_ref().map_or(scene_kernel || water_portals, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().

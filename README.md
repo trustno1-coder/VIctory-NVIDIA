@@ -216,6 +216,9 @@ speed, in the picture and in simply being able to play it:
   card a frame. They are left out there: no blocks and 30 fps instead of 25
   on the first boat ride (RTX 5070), with water that is darker and bluer.
   WATER LIGHT in the menu (`VICTORY_WATER_LIGHT=1`) runs them again.
+  `--set VICTORY_WATER_VOLUME_PORTALS=1` separately enables an experimental
+  lowering for the volume-portals compute shader on 32-lane hosts. An explicit
+  `VICTORY_WAVE_WIDE` setting takes precedence.
 - **One command to play**: the launcher builds the layer the first time and
   applies what the menu saved.
 - **`Get-NVIDIA-DLSS.cmd`**: the eight NVIDIA files that are loaded, about
