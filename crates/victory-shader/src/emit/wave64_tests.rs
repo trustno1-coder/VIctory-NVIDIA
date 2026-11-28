@@ -1053,3 +1053,182 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+/// A wave64 compute program of 128 threads that uses the host's full 32 KiB of LDS (8192
+/// dwords) and, inside a lane branch after `s_barrier`, reads LDS and reserves output slots with
+/// `ds_add_rtn_u32` (the allocation idiom over LDS). Pair meetings cannot fit past 32 KiB of
+/// LDS, so the program lowers in local-waves mode without extra LDS dwords, validates, and
+/// gives each active thread a distinct slot on the hardware device.
+#[test]
+fn full_lds_local_wave_lds_atomic_allocation_lowers_to_wave32() {
+    let words = [
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xD834_0004,
+        0x0000_0101, // ds_write_b32 v1, v1 offset:4
+        0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD834_0010,
+        0x0000_0001, // ds_write_b32 v1, v0 offset:16
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+        0xBF88_001B, // s_cbranch_execz +27
+        0xD8D8_0010,
+        0x0200_0001, // ds_read_b32 v2, v1 offset:16
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE90_147E, // s_ff1_i32_b64 s16, exec
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0xD765_0003,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0xD766_0004,
+        0x0002_06C1, // v_mbcnt_hi_u32_b32 v4, -1, v3
+        0xD765_0003,
+        0x0001_007E, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0xD766_0003,
+        0x0002_067F, // v_mbcnt_hi_u32_b32 v3, exec_hi, v3
+        0x7D24_0810, // v_cmpx_eq_i32 exec, s16, v4
+        0xBE8C_100E, // s_bcnt1_i32_b64 s12, s[14:15]
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x7E0A_020C, // v_mov_b32 v5, s12
+        0xD880_0004,
+        0x0400_0504, // ds_add_rtn_u32 v4, v4, v5 offset:4
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E20_0504, // v_readfirstlane_b32 s16, v4
+        0x4A06_0610, // v_add_nc_u32 v3, s16, v3
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0xE070_1000,
+        0x8002_0203, // buffer_store_dword v2, v3, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, true, 128);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 64 << 15; // 64 * 512 B = 32 KiB (8192 dwords)
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+
+    // Negative control: without local waves, pair meetings overflow 32 KiB LDS and plain lowering
+    // stays at wave64.
+    let (wave_plain, _) = lowered_with_wave(&native, &p, &HashSet::new());
+    assert_eq!(wave_plain, Some(64), "plain lowering should stay wave64");
+    let pair_err = lower::with_pair_meetings(|| lowered(&native, &p, &HashSet::new())).err();
+    assert!(
+        matches!(pair_err, Some(ShaderError::Unsupported { what, .. }) if what.contains("32 KiB")),
+        "expected 32 KiB LDS refusal under pair meetings, got {pair_err:?}",
+    );
+
+    // Allocation idiom recognizes `ds_add_rtn_u32`.
+    lower::wave_local(&p, &st).expect("wave_local should accept ds_add_rtn_u32");
+
+    // Local waves lowers to wave32 without exceeding 32 KiB LDS.
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+    let io = io::raise(&p, &native).expect("io");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(
+        &crate::Container {
+            version: (1, 0),
+            digest: [0; 16],
+            parts: Vec::new(),
+        },
+        &native,
+        &p,
+        &st,
+        &io,
+        &res,
+    );
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("emit should lower to wave32");
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    let active = 75u32;
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = active;
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(128)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let mut got: Vec<u32> = out[0][..active as usize].to_vec();
+    got.sort_unstable();
+    let want: Vec<u32> = (1..=active).collect();
+    assert_eq!(got, want, "every active thread must get a distinct slot");
+    assert!(out[0][active as usize..128].iter().all(|&x| x == 0));
+    eprintln!("ran on the hardware device: 75 of 128 threads allocated unique slots in 32 KiB LDS");
+}
+
+/// In local-waves mode, `console_lane()` still returns the console lane (0..63, so 32..63 for
+/// the upper host wave) whenever LDS has room for the `halves` counter, and only falls back to
+/// the host lane (0..31) when `halves` is `None` at 32 KiB LDS.
+#[test]
+fn local_waves_console_lane_keeps_upper_half_when_lds_has_room() {
+    let words = [
+        0xD765_0003,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0xD766_0004,
+        0x0002_06C1, // v_mbcnt_hi_u32_b32 v4, -1, v3
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8002_0402, // buffer_store_dword v4, v2, s[8:11], 0 offen
+    ];
+    let lower_with_lds = |lds_blocks: u32| {
+        let mut native = native_of(&words, true, 128);
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= lds_blocks << 15;
+        }
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        lower::with_local_waves(|| lowered_on(&native, &p, &HashSet::new(), 32)).expect("lower")
+    };
+    let with_room = lower_with_lds(1);
+    let full_lds = lower_with_lds(64);
+    assert_ne!(with_room.dxil, full_lds.dxil, "halves counter vs host lane fallback");
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let run = |shader: &HostShader| -> Option<Vec<u32>> {
+        let (root, pso) = host.compute_pipeline(shader).ok()?;
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out[0][..128].to_vec())
+    };
+    let Some(got_room) = run(&with_room) else { return };
+    assert_eq!(got_room.iter().filter(|&&x| x >= 32).count(), 64, "upper host waves keep 32..63");
+    let Some(got_full) = run(&full_lds) else { return };
+    assert_eq!(got_full.iter().filter(|&&x| x >= 32).count(), 0, "full 32 KiB LDS falls back to 0..31");
+    eprintln!("ran on the hardware device: local_waves with room keeps 32..63, full LDS uses 0..31");
+}
