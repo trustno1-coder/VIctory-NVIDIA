@@ -95,7 +95,9 @@ pub(super) fn hot_within(shadow: &Shadow, from: usize, to: usize, out: &mut Vec<
             let (a, b) = piece_offsets(shadow, piece);
             let (a, b) = (a.max(lo) + start, b.min(hi) + start);
             match out.last_mut() {
-                Some(last) if last.1 >= a => last.1 = last.1.max(b),
+                // (`out` may hold other ranges already, above this one: the
+                // callers sort and join after.)
+                Some(last) if last.0 <= a && last.1 >= a => last.1 = last.1.max(b),
                 _ => out.push((a, b)),
             }
         }
