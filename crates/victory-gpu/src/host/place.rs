@@ -32,8 +32,10 @@
 //! ([`Placed::waits`]).
 //!
 //! Copies to memory that has no host copy yet are done as before: nothing on
-//! the card has read or written it. So are those of more than 8 MiB out of
-//! memory shaders do not write (streaming).
+//! the card has read or written it. Large copies out of memory shaders do not
+//! write also go at their place when scratch upload memory is available: a
+//! deferred CPU copy would otherwise let a later write to the same bytes reach
+//! an earlier GPU read in the same list or in a submission still in the air.
 
 use super::*;
 use crate::shadow::Shadow;
@@ -42,9 +44,6 @@ pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_COPIES_IN_PLACE").is_none_or(|v| v != "0"))
 }
-
-/// The most bytes copied out of memory shaders do not write.
-const MOST: usize = 8 << 20;
 
 /// Since the last frame-rate line: copies at their place, their bytes, those
 /// out of a host copy, and texture copies out of one.
@@ -206,13 +205,16 @@ impl HostList {
             return false;
         };
         let own = shaders_own(src, len);
+        // Prefer a placed GPU copy whenever scratch (or a shader-owned source)
+        // is available: deferring a large CPU `Step::Copy` until submission
+        // collapses mid-list and cross-submission order (issue #844). The old
+        // `MOST` gate sent streaming copies above 8 MiB down that path.
         let scratch = match &own {
             Some(_) => None,
-            None if len <= MOST => match self.scratch_at(len as u64) {
+            None => match self.scratch_at(len as u64) {
                 Some(scratch) => Some(scratch),
                 None => return false,
             },
-            None => return false,
         };
         let at = to.offset(dst as u64);
         // What the title's CPU wrote around and under it so far goes first.

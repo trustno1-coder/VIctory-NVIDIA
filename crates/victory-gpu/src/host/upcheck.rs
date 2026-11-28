@@ -913,19 +913,149 @@ mod tests {
         assert!(first <= 6 && back[first..].iter().all(|b| *b), "{back:?}");
     }
 
-    /// The title copies another value to the same bytes in each of three
-    /// submissions, and each has a draw (a copy here) that reads them. The
-    /// card is busy meanwhile, so all three are prepared before the first
-    /// runs: each must read its own.
-    fn each_reads_its_own(len: usize, resource: usize, carded: bool) {
-        let Some(host) = host() else {
-            return;
-        };
+    /// Hold the direct queue until all CPU submissions return. Release it
+    /// even if preparation blocks or unwinds, so a failure can be reported.
+    fn while_queue_waits(host: &Host, submit: impl FnOnce()) -> bool {
+        // SAFETY: a fresh fence for this round, kept alive until signalled.
+        let gate: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        std::thread::scope(|threads| {
+            let (ready, release) = std::sync::mpsc::channel();
+            let fence = &gate;
+            let watchdog = threads.spawn(move || {
+                let submitted = release.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+                // SAFETY: only this thread signals the gate.
+                unsafe { fence.Signal(1) }.unwrap();
+                submitted
+            });
+            // SAFETY: a GPU-side wait on a live fence. The watchdog can
+            // release it independently of this thread and the host queue.
+            unsafe { host.queue.Wait(&gate, 1) }.unwrap();
+            submit();
+            let _ = ready.send(());
+            watchdog.join().unwrap()
+        })
+    }
+
+    /// Two CPU-owned copies and their GPU reads in the same public list.
+    #[test]
+    #[ignore = "synthetic ordering probe in its own process"]
+    fn two_public_copies_in_the_same_list() {
+        use crate::object::{S_OK, This, guid, slot};
+        let host = host().expect("D3D12 host");
+        let size: usize = std::env::var("COPY_PROBE_BYTES")
+            .map_or((8 << 20) + 256, |v| v.parse().expect("copy size in bytes"));
+        // Default expects placed copies: large public copies keep GPU order at
+        // their place when scratch is available. Set COPY_PROBE_PLACED=0 with
+        // VICTORY_COPIES_IN_PLACE=0 to force the deferred CPU path.
+        let placed = std::env::var("COPY_PROBE_PLACED").as_deref() != Ok("0");
+        let null = std::ptr::null();
+        let alloc_id = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_id = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &alloc_id, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_id, &mut list),
+            S_OK
+        );
+        let source = crate::resource::test_buffer((2 * size) as u64);
+        let destination = crate::resource::test_buffer((size + 8192).max(256 << 10) as u64);
+        let (src, _) = crate::resource::buffer_bytes(source).unwrap();
+        let (dst, width) = crate::resource::buffer_bytes(destination).unwrap();
+        let shadow = crate::shadow::find(dst as u64, width).unwrap();
+        let (output, mapped) = host.shared_buffer((2 * size) as u64).unwrap();
+        let init = host.new_list().unwrap();
+        shadow.refresh(&init, dst as u64, width);
+        init.close();
+        host.execute_own(&init);
+        settle_now(WHY_SYNC);
+        let copy = slot::<extern "system" fn(This, This, u64, This, u64, u64)>(list, 0x78);
+        for v in 0..2 {
+            // SAFETY: live, disjoint and in bounds. Both initializations precede submission.
+            unsafe {
+                std::ptr::write_bytes(src.add(v * size), 0x21 + 0x30 * v as u8, size);
+            }
+            copy(
+                list,
+                destination,
+                8192,
+                source,
+                (v * size) as u64,
+                size as u64,
+            );
+            let native = crate::list::host_list(list).unwrap();
+            read_out(native, &shadow, 8192, size, (&output, (v * size) as u64));
+        }
+        let native = crate::list::host_list(list).unwrap();
+        {
+            let d = native.deferred();
+            assert_eq!(
+                d.copies
+                    .iter()
+                    .filter(|s| matches!(s, Step::Placed(_)))
+                    .count(),
+                if placed { 2 } else { 0 }
+            );
+            assert_eq!(
+                d.copies
+                    .iter()
+                    .filter(|s| matches!(s, Step::Copy(..)))
+                    .count(),
+                if placed { 0 } else { 2 }
+            );
+        }
+        assert_eq!(
+            slot::<extern "system" fn(This) -> i32>(list, 0x48)(list),
+            S_OK
+        );
+        host.execute_own(native);
+        settle_now(WHY_SYNC);
+        // SAFETY: both device copies completed and the mapping is live.
+        let bytes = unsafe { std::slice::from_raw_parts(mapped, 2 * size) };
+        eprintln!(
+            "SAME_LIST size={size} placed={placed} paired={} first={:#04x} second={:#04x}",
+            shadow.carded(),
+            bytes[0],
+            bytes[size]
+        );
+        let first = bytes[..size].iter().position(|&v| v != 0x21);
+        let second = bytes[size..].iter().position(|&v| v != 0x51);
+        for object in [list, allocator, source, destination] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        assert_eq!(
+            (first, second),
+            (None, None),
+            "first wrong byte offsets in the two GPU reads"
+        );
+    }
+
+    /// Each submission copies a distinct payload to the same bytes and
+    /// then reads it. All three are prepared before the GPU may read any.
+    fn each_reads_its_own(len: usize, resource: usize, pc_memory: bool) {
+        let host = host().expect("this opt-in test requires a D3D12 host");
         let (title, start, shadow) = title_of(resource, true, len);
-        assert_eq!(shadow.carded(), carded, "where the copy is");
-        let slow = Slow::new(host);
+        let carded = !pc_memory || std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1");
+        assert_eq!(shadow.carded(), carded, "whether the copy has two sides");
+        if pc_memory {
+            let mut heap = D3D12_HEAP_PROPERTIES::default();
+            // SAFETY: a live committed resource and a valid output.
+            unsafe { shadow.buffer.GetHeapProperties(Some(&mut heap), None) }.unwrap();
+            assert_eq!(heap.MemoryPoolPreference, D3D12_MEMORY_POOL_L0, "use VICTORY_CARD_BUFFERS_MB=0 with two sides");
+        }
         let (out, out_data) = host.shared_buffer(1 << 16).unwrap();
-        let mut lists = Vec::new();
         const AT: usize = 8192;
         // All there once.
         let all = host.new_list().unwrap();
@@ -933,40 +1063,42 @@ mod tests {
         all.close();
         host.execute_own(&all);
         settle_now(WHY_SYNC);
-        lists.push(all);
         let mut wrong = Vec::new();
         for round in 0..6u8 {
-            for v in 0..3u8 {
-                title[65_536 + usize::from(v) * 256..][..256].fill(round * 16 + v + 1);
-            }
-            let busy = host.new_list().unwrap();
-            slow.record(&busy, 40);
-            busy.close();
-            host.execute_own(&busy);
-            lists.push(busy);
+            let mut lists = Vec::with_capacity(3);
             for v in 0..3usize {
+                let source = 65_536 + v * 256;
+                for (offset, byte) in title[source..source + 256].iter_mut().enumerate() {
+                    *byte = (round * 16 + v as u8 + 1).wrapping_add(offset as u8);
+                }
                 let list = host.new_list().unwrap();
-                list.defer_copy((start + AT) as *mut u8, (start + 65_536 + v * 256) as *const u8, 256);
+                list.defer_copy((start + AT) as *mut u8, (start + source) as *const u8, 256);
                 shadow.refresh(&list, (start + AT) as u64, 256);
                 // SAFETY: an open list; live buffers.
                 unsafe {
                     list.list.CopyBufferRegion(&out, (v * 256) as u64, &shadow.buffer, AT as u64, 256);
                 }
                 list.close();
-                host.execute_own(&list);
                 lists.push(list);
             }
+            let mut asynchronous = true;
+            let submitted = while_queue_waits(host, || {
+                for list in &lists {
+                    asynchronous &= host.execute_own(list) != 0;
+                }
+            });
             settle_now(WHY_SYNC);
+            assert!(submitted && asynchronous, "all three submissions must return with the direct queue gated");
             // SAFETY: a mapping of 64 KiB; the copies into it have run.
             let read = unsafe { std::slice::from_raw_parts(out_data, 768) };
-            for v in 0..3u8 {
-                let got = read[usize::from(v) * 256];
-                if got != round * 16 + v + 1 {
-                    wrong.push((round, v, got - round * 16));
+            for (v, bytes) in read.chunks_exact(256).enumerate() {
+                let first = round * 16 + v as u8 + 1;
+                if let Some((offset, &got)) = bytes.iter().enumerate().find(|&(i, &b)| b != first.wrapping_add(i as u8)) {
+                    wrong.push((round, v, offset, first.wrapping_add(offset as u8), got));
                 }
             }
         }
-        eprintln!("read another submission's value (round, submission, whose + 1): {wrong:?}");
+        eprintln!("wrong copies (round, submission, offset, expected, observed): {wrong:?}");
         let stale = STALE.lock().unwrap_or_else(|e| e.into_inner());
         let found = stale.get(&shadow.span()).map_or(0, |s| s.words);
         eprintln!("the check at sends found {found} words");
@@ -979,13 +1111,13 @@ mod tests {
     #[test]
     #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
     fn each_submission_reads_its_own_copy_on_the_card() {
-        each_reads_its_own(LEN, 0x7777, true);
+        each_reads_its_own(LEN, 0x7777, false);
     }
 
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 in its own process; with VICTORY_CARD_ALL=1 also set VICTORY_CARD_BUFFERS_MB=0"]
     fn each_submission_reads_its_own_copy_in_pc_memory() {
-        each_reads_its_own(256 << 10, 0x8888, std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"));
+        each_reads_its_own(256 << 10, 0x8888, true);
     }
 
     /// What a draw of `list` reads at `at`: comes to `out`.

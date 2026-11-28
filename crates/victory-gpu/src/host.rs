@@ -3076,6 +3076,10 @@ struct Sent {
     texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Submission-owned bytes restored into one-sided host copies before the
+    /// lists ([`Host::pc_before`]), and the prelude list that copied them,
+    /// kept until the flight has run.
+    pc_sends: Option<(Option<Prelude>, send::Memory)>,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -3092,6 +3096,7 @@ struct Flight {
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
     texture_back_ranges: Vec<(usize, usize)>,
+    pc_sends: Option<(Option<Prelude>, send::Memory)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -5043,6 +5048,50 @@ impl Host {
             .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
     }
 
+    /// One-sided host copies this submission's CPU buffer copies wrote: take
+    /// their bytes into submission-owned upload memory and copy them onto the
+    /// GPU-visible mapping before the lists run. Later prepares may overwrite
+    /// that mapping; the owned buffer keeps this submission's value.
+    fn pc_before(&self) -> Option<(Option<Prelude>, send::Memory)> {
+        let dirty = crate::shadow::pc_copied();
+        if dirty.is_empty() || !send::own() {
+            return None;
+        }
+        let own = send::take_copies(self, &dirty)?;
+        let Some(sync) = self.make_prelude() else {
+            // Keep the snapshot anyway: without a list the mapping already
+            // holds these bytes for a submission that runs alone.
+            return Some((None, own.memory()));
+        };
+        let (allocator, list) = &sync;
+        // SAFETY: a fresh prelude list; live buffers and ranges inside them.
+        // The list and owned memory are kept until the flight lands.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                own.record(self, list, &dirty, |_| false);
+                list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                Ok(())
+            })()
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("one-sided host copies could not be restored for this submission ({e})"));
+        }
+        Some((Some(sync), own.memory()))
+    }
+
+    /// Gives back what [`Host::pc_before`] held for a finished submission.
+    fn pc_done(&self, pc: (Option<Prelude>, send::Memory)) {
+        let (prelude, memory) = pc;
+        send::give_back(memory);
+        if let Some(prelude) = prelude {
+            PRELUDES_ALIVE.fetch_sub(1, Ordering::Relaxed);
+            drop(prelude);
+        }
+    }
+
     /// The plan's submission has run and its results were read
     /// ([`Host::card_back`]): its lists are free for the next plan. Called
     /// when nothing of ours is on the card, so the compare's results start
@@ -5447,6 +5496,9 @@ impl Host {
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
+                    if let Some(pc) = flight.pc_sends {
+                        self.pc_done(pc);
+                    }
                     if let Some(own) = flight.own {
                         own.landed();
                     }
@@ -5733,6 +5785,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
+                pc_sends: sent.pc_sends,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -5789,6 +5842,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
+                pc_sends: sent.pc_sends,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -5929,6 +5983,9 @@ impl Host {
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        if let Some(pc) = flight.pc_sends {
+                            self.pc_done(pc);
                         }
                         for detached in &mut flight.lists {
                             detached.release_tables();
@@ -6227,6 +6284,10 @@ impl Host {
         }
         let declared = declared_writes(runs);
         let card = self.card_before(&declared, &picked, flown);
+        // One-sided host copies written by this submission's CPU buffer
+        // copies: restore their bytes from a submission-owned snapshot so a
+        // later prepare cannot overwrite what this one's GPU reads still use.
+        let pc_sends = self.pc_before();
         if let Some(probe) = probe {
             let finished = FINISHED.load(Ordering::Acquire);
             two_queues::place(probe, this_submission, card.is_some(), own.is_some(), runs.len(), finished);
@@ -6307,6 +6368,7 @@ impl Host {
                 own,
                 texture_back_ranges,
                 writes,
+                pc_sends,
             };
             batch.give_back();
             working(was_working);
@@ -6425,6 +6487,9 @@ impl Host {
         hand_back(&back);
         if let Some(card) = card {
             self.card_done(card);
+        }
+        if let Some(pc) = pc_sends {
+            self.pc_done(pc);
         }
         #[cfg(feature = "diagnostics")]
         if !back.is_empty() {

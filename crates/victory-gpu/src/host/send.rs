@@ -143,9 +143,25 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
             return Some(spare.swap_remove(i));
         }
     }
+    #[cfg(test)]
+    if std::env::var_os("COPY_PROBE_REFUSE_FRESH_UPLOAD").is_some() {
+        eprintln!("synthetic fresh snapshot allocation refusal: {size} bytes");
+        return None;
+    }
     // By doubles, so that the next of about this size finds it: what
     // submissions send differs from frame to frame.
     let size = size.max(8 << 20).next_power_of_two();
+    memory_new(host, size)
+}
+
+/// A one-off upload when the spare pool and the pooled fresh path cannot
+/// supply memory: still private to the submission, so later prepares cannot
+/// change what this one's GPU copies read (unlike the CPU staging side).
+fn memory_unpooled(host: &Host, size: u64) -> Option<Memory> {
+    memory_new(host, size.max(256).next_multiple_of(256))
+}
+
+fn memory_new(host: &Host, size: u64) -> Option<Memory> {
     let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
     let (buffer, data) = match mapped {
         Some(made) => made,
@@ -191,11 +207,23 @@ const RUNS_AT_A_TIME: usize = 4096;
 
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+    take_inner(host, dirty, true)
+}
+
+/// Like [`take`], but every run is a buffer copy (no compute scatter): for
+/// one-sided L0 mappings that are not unordered-access destinations.
+pub(super) fn take_copies(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+    take_inner(host, dirty, false)
+}
+
+fn take_inner(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)], pairs: bool) -> Option<Own> {
     let began = std::time::Instant::now();
-    pass(host)?;
+    if pairs {
+        pass(host)?;
+    }
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
-    let short = |&(a, b): &(usize, usize)| short(a, b - a);
+    let short = |&(a, b): &(usize, usize)| pairs && short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
     for (_, ranges) in dirty {
@@ -211,7 +239,9 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     if at == 0 {
         return None;
     }
-    let memory = memory(host, at)?;
+    // Prefer the spare pool; if that and the pooled fresh path fail, a
+    // one-off upload still keeps this submission's bytes private.
+    let memory = memory(host, at).or_else(|| memory_unpooled(host, at))?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
