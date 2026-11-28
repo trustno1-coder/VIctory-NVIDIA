@@ -1,10 +1,24 @@
 //! Which processors our own threads run on, where a processor has two kinds
-//! of cores. `cpu_sets` and `keep_on_fast_cores` are fxceless/victory-fork's
-//! (`framelog.rs`, commit 0b0074e0, GPL-3.0-or-later, as this).
+//! of cores, or its cores in more than one group around a cache of their own
+//! (a Ryzen of two dies: 9900X, 9950X, 7900X, 5900X ...). `cpu_sets` and
+//! `keep_on_fast_cores` are fxceless/victory-fork's (`framelog.rs`, commit
+//! 0b0074e0, GPL-3.0-or-later, as this).
 
-/// The system's processor sets of group 0: each one's id and its efficiency
-/// class (higher is faster).
-fn cpu_sets() -> Vec<(u32, u8)> {
+/// One of the system's processor sets of group 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Set {
+    id: u32,
+    /// Efficiency class: higher is faster.
+    class: u8,
+    /// The last-level cache it shares (a Ryzen's die: its L3).
+    cache: u8,
+    /// The system's ranking of it for single threads (CPPC's preferred
+    /// cores; 0 where Windows does not say).
+    rank: u8,
+}
+
+/// The system's processor sets of group 0.
+fn cpu_sets() -> Vec<Set> {
     use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
@@ -24,7 +38,9 @@ fn cpu_sets() -> Vec<(u32, u8)> {
         // SAFETY: the record's type is CpuSet (the only one there is).
         let set = unsafe { &info.Anonymous.CpuSet };
         if set.Group == 0 {
-            sets.push((set.Id, set.EfficiencyClass));
+            // SAFETY: a byte of the union's four, zero where it is reserved.
+            let rank = unsafe { set.Anonymous2.SchedulingClass };
+            sets.push(Set { id: set.Id, class: set.EfficiencyClass, cache: set.LastLevelCacheIndex, rank });
         }
         at += info.Size as usize;
     }
@@ -32,10 +48,42 @@ fn cpu_sets() -> Vec<(u32, u8)> {
 }
 
 /// The sets of the fastest class, if there are slower ones too.
-fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
-    let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
-    let fast: Vec<u32> = sets.iter().filter(|c| c.1 == best).map(|c| c.0).collect();
+fn fast_of(sets: &[Set]) -> Vec<u32> {
+    let best = sets.iter().map(|c| c.class).max().unwrap_or(0);
+    let fast: Vec<u32> = sets.iter().filter(|c| c.class == best).map(|c| c.id).collect();
     if fast.len() == sets.len() { Vec::new() } else { fast }
+}
+
+/// Where all cores are of one kind but share more than one last-level
+/// cache (a Ryzen 9 9900X: two dies of six cores, 32 MB of L3 each): the
+/// sets of one cache, that of the best-ranked core (the system's preferred
+/// cores; a tie: the first cache, a Ryzen's first die). Otherwise none.
+///
+/// The threads a frame waits for hand their work to each other (the
+/// submitting thread, the threads that spread its refreshes, those that
+/// land copies, the one that makes the heaps' records): on one die what
+/// one wrote is in the cache the next reads; across the two it goes over
+/// the link between them, at several times the latency (on Zen 4 and 5
+/// about 70-100 ns against 10-15). The title's own threads are not asked
+/// for and keep both dies.
+fn one_cache_of(sets: &[Set]) -> Vec<u32> {
+    let Some(first) = sets.first() else { return Vec::new() };
+    if sets.iter().any(|s| s.class != first.class) || sets.iter().all(|s| s.cache == first.cache) {
+        return Vec::new();
+    }
+    let best = sets.iter().max_by(|a, b| a.rank.cmp(&b.rank).then(b.cache.cmp(&a.cache))).map_or(first.cache, |s| s.cache);
+    sets.iter().filter(|s| s.cache == best).map(|s| s.id).collect()
+}
+
+/// `VICTORY_ONE_CCD`: on a processor whose cores are alike but in groups
+/// around caches of their own, the threads `VICTORY_FAST_CORES` 1 and 2
+/// name (those a frame waits for, and those they share their work with)
+/// are kept on one group ([`one_cache_of`]); 0: not (as before). Those of
+/// 3 (the many that translate lists) are left to every core either way:
+/// with the helpers they would be more threads than one die runs at once.
+fn one_ccd() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_ONE_CCD").map_or(true, |v| v.trim() != "0"))
 }
 
 /// `VICTORY_FAST_CORES`: 0: no thread asks; 1: the threads a frame waits for
@@ -93,21 +141,31 @@ fn ask(what: &str, from: u32) {
     if stage() < from {
         return;
     }
-    static FAST: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
-    let (fast, of) = FAST.get_or_init(|| {
+    static FAST: std::sync::OnceLock<(Vec<u32>, Vec<u32>, usize)> = std::sync::OnceLock::new();
+    let (fast, one_cache, of) = FAST.get_or_init(|| {
         let sets = cpu_sets();
-        (fast_of(&sets), sets.len())
+        (fast_of(&sets), one_cache_of(&sets), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
-    if fast.is_empty() {
+    if !fast.is_empty() {
+        // SAFETY: our own thread and a list of the system's own set ids.
+        let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) };
+        if ok == 0 {
+            tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
+        } else {
+            tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
+        }
+        return;
+    }
+    // All alike: on one die of two, if there are two, for the threads a frame waits for.
+    if one_cache.is_empty() || from > 2 || !one_ccd() {
         return;
     }
     // SAFETY: our own thread and a list of the system's own set ids.
-    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) };
+    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), one_cache.as_ptr(), one_cache.len() as u32) };
     if ok == 0 {
-        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on one die");
     } else {
-        tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
+        tracing::info!(what, sets = one_cache.len(), of, "the thread is kept on one die, beside its cache (VICTORY_ONE_CCD=0: not)");
     }
 }
 
@@ -163,12 +221,33 @@ impl Priority {
 mod tests {
     use super::*;
 
+    fn set(id: u32, class: u8, cache: u8, rank: u8) -> Set {
+        Set { id, class, cache, rank }
+    }
+
     #[test]
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
-        assert_eq!(fast_of(&[(256, 1), (257, 1), (258, 0)]), [256, 257]);
-        assert!(fast_of(&[(256, 0), (257, 0)]).is_empty());
+        assert_eq!(fast_of(&[set(256, 1, 0, 0), set(257, 1, 0, 0), set(258, 0, 0, 0)]), [256, 257]);
+        assert!(fast_of(&[set(256, 0, 0, 0), set(257, 0, 0, 0)]).is_empty());
         assert!(fast_of(&[]).is_empty());
         assert!(!cpu_sets().is_empty());
         std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
+    }
+
+    #[test]
+    fn two_dies_of_alike_cores_keep_one_die() {
+        // A 9900X: 24 sets, 12 on each die's cache; no ranking given: the first die.
+        let two: Vec<Set> = (0..24).map(|i| set(256 + i, 0, (i / 12) as u8 * 12, 0)).collect();
+        assert_eq!(one_cache_of(&two), (256..268).collect::<Vec<u32>>());
+        // The system's preferred cores on the second die: that one.
+        let mut ranked = two.clone();
+        ranked[15].rank = 9;
+        assert_eq!(one_cache_of(&ranked), (268..280).collect::<Vec<u32>>());
+        // One die (a 9800X3D), or two kinds of cores (left to `fast_of`): none.
+        let one: Vec<Set> = (0..16).map(|i| set(256 + i, 0, 0, 0)).collect();
+        assert!(one_cache_of(&one).is_empty());
+        let hybrid = [set(256, 1, 0, 0), set(257, 0, 1, 0)];
+        assert!(one_cache_of(&hybrid).is_empty());
+        assert!(one_cache_of(&[]).is_empty());
     }
 }

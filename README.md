@@ -354,6 +354,9 @@ to check memory on systems with 32 GB of RAM or GPUs with 8 GB of VRAM.
 - [docs/architecture.md](docs/architecture.md): the layer's parts.
 - [docs/findings.md](docs/findings.md): measurements behind the choices.
 - [docs/dlss.md](docs/dlss.md): DLSS and Frame Generation.
+- [docs/ryzen-9900x-rtx-3070ti.md](docs/ryzen-9900x-rtx-3070ti.md): a
+  two-die Ryzen with an 8 GB card: what the layer does for it and the
+  settings to start from.
 - [docs/linux-proton.md](docs/linux-proton.md): building on Linux and first
   runs under Proton (experimental).
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): the title's ray tracing
