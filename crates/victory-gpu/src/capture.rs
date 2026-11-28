@@ -144,6 +144,9 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    let Some(folder) = folder() else {
+        return false;
+    };
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
@@ -152,7 +155,25 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    n.is_power_of_two() || listed(n) || before_world || in_world || asked(folder, n)
+}
+
+/// A file named `now` in the capture folder asks for the next frame (and
+/// is removed), so a tool (`scripts\bench.ps1`) can look at the screen of a
+/// title running in the background whenever it wants. The frame asked for
+/// stays wanted for every check of it.
+fn asked(folder: &std::path::Path, n: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ASKED: AtomicU64 = AtomicU64::new(u64::MAX);
+    if ASKED.load(Relaxed) == n {
+        return true;
+    }
+    let now = folder.join("now");
+    if now.exists() && std::fs::remove_file(&now).is_ok() {
+        ASKED.store(n, Relaxed);
+        return true;
+    }
+    false
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
