@@ -216,6 +216,39 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Mirrors a contiguous aligned copy into one heap with one registry lookup
+/// and one pending lock. Other ranges keep the per-handle lookup.
+#[cfg(windows)]
+fn mirror_copy(dst: u64, count: u32, kind: u32, step: u64) {
+    let end = dst + u64::from(count) * step;
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&(start, limit, at)) = heaps.iter().find(|&&(start, limit, _)| dst < limit && start < end) else {
+        return;
+    };
+    // SAFETY: the registry lock keeps registered heaps alive.
+    let heap = unsafe { &*(at as *const Heap) };
+    if dst < start || end > limit || kind != heap.desc.kind || !(dst - start).is_multiple_of(step) {
+        drop(heaps);
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    }
+    let first = ((dst - start) / step) as u32;
+    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+    match heap.host.get() {
+        None => pending.extend(first..first + count),
+        Some(host) => {
+            drop(pending);
+            if let Some(host) = host {
+                for i in first..first + count {
+                    host.mirror(i, start + u64::from(i) * step, false);
+                }
+            }
+        }
+    }
+}
+
 /// Whether [`sync_heaps`] is done (`VICTORY_HEAP_SYNC=0`: not).
 #[cfg(windows)]
 fn sync_on() -> bool {
@@ -1889,7 +1922,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         return;
     };
     let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
+    if dst != 0 && src != 0 && count != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
         #[cfg(windows)]
         unsafe {
@@ -1901,9 +1934,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
         };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_copy(dst, count, kind, step);
     }
 }
 
@@ -2507,5 +2538,39 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn contiguous_descriptor_copies_replay_pending_and_update_live_slots() {
+        let null = std::ptr::null();
+        let desc = HeapDesc { kind: SAMPLERS, count: 320, flags: SHADER_VISIBLE, nodes: 0 };
+        let mut h = null;
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let heap = heap(h);
+        let dst = heap.start;
+        let mut source = [[0u64; 2]; 304];
+        let src = source.as_mut_ptr() as u64;
+        for i in [0, 255, 256, 303] {
+            create_sampler(null, &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], src + i * 16);
+        }
+        copy_simple(null, 304, dst, src, SAMPLERS);
+        assert_eq!(heap.pending.lock().unwrap().as_slice(), (0..304).collect::<Vec<_>>());
+        if crate::host::host().is_some() {
+            let host = heap.host().expect("host sampler heap");
+            for i in [0, 255, 256, 303] {
+                assert!(host.made(i));
+            }
+            // SAFETY: these are full descriptors in the live source and destination.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src as *const u8, (dst + 16) as *mut u8, 16);
+                (dst as *mut [u64; 2]).write_unaligned([0; 2]);
+            }
+            copy_simple(null, 304, dst, dst, SAMPLERS);
+            assert!(!host.made(0));
+            assert!(host.made(1));
+            assert!(host.made(303));
+        }
+        release(h);
     }
 }
