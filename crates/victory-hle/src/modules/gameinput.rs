@@ -1226,6 +1226,9 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::System::Power::{
+        ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1234,9 +1237,10 @@ mod host {
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
         XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT,
         XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB,
-        XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_START,
-        XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState,
-        XInputSetState,
+        XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, XINPUT_GAMEPAD_RIGHT_SHOULDER,
+        XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, XINPUT_GAMEPAD_START,
+        XINPUT_GAMEPAD_TRIGGER_THRESHOLD, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE,
+        XINPUT_VIBRATION, XInputGetState, XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowThreadProcessId,
@@ -1281,6 +1285,70 @@ mod host {
         }
     }
 
+    /// Button presses and analog input outside the XInput dead zones, in
+    /// `PadState` units. This never changes the input the title receives.
+    fn pad_active(pad: PadState) -> bool {
+        let outside = |x: f32, y: f32, dead_zone: u16| {
+            let radius = f32::from(dead_zone) / f32::from(i16::MAX);
+            x * x + y * y > radius * radius
+        };
+        let trigger = f32::from(XINPUT_GAMEPAD_TRIGGER_THRESHOLD) / f32::from(u8::MAX);
+        pad.buttons != 0
+            || pad.left_trigger > trigger
+            || pad.right_trigger > trigger
+            || outside(pad.left_x, pad.left_y, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE)
+            || outside(
+                pad.right_x,
+                pad.right_y,
+                XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE,
+            )
+    }
+
+    #[derive(Default)]
+    struct PadActivity {
+        last_reset: Option<Instant>,
+    }
+
+    impl PadActivity {
+        /// Checks all physical pads once per poll, then returns slot zero
+        /// with the scripted keys it would get anyway.
+        fn first_pad(
+            &mut self,
+            pads: &[Option<PadState>; PADS],
+            clock: impl FnOnce() -> Instant,
+            is_foreground: impl FnOnce() -> bool,
+            reset_idle: impl FnOnce(),
+            scripted_keys: impl FnOnce() -> Vec<u8>,
+        ) -> Option<PadState> {
+            if pads.iter().flatten().copied().any(pad_active) {
+                let now = clock();
+                if self
+                    .last_reset
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+                    && is_foreground()
+                {
+                    reset_idle();
+                    self.last_reset = Some(now);
+                }
+            }
+            let mut pad = pads[0]?;
+            // Scripted keys also press the first pad's buttons: with a real
+            // pad connected, the title's start screen sees no stand-in pad.
+            for vk in scripted_keys() {
+                if let Some(&(_, button)) = FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    pad.buttons |= button;
+                }
+            }
+            Some(pad)
+        }
+    }
+
+    fn reset_idle_timers() {
+        // SAFETY: supported flags combined without ES_CONTINUOUS, so this
+        // only restarts the current display and system idle timers.
+        unsafe { SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) };
+    }
+
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
@@ -1288,6 +1356,7 @@ mod host {
         /// The input snapshot for this poll and the HID connection owning each slot.
         pads: [Option<PadState>; PADS],
         hid_slots: [Option<u64>; PADS],
+        pad_activity: PadActivity,
     }
 
     impl Host {
@@ -1330,21 +1399,15 @@ mod host {
                     &mut self.hid_slots,
                     super::playstation::pads,
                 );
+                return self.pad_activity.first_pad(
+                    &self.pads,
+                    Instant::now,
+                    focused,
+                    reset_idle_timers,
+                    scripted,
+                );
             }
-            #[allow(unused_mut)]
-            let mut pad = self.pads[slot]?;
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
-            if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
-                }
-            }
-            Some(pad)
+            self.pads[slot]
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1546,6 +1609,116 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[test]
+    fn all_physical_pad_slots_share_one_idle_reset_per_second() {
+        let mut activity = PadActivity::default();
+        let start = Instant::now();
+        let pressed = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        let pads = [None, pressed, pressed, None];
+        let mut resets = 0;
+        for (ms, expected) in [(0, 1), (999, 1), (1000, 2)] {
+            let first = activity.first_pad(
+                &pads,
+                || start + Duration::from_millis(ms),
+                || true,
+                || resets += 1,
+                Vec::new,
+            );
+            assert_eq!(first, None);
+            assert_eq!(resets, expected);
+        }
+    }
+
+    #[test]
+    fn pad_idle_reset_uses_normalized_xinput_thresholds() {
+        let quiet = PadState {
+            left_x: 7848.0 / 32767.0,
+            right_y: -8689.0 / 32767.0,
+            left_trigger: 30.0 / 255.0,
+            right_trigger: 29.0 / 255.0,
+            ..Default::default()
+        };
+        let mut activity = PadActivity::default();
+        for pads in [[None; PADS], [Some(quiet); PADS]] {
+            assert_eq!(
+                activity.first_pad(
+                    &pads,
+                    Instant::now,
+                    || true,
+                    || panic!("idle input reset the timers"),
+                    Vec::new,
+                ),
+                pads[0]
+            );
+        }
+        for pad in [
+            PadState {
+                left_x: 7850.0 / 32767.0,
+                ..quiet
+            },
+            PadState {
+                right_y: -8690.0 / 32767.0,
+                ..quiet
+            },
+            PadState {
+                left_trigger: 31.0 / 255.0,
+                ..quiet
+            },
+            PadState {
+                right_trigger: 31.0 / 255.0,
+                ..quiet
+            },
+            PadState {
+                left_x: 0.2,
+                left_y: 0.2,
+                ..quiet
+            },
+        ] {
+            assert!(pad_active(pad));
+        }
+    }
+
+    #[test]
+    fn a_background_pad_does_not_reset_idle_or_delay_the_first_foreground_reset() {
+        let mut activity = PadActivity::default();
+        let now = Instant::now();
+        let pad = Some(PadState {
+            buttons: B,
+            ..Default::default()
+        });
+        let pads = [pad, None, None, None];
+        let mut resets = 0;
+        for (foreground, expected) in [(false, 0), (true, 1)] {
+            let first = activity.first_pad(&pads, || now, || foreground, || resets += 1, Vec::new);
+            assert_eq!(first, pad);
+            assert_eq!(resets, expected);
+        }
+    }
+
+    #[test]
+    fn scripted_buttons_are_delivered_without_resetting_idle() {
+        let mut activity = PadActivity::default();
+        let pads = [Some(PadState::default()), None, None, None];
+        let first = activity.first_pad(
+            &pads,
+            Instant::now,
+            || true,
+            || panic!("a scripted button reset the timers"),
+            || vec![0x0D], // Enter -> A
+        );
+        assert_eq!(
+            first,
+            Some(PadState {
+                buttons: A,
+                ..Default::default()
+            })
+        );
+        assert_eq!(pads[0], Some(PadState::default()));
     }
 
     #[test]
