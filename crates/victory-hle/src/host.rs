@@ -58,6 +58,12 @@ impl Default for HostPolicy {
     }
 }
 
+/// True if `dll` is a plain file name with no path separators, drive/stream
+/// colons, NUL bytes, or `.`/`..` traversal segments.
+pub(crate) fn is_bare_dll_name(dll: &str) -> bool {
+    !dll.is_empty() && dll != "." && dll != ".." && !dll.contains(['\\', '/', ':', '\0'])
+}
+
 impl HostPolicy {
     /// No pass-through at all: shows the full surface a title needs.
     pub fn none() -> Self {
@@ -65,6 +71,9 @@ impl HostPolicy {
     }
 
     pub fn allows(&self, dll: &str) -> bool {
+        if !is_bare_dll_name(dll) {
+            return false;
+        }
         let dll = dll.to_ascii_lowercase();
         self.allow
             .iter()
@@ -135,6 +144,9 @@ mod imp {
     }
 
     fn module(dll: &str) -> Option<usize> {
+        if !super::is_bare_dll_name(dll) {
+            return None;
+        }
         let key = dll.to_ascii_lowercase();
         let cache = || MODULES.lock().unwrap_or_else(|e| e.into_inner());
         let cached = cache().get(&key).copied();

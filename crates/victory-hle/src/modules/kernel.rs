@@ -17,7 +17,10 @@ pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&wide(name), false).unwrap_or_else(|| host::get_module_handle_w(name))
+    match find_module(&wide(name), false) {
+        ModuleLookup::Resolved(handle) => handle,
+        ModuleLookup::Host(dll) => host::get_system_module_handle(&dll),
+    }
 }
 
 /// See [`GetModuleHandleW`].
@@ -25,7 +28,10 @@ pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
+    match find_module(&narrow(name), false) {
+        ModuleLookup::Resolved(handle) => handle,
+        ModuleLookup::Host(dll) => host::get_system_module_handle(&dll),
+    }
 }
 
 /// A NUL-terminated string from the title.
@@ -109,18 +115,20 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
 /// Console-only DLLs we implement load as a pseudo handle (titles load
 /// `xgameruntime.dll` this way), the title's DLLs as the images we map
-/// (on first use if nothing imports them); anything else loads on the host.
+/// (on first use if nothing imports them); allow-listed host DLLs load from
+/// System32 only, never from the current folder or an arbitrary path.
 pub extern "system" fn LoadLibraryExA(
     name: *const u8,
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
-    if !name.is_null()
-        && let Some(handle) = find_module(&narrow(name), runs_code(flags))
-    {
-        return handle;
+    if name.is_null() {
+        return host::load_null_library(file, flags);
     }
-    host::load_library_ex_a(name, file, flags)
+    match find_module(&narrow(name), runs_code(flags)) {
+        ModuleLookup::Resolved(handle) => handle,
+        ModuleLookup::Host(dll) => host::load_system_library(&dll, file, flags),
+    }
 }
 
 /// See [`LoadLibraryExA`].
@@ -129,12 +137,13 @@ pub extern "system" fn LoadLibraryExW(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
-    if !name.is_null()
-        && let Some(handle) = find_module(&wide(name), runs_code(flags))
-    {
-        return handle;
+    if name.is_null() {
+        return host::load_null_library(file, flags);
     }
-    host::load_library_ex_w(name, file, flags)
+    match find_module(&wide(name), runs_code(flags)) {
+        ModuleLookup::Resolved(handle) => handle,
+        ModuleLookup::Host(dll) => host::load_system_library(&dll, file, flags),
+    }
 }
 
 /// False for loads as data or resources (`DONT_RESOLVE_DLL_REFERENCES`,
@@ -299,11 +308,69 @@ fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
 }
 
-/// The title's images and our console modules by name; `None` leaves the
-/// name to the host, which only DLLs `HostPolicy` passes through get (as at
-/// import binding); others fail. With `load`, a title DLL not mapped yet is
-/// mapped now.
-fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
+enum ModuleLookup {
+    /// Handled directly: a title image, a pseudo module, or a refused lookup (`NULL`).
+    Resolved(*mut c_void),
+    /// An allow-listed host System32 DLL, validated as a bare file name.
+    Host(String),
+}
+
+/// The host's `System32` directory (lower-case, without trailing `\`), taken
+/// from `kernel32.dll`'s own loaded path.
+fn system32_dir() -> Option<String> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let name: Vec<u16> = "kernel32.dll".encode_utf16().chain([0]).collect();
+        let module = host::get_module_handle_w(name.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 512];
+        let len = host::get_module_file_name_w(module, buf.as_mut_ptr(), buf.len() as u32) as usize;
+        if len == 0 || len >= buf.len() {
+            return None;
+        }
+        let full = String::from_utf16_lossy(&buf[..len]);
+        let full = full.strip_prefix(r"\\?\").unwrap_or(&full);
+        let (dir, _) = full.rsplit_once('\\')?;
+        Some(dir.trim_end_matches('\\').to_ascii_lowercase())
+    })
+    .clone()
+}
+
+/// True if `path` names a host DLL without escaping `System32`: either a bare
+/// file name (`kernel32`, `dbghelp.dll`), or a direct child of the host's
+/// `System32` directory (optionally prefixed with `\\?\`) with no traversal.
+fn is_allowed_host_path(path: &str) -> bool {
+    if crate::host::is_bare_dll_name(path) {
+        return true;
+    }
+    let trimmed = path.strip_prefix(r"\\?\").unwrap_or(path);
+    if trimmed.starts_with(['\\', '/']) {
+        return false;
+    }
+    let Some((dir, name)) = trimmed.rsplit_once(['\\', '/']) else {
+        return false;
+    };
+    if !crate::host::is_bare_dll_name(name) {
+        return false;
+    }
+    let normalized_dir = dir.replace('/', "\\");
+    let normalized_dir = normalized_dir.trim_end_matches('\\');
+    if normalized_dir
+        .split('\\')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return false;
+    }
+    system32_dir().is_some_and(|sys32| normalized_dir.eq_ignore_ascii_case(&sys32))
+}
+
+/// The title's images and our console modules by name; allow-listed host DLLs
+/// return [`ModuleLookup::Host`] with their bare name so callers load them
+/// from System32 only (as at import binding); others fail. With `load`, a
+/// title DLL not mapped yet is mapped now.
+fn find_module(path: &str, load: bool) -> ModuleLookup {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     // As the Windows loader does, a name without extension means a DLL.
     let file = if file.contains('.') {
@@ -315,18 +382,18 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     // another thread is still initialising, as the Windows loader lock does.
     if load {
         match runtime::load_title_dll(&file) {
-            Ok(Some(base)) => return Some(base as *mut c_void),
+            Ok(Some(base)) => return ModuleLookup::Resolved(base as *mut c_void),
             Ok(None) => {}
             // Not the host: it would load the unpatched DLL from the title's folder.
             Err(error) => {
                 tracing::error!(dll = file, %error, "mapping a title DLL failed");
                 host::set_last_error(ERROR_MOD_NOT_FOUND);
-                return Some(std::ptr::null_mut());
+                return ModuleLookup::Resolved(std::ptr::null_mut());
             }
         }
     }
     if let Some(base) = runtime::image_named(&file) {
-        return Some(base as *mut c_void);
+        return ModuleLookup::Resolved(base as *mut c_void);
     }
     // DLLs the host has too are real host modules, whatever `--strict` says.
     let host_dll = HostPolicy::default().allows(&file);
@@ -334,16 +401,17 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
         if load {
             tracing::info!(dll = file, "loaded as a pseudo module");
         }
-        return Some(handle(m));
+        return ModuleLookup::Resolved(handle(m));
     }
-    if host_dll {
-        return None;
+    if host_dll && is_allowed_host_path(path) {
+        return ModuleLookup::Host(file);
     }
-    // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
-    // the console does not have it.
-    refuse(&file);
+    // Any other host DLL (wininet, urlmon, ...), or an allow-listed name
+    // pointed outside System32, is beyond what we guard, and the console does
+    // not have it.
+    refuse(if host_dll { path } else { &file });
     host::set_last_error(ERROR_MOD_NOT_FOUND);
-    Some(std::ptr::null_mut())
+    ModuleLookup::Resolved(std::ptr::null_mut())
 }
 
 /// Logs a DLL name the title is refused, once.
@@ -490,10 +558,20 @@ mod host {
     use windows_sys::Win32::Foundation::{FreeLibrary, SetLastError};
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     use windows_sys::Win32::System::LibraryLoader::{
-        DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
-        GetModuleHandleW, GetProcAddress, LoadLibraryExA, LoadLibraryExW,
+        DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleW,
+        GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        LOAD_LIBRARY_SEARCH_USER_DIRS, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
     };
     use windows_sys::Win32::System::Threading::TerminateProcess;
+
+    /// Search-path flags that widen resolution beyond `System32` or conflict
+    /// with `LOAD_LIBRARY_SEARCH_SYSTEM32`.
+    const UNSAFE_SEARCH_FLAGS: u32 = LOAD_WITH_ALTERED_SEARCH_PATH
+        | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+        | LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+        | LOAD_LIBRARY_SEARCH_USER_DIRS
+        | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
 
     unsafe extern "C" {
         #[link_name = "exit"]
@@ -510,9 +588,14 @@ mod host {
         unsafe { GetModuleHandleW(name) }
     }
 
-    pub(super) fn get_module_handle_a(name: *const u8) -> *mut c_void {
-        // SAFETY: see above.
-        unsafe { GetModuleHandleA(name) }
+    pub(super) fn get_system_module_handle(dll: &str) -> *mut c_void {
+        if !crate::host::is_bare_dll_name(dll) {
+            set_last_error(super::ERROR_MOD_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
+        let wide: Vec<u16> = dll.encode_utf16().chain([0]).collect();
+        // SAFETY: NUL-terminated bare DLL name.
+        unsafe { GetModuleHandleW(wide.as_ptr()) }
     }
 
     pub(super) fn get_module_file_name_w(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
@@ -530,18 +613,20 @@ mod host {
         unsafe { SetLastError(code) }
     }
 
-    pub(super) fn load_library_ex_a(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void {
-        // SAFETY: see above.
-        unsafe { LoadLibraryExA(name, file, flags) }
+    pub(super) fn load_null_library(file: *mut c_void, flags: u32) -> *mut c_void {
+        // SAFETY: forwarding a null library name preserves the host's error code.
+        unsafe { LoadLibraryExW(std::ptr::null(), file, flags) }
     }
 
-    pub(super) fn load_library_ex_w(
-        name: *const u16,
-        file: *mut c_void,
-        flags: u32,
-    ) -> *mut c_void {
-        // SAFETY: see above.
-        unsafe { LoadLibraryExW(name, file, flags) }
+    pub(super) fn load_system_library(dll: &str, file: *mut c_void, flags: u32) -> *mut c_void {
+        if !crate::host::is_bare_dll_name(dll) {
+            set_last_error(super::ERROR_MOD_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
+        let wide: Vec<u16> = dll.encode_utf16().chain([0]).collect();
+        let flags = (flags & !UNSAFE_SEARCH_FLAGS) | LOAD_LIBRARY_SEARCH_SYSTEM32;
+        // SAFETY: NUL-terminated bare DLL name; System32 only, never the current folder or PATH.
+        unsafe { LoadLibraryExW(wide.as_ptr(), file, flags) }
     }
 
     pub(super) fn get_proc_address(module: *mut c_void, name: *const u8) -> *mut c_void {
@@ -626,11 +711,7 @@ mod host {
         std::ptr::null_mut()
     }
 
-    pub(super) fn get_module_handle_a(_: *const u8) -> *mut c_void {
-        std::ptr::null_mut()
-    }
-
-    pub(super) fn load_library_ex_a(_: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
+    pub(super) fn get_system_module_handle(_: &str) -> *mut c_void {
         std::ptr::null_mut()
     }
 
@@ -644,7 +725,11 @@ mod host {
 
     pub(super) fn set_last_error(_: u32) {}
 
-    pub(super) fn load_library_ex_w(_: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
+    pub(super) fn load_null_library(_: *mut c_void, _: u32) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    pub(super) fn load_system_library(_: &str, _: *mut c_void, _: u32) -> *mut c_void {
         std::ptr::null_mut()
     }
 
@@ -812,6 +897,61 @@ mod tests {
             GetProcAddress(ws2, 4 as *const u8) as usize,
             crate::registry::lookup("ws2_32.dll", "connect").unwrap()
         );
+        // Explicit System32 paths for allow-listed DLLs stay allowed.
+        let sys32 = system32_dir().expect("System32 resolved from kernel32.dll");
+        let sys_kernel32 = format!(r"{sys32}\kernel32.dll");
+        assert_eq!(LoadLibraryW(w(&sys_kernel32).as_ptr()), kernel32);
+        let verbatim_kernel32 = format!(r"\\?\{sys_kernel32}");
+        assert_eq!(GetModuleHandleW(w(&verbatim_kernel32).as_ptr()), kernel32);
+        // Datafile loads of allow-listed System32 DLLs still work with forced System32 search.
+        let as_data = LoadLibraryExW(w("kernel32.dll").as_ptr(), std::ptr::null_mut(), 0x2);
+        assert!(!as_data.is_null());
+        assert_eq!(FreeLibrary(as_data), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_library_refuses_paths_outside_system32() {
+        let dir = tempfile::tempdir().unwrap();
+        let planted_wildcard = dir.path().join("vcruntime140_hijack.dll");
+        let planted_exact = dir.path().join("dbghelp.dll");
+        std::fs::copy(r"C:\Windows\System32\version.dll", &planted_wildcard).unwrap();
+        std::fs::copy(r"C:\Windows\System32\version.dll", &planted_exact).unwrap();
+
+        let sys32 = system32_dir().expect("System32 resolved from kernel32.dll");
+        let bad_paths = [
+            planted_wildcard.to_string_lossy().into_owned(),
+            planted_exact.to_string_lossy().into_owned(),
+            r"\\127.0.0.1\share\cabinet.dll".to_owned(),
+            r"//127.0.0.1/share/cabinet.dll".to_owned(),
+            r"vcruntime140\..\ws2_32.dll".to_owned(),
+            r"vcruntime140/../wininet.dll".to_owned(),
+            r".\dbghelp.dll".to_owned(),
+            r"C:dbghelp.dll".to_owned(),
+            format!(r"{sys32}\..\System32\kernel32.dll"),
+            format!(r"{sys32}\kernel32.dll:stream"),
+        ];
+        for path in &bad_paths {
+            assert!(
+                LoadLibraryW(w(path).as_ptr()).is_null(),
+                "LoadLibraryW should refuse {path}"
+            );
+            assert_eq!(
+                // SAFETY: reads this thread's last error.
+                unsafe { windows_sys::Win32::Foundation::GetLastError() },
+                ERROR_MOD_NOT_FOUND,
+                "{path}"
+            );
+            let narrow = std::ffi::CString::new(path.as_str()).unwrap();
+            assert!(
+                LoadLibraryA(narrow.as_ptr().cast()).is_null(),
+                "LoadLibraryA should refuse {path}"
+            );
+            assert!(
+                GetModuleHandleW(w(path).as_ptr()).is_null(),
+                "GetModuleHandleW should refuse {path}"
+            );
+        }
     }
 
     #[test]

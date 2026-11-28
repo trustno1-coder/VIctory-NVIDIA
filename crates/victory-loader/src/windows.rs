@@ -139,6 +139,18 @@ fn map_imports(
     Ok(())
 }
 
+/// True if `name` is a single normal file name component (no directories,
+/// drive/stream colons, `..`, or NUL bytes) so `title_dir.join(name)` can
+/// never escape `title_dir`.
+fn is_plain_dll_name(name: &str) -> bool {
+    if name.is_empty() || name.contains(['\\', '/', ':', '\0']) {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
 fn map_dll(
     name: &str,
     dirs: (&Path, &Path),
@@ -147,6 +159,13 @@ fn map_dll(
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
     let name = name.to_ascii_lowercase();
+    if !is_plain_dll_name(&name) {
+        tracing::warn!(
+            dll = name,
+            "ignoring title DLL import outside the title folder"
+        );
+        return Ok(());
+    }
     let path = dirs.0.join(&name);
     if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
         return Ok(());
