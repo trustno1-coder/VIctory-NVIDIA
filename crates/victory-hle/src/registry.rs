@@ -25,6 +25,9 @@ pub struct HleModule {
 
 impl HleModule {
     pub fn serves(&self, dll: &str) -> bool {
+        if !crate::host::is_bare_dll_name(dll) {
+            return false;
+        }
         let dll = dll.to_ascii_lowercase();
         self.dlls
             .iter()
