@@ -163,3 +163,9 @@ mod tests {
         assert_eq!(r.classify("rpcrt4.dll", &name("RpcServerRegisterIf")), None);
     }
 }
+
+/// The log's line of which build this is and with which switches
+/// (`victory run` says it first thing).
+pub fn log_build(commit: &str, switches: &str) {
+    tracing::info!(commit, switches, "victory build and switches");
+}

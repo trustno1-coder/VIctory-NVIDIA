@@ -117,6 +117,16 @@ pub fn run(
     if execute {
         check_cpu_features()?;
     }
+    // Which build, and with which switches: a launcher that builds and starts
+    // the layer by itself (VILauncher) shows neither, and a switch that never
+    // reached the layer looked like one that changed nothing.
+    let mut switches: Vec<String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("VICTORY_"))
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    switches.sort();
+    println!("build          commit {}", env!("VICTORY_COMMIT"));
+    victory_hle::log_build(env!("VICTORY_COMMIT"), &switches.join(" "));
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
