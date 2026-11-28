@@ -1460,6 +1460,14 @@ pub(crate) fn want_level(this: This, first: u32) {
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// Title textures the host renders to or writes ([`fills`] false), since the
+/// start: made, and released by the title. For the memory line: if the title
+/// goes on making them and releases few, the host copies the sweep never lets
+/// go are ones the title still holds (#791).
+#[cfg(windows)]
+pub(crate) static TARGET_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
 #[cfg(windows)]
@@ -2693,14 +2701,19 @@ pub(crate) static SWEPT_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sy
 /// first page); those nothing has used for 30 seconds and 60 frames and
 /// that no list and no slot holds; those that are both; the copies of
 /// textures the title fills that the host copied into; and, of the first,
-/// the placed ones. Render-target copies grew from 2,319 MB at the world's
+/// the placed ones, those whose title memory the title made a newer target
+/// at since ([`superseded`]), and those whose title memory is not mapped now,
+/// placed or not. Render-target copies grew from 2,319 MB at the world's
 /// first frame to 3,075 MB 150 s later in run 197 and never shrank, while
 /// 26,517 copies of filled textures were let go to stay under the card's
-/// line.
+/// line; on an 8 GB card they grew by 1.4 GB over a session (#791).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn targets_census() -> [u64; 12] {
+pub(crate) fn targets_census() -> [u64; 16] {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut c = [0u64; 12];
+    let mut c = [0u64; 16];
+    // The newest target at each address, copied before the textures' lock is
+    // taken, so that the two are never held together.
+    let newest = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let all = textures();
     for &at in all.iter() {
         // SAFETY: as in `let_go_idle`.
@@ -2741,8 +2754,24 @@ pub(crate) fn targets_census() -> [u64; 12] {
         if placed {
             add(10);
         }
+        if superseded(&newest, at, r.data() as u64) {
+            add(12);
+        }
+        if !crate::texture::committed(r.data().cast_const(), 1) {
+            add(14);
+        }
     }
     c
+}
+
+/// Whether the target `at`, whose title memory is at `address`, is no longer
+/// the newest target there: the title made another at the same memory after
+/// it ([`TARGETS_AT`], `newest`, holds the newest at each address). Its host
+/// copy then holds what the title no longer draws to there.
+#[cfg(windows)]
+#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+fn superseded(newest: &std::collections::BTreeMap<u64, usize>, at: usize, address: u64) -> bool {
+    newest.get(&address).is_some_and(|&n| n != at)
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -3255,6 +3284,7 @@ fn hand_out_resource(
         textures().insert(at);
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
+            TARGET_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             TARGETS_AT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3282,6 +3312,7 @@ impl Drop for Resource {
             crate::texback::released(address);
             textures().remove(&address);
             if !fills(&self.desc) {
+                TARGET_TEXTURES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
                 if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
@@ -5309,5 +5340,41 @@ float4 lit() : SV_Target { return 1.0; }
         drop(held);
         assert!(!textures().contains(&(source as usize)), "the last reference frees it");
         resource_release(view);
+    }
+
+    /// A target the title made another target at the same memory after is
+    /// told apart from the newest one there, and both count as made and as
+    /// released (the memory line's census, #791).
+    #[test]
+    fn a_target_with_a_newer_one_at_its_memory_is_superseded() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        // Unordered access: a texture the host writes, not one the title fills.
+        let target = ResourceDesc { flags: 4, ..texture(4, 4, 28, 1) };
+        assert!(!fills(&target));
+        let [made, released] = TARGET_TEXTURES.each_ref().map(|n| n.load(Relaxed));
+        let (mut older, mut newer) = (null, null);
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &target, 0, null.cast(), &RESOURCE_IIDS[0], &mut older),
+            S_OK
+        );
+        let at = resource(older).data() as u64;
+        assert_eq!(
+            create_at_address(null, at, &target, 0, null.cast(), &RESOURCE_IIDS[0], &mut newer),
+            S_OK
+        );
+        let newest = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(superseded(&newest, older as usize, at), "the older one");
+        assert!(!superseded(&newest, newer as usize, at), "the newest one");
+        assert!(!superseded(&newest, older as usize, at + 4096), "no target there");
+        // (Other tests make and release textures meanwhile: at least ours.)
+        assert!(TARGET_TEXTURES[0].load(Relaxed) >= made + 2);
+        resource_release(newer);
+        resource_release(older);
+        assert!(TARGET_TEXTURES[1].load(Relaxed) >= released + 2);
     }
 }

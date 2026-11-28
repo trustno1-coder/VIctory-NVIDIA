@@ -816,8 +816,9 @@ fn log_memory() {
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
     }
     let targets = crate::resource::targets_census();
+    let [targets_made, targets_released] = crate::resource::TARGET_TEXTURES.each_ref().map(|n| n.load(Relaxed));
     tracing::info!(
-        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
+        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB. Of the first, {} whose title memory has a newer target now {:.0} MB and {} whose title          memory is not mapped now, placed or not, {:.0} MB; title textures the host renders to or writes since the          start: {targets_made} made, {targets_released} released",
         targets[0],
         mb(targets[1]),
         targets[10],
@@ -830,6 +831,10 @@ fn log_memory() {
         mb(targets[7]),
         targets[8],
         mb(targets[9]),
+        targets[12],
+        mb(targets[13]),
+        targets[14],
+        mb(targets[15]),
     );
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
