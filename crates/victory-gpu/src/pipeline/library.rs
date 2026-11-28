@@ -5,8 +5,8 @@
 //!    a hash of all that its host description holds (the translated
 //!    shaders' code, which changes when a translation does, our root
 //!    signature, the graphics state). The library is saved under the cache
-//!    folder; the host refuses a library of another adapter or driver, and
-//!    an entry whose description differs, so neither is ever used.
+//!    folder for the active adapter. The host still checks compatibility
+//!    with the adapter, driver and pipeline descriptions.
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
@@ -48,16 +48,19 @@
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory2, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+};
 use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Sets the shared list directory and the root for adapter libraries.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
@@ -206,22 +209,18 @@ enum Blob {
 }
 
 impl Blob {
-    /// The library file in `dir`: a library a save left beside it
-    /// ([`NEXT_FILE`]) takes its place first.
-    fn of(dir: &std::path::Path) -> Blob {
-        let path = dir.join(LIBRARY_FILE);
-        let next = dir.join(NEXT_FILE);
-        if next.exists() && std::fs::rename(&next, &path).is_err() {
-            tracing::warn!("the host pipeline library saved last could not take the old one's place");
-        }
+    /// Distinguishes a missing library from one present but unreadable.
+    /// An empty file counts as present.
+    fn read(path: &Path) -> std::io::Result<Option<Blob>> {
         if mapped()
-            && let Some(file) = Mapped::open(&path)
+            && let Some(file) = Mapped::open(path)
         {
-            return Blob::Mapped(file);
+            return Ok(Some(Blob::Mapped(file)));
         }
-        match std::fs::read(&path) {
-            Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
-            _ => Blob::None,
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(if bytes.is_empty() { Blob::None } else { Blob::Held(bytes) })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -450,6 +449,11 @@ struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
     _blob: Blob,
+    /// The directory consulted when opening the library. An unidentified
+    /// adapter or an unreadable scoped cache leaves this unset.
+    cache: Option<PathBuf>,
+    /// Only a mapped scoped file can be replaced by this run's saves.
+    mapped_scoped: bool,
     /// Pipelines stored since the last save.
     added: AtomicU64,
     /// Stores share it and a save takes it alone: the size the library
@@ -485,19 +489,94 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
-/// start renames it over the library first ([`Blob::of`]).
+/// start renames it over the library first ([`read_scoped`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
 
+fn device_adapter(device: &ID3D12Device) -> Option<DXGI_ADAPTER_DESC1> {
+    // SAFETY: the queries use the live D3D12 device and DXGI adapters.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let luid = device.GetAdapterLuid();
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid)
+            .or_else(|_| factory.EnumWarpAdapter()).ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        (desc.AdapterLuid.HighPart == luid.HighPart && desc.AdapterLuid.LowPart == luid.LowPart).then_some(desc)
+    }
+}
+
+fn adapter_dir(root: &Path, adapter: &DXGI_ADAPTER_DESC1) -> PathBuf {
+    // A LUID identifies the device for a DXGI query, and can change after reboot.
+    let kind = if adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 { "software" } else { "hardware" };
+    root.join("adapters").join(format!(
+        "{kind}-{:04x}-{:04x}-{:08x}-{:02x}",
+        adapter.VendorId, adapter.DeviceId, adapter.SubSysId, adapter.Revision,
+    ))
+}
+
+fn read_scoped(dir: &Path) -> std::io::Result<Option<Blob>> {
+    let path = dir.join(LIBRARY_FILE);
+    let next = dir.join(NEXT_FILE);
+    if next.try_exists()? {
+        std::fs::rename(&next, &path)?;
+    }
+    Blob::read(&path)
+}
+
+fn load_cache(root: &Path, scoped: Option<PathBuf>) -> (Blob, Option<PathBuf>, bool) {
+    if let Some(dir) = &scoped {
+        match read_scoped(dir) {
+            Ok(Some(blob)) => return (blob, scoped, true),
+            Ok(None) => {}
+            Err(error) => {
+                // Leave this adapter's cache intact even if it becomes readable later.
+                tracing::warn!(%error, path = %dir.display(), "host pipeline cache could not be read");
+                let blob = Blob::read(&dir.join(LIBRARY_FILE)).ok().flatten().unwrap_or(Blob::None);
+                return (blob, None, false);
+            }
+        }
+    }
+    // The old cache may hold a pending save. Read it without promoting it:
+    // an older executable or another adapter may still use these files.
+    let legacy = Blob::read(&root.join(NEXT_FILE))
+        .and_then(|blob| match blob {
+            Some(_) => Ok(blob),
+            None => Blob::read(&root.join(LIBRARY_FILE)),
+        });
+    match legacy {
+        Ok(blob) => (blob.unwrap_or(Blob::None), scoped, false),
+        Err(error) => {
+            tracing::warn!(%error, "legacy host pipeline cache could not be read");
+            (Blob::None, scoped, false)
+        }
+    }
+}
+
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
-            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-            let library = open(&device, blob);
+            let device = &crate::host::host()?.device;
+            let pipeline_device = device.cast::<ID3D12Device1>().ok()?;
+            let (blob, cache, loaded_scoped) = DIR.get().map_or((Blob::None, None, false), |root| {
+                let scoped = device_adapter(device).map(|adapter| adapter_dir(root, &adapter));
+                if scoped.is_none() {
+                    tracing::warn!("host adapter could not be identified; pipeline library writes are disabled");
+                }
+                load_cache(root, scoped)
+            });
+            let library = open(&pipeline_device, blob).map(|mut library| {
+                library.cache = cache;
+                if let Blob::Mapped(file) = &library._blob {
+                    library.mapped_scoped = loaded_scoped;
+                    VIEW[1].store(file.len, Ordering::Relaxed);
+                    VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
+                    LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+                }
+                library
+            });
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
@@ -540,14 +619,11 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                 let bytes = blob.bytes().len();
                 BLOB.store(bytes as u64, Ordering::Relaxed);
                 tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
-                if let Blob::Mapped(file) = &blob {
-                    VIEW[1].store(file.len, Ordering::Relaxed);
-                    VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
-                    LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
-                }
                 return Some(Library {
                     library,
                     _blob: blob,
+                    cache: None,
+                    mapped_scoped: false,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
                 });
@@ -564,6 +640,8 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     Some(Library {
         library,
         _blob: Blob::None,
+        cache: None,
+        mapped_scoped: false,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
     })
@@ -637,72 +715,39 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Saves the adapter's library and shared scheduling lists when they change.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
-    }
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!(error = %e, "host pipeline library not saved");
-        return;
-    }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
-    // The bytes of the library written to `tmp`; 0 when no pipeline was
-    // added: the library on disk is then what it was, and only the early
-    // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
-        let _all = one_call();
-        // No store between asking the size and writing; loads go on.
-        let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
-        let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
-            return;
-        }
-        if added == 0 {
-            0
-        } else {
-            // SAFETY: a plain query.
-            let size = unsafe { library.library.GetSerializedSize() };
-            let _call = call("serialise", "the whole library");
-            if let Err(e) = serialise(&library.library, &tmp, size) {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                let _ = std::fs::remove_file(&tmp);
-                return;
-            }
-            library.added.store(0, Ordering::Relaxed);
-            SAVED.store(size as u64, Ordering::Relaxed);
-            size
+    let Some(dir) = DIR.get() else { return };
+    // Keep periodic and shutdown saves in order through publication.
+    let mut last = if now {
+        LAST.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match LAST.try_lock() {
+            Ok(last) => last,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
         }
     };
-    // Through `used`: a process that asked for none yet (`victory shaders`)
-    // must not write the earlier runs' list over with nothing.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
-    if bytes > 0 && library_written.is_ok() {
-        // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
-        if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
-            REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
-            REPLACED[0].fetch_add(1, Ordering::Relaxed);
-        }
-        crate::host::trail(|| {
-            format!(
-                "pipeline library: saved {bytes} bytes, {}",
-                if in_place { "renamed over the library's file" } else { "left beside the library's file for the next start" }
-            )
-        });
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
     }
+    *last = Some(std::time::Instant::now());
+    let bytes = match library().map_or(Ok(0), save_library) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "host pipeline library not saved");
+            0
+        }
+    };
+    if !USED_CHANGED.swap(false, Ordering::Relaxed) && bytes == 0 {
+        return;
+    }
+    // Both lists describe title pipelines and stay shared across adapters.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
     let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
-    let written = library_written
+    let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
@@ -714,8 +759,49 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(error) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(%error, "shared pipeline lists not saved");
+        }
     }
+}
+
+fn save_library(library: &Library) -> std::io::Result<usize> {
+    let Some(dir) = library.cache.as_deref() else { return Ok(0) };
+    let _all = one_call();
+    // No store between asking the size and writing; loads go on.
+    let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
+    if library.added.load(Ordering::Relaxed) == 0 {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!("host-pipelines.tmp-{}", std::process::id()));
+    // SAFETY: a plain query.
+    let size = unsafe { library.library.GetSerializedSize() };
+    let serialised = {
+        let _call = call("serialise", "the whole library");
+        serialise(&library.library, &tmp, size)
+    };
+    let in_place = match serialised.and_then(|()| replace_library(dir, &tmp)) {
+        Ok(in_place) => in_place,
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+    };
+    library.added.store(0, Ordering::Relaxed);
+    SAVED.store(size as u64, Ordering::Relaxed);
+    if in_place && library.mapped_scoped {
+        REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
+        REPLACED[0].fetch_add(1, Ordering::Relaxed);
+    }
+    crate::host::trail(|| {
+        format!(
+            "pipeline library: saved {size} bytes, {}",
+            if in_place { "renamed over the library's file" } else { "left beside the library's file for the next start" }
+        )
+    });
+    Ok(size)
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
@@ -743,8 +829,13 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// is open ([`holds`]; with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
-fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+fn replace_library(dir: &Path, tmp: &Path) -> std::io::Result<bool> {
+    let next = dir.join(NEXT_FILE);
+    // An existing pending save would take precedence over the primary file.
+    if !next.try_exists()? && std::fs::rename(tmp, dir.join(LIBRARY_FILE)).is_ok() {
+        return Ok(true);
+    }
+    std::fs::rename(tmp, next).map(|()| false)
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -901,6 +992,102 @@ mod tests {
         assert!(matches!(library._blob, Blob::None));
     }
 
+    #[test]
+    fn switching_between_hardware_and_warp_preserves_each_cache() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+
+        // SAFETY: DXGI queries and device creation with valid out parameters.
+        let (hardware, warp) = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter1>() else {
+                return; // no WARP adapter here
+            };
+            let mut hardware: Option<ID3D12Device> = None;
+            let mut software: Option<ID3D12Device> = None;
+            let Ok(()) = D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut hardware) else {
+                return; // no D3D12 hardware device here
+            };
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_12_0, &mut software).unwrap();
+            (hardware.unwrap(), software.unwrap())
+        };
+        let hardware_adapter = device_adapter(&hardware).expect("identify the hardware device");
+        if hardware_adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            return; // the default device is WARP too
+        }
+        let warp_adapter = device_adapter(&warp).expect("identify WARP");
+        if warp_adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+            return; // DXGI may return hardware under Proton
+        }
+        let root = tempfile::tempdir().unwrap();
+        let hardware_path = adapter_dir(root.path(), &hardware_adapter);
+        let warp_path = adapter_dir(root.path(), &warp_adapter);
+        assert_ne!(hardware_path, warp_path);
+        let save = |device: &ID3D12Device, path: &Path| {
+            let mut library = open(&device.cast().unwrap(), Blob::None).expect("D3D12 pipeline library");
+            library.cache = Some(path.to_path_buf());
+            library.added.store(1, Ordering::Relaxed);
+            assert!(save_library(&library).unwrap() > 0);
+            std::fs::read(path.join(LIBRARY_FILE)).unwrap()
+        };
+        let hardware_bytes = save(&hardware, &hardware_path);
+        let warp_bytes = save(&warp, &warp_path);
+        for (device, path, contents) in [
+            (&hardware, &hardware_path, &hardware_bytes),
+            (&warp, &warp_path, &warp_bytes),
+            (&hardware, &hardware_path, &hardware_bytes),
+        ] {
+            let (blob, save_to, scoped) = load_cache(root.path(), Some(path.clone()));
+            assert_eq!(blob.bytes(), contents.as_slice());
+            assert_eq!(save_to.as_ref(), Some(path));
+            assert!(scoped);
+            let library = open(&device.cast().unwrap(), blob).expect("reopen adapter library");
+            assert_eq!(library._blob.bytes(), contents.as_slice());
+        }
+        eprintln!("verified D3D12 library switching between {:?} and {:?}", hardware_path.file_name(), warp_path.file_name());
+        assert!(!root.path().join(LIBRARY_FILE).exists());
+    }
+
+    #[test]
+    fn legacy_cache_is_read_only_and_an_unreadable_scope_is_protected() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(LIBRARY_FILE);
+        let pending = root.path().join(NEXT_FILE);
+        std::fs::write(&legacy, b"old").unwrap();
+        std::fs::write(&pending, b"pending").unwrap();
+        let scoped = root.path().join("adapters/hardware");
+        let (blob, save_to, found) = load_cache(root.path(), Some(scoped.clone()));
+        assert_eq!(blob.bytes(), b"pending");
+        assert_eq!(save_to.as_ref(), Some(&scoped));
+        assert!(!found);
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"old");
+        assert_eq!(std::fs::read(&pending).unwrap(), b"pending");
+        assert!(load_cache(root.path(), None).1.is_none());
+
+        std::fs::create_dir_all(scoped.join(LIBRARY_FILE)).unwrap();
+        let (blob, save_to, found) = load_cache(root.path(), Some(scoped.clone()));
+        assert!(blob.bytes().is_empty());
+        assert!(save_to.is_none());
+        assert!(!found);
+
+        std::fs::remove_dir(scoped.join(LIBRARY_FILE)).unwrap();
+        std::fs::write(scoped.join(LIBRARY_FILE), b"").unwrap();
+        let (blob, save_to, found) = load_cache(root.path(), Some(scoped.clone()));
+        assert!(blob.bytes().is_empty());
+        assert_eq!(save_to, Some(scoped));
+        assert!(found);
+    }
+
+    #[test]
+    fn a_new_save_supersedes_an_existing_pending_library() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(NEXT_FILE), b"stale pending").unwrap();
+        let tmp = dir.path().join("test.tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+        assert!(!replace_library(dir.path(), &tmp).unwrap());
+        assert_eq!(read_scoped(dir.path()).unwrap().unwrap().bytes(), b"new");
+        assert!(!dir.path().join(NEXT_FILE).exists());
+    }
+
     /// A mapped file reads as the file's bytes, a file written through a
     /// mapping holds what was written, and the library's file can be
     /// replaced while it is mapped (or the new one waits as the next).
@@ -908,12 +1095,12 @@ mod tests {
     fn the_library_file_is_mapped_and_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);
-        assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
+        assert!(read_scoped(dir.path()).unwrap().is_none(), "no file yet");
         std::fs::write(&path, b"").unwrap();
-        assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
+        assert!(matches!(read_scoped(dir.path()).unwrap(), Some(Blob::None)), "an empty file");
         let old: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
         std::fs::write(&path, &old).unwrap();
-        let blob = Blob::of(dir.path());
+        let blob = read_scoped(dir.path()).unwrap().unwrap();
         assert!(matches!(blob, Blob::Mapped(_)) || !mapped());
         assert_eq!(blob.bytes(), &old[..]);
         // A save while the old file is mapped.
@@ -930,7 +1117,7 @@ mod tests {
         assert_eq!(blob.bytes(), &old[..]);
         drop(blob);
         // The next start reads the new one, wherever the save left it.
-        assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
+        assert_eq!(read_scoped(dir.path()).unwrap().unwrap().bytes(), &new[..]);
         assert!(!dir.path().join(NEXT_FILE).exists());
     }
 
