@@ -87,13 +87,19 @@ pub(crate) const CUT: usize = 23;
 /// asked as one again each time, as made; 0: it is remembered for ten seconds and asked by
 /// its halves at once (`crate::watch::ask_run`).
 pub(crate) const NF: usize = 24;
-/// 0: a refresh that copies nothing learns so from tables read with no lock taken where they
+/// 1: a refresh that copies nothing learns so from tables read with no lock taken where they
 /// can say it (`crate::watch::nothing_since`), and where a flush has very many refreshes those
-/// go before a thread is woken for them; 1: from the journal, on the threads, as made.
+/// go before a thread is woken for them; 0: from the journal, on the threads, as made. (Runs
+/// 67-68: two thirds fewer refreshes on the threads, and no time gained, with ray tracing or
+/// without: the refreshes that copy nothing are not what the refreshes cost.)
 pub(crate) const Q: usize = 25;
+/// 1: ranges of private title memory of 16 MB and more that the write watch found clean for
+/// two seconds are made read-only and not asked about until a write faults into one
+/// (`crate::watch::seal`); 0: asked every time, as made.
+pub(crate) const SEAL: usize = 26;
 
 /// The switches' names in the file and what they are without it.
-const KNOBS: [(&str, i64); 26] = [
+const KNOBS: [(&str, i64); 27] = [
     ("reuse", 1),
     ("zero", 1),
     ("a", 0),
@@ -120,8 +126,9 @@ const KNOBS: [(&str, i64); 26] = [
     ("cut", 0),
     ("nf", 0),
     ("q", 0),
+    ("seal", 0),
 ];
-static VALUES: [AtomicI64; 26] = [const { AtomicI64::new(0) }; 26];
+static VALUES: [AtomicI64; 27] = [const { AtomicI64::new(0) }; 27];
 
 /// Switch `p`, asked by the submitting thread before each submission: its
 /// priority is "highest" with 1 or 2, "above normal" (as made) with 0. (The
@@ -630,6 +637,15 @@ static ASK_BIG: std::sync::Mutex<Vec<(usize, usize, u64, u64, u64)>> = std::sync
 /// each, those asked before any thread was woken.
 static QUICK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Seals of large ranges (switch `seal`): askings answered by a seal that stands, seals made,
+/// seals opened (by a fault, a write of ours, a write of the kernel's, the title's free or
+/// call, the switch or a seal that did not come to stand), seals found changed at a look.
+static SEAL_COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+pub(crate) fn seal(what: usize) {
+    SEAL_COUNTS[what].fetch_add(1, Relaxed);
+}
+
 pub(crate) fn quick(same: bool, front: bool) {
     QUICK[usize::from(!same)].fetch_add(1, Relaxed);
     if front {
@@ -1114,6 +1130,21 @@ pub(crate) fn log(frames: f64) {
             kinds,
             top.join("; "),
             large_line
+        );
+    }
+    let se: Vec<u64> = SEAL_COUNTS.iter().map(|a| a.swap(0, Relaxed)).collect();
+    if se.iter().sum::<u64>() > 0 {
+        tracing::info!(
+            "seals of large ranges (lab, seal): {:.1} askings a frame answered by a seal that stands; in the second {} seals made, opened: \
+             {} by a fault, {} by a write of ours, {} by a write of the kernel's, {} by the title's free or call, {} others; {} found changed",
+            se[0] as f64 / frames,
+            se[1],
+            se[2],
+            se[3],
+            se[4],
+            se[5],
+            se[6],
+            se[7]
         );
     }
     let q: Vec<f64> = QUICK.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();

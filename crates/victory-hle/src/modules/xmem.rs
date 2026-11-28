@@ -2821,7 +2821,18 @@ extern "system" fn title_virtual_query(address: *const c_void, out: *mut MEMORY_
 /// The title's own `VirtualProtect`, as [`title_virtual_query`].
 extern "system" fn title_virtual_protect(address: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
     use windows_sys::Win32::System::Memory::VirtualProtect;
+    victory_gpu::title_memory_protecting(address as usize, size);
     materialize_for(address as usize, size, Touch::TitleCall);
+    // SAFETY: the title's own arguments.
+    unsafe { VirtualProtect(address, size, protect, old) }
+}
+
+/// The title's own `VirtualProtect` where views are not kept in the books:
+/// what the GPU side made read-only there itself (a seal of its write
+/// watch) is the title's again first, and the call is the system's.
+extern "system" fn title_virtual_protect_told(address: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    victory_gpu::title_memory_protecting(address as usize, size);
     // SAFETY: the title's own arguments.
     unsafe { VirtualProtect(address, size, protect, old) }
 }
@@ -2834,10 +2845,11 @@ pub(crate) fn module() -> HleModule {
         crate::HleExport { name: "VirtualQuery", address: title_virtual_query as *const () as usize },
         crate::HleExport { name: "VirtualProtect", address: title_virtual_protect as *const () as usize },
     ];
+    let told = crate::HleExport { name: "VirtualProtect", address: title_virtual_protect_told as *const () as usize };
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
-        exports: soft.then_some(asks).into_iter().flatten().chain([
+        exports: soft.then_some(asks).into_iter().flatten().chain((!soft).then_some(told)).chain([
             crate::HleExport { name: "VirtualFree", address: title_virtual_free as *const () as usize },
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),

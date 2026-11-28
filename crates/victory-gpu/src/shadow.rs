@@ -4221,10 +4221,10 @@ impl Shadow {
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
-        // (Lab, switch `q`=1: as made.) The range was taken whole after an
+        // (Lab, switch `q`=1; 0: as made.) The range was taken whole after an
         // asking, and nothing was noted in its pages since: known from the
         // tables, with the journal's lock and `copied`'s left alone.
-        if crate::lab::knob(crate::lab::Q) == 0 {
+        if crate::lab::knob(crate::lab::Q) != 0 {
             let same = crate::watch::nothing_since(from, to, self.ranged(from, to));
             crate::lab::quick(same, quick);
             if same {
