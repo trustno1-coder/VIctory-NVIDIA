@@ -4670,7 +4670,8 @@ mod tests {
     /// A late entry of a fault that found the block already writable must not
     /// undo a guard taken since: the block stays read-only with its PROTECTED
     /// bit and clean notes, and the title's next write still faults into the
-    /// handler and is reported at the next asking.
+    /// handler and is reported at the next asking. The other view the fault
+    /// told as written keeps its guard notes too.
     #[test]
     fn a_late_fault_leaves_the_guard_taken_since() {
         let (section, one, two) = two_views(BLOCK);
@@ -4688,20 +4689,32 @@ mod tests {
 
         // The entry of a fault that found the block already writable, settled
         // after this guard was taken: its own VirtualProtect did not change
-        // the protection, so the memory is still read-only.
+        // the protection, so the memory is still read-only. As `open_unlocked`
+        // does, tell the other view as written and mark both views beside a
+        // guard, clearing PUBLISHED, before queuing the entry.
         assert!(!OPENING.swap_on(block(two)));
+        TOLD.set(block(one));
+        BESIDE.set(block(one));
+        BESIDE.set(block(two));
+        PUBLISHED.clear(block(one));
+        PUBLISHED.clear(block(two));
         {
             let mut opened = OPENED.lock().unwrap();
-            opened.push(Opened { block: block(two), at: std::time::Instant::now(), others: Vec::new(), hot: None, took: false });
+            opened.push(Opened { block: block(two), at: std::time::Instant::now(), others: vec![block(one)], hot: None, took: false });
             TO_SETTLE.store(opened.len(), std::sync::atomic::Ordering::SeqCst);
         }
+        assert!(unsettled(block(one), block(one) + 1));
         assert!(unsettled(block(two), block(two) + 1));
         assert!(!writable(two));
         {
-            // Whoever takes the lock next settles it: only its own bit goes.
+            // Whoever takes the lock next settles it: only this entry's bits
+            // go; the guard taken since keeps its notes at both views.
             let g = guards();
             assert!(g.protected.contains(block(two)) && g.clean.contains(block(two)));
-            assert!(PROTECTED.any(block(two), block(two) + 1));
+            assert!(g.protected.contains(block(one)) && g.clean.contains(block(one)));
+            assert!(PROTECTED.any(block(two), block(two) + 1) && PROTECTED.any(block(one), block(one) + 1));
+            assert!(!TOLD.any(block(one), block(one) + 1));
+            assert!(!unsettled(block(one), block(one) + 1));
             assert!(!OPENING.any(block(two), block(two) + 1) && !unsettled(block(two), block(two) + 1));
         }
         assert!(!writable(one) && !writable(two), "the guard taken since is still there");
