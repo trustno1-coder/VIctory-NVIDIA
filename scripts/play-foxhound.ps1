@@ -13,7 +13,8 @@
 # delete that file to go back to them.
 #
 # Build first (README). Run from a normal window, not as administrator. Each run writes a log to
-# %LOCALAPPDATA%\victory\logs. Every VICTORY_... switch is described in a comment where the code reads it.
+# %LOCALAPPDATA%\victory\logs (VICTORY_HOME\logs when VICTORY_HOME is set). Every VICTORY_... switch is
+# described in a comment where the code reads it.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [ValidateSet('diag', 'release')][string]$Build = 'release',
@@ -170,12 +171,16 @@ if (-not (Test-Path $victory)) {
     if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
-# Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
+# Switches left over in this window are cleared; path settings and the card stay, as the launcher's KEPT
+# keeps them (apps\victory\src\play.rs; victory.toml gives the paths otherwise). Cleared, VICTORY_HOME sent
+# the preload's and the game's caches to %LOCALAPPDATA% (#751).
+$paths = 'VICTORY_HOME', 'VICTORY_ADAPTER', 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR', 'VICTORY_LOG'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
-$logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
+# Where victory.exe keeps its own logs too (victory-core's config.rs): VICTORY_HOME, else %LOCALAPPDATA%\victory.
+$victoryHome = if ($env:VICTORY_HOME) { $env:VICTORY_HOME } else { Join-Path $env:LOCALAPPDATA 'victory' }
+$logs = Join-Path $victoryHome 'logs'; New-Item -ItemType Directory -Force $logs | Out-Null
 $log = Join-Path $logs ('victory-nvidia-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
 $writer = [IO.StreamWriter]::new($log, $false, [Text.UTF8Encoding]::new($false)); $writer.AutoFlush = $true
 $writer.WriteLine("# console=$console build=$Build preload=$preload switches: " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '))

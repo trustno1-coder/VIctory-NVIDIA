@@ -1,5 +1,6 @@
 # Fetches MFG Unlocker (github.com/dashdogy/MFG-Unlocker, someone else's MIT-licensed mod, about 5 MB) into
-# %LOCALAPPDATA%\victory\mfg-unlocker, or the folder -To names. It lets DLSS Frame Generation run on GeForce
+# %LOCALAPPDATA%\victory\mfg-unlocker (VICTORY_HOME\mfg-unlocker when VICTORY_HOME is set, where victory.exe
+# looks), or the folder -To names. It lets DLSS Frame Generation run on GeForce
 # RTX 20 and 30 cards, which NVIDIA does not support. victory.exe loads it only with the F1 menu's MFG UNLOCKER
 # on (VICTORY_MFG_UNLOCKER=1); nothing is renamed or put beside the game. It is not part of this repository and
 # was not tested by this fork. Its release v1.7.2 is pinned: the zip and the DLL in it are checked against the
@@ -10,7 +11,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-$dir = if ($To) { $To } else { Join-Path $env:LOCALAPPDATA 'victory\mfg-unlocker' }
+$dir = if ($To) { $To } elseif ($env:VICTORY_HOME) { Join-Path $env:VICTORY_HOME 'mfg-unlocker' } else { Join-Path $env:LOCALAPPDATA 'victory\mfg-unlocker' }
 $version = '1.7.2'
 # From the release's SHA256SUMS.txt (also GitHub's own digest of the zip).
 $package = 'E002D624E3E7BA5CEDAB7211043C096FE8F555C30FF43500235A0686C7893F22'
