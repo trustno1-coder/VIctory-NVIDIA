@@ -137,6 +137,23 @@ mod adapter_tests {
     }
 
     #[test]
+    fn a_warp_shader_host_uses_a_software_adapter() {
+        use super::*;
+        let _turn = super::super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(true) else { return };
+        // SAFETY: resolve the device's LUID through the same DXGI runtime.
+        let desc = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).unwrap();
+            adapter.GetDesc1().unwrap()
+        };
+        assert_ne!(
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0,
+            "WARP selected hardware {:04x}:{:04x}", desc.VendorId, desc.DeviceId
+        );
+    }
+
+    #[test]
     fn the_card_with_the_most_own_memory_unless_one_is_named() {
         // A laptop: the monitor on the integrated GPU, the card without outputs.
         assert_eq!(name(cards(), None), "NVIDIA GeForce RTX 4070 Ti");
@@ -189,7 +206,11 @@ impl Host {
             if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                let adapter: IDXGIAdapter1 = factory.EnumWarpAdapter().map_err(err)?;
+                let desc = adapter.GetDesc1().map_err(err)?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                    return Err(format!("DXGI returned hardware {:04x}:{:04x} for WARP", desc.VendorId, desc.DeviceId));
+                }
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 if let Some((adapter, ..)) = hardware_adapter() {
