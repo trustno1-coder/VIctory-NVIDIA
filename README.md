@@ -216,6 +216,12 @@ speed, in the picture and in simply being able to play it:
   card a frame. They are left out there: no blocks and 30 fps instead of 25
   on the first boat ride (RTX 5070), with water that is darker and bluer.
   WATER LIGHT in the menu (`VICTORY_WATER_LIGHT=1`) runs them again.
+- **Faces with their skin.** The title builds the map of a head's blend
+  shapes once, at its first dispatch; when that pipeline was still being
+  made, the dispatch was dropped and female player faces showed only eyes
+  and teeth. The pipeline is now made as soon as the title creates it, ahead
+  of the others, and its first dispatch waits up to two seconds for it
+  (`VICTORY_HEAD_MAP_WAIT=0`: the ordinary order and wait, as before).
 - **One command to play**: the launcher builds the layer the first time and
   applies what the menu saved.
 - **`Get-NVIDIA-DLSS.cmd`**: the eight NVIDIA files that are loaded, about
