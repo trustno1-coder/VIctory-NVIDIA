@@ -81,6 +81,7 @@ fn build() -> [u8; 32] {
             "VICTORY_THREAD_TICKET",
             "VICTORY_LDS_LOOP_ATOMICS",
             "VICTORY_LDS_BOUNDS",
+            "VICTORY_DIRTY_BITMAP",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -287,6 +288,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    out.push(u8::from(s.dirty_tracked));
     out
 }
 
@@ -355,6 +357,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let dirty_tracked = r.take(1)?[0] != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -365,6 +368,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        dirty_tracked,
     })
 }
 
@@ -399,6 +403,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            dirty_tracked: true,
         }
     }
 

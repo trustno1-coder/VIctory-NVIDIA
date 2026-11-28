@@ -68,6 +68,12 @@ pub const MEMORY_PAGES: u32 = 1 << 21;
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// The root UAV `u<SLOT_DIRTY>` in [`ROOT_CBV_SPACE`]: a bitmap of
+/// [`MEMORY_PAGES`] 64 KiB title-address-space pages ([`DIRTY_WORDS`] dwords,
+/// 256 KiB) marking every page a shader's buffer or flat-memory stores touch.
+pub const SLOT_DIRTY: u8 = 251;
+/// Dwords of the [`SLOT_DIRTY`] bitmap (`MEMORY_PAGES / 32` = 65,536).
+pub const DIRTY_WORDS: u32 = MEMORY_PAGES / 32;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

@@ -396,7 +396,7 @@ pub(super) fn order(runs: &[&HostList]) {
         for step in &list.deferred().copies {
             match step {
                 Step::Refresh(_, at, len) => read.push((*at, *at + *len)),
-                Step::GpuWrite(_, at, len) => written.push((*at, *at + *len)),
+                Step::GpuWrite(_, at, len, _) => written.push((*at, *at + *len)),
                 &Step::Copy(dst, src, len) => {
                     let mut say = |what: &'static str, range: (usize, usize)| {
                         let e = misplaced.1.entry((what, len, dst)).or_default();

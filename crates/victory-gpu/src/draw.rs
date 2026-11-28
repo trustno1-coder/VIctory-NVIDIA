@@ -152,8 +152,10 @@ thread_local! {
     static TESTED_DEPTH: std::cell::Cell<(usize, bool)> =
         const { std::cell::Cell::new((0, false)) };
     /// While a stage's tables are walked (`State::tables`): whether that
-    /// stage's shader can store to buffers (`Translated::stores`).
+    /// stage's shader can store to buffers (`Translated::stores`), and
+    /// whether `SLOT_DIRTY` tracks every buffer store in that stage.
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static DIRTY_TRACKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -1680,7 +1682,7 @@ impl State {
             return 0;
         }
         let address = self.view_address(compute, slot, dword);
-        if address == 0 {
+        if address == 0 && !DIRTY_TRACKED.get() {
             // The first few say what lies there instead.
             static SAID: AtomicU64 = AtomicU64::new(0);
             if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -1874,7 +1876,13 @@ impl State {
         // A list without a view heap: one of the title's for the views the
         // host itself puts into heap slots.
         if self.heaps[0] == 0
-            && p.stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty())
+            && p.stages.iter().any(|s| {
+                !s.root_srvs.is_empty()
+                    || s.root_uavs.iter().any(|&(slot, _)| {
+                        slot != victory_shader::emit::SLOT_FAULTS
+                            && slot != victory_shader::emit::SLOT_DIRTY
+                    })
+            })
             && let Some(heap) = crate::descriptor::lent_heap()
         {
             once!("a dispatch without a view heap that needs one gets the title's");
@@ -1952,12 +1960,15 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            let stage_dirty = crate::dirty::on() && t.host.dirty_tracked;
             STORES.set(t.stores);
+            DIRTY_TRACKED.set(stage_dirty);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
             let made = self.tables(list, &t.tables, compute);
             STORES.set(true);
+            DIRTY_TRACKED.set(false);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1975,7 +1986,7 @@ impl State {
                 // Only through a store by address: what it stores through
                 // views is declared with them.
                 let use_ = if crate::pipeline::is_builder(self.pipeline as This) || writes && t.stores_by_address {
-                    crate::memory::Use::Builds { back: writes }
+                    crate::memory::Use::Builds { back: writes, dirty: stage_dirty }
                 } else {
                     crate::memory::Use::Reads
                 };
@@ -2000,8 +2011,10 @@ impl State {
                 };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
+                        DIRTY_TRACKED.set(stage_dirty);
                         values[u.index as usize] =
                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
+                        DIRTY_TRACKED.set(false);
                         continue;
                     }
                     let fresh = made
@@ -2124,6 +2137,21 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_DIRTY {
+                    // Ours: 64 KiB dirty-page bitmap (`u251`).
+                    let Some(gpu) = list.dirty_gpu() else {
+                        return false;
+                    };
+                    // SAFETY: an open list; `list` holds the bitmap until reset.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -2146,7 +2174,7 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                if !self.root_uav(list, address, param, compute, writes, stage_dirty) {
                     return false;
                 }
             }
@@ -2175,6 +2203,7 @@ impl State {
         param: u32,
         compute: bool,
         writes: bool,
+        dirty: bool,
     ) -> bool {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -2200,7 +2229,7 @@ impl State {
             if writes {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(a, len, self.pipeline);
-                s.gpu_writes(list, a, len);
+                s.gpu_writes_dirty(list, a, len, dirty);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -5655,7 +5684,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             if STORES.get() || !write_skip() {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
-                shadow.gpu_writes(list, address, len);
+                shadow.gpu_writes_dirty(list, address, len, DIRTY_TRACKED.get());
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

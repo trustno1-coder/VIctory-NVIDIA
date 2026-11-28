@@ -114,8 +114,8 @@ const SWEEP: usize = 128;
 pub(crate) enum Use {
     Reads,
     /// Stores by address, as the structure builder; `back`: its results in
-    /// small title buffers come back.
-    Builds { back: bool },
+    /// small title buffers come back, `dirty`: `SLOT_DIRTY` tracks them.
+    Builds { back: bool, dirty: bool },
 }
 
 /// A page of title memory in an arena.
@@ -759,7 +759,7 @@ impl Memory {
 
     /// A small title buffer whose results come back, if its pages are
     /// windows of title memory itself (or a copy of the buffer's own).
-    fn small(&mut self, list: &HostList, start: u64, len: u64) {
+    fn small(&mut self, list: &HostList, start: u64, len: u64, dirty: bool) {
         let mut at = start;
         while at < start + len {
             let page = at / PAGE;
@@ -769,7 +769,7 @@ impl Memory {
                 && !self.pages.contains_key(&page)
             {
                 self.copies[k].refresh(list, at, n);
-                self.copies[k].gpu_writes(list, at, n);
+                self.copies[k].gpu_writes_dirty(list, at, n, dirty);
                 self.stats.back += 1;
             }
             at += n;
@@ -1024,10 +1024,10 @@ pub(crate) fn ready(
         if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
                 && len <= BACK
-                && use_ == (Use::Builds { back: true })
+                && let Use::Builds { back: true, dirty } = use_
                 && list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
             {
-                m.small(list, start, len);
+                m.small(list, start, len, dirty);
             }
             m.opens(at);
             if !packed && crate::shadow::in_buffer(at, 1).is_none() {

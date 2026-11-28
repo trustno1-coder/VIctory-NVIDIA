@@ -84,6 +84,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        dirty_tracked: lowered.dirty_tracked,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -129,7 +130,7 @@ pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec
         // Both tables start at heap index 0.
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            assert_eq!(u.root, RootType::Table, "{u:?}");
+            assert!(matches!(u.root, RootType::Table | RootType::Other(_)), "{u:?}");
             ud[u.index as usize] = 0;
         }
         let words = host
@@ -386,6 +387,7 @@ fn immediate_sampler_chosen_by_control_flow() {
             root_srvs: lowered.root_srvs,
             root_uavs: lowered.root_uavs,
             root_indexed_views: Vec::new(),
+            dirty_tracked: lowered.dirty_tracked,
         };
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
@@ -408,7 +410,7 @@ fn immediate_sampler_chosen_by_control_flow() {
                 let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
                 for u in &shader.user_data {
                     ud[u.index as usize] = match (u.root, u.slot) {
-                        (RootType::Table, 0) => 0,
+                        (RootType::Table, 0) | (RootType::Other(_), _) => 0,
                         (RootType::Constants, 1) => branch,
                         other => panic!("unexpected user data {other:?}"),
                     };

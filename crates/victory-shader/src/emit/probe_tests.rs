@@ -34,6 +34,7 @@ fn probe() {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            dirty_tracked: false,
         };
         let (root, pso) = match host.compute_pipeline(&shader) {
             Ok(made) => made,
