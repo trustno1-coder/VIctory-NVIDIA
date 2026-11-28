@@ -1413,11 +1413,33 @@ mod host {
         })
     }
 
+    /// `VICTORY_KEYS_FROM=world`: scripted keys count from the world's first
+    /// frame (the first of 500 draws or more, `victory_gpu::world_since`)
+    /// instead of from when input starts, and none is pressed before it. A
+    /// route then begins at the same place whatever the loading took.
+    fn from_world() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var("VICTORY_KEYS_FROM").is_ok_and(|v| v.trim().eq_ignore_ascii_case("world"));
+            if on {
+                tracing::info!("scripted keys count from the world's first frame (VICTORY_KEYS_FROM=world)");
+            }
+            on
+        })
+    }
+
+    /// What `VICTORY_KEYS` times count from: when input started, or with
+    /// [`from_world`] the world's first frame (none before it).
+    fn script_base(start: Instant, world: Option<Instant>, from_world: bool) -> Option<Instant> {
+        if from_world { world } else { Some(start) }
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. Keys as [`key_code`] names them (the
-    /// stand-in pad's table maps them to buttons). Also the keys of
-    /// [`live`] (`VICTORY_KEYS_FILE`).
+    /// time; with `VICTORY_KEYS_FROM=world`, after the world's first frame),
+    /// with or without focus. Keys as [`key_code`] names them (the stand-in
+    /// pad's table maps them to buttons). Also the keys of [`live`]
+    /// (`VICTORY_KEYS_FILE`).
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1434,12 +1456,13 @@ mod host {
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        let mut down: Vec<u8> = keys
-            .iter()
-            .filter(|&&(from, to, _)| (from..to).contains(&now))
-            .map(|&(_, _, vk)| vk)
-            .collect();
+        let mut down: Vec<u8> = match script_base(*start, victory_gpu::world_since(), from_world()) {
+            Some(base) => {
+                let now = base.elapsed();
+                keys.iter().filter(|&&(from, to, _)| (from..to).contains(&now)).map(|&(_, _, vk)| vk).collect()
+            }
+            None => Vec::new(),
+        };
         for vk in live() {
             if !down.contains(&vk) {
                 down.push(vk);
@@ -1473,7 +1496,9 @@ mod host {
     /// (keys as [`key_code`] names them), e.g. `Enter`, `W 3` (walk ahead for
     /// three seconds) or `Enter 0.2 5`. A thread of ours reads what was
     /// appended every 50 ms; lines in the file before the run are skipped.
-    /// With or without focus, as [`scripted`]. The keys held now.
+    /// With or without focus, as [`scripted`]; not held back by
+    /// `VICTORY_KEYS_FROM` (a driver passes the menus this way). The keys
+    /// held now.
     fn live() -> Vec<u8> {
         use std::io::{Read, Seek, SeekFrom};
         use std::sync::Mutex;
@@ -1536,6 +1561,17 @@ mod host {
         assert_eq!(live_line("D x", t).unwrap().hold, Duration::from_millis(200));
         assert!(live_line("Shift", t).is_none());
         assert!(live_line("", t).is_none());
+    }
+
+    #[test]
+    fn keys_from_the_world() {
+        let t = Instant::now();
+        let world = t + Duration::from_secs(90);
+        // VICTORY_KEYS: from input's start, or from the world (nothing before it).
+        assert_eq!(script_base(t, None, false), Some(t));
+        assert_eq!(script_base(t, Some(world), false), Some(t));
+        assert_eq!(script_base(t, None, true), None);
+        assert_eq!(script_base(t, Some(world), true), Some(world));
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
