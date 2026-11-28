@@ -2088,21 +2088,35 @@ fn commit(base: usize, len: usize) -> bool {
 /// gets; otherwise as a warning.
 fn commit_refused(len: usize, what: &str, error: std::io::Error) {
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
-        let mut info = PERFORMANCE_INFORMATION {
-            cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
-            ..Default::default()
-        };
-        // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
-        let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
         victory_loader::log_crash(&commit_limit_message(
             len,
             what,
             &error,
-            queried.then_some(&info),
+            system_commit().as_ref(),
         ));
     } else {
         tracing::warn!(len, %error, "committing {what} failed");
     }
+}
+
+/// Reports to `crashes.log` that the host allocator refused `len_bytes` of
+/// APU heap memory. There is no Windows error code to give: `std::alloc`
+/// allocates with `HeapAlloc`, which does not set one when it fails.
+pub(crate) fn report_allocator_refusal(len_bytes: usize) {
+    victory_loader::log_crash(&allocator_refusal_message(
+        len_bytes,
+        system_commit().as_ref(),
+    ));
+}
+
+/// The system commit, if Windows reports it.
+fn system_commit() -> Option<PERFORMANCE_INFORMATION> {
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
+    (unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0).then_some(info)
 }
 
 fn commit_limit_message(
@@ -2111,9 +2125,27 @@ fn commit_limit_message(
     error: &std::io::Error,
     info: Option<&PERFORMANCE_INFORMATION>,
 ) -> String {
-    let mut message = format!(
-        "VIctory: Windows commit limit reached while committing {len} bytes of {what}: {error}.\n"
-    );
+    refusal_message(
+        format_args!(
+            "Windows commit limit reached while committing {len} bytes of {what}: {error}"
+        ),
+        info,
+    )
+}
+
+fn allocator_refusal_message(len_bytes: usize, info: Option<&PERFORMANCE_INFORMATION>) -> String {
+    refusal_message(
+        format_args!("the host allocator refused {len_bytes} bytes of APU heap memory"),
+        info,
+    )
+}
+
+/// What the host refused, then the system commit and what the user can do.
+fn refusal_message(
+    refusal: std::fmt::Arguments<'_>,
+    info: Option<&PERFORMANCE_INFORMATION>,
+) -> String {
+    let mut message = format!("VIctory: {refusal}.\n");
     if let Some(info) = info {
         use std::fmt::Write;
 
@@ -3023,6 +3055,23 @@ mod tests {
         assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE + FRAMES), None);
         let p = free_run([PAGE_LIMIT - FRAMES], FRAMES).unwrap();
         assert_eq!((p >> 4 & 0x1f_ffff) << 4, p);
+    }
+
+    #[test]
+    fn allocator_refusal_report_names_apu_heap_and_system_commit() {
+        let info = PERFORMANCE_INFORMATION {
+            CommitTotal: 512,
+            CommitLimit: 768,
+            PageSize: 4096,
+            ..Default::default()
+        };
+        let report = allocator_refusal_message(4 * MIB, Some(&info));
+        assert!(report.contains("host allocator refused 4194304 bytes of APU heap memory"));
+        assert!(report.contains("System commit: 2 MiB of 3 MiB in use"));
+        assert!(report.contains("Windows paging file size"));
+        let fallback = allocator_refusal_message(4 * MIB, None);
+        assert!(fallback.contains("4194304 bytes of APU heap memory"));
+        assert!(!fallback.contains("System commit:"));
     }
 
     #[test]
