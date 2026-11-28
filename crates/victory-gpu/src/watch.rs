@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
+use std::sync::atomic::Ordering;
 use std::sync::{Condvar, Mutex, RwLock};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -250,6 +251,87 @@ impl Drop for Asking {
     }
 }
 
+/// Whether a submission's askings ([`ask_ahead`], [`ask_rest`]) hold only
+/// the pages they ask about ([`Askings`]). On by default;
+/// `VICTORY_ASK_HOLD_ALL=1`: they hold all memory, as before.
+///
+/// Holding all memory, each waited for every other asking to end and made
+/// every other wait for it: the descriptor heaps' thread, which holds a
+/// heap's pages through its asking and through guarding them again, began
+/// its round just before the submission's asking (the log of 2026-11-28:
+/// 5.1-6.4 ms of its asking a frame, in some 16 rounds), and texture
+/// refreshes on the helpers ask too. Neither asks about the submission's
+/// pages more often than before: only about others, at the same time.
+fn hold_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_HOLD_ALL").is_none_or(|v| v != "1"))
+}
+
+/// Page ranges held in [`ASKING`] together until dropped: all of them or
+/// none, so that two threads that each hold several never wait for each
+/// other in a circle.
+struct Askings(Vec<(usize, usize)>);
+
+impl Askings {
+    /// `ranges`: page ranges in order, none touching another ([`merged`]).
+    fn hold(ranges: Vec<(usize, usize)>) -> Askings {
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        if held.iter().any(|&(a, b)| overlaps(&ranges, a, b)) {
+            held = waited(0, || {
+                let mut held = held;
+                while held.iter().any(|&(a, b)| overlaps(&ranges, a, b)) {
+                    held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
+                }
+                held
+            });
+        }
+        held.extend_from_slice(&ranges);
+        Askings(ranges)
+    }
+
+    /// Those of `ranges` (in order, none touching another) if
+    /// [`hold_pages`], else all memory.
+    fn hold_or_all(ranges: Vec<(usize, usize)>) -> Result<Askings, Asking> {
+        if hold_pages() { Ok(Askings::hold(ranges)) } else { Err(Asking::hold_all()) }
+    }
+}
+
+impl Drop for Askings {
+    fn drop(&mut self) {
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        for range in &self.0 {
+            if let Some(i) = held.iter().position(|r| r == range) {
+                held.swap_remove(i);
+            }
+        }
+        drop(held);
+        ASKING.1.notify_all();
+    }
+}
+
+/// Whether `[a, b)` overlaps one of `ranges` (in order, none touching
+/// another).
+fn overlaps(ranges: &[(usize, usize)], a: usize, b: usize) -> bool {
+    // The first that ends after `a`: it overlaps if it begins before `b`.
+    let i = ranges.partition_point(|&(_, end)| end <= a);
+    ranges.get(i).is_some_and(|&(start, _)| start < b)
+}
+
+/// `ranges` in order, those that overlap or touch made one, empty ones
+/// left out.
+fn merged(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.retain(|r| r.0 < r.1);
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
 thread_local! {
     /// Room for the kernel's answer.
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -325,7 +407,20 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
+/// Fast-path mirror of `journal().kept`: avoids building/sorting `ask_ahead`
+/// ranges and taking an exclusive `journal_mut()` write lock on every flush
+/// while a submission's one asking (`VICTORY_ASK_ONCE`) stands.
+static JOURNAL_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the submission's one asking (`ask_once`) currently stands.
+pub(crate) fn is_kept() -> bool {
+    JOURNAL_KEPT.load(Ordering::Acquire)
+}
+
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if is_kept() {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -342,8 +437,9 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if journal().kept {
         return;
     }
-    let _all = Asking::hold_all();
-    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    // The runs asked about: pieces close together, with the pages between
+    // them, which the kernel's asking walks and resets too.
+    let mut runs = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -356,8 +452,14 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        runs.push((i, k, first, last));
         i = k;
+    }
+    // Those pages held ([`hold_pages`]) until the answers are in the journal.
+    let _held = Askings::hold_or_all(merged(runs.iter().map(|&(.., first, last)| (first, last)).collect()));
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    for &(i, k, ..) in &runs {
+        ask_run(&pieces[i..k], &mut asked, &mut written);
     }
     note_hot(&written);
     let mut j = journal_mut();
@@ -507,6 +609,9 @@ fn ask_early(every: std::time::Duration) {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
+    if is_kept() {
+        return;
+    }
     let mut j = journal_mut();
     if !j.kept {
         j.ahead.clear();
@@ -552,22 +657,28 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
-    let _all = Asking::hold_all();
-    let mut ahead = {
-        let mut j = journal_mut();
-        std::mem::take(&mut j.ahead)
-    };
+    // (Read, not taken: holding only its own pages ([`hold_pages`]), this
+    // asking lets other threads ask meanwhile, and the journal goes on
+    // answering them for what `ask_ahead` asked.)
+    let mut ahead = journal().ahead.clone();
+    // The ranges it asks about: those `ask_ahead` left, held until the
+    // answers are in the journal.
+    let alone: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|&&(start, end)| start < end && !published(start, end))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .filter(|&(first, last)| !ahead.iter().any(|&(a, b)| a <= first && last <= b))
+        .collect();
+    let _held = Askings::hold_or_all(merged(alone.clone()));
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
+    // (Those held, and no others: a range's bits found since are no reason
+    // to ask about a range not held.)
     let mut written = Vec::new();
-    for &(start, end) in ranges {
-        if start >= end || published(start, end) {
-            continue;
-        }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    for (first, last) in alone {
         if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
             && let Some(pages) = kernel_written(first, last)
         {
@@ -586,17 +697,23 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.note(page, parts, now);
     }
-    j.kept = !ahead.is_empty();
+    let kept = !ahead.is_empty();
+    j.kept = kept;
     j.ahead = ahead;
+    JOURNAL_KEPT.store(kept, Ordering::Release);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    if !is_kept() {
+        return;
+    }
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+        JOURNAL_KEPT.store(false, Ordering::Release);
     }
 }
 
@@ -604,6 +721,9 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    if !is_kept() || len == 0 {
+        return;
+    }
     let mut j = journal_mut();
     if !j.kept || len == 0 {
         return;
@@ -750,29 +870,69 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     Some(answer)
 }
 
+/// A held read guard on the write-watch journal, allowing callers to check
+/// many buffers with [`JournalRead::nothing_new_atomic`] without acquiring
+/// `JOURNAL`'s `RwLock` on every single buffer.
+///
+/// Callers MUST drop `JournalRead` before calling any function that acquires
+/// `journal_mut()` (such as [`writes`]).
+pub(crate) struct JournalRead(std::sync::RwLockReadGuard<'static, Journal>);
+
+/// Acquires a shared read guard on the write-watch journal for batched
+/// [`JournalRead::nothing_new_atomic`] checks.
+pub(crate) fn read_journal() -> JournalRead {
+    JournalRead(journal())
+}
+
+impl JournalRead {
+    /// Lock-free check of whether nothing of `[start, end)` was written since
+    /// `copied` (one `AtomicU64` per 64 KiB page from `base` on) was taken.
+    /// Only invokes `ranged_fn` (which may lock `Shadow.ranged`) when a page in
+    /// `[first, last)` is partial (`0`) or older than a recorded write, keeping
+    /// the common whole-page no-op path 100% mutex-free.
+    pub(crate) fn nothing_new_atomic(
+        &self,
+        start: usize,
+        end: usize,
+        base: usize,
+        copied: &[std::sync::atomic::AtomicU64],
+        ranged_fn: impl FnOnce() -> u64,
+    ) -> bool {
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        let known = published(start, end);
+        #[cfg(feature = "diagnostics")]
+        if known {
+            crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+        }
+        let j = &*self.0;
+        if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            return false;
+        }
+        let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+            return false;
+        };
+        let all_nonzero = taken.iter().all(|at| at.load(Ordering::Acquire) != 0);
+        if all_nonzero && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].load(Ordering::Acquire)) {
+            return true;
+        }
+        let ranged = ranged_fn();
+        (ranged != 0 || all_nonzero)
+            && j.written
+                .range(first..last)
+                .all(|(&page, &write)| write <= taken[page - first].load(Ordering::Acquire).max(ranged))
+    }
+}
+
 /// Whether nothing of `[start, end)` was written that a copy with the notes
 /// `copied` (the asking after which each page from page `base` on was taken)
 /// and `ranged` (the asking after which a range that holds this one was
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
+#[cfg(test)]
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    // The bits first, then the journal, as in `writes`.
-    let known = published(start, end);
-    #[cfg(feature = "diagnostics")]
-    if known {
-        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
-    }
-    let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return false;
-    }
-    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
-        return false;
-    };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    let atomic: Vec<std::sync::atomic::AtomicU64> = copied.iter().map(|&v| std::sync::atomic::AtomicU64::new(v)).collect();
+    read_journal().nothing_new_atomic(start, end, base, &atomic, || ranged)
 }
 
 impl Tracked {
@@ -5280,5 +5440,53 @@ mod many_askers_tests {
         BITS.clear_all(0, usize::MAX);
         assert!(!BITS.any(0, 1 << 31));
         assert!(!BITS.swap_on(70) && BITS.swap_on(70) && BITS.all(70, 71));
+    }
+}
+
+#[cfg(test)]
+mod ask_holds {
+    use super::{Askings, merged, overlaps};
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::time::Duration;
+
+    #[test]
+    fn ranges_are_merged_in_order_and_told_apart() {
+        assert_eq!(merged(vec![(9, 12), (1, 3), (3, 5), (4, 4), (11, 20), (30, 31)]), [(1, 5), (9, 20), (30, 31)]);
+        assert!(merged(vec![(5, 5)]).is_empty());
+        let held = [(1, 5), (9, 20), (30, 31)];
+        assert!(overlaps(&held, 0, 2));
+        assert!(overlaps(&held, 4, 9));
+        assert!(!overlaps(&held, 5, 9), "touching is not overlapping");
+        assert!(!overlaps(&held, 20, 30));
+        assert!(overlaps(&held, 19, 21));
+        assert!(overlaps(&held, 0, usize::MAX));
+        assert!(!overlaps(&held, 31, usize::MAX));
+        assert!(!overlaps(&[], 0, usize::MAX));
+    }
+
+    /// Pages held by one asking hold up an asking of any of them, and of no
+    /// other page; several are taken all at once.
+    #[test]
+    fn an_asking_waits_only_for_the_pages_it_asks_about() {
+        // Far above any page the other tests' memory has.
+        const AT: usize = usize::MAX / 2;
+        let held = Askings::hold(vec![(AT, AT + 4), (AT + 10, AT + 12)]);
+        // Other pages: at once.
+        drop(Askings::hold(vec![(AT + 4, AT + 10), (AT + 12, AT + 20)]));
+        drop(super::Asking::hold(AT + 5, AT + 6));
+        // One page in common: not before the first lets go.
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _second = Askings::hold(vec![(AT + 6, AT + 8), (AT + 11, AT + 13)]);
+                done.store(true, SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!done.load(SeqCst), "an asking of a held page went ahead");
+            drop(held);
+        });
+        assert!(done.load(SeqCst));
+        // And all of them are let go.
+        drop(Askings::hold(vec![(AT, AT + 20)]));
     }
 }

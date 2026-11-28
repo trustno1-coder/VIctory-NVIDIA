@@ -205,21 +205,28 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     retry_growth_at: u64,
+    /// Blocks being made ahead by a thread outside the lock ([`take_from`]),
+    /// counted as empty ones so that no two threads make the same one.
+    making_ahead: usize,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, making_ahead: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
+    /// (`make` runs with the pool borrowed; the pools of the process are
+    /// taken from with [`take_from`], which makes blocks with their lock let go.)
+    #[cfg(test)]
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
         self.take_ripe(len, align, now, Ripe::ALL, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
     /// ahead too, when few are empty.
+    #[cfg(test)]
     fn take_ripe(
         &mut self,
         len: u64,
@@ -228,6 +235,33 @@ impl<B: Clone> Pool<B> {
         ripe: Ripe,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
+        let (i, start) = match self.cut(len, align, now, ripe)? {
+            Some(found) => found,
+            None => {
+                if !self.may_grow(now) {
+                    return None;
+                }
+                let Some(memory) = make() else {
+                    self.failed_growth(now);
+                    return None;
+                };
+                self.add_and_cut(memory, ripe.started, len, align)?
+            }
+        };
+        if self.short_ahead(now, ripe) {
+            match make() {
+                Some(memory) => {
+                    self.add(memory, ripe.started);
+                }
+                None => self.failed_growth(now),
+            }
+        }
+        self.taken(i, start, len, ripe)
+    }
+
+    /// Where a piece of `len` bytes was cut from a block there is: `None`
+    /// if it is never pooled, `Some(None)` if no block has room.
+    fn cut(&mut self, len: u64, align: u64, now: u64, ripe: Ripe) -> Option<Option<(usize, u64)>> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
         if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
@@ -251,45 +285,47 @@ impl<B: Clone> Pool<B> {
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
-        // A failed 64 MiB block must not trigger another driver call for each
-        // small texture. Existing free ranges remain usable during backoff.
-        let (i, start) = match found {
-            Some(found) => found,
-            None => {
-                let memory = self.grow(now, &mut make)?;
-                let i = self.add(memory, ripe.started);
-                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
-            }
-        };
-        if ripe.ahead > 0 {
-            if !ripe.is(self.blocks[i].as_ref()?) {
-                let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
-                }
-            }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
-            if empty < ripe.ahead
-                && let Some(memory) = self.grow(now, &mut make)
-            {
-                self.add(memory, ripe.started);
+        Some(found)
+    }
+
+    /// Whether a block may be made now: a failed 64 MiB block must not
+    /// trigger another driver call for each small texture. Existing free
+    /// ranges remain usable during backoff.
+    fn may_grow(&self, now: u64) -> bool {
+        now >= self.retry_growth_at
+    }
+
+    fn failed_growth(&mut self, now: u64) {
+        self.retry_growth_at = now.saturating_add(500);
+    }
+
+    /// Adds a block just made and cuts the piece from it.
+    fn add_and_cut(&mut self, memory: B, made: u64, len: u64, align: u64) -> Option<(usize, u64)> {
+        let i = self.add(memory, made);
+        Some((i, self.blocks[i].as_mut()?.free.take(len, align)?))
+    }
+
+    /// Whether a block is to be made ahead: fewer are empty (or being made)
+    /// than are wanted.
+    fn short_ahead(&self, now: u64, ripe: Ripe) -> bool {
+        ripe.ahead > 0
+            && self.may_grow(now)
+            && self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count() + self.making_ahead < ripe.ahead
+    }
+
+    /// The piece cut at `start` of block `i`, its memory, and whether it was
+    /// used before.
+    fn taken(&mut self, i: usize, start: u64, len: u64, ripe: Ripe) -> Option<(Piece, B, bool)> {
+        let block = self.blocks[i].as_mut()?;
+        if ripe.ahead > 0 && !ripe.is(block) {
+            let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
             }
         }
-        let block = self.blocks[i].as_mut()?;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
-    }
-
-    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
-        if now < self.retry_growth_at {
-            return None;
-        }
-        let block = make();
-        if block.is_none() {
-            self.retry_growth_at = now.saturating_add(500);
-        }
-        block
     }
 
     fn add(&mut self, memory: B, made: u64) -> usize {
@@ -396,6 +432,93 @@ static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [`Pool::take_ripe`] of a pool behind a lock, with blocks made while the
+/// lock is let go. Making one is a 64 MiB heap or upload buffer, made
+/// resident and waited for until it is mapped (`crate::host::resident`,
+/// `crate::host::mapped`): a tenth of a millisecond to some, but over a
+/// second near the card's budget (`MakeResident` waits for the system to
+/// evict first). Under the lock every thread that took a texture, or gave
+/// one back, waited for that.
+///
+/// `ripe` is asked again once a block is made: a block is ripe once the
+/// submissions begun before it was made have finished, so its mark is
+/// taken after the making (a mark taken before would be too low).
+///
+/// Two threads that both find no room may each make a block; the second
+/// is a block made ahead, or a spare that [`Pool::reclaim`] lets go.
+fn take_from<B: Clone + 'static>(
+    pool: &'static Mutex<Pool<B>>,
+    len: u64,
+    align: u64,
+    ripe: impl Fn() -> Ripe,
+    make: impl FnMut() -> Option<B>,
+) -> Option<(Piece, B, bool)> {
+    take_from_with(pool, len, align, ripe, make, None)
+}
+
+fn take_from_with<B: Clone + 'static>(
+    pool: &'static Mutex<Pool<B>>,
+    len: u64,
+    align: u64,
+    ripe: impl Fn() -> Ripe,
+    mut make: impl FnMut() -> Option<B>,
+    on_none_empty: Option<fn()>,
+) -> Option<(Piece, B, bool)> {
+    let first = ripe();
+    let mut p = lock(pool);
+    let (i, start) = match p.cut(len, align, now(), first)? {
+        Some(found) => found,
+        None => {
+            if !p.may_grow(now()) {
+                return None;
+            }
+            drop(p);
+            let made = make();
+            let mark = ripe().started;
+            p = lock(pool);
+            let Some(memory) = made else {
+                p.failed_growth(now());
+                return None;
+            };
+            p.add_and_cut(memory, mark, len, align)?
+        }
+    };
+    let ahead = p.short_ahead(now(), first);
+    if ahead {
+        p.making_ahead += 1;
+    }
+    let taken = p.taken(i, start, len, first);
+    let none_empty =
+        on_none_empty.is_some() && first.ahead == 0 && !p.blocks.iter().flatten().any(|b| b.free.whole(BLOCK));
+    drop(p);
+    if ahead {
+        /// Counts the block as made (or not) even if `make` unwinds.
+        struct Making<B: Clone + 'static>(&'static Mutex<Pool<B>>);
+        impl<B: Clone + 'static> Drop for Making<B> {
+            fn drop(&mut self) {
+                let mut p = lock(self.0);
+                p.making_ahead = p.making_ahead.saturating_sub(1);
+            }
+        }
+        let making = Making(pool);
+        let made = make();
+        let mark = ripe().started;
+        let mut p = lock(pool);
+        // Counted off under the same lock the block is added under.
+        std::mem::forget(making);
+        p.making_ahead = p.making_ahead.saturating_sub(1);
+        match made {
+            Some(memory) => {
+                p.add(memory, mark);
+            }
+            None => p.failed_growth(now()),
+        }
+    } else if none_empty && let Some(f) = on_none_empty {
+        f();
+    }
+    taken
 }
 
 /// Bytes of the pieces textures hold now.
@@ -527,7 +650,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let (piece, memory, again) = take_from(&STAGING, bytes, 512, || Ripe::ALL, || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -782,6 +905,63 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece, small: u64) {
     }
 }
 
+/// A new block of texture memory, resident and mapped (waited for).
+fn make_texture_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: BLOCK,
+        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    // SAFETY: plain creation.
+    if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+        crate::residency::allocation_error(&e);
+        tracing::warn!(error = %e, "no block of texture memory");
+    }
+    if let Some(h) = &heap
+        && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+    {
+        tracing::warn!(error = %e, "a block of texture memory is not resident");
+        return None;
+    }
+    heap
+}
+
+/// Whether one empty block of textures is kept made by a thread of ours,
+/// for the next texture no block has room for (`VICTORY_BLOCK_AHEAD=0`:
+/// none, the thread that needs it makes it, as before).
+fn block_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BLOCK_AHEAD").is_none_or(|v| v != "0"))
+}
+
+static MAKING_AHEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MADE_AHEAD: AtomicU64 = AtomicU64::new(0);
+
+/// Makes one empty block of textures on a thread of ours ([`block_ahead`]),
+/// unless one is being made.
+fn make_one_ahead() {
+    if !block_ahead() || !crate::resource::room_lately() || MAKING_AHEAD.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let made = std::thread::Builder::new().name("victory-block-ahead".into()).spawn(|| {
+        if let Some(host) = crate::host::host()
+            && let Some(heap) = make_texture_block(&host.device)
+        {
+            let mut pool = lock(&TEXTURES);
+            if !pool.blocks.iter().flatten().any(|b| b.free.whole(BLOCK)) {
+                pool.add(heap, crate::host::submissions().0);
+                MADE_AHEAD.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        MAKING_AHEAD.store(false, Ordering::Release);
+    });
+    if made.is_err() {
+        MAKING_AHEAD.store(false, Ordering::Release);
+    }
+}
+
 /// A texture of `desc` (no target, depth or unordered access) in a block;
 /// `None`: not pooled, or the host refused.
 ///
@@ -823,27 +1003,7 @@ pub(crate) unsafe fn texture(
         0
     };
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        // SAFETY: plain creation.
-        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
-            tracing::warn!(error = %e, "no block of texture memory");
-        }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
-        }
-        heap
-    })?;
+    let (piece, heap, again) = take_from_with(&TEXTURES, info.SizeInBytes, info.Alignment.max(1), Ripe::now, || make_texture_block(device), Some(make_one_ahead))?;
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -1003,6 +1163,132 @@ mod tests {
         assert!(none.take(65536, 65536, 0, || None).is_none());
     }
 
+    /// What a thread that only cuts pieces from a block with room waits for
+    /// while another thread makes new blocks of the card's memory, each a
+    /// heap of 64 MiB made resident and waited for until it is mapped, as
+    /// [`texture`] makes them: with the blocks made inside the pool's lock
+    /// ([`Pool::take_ripe`], the way it was) and with the lock let go
+    /// ([`take_from`]). Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn waits_for_a_piece_while_blocks_are_made() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        const BLOCKS: usize = 12;
+        let Some(host) = crate::host::host() else { return };
+        if let Some((_, name, _)) = victory_shader::emit::host::hardware_adapter() {
+            println!("adapter: {name}");
+        }
+        let make_block = |device: &ID3D12Device| -> Option<ID3D12Heap> {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: BLOCK,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            // SAFETY: plain creation.
+            unsafe { device.CreateHeap(&desc, &mut heap) }.ok()?;
+            let heap = heap?;
+            crate::host::resident(device, &heap).and_then(|()| crate::host::mapped(device)).ok()?;
+            Some(heap)
+        };
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        for inside in [true, false] {
+            let pool: &'static Mutex<Pool<ID3D12Heap>> = Box::leak(Box::new(Mutex::new(Pool::new(SPARE_KEPT))));
+            // The block the other thread cuts from: room for all its pieces.
+            assert!(take_from(pool, 256, 256, || Ripe::ALL, || make_block(&host.device)).is_some());
+            let done = AtomicBool::new(false);
+            let (makes, waits) = std::thread::scope(|s| {
+                let maker = s.spawn(|| {
+                    // A whole block each time, made ahead too: a new block for
+                    // every piece.
+                    let ripe = || Ripe { started: 0, finished: 0, ahead: 1 };
+                    let make = || make_block(&host.device);
+                    let mut makes = Vec::new();
+                    for _ in 0..BLOCKS {
+                        let began = Instant::now();
+                        let taken = if inside {
+                            lock(pool).take_ripe(BLOCK, 65536, now(), ripe(), make)
+                        } else {
+                            take_from(pool, BLOCK, 65536, ripe, make)
+                        };
+                        assert!(taken.is_some(), "a block of the card's memory");
+                        makes.push(began.elapsed());
+                    }
+                    done.store(true, Ordering::Release);
+                    makes
+                });
+                let mut waits = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    let began = Instant::now();
+                    let taken = take_from(pool, 256, 256, || Ripe::ALL, || panic!("the first block has room"));
+                    waits.push(began.elapsed());
+                    assert!(taken.is_some());
+                    std::thread::yield_now();
+                }
+                (maker.join().unwrap(), waits)
+            });
+            let mut sorted = waits.clone();
+            sorted.sort_unstable();
+            let at = |q: f64| sorted[((sorted.len() - 1) as f64 * q) as usize];
+            println!(
+                "blocks made {}: {BLOCKS} pieces that each made blocks, {:.2} ms each on average; {} pieces cut from a block with \
+                 room meanwhile: median {:.4} ms, 99th percentile {:.3} ms, longest {:.3} ms, {:.1} ms in all",
+                if inside { "inside the lock (before)" } else { "with the lock let go (after)" },
+                ms(makes.iter().sum::<Duration>()) / BLOCKS as f64,
+                sorted.len(),
+                ms(at(0.5)),
+                ms(at(0.99)),
+                ms(*sorted.last().unwrap()),
+                ms(waits.iter().sum()),
+            );
+            // The card's memory back.
+            let mut p = lock(pool);
+            p.blocks.clear();
+            p.resting.clear();
+        }
+    }
+
+    /// A block is made with the pool's lock let go (making one waits for
+    /// residency, up to a second near the card's budget), it is marked with
+    /// the submissions begun after its making, and a block made ahead is
+    /// counted off again whether it was made or not.
+    #[test]
+    fn blocks_are_made_with_the_pool_let_go() {
+        static POOL: Mutex<Pool<u64>> = Mutex::new(Pool::new(SPARE_KEPT));
+        let made = std::cell::Cell::new(0u64);
+        let make = || {
+            assert!(POOL.try_lock().is_ok(), "a block was made with the pool's lock held");
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        // Ten more submissions begun for every block made: a mark taken
+        // before a making would be ten lower.
+        let ripe = || Ripe { started: made.get() * 10, finished: 0, ahead: 2 };
+        let (piece, memory, again) = take_from(&POOL, BLOCK / 2, 65536, ripe, make).unwrap();
+        assert_eq!((piece.start, memory, again), (0, 1, false));
+        assert_eq!(made.get(), 2, "one more made ahead");
+        {
+            let p = lock(&POOL);
+            let marks: Vec<u64> = p.blocks.iter().flatten().map(|b| b.made).collect();
+            assert_eq!(marks, [10, 20]);
+            assert_eq!(p.making_ahead, 0);
+        }
+        // Block 2 is empty, so one more is made ahead; then that one fails.
+        assert_eq!(take_from(&POOL, BLOCK / 2, 65536, ripe, make).unwrap().1, 1);
+        assert_eq!(made.get(), 3);
+        let refuse = || {
+            assert!(POOL.try_lock().is_ok(), "a block was made with the pool's lock held");
+            None
+        };
+        let full = || Ripe { started: 100, finished: 100, ahead: 4 };
+        assert!(take_from(&POOL, BLOCK / 2, 65536, full, refuse).is_some(), "cut from a block there is");
+        let p = lock(&POOL);
+        assert_eq!(p.making_ahead, 0, "a block not made is counted off");
+        assert!(!p.may_grow(now()), "and blocks are not asked for again at once");
+    }
+
     #[test]
     fn pieces_come_from_blocks_older_than_the_lists_that_run() {
         let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
@@ -1073,5 +1359,44 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn an_empty_block_is_made_ahead_once_none_is_left() {
+        let Some(host) = crate::host::host() else { return };
+        if !block_ahead() || ahead() != 0 || !crate::resource::room_lately() {
+            return;
+        }
+        let made_before = MADE_AHEAD.load(Ordering::Relaxed);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2048,
+            Height: 2048,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let empty = || lock(&TEXTURES).blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            // SAFETY: a valid description.
+            held.extend(unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) });
+            if empty() == 0 {
+                break;
+            }
+        }
+        let began = std::time::Instant::now();
+        while empty() == 0 && began.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(empty() >= 1, "no block was made ahead");
+        while MAKING_AHEAD.load(Ordering::Acquire) && began.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!MAKING_AHEAD.load(Ordering::Acquire), "the thread that makes it ahead did not end");
+        assert!(MADE_AHEAD.load(Ordering::Relaxed) > made_before, "the empty block is not one made ahead");
+        drop(held);
     }
 }

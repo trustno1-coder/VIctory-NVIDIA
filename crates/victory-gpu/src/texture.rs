@@ -113,8 +113,30 @@ struct Last {
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
-/// and after the hash found a change the guard did not see.
-const HOT_FRAMES: u64 = 64;
+/// and after the hash found a change the guard did not see
+/// (`VICTORY_TEXTURE_HOT_FRAMES`, default 64).
+fn hot_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_HOT_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64)
+    })
+}
+
+/// How often (in frames) a guarded texture is re-hashed even when the guard
+/// saw no write (`VICTORY_TEXTURE_HASH_EVERY`, default 8; 0 disables blind
+/// periodic re-hashing).
+fn hash_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_HASH_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(8)
+    })
+}
 
 /// Whether a guarded texture whose memory the hash found changed although
 /// the guard saw no write is hashed at every check for a while
@@ -1481,19 +1503,21 @@ impl Staging {
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
+            let every = hash_every();
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame
-                .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+            let turn = every != 0
+                && frame
+                    .wrapping_add((start >> 16) as u64)
+                    .is_multiple_of(every);
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
+            let hot_len = hot_frames();
             if last.hot_until == 0 {
-                last.hot_until = frame + HOT_FRAMES;
+                last.hot_until = frame + hot_len;
             }
-            let hot = hot_textures() && frame < last.hot_until;
+            let hot = hot_len != 0 && hot_textures() && frame < last.hot_until;
             if !exact && unwritten && !turn && !hot {
                 return 0;
             }
@@ -1501,8 +1525,9 @@ impl Staging {
         }
         // A change the guard did not see: hashed at every check for a while.
         let found_blind = |last: &mut Last| {
-            if blind && hot_textures() {
-                last.hot_until = crate::frame::current() + HOT_FRAMES;
+            let hot_len = hot_frames();
+            if blind && hot_len != 0 && hot_textures() {
+                last.hot_until = crate::frame::current() + hot_len;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHot, 1);
             }
@@ -1752,6 +1777,15 @@ impl Staging {
                 linear.fill(0);
                 continue;
             }
+            if let Some((from, to)) = mip_tiled_range(&self.layout, mip, slice)
+                && to <= tiled.len()
+                && is_all_zero(&tiled[from..to])
+            {
+                // Unmapped or zeroed mip (e.g. streamed texture with mip 0 not
+                // resident yet): detiling zeros always yields zeros.
+                linear.fill(0);
+                continue;
+            }
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
@@ -1761,6 +1795,38 @@ impl Staging {
             }
         }
     }
+}
+
+/// Byte range in `tiled` for `(mip, slice)` when it is a contiguous individual
+/// mip (non-3D and before `first_tail_mip`).
+fn mip_tiled_range(layout: &victory_formats::texture::Layout, mip: u32, slice: u32) -> Option<(usize, usize)> {
+    if layout.desc.dimension == victory_formats::texture::Dimension::Tex3d
+        || mip >= layout.first_tail_mip
+        || slice >= layout.slices
+    {
+        return None;
+    }
+    let m = layout.mips.get(mip as usize)?;
+    let end = if mip == 0 {
+        layout.slice_size
+    } else {
+        layout.mips.get(mip as usize - 1)?.offset
+    };
+    if m.offset >= end {
+        return None;
+    }
+    let base = slice as u64 * layout.slice_size;
+    let from = usize::try_from(base.checked_add(m.offset)?).ok()?;
+    let to = usize::try_from(base.checked_add(end)?).ok()?;
+    Some((from, to))
+}
+
+fn is_all_zero(bytes: &[u8]) -> bool {
+    // SAFETY: `align_to::<u128>` is safe for `u8` slices; `u128` has no invalid bit patterns.
+    let (head, body, tail) = unsafe { bytes.align_to::<u128>() };
+    head.iter().all(|&b| b == 0)
+        && body.iter().all(|&w| w == 0)
+        && tail.iter().all(|&b| b == 0)
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -2361,6 +2427,32 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    #[test]
+    fn zero_mip_range_is_detected_for_non_tail_mips() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 512,
+            height: 512,
+            depth: 1,
+            mips: 10,
+            samples: 1,
+            element_bytes: 16,
+            block: 4,
+            swizzle: Swizzle::LINEAR,
+        };
+        let layout = Layout::new(&desc).expect("valid layout");
+        let mut tiled = vec![0u8; layout.size as usize];
+        let (from0, to0) = super::mip_tiled_range(&layout, 0, 0).expect("mip 0 range");
+        assert!(super::is_all_zero(&tiled[from0..to0]));
+        tiled[from0 + 7] = 1;
+        assert!(!super::is_all_zero(&tiled[from0..to0]));
+        assert!(super::is_all_zero(&[0u8; 31]));
+        assert!(!super::is_all_zero(&[0, 0, 0, 1, 0, 0]));
+        assert_eq!(super::hash_every(), 8);
+        assert_eq!(super::hot_frames(), 64);
     }
 }
 

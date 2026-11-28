@@ -149,9 +149,12 @@ impl Heap {
         self.host
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
-                for i in pending.drain(..) {
-                    h.mirror(i, self.start + u64::from(i) * step, false);
+                let mut h = host::HostHeap::new(self.samplers(), self.desc.count)?;
+                {
+                    let mut batch = host::QueueFlusher::new_unpublished(&mut h);
+                    for i in pending.drain(..) {
+                        batch.mirror(i, self.start + u64::from(i) * step, false);
+                    }
                 }
                 Some(h)
             })
@@ -204,6 +207,12 @@ fn mirror(handle: u64) {
     let Some(index) = heap.index(handle) else {
         return;
     };
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            host.mirror(index, handle, false);
+        }
+        return;
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -211,6 +220,85 @@ fn mirror(handle: u64) {
             drop(pending);
             if let Some(host) = host {
                 host.mirror(index, handle, false);
+            }
+        }
+    }
+}
+
+/// Mirrors `count` consecutive descriptors of stride `step` starting at `dst`,
+/// hoisting the `SHADER_HEAPS` lookup when
+/// `count > 1` and the range lies inside a single shader-visible heap.
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    if count == 0 {
+        return;
+    }
+    if count == 1 {
+        mirror(dst);
+        return;
+    }
+    let Some(len) = u64::from(count).checked_mul(step) else {
+        return;
+    };
+    let Some(range_end) = dst.checked_add(len) else {
+        return;
+    };
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut overlaps = heaps.iter().filter(|&&(start, end, _)| dst < end && start < range_end);
+    let Some(&(start, end, at)) = overlaps.next() else {
+        return;
+    };
+    if dst < start || range_end > end || overlaps.next().is_some() {
+        drop(heaps);
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    };
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+    // the `SHADER_HEAPS` lock we hold here.
+    let heap = unsafe { &*(at as *const Heap) };
+    let Some(first) = heap.index(dst) else {
+        return;
+    };
+    let Some(heap_step) = increment(heap.desc.kind).map(u64::from) else {
+        return;
+    };
+    if heap_step != step || dst - start != u64::from(first) * step {
+        drop(heaps);
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    }
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            for i in 0..count {
+                let index = first + i;
+                if index >= heap.desc.count {
+                    break;
+                }
+                host.mirror(index, dst + u64::from(i) * step, false);
+            }
+        }
+        return;
+    }
+    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+    match heap.host.get() {
+        None => {
+            let avail = heap.desc.count.saturating_sub(first).min(count);
+            pending.extend(first..first + avail);
+        }
+        Some(host) => {
+            drop(pending);
+            if let Some(host) = host {
+                for i in 0..count {
+                    let index = first + i;
+                    if index >= heap.desc.count {
+                        break;
+                    }
+                    host.mirror(index, dst + u64::from(i) * step, false);
+                }
             }
         }
     }
@@ -1019,7 +1107,7 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
 /// A shader view or sampler as the title described it (descriptions in the
 /// host's layout, kept as words), for the host to build its own from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
@@ -1076,16 +1164,53 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+/// Fast non-cryptographic 64-bit hasher for internal view/shape lookup maps
+/// (keeps lock hold times O(1) without extra crate dependencies).
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut h = self.0;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let v = u64::from_ne_bytes(c.try_into().expect("8-byte chunk"));
+            h = (h.rotate_left(5) ^ v).wrapping_mul(K);
+        }
+        for &b in chunks.remainder() {
+            h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(K);
+        }
+        self.0 = h;
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(i)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+}
+
+type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
+
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
-    index: std::collections::BTreeMap<View, u32>,
+    index: FastMap<View, u32>,
     /// Entries naming each resource.
-    by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
+    by_resource: FastMap<usize, Vec<u32>>,
     free: Vec<u32>,
-    /// The shapes of views of placed memory, and where each is.
-    shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
     /// Entries of views that no resource releases (constant buffer views
     /// and views of placed memory that did not fit a record), oldest first,
     /// with the generation each was made at: past [`ownerless_cap`] the
@@ -1093,19 +1218,45 @@ struct Views {
     ownerless: std::collections::VecDeque<(u32, u32)>,
 }
 
+/// Append-only table of placed-view shapes, kept under its own `RwLock` so
+/// frequent `PLACED` lookups across recording threads never stall behind
+/// `VIEWS` resource-creation or `forget` writes.
+struct ViewShapes {
+    /// The shapes of views of placed memory, and where each is.
+    shapes: Vec<Shape>,
+    shape_index: FastMap<Shape, u32>,
+}
+
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
-/// world. Readers share it; only a view not seen before (a new table entry
-/// or shape) and a released resource take it alone.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
-    list: Vec::new(),
-    index: std::collections::BTreeMap::new(),
-    by_resource: std::collections::BTreeMap::new(),
-    free: Vec::new(),
-    shapes: Vec::new(),
-    shape_index: std::collections::BTreeMap::new(),
-    ownerless: std::collections::VecDeque::new(),
-});
+/// world. Readers share it; only a view not seen before (a new table entry)
+/// and a released resource take it alone.
+static VIEWS: std::sync::OnceLock<std::sync::RwLock<Views>> = std::sync::OnceLock::new();
+
+static VIEW_SHAPES: std::sync::OnceLock<std::sync::RwLock<ViewShapes>> = std::sync::OnceLock::new();
+
+#[inline]
+fn views_lock() -> &'static std::sync::RwLock<Views> {
+    VIEWS.get_or_init(|| {
+        std::sync::RwLock::new(Views {
+            list: Vec::new(),
+            index: FastMap::default(),
+            by_resource: FastMap::default(),
+            free: Vec::new(),
+            ownerless: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+#[inline]
+fn shapes_lock() -> &'static std::sync::RwLock<ViewShapes> {
+    VIEW_SHAPES.get_or_init(|| {
+        std::sync::RwLock::new(ViewShapes {
+            shapes: Vec::new(),
+            shape_index: FastMap::default(),
+        })
+    })
+}
 
 /// How many table entries of views without a resource are kept
 /// ([`Views::ownerless`]). Once the shapes of placed views are full (the
@@ -1231,7 +1382,7 @@ fn shape_census(shape: &Shape, count: usize) {
             set.insert(w);
         }
     }
-    if count == 1000 || (count > 0 && count % 50_000 == 0) {
+    if count == 1000 || (count > 0 && count.is_multiple_of(50_000)) {
         let distinct: Vec<String> = seen.iter().map(|s| s.len().to_string()).collect();
         let last: Vec<String> = words.iter().map(|w| format!("{w:x}")).collect();
         tracing::info!(
@@ -1249,7 +1400,7 @@ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
     kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
 }
 
-impl Views {
+impl ViewShapes {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
     fn shape(&mut self, shape: Shape) -> Option<u32> {
@@ -1278,6 +1429,9 @@ impl Views {
         desc[12..].copy_from_slice(&rest[10..]);
         Some(View::Placed(unordered, resource, desc))
     }
+}
+
+impl Views {
 
     /// The record words of `view` as a table entry, if it has one.
     fn entry_of(&self, view: &View) -> Option<[u32; 2]> {
@@ -1362,8 +1516,8 @@ fn words_for(view: View) -> [u32; 2] {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
-                    let shape = known.or_else(|| views_write().shape(shape));
+                    let known = shapes_read().shape_index.get(&shape).copied();
+                    let shape = known.or_else(|| shapes_write().shape(shape));
                     if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
@@ -1381,12 +1535,13 @@ fn words_for(view: View) -> [u32; 2] {
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    match VIEWS.try_read() {
+    let lock = views_lock();
+    match lock.try_read() {
         Ok(views) => views,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             let started = std::time::Instant::now();
-            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            let views = lock.read().unwrap_or_else(|e| e.into_inner());
             waited(1, started);
             views
         }
@@ -1394,14 +1549,43 @@ fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    match VIEWS.try_write() {
+    let lock = views_lock();
+    match lock.try_write() {
         Ok(views) => views,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             let started = std::time::Instant::now();
-            let views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+            let views = lock.write().unwrap_or_else(|e| e.into_inner());
             waited(1, started);
             views
+        }
+    }
+}
+
+fn shapes_read() -> std::sync::RwLockReadGuard<'static, ViewShapes> {
+    let lock = shapes_lock();
+    match lock.try_read() {
+        Ok(shapes) => shapes,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let shapes = lock.read().unwrap_or_else(|e| e.into_inner());
+            waited(1, started);
+            shapes
+        }
+    }
+}
+
+fn shapes_write() -> std::sync::RwLockWriteGuard<'static, ViewShapes> {
+    let lock = shapes_lock();
+    match lock.try_write() {
+        Ok(shapes) => shapes,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let shapes = lock.write().unwrap_or_else(|e| e.into_inner());
+            waited(1, started);
+            shapes
         }
     }
 }
@@ -1418,6 +1602,7 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
 pub(crate) fn views_kept() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
     let views = views_read();
+    let shapes = shapes_read();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
     let (mut constants, mut placed) = (0, 0);
@@ -1433,11 +1618,11 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.free.len() as u64,
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
-            + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+            + shapes.shapes.capacity() as u64 * shape
+            + shapes.shape_index.len() as u64 * shape * 3 / 2,
         constants,
         placed,
-        views.shapes.len() as u64,
+        shapes.shapes.len() as u64,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
     ]
@@ -1657,6 +1842,9 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
+    if !views_read().by_resource.contains_key(&resource) {
+        return;
+    }
     let mut views = views_write();
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
@@ -1687,7 +1875,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => shapes_read().placed_of(i, generation),
         _ => None,
     }
 }
@@ -1704,6 +1892,11 @@ pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
+    view_with_key(handle).map(|(_, view)| view)
+}
+
+/// The `(key, view)` recorded at `handle`, if one is (and its resource is alive).
+pub(crate) fn view_with_key(handle: u64) -> Option<(u64, View)> {
     if handle == 0 {
         return None;
     }
@@ -1712,7 +1905,8 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     if tag != VIEW_TAG {
         return None;
     }
-    view_at(i, generation)
+    let key = u64::from(generation) << 32 | u64::from(i);
+    view_at(i, generation).map(|view| (key, view))
 }
 
 /// A description of `N` words, if the title passes one.
@@ -1901,9 +2095,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
         };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_range(dst, count, step);
     }
 }
 
@@ -2324,11 +2516,9 @@ mod tests {
     fn ownerless_entries_are_capped() {
         let mut views = Views {
             list: Vec::new(),
-            index: std::collections::BTreeMap::new(),
-            by_resource: std::collections::BTreeMap::new(),
+            index: FastMap::default(),
+            by_resource: FastMap::default(),
             free: Vec::new(),
-            shapes: Vec::new(),
-            shape_index: std::collections::BTreeMap::new(),
             ownerless: std::collections::VecDeque::new(),
         };
         let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
@@ -2422,8 +2612,8 @@ mod tests {
             View::Placed(_, r, _) => *r == kept,
             _ => false,
         };
-        let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == kept).count();
+        let entries = || views_read().list.iter().filter(|(v, _)| mine(v)).count();
+        let shapes = || shapes_read().shapes.iter().filter(|s| s.1 == kept).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
@@ -2507,5 +2697,51 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod audit_regressions {
+    use super::*;
+    #[test]
+    fn audit_range_matches_individual_with_aliases() {
+        let memory = [0u64; 16];
+        let start = memory.as_ptr() as u64;
+        let register = |start, count| {
+            let h = Box::new(Heap {
+                object: Object::new(&FUNCTIONS),
+                desc: HeapDesc {
+                    kind: 0,
+                    count,
+                    flags: SHADER_VISIBLE,
+                    nodes: 0,
+                },
+                start,
+                memory: None,
+                host: Default::default(),
+                pending: Default::default(),
+                written: None,
+            });
+            SHADER_HEAPS.write().unwrap().push((
+                start,
+                start + u64::from(count) * 32,
+                &*h as *const Heap as usize,
+            ));
+            h
+        };
+        let earlier = register(start + 32, 1);
+        let later = register(start, 3);
+        for i in 0..3 {
+            mirror(start + i * 32);
+        }
+        let take = || {
+            (
+                std::mem::take(&mut *earlier.pending.lock().unwrap()),
+                std::mem::take(&mut *later.pending.lock().unwrap()),
+            )
+        };
+        let expected = take();
+        mirror_range(start, 3, 32);
+        assert_eq!(take(), expected);
     }
 }
