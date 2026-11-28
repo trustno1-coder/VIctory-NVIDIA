@@ -7314,6 +7314,10 @@ impl HostList {
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
         for target in wanted {
+            // After deduplication, skip copies the CPU tiler would discard.
+            if !target.can_land() {
+                continue;
+            }
             self.settle(&target.copy, COPY_SOURCE);
             if let Some(back) = crate::texback::record(&self.list, target) {
                 self.deferred().texture_backs.push(back);

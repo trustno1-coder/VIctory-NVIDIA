@@ -122,6 +122,19 @@ impl Target {
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+
+    pub(crate) fn can_land(&self) -> bool {
+        if self.layout.addressable() {
+            return true;
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(
+            swizzle = self.layout.desc.swizzle.0,
+            samples = self.layout.desc.samples,
+            "texture readback skipped: tiling this console layout is unsupported"
+        ));
+        false
+    }
 }
 
 /// The readback resources and the allocation the pixels belong to.

@@ -3987,6 +3987,48 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    #[ignore = "requires VICTORY_D3D12_WARP=1 and a texture readback for 256x256f41"]
+    fn only_addressable_textures_record_readbacks() {
+        use victory_formats::texture::Swizzle;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT;
+        use windows::Win32::Graphics::Dxgi::IDXGIAdapter1;
+        use windows::core::Interface;
+
+        assert!(crate::switch::on("VICTORY_D3D12_WARP"));
+        let adapter: IDXGIAdapter1 = crate::host::warp_adapter().unwrap().cast().unwrap();
+        let host = crate::host::host().expect("D3D12 software device");
+        // SAFETY: these are live DXGI adapter and device queries.
+        let (adapter_desc, device_luid) = unsafe { (adapter.GetDesc1().unwrap(), host.device.GetAdapterLuid()) };
+        assert_eq!(adapter_desc.VendorId, 0x1414);
+        assert_eq!(adapter_desc.AdapterLuid.HighPart, device_luid.HighPart);
+        assert_eq!(adapter_desc.AdapterLuid.LowPart, device_luid.LowPart);
+
+        for (swizzle, supported) in [(Swizzle::SW_4KB_S, true), (Swizzle::SW_64KB_R_X, false)] {
+            let desc = ResourceDesc {
+                layout: 0x100 | swizzle.0,
+                ..texture(256, 256, DXGI_FORMAT_R32_FLOAT.0 as u32, 1)
+            };
+            let null = std::ptr::null();
+            let mut title = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut title),
+                S_OK
+            );
+            assert!(crate::texback::wanted(title));
+            assert!(host_copy(title).is_some(), "both layouts have a host texture");
+            let list = host.new_list().unwrap();
+            list.texture_written(title);
+            list.texture_written(title);
+            list.close();
+            let recorded = list.has_recorded_work();
+            drop(list);
+            resource_release(title);
+            assert_eq!(recorded, supported, "swizzle {}", swizzle.0);
+        }
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,
