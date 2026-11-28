@@ -109,6 +109,25 @@ mod tests {
         );
     }
 
+    /// ExitProcess is an exit a title can reach without the CRT's exit:
+    /// it must be ours, so the loader's process-detach notices run before
+    /// the host ends the process.
+    #[test]
+    fn exit_process_resolves_to_our_export() {
+        let r = HleResolver::default();
+        for dll in [
+            "kernel32.dll",
+            "kernelbase.dll",
+            "api-ms-win-core-processthreads-l1-1-0.dll",
+        ] {
+            assert_eq!(
+                r.classify(dll, &name("ExitProcess")),
+                Some(Provenance::Hle),
+                "{dll}"
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn shared_api_sets_pass_through_to_host() {
