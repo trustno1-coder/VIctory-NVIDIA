@@ -1,6 +1,8 @@
 //! Fingerprints the shader translator, so that cached translations
 //! (`src/shader_cache.rs`) last until the translator itself changes and not
-//! only until the next build of anything.
+//! only until the next build of anything. Also sets `cfg(agility_runtime)` for
+//! the unit-test executable when the D3D12 runtime staged by
+//! `cargo xtask agility` is present.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +18,7 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(agility_runtime)");
     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
     let crates = here.join("..");
     let root = crates.join("..");
@@ -42,4 +45,26 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-env=VICTORY_TRANSLATOR={}", hash.finalize().to_hex());
+
+    // D3D12 uses the runtime an executable names only if it is there: with the
+    // exports but no D3D12Core.dll, device creation fails. So the tests export
+    // them only when the runtime is staged; without it they use the in-box
+    // runtime. The exports are a linker directive in src/agility.rs, which
+    // only the unit-test executable has: a link argument from here would
+    // reach the integration tests too, which lack the symbols.
+    // OUT_DIR is <target>/<profile>/build/<package>-<hash>/out.
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+    let Some(profile) = out.ancestors().nth(3) else {
+        return;
+    };
+    let core = profile.join("D3D12").join("D3D12Core.dll");
+    let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    if msvc && core.exists() {
+        println!("cargo::rerun-if-changed={}", core.display());
+        println!("cargo::rustc-cfg=agility_runtime");
+    } else {
+        // Watching a missing file would rebuild the crate every time;
+        // `cargo xtask agility` touches this file instead.
+        println!("cargo::rerun-if-changed=build.rs");
+    }
 }
