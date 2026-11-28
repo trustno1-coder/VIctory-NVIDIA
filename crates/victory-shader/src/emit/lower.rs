@@ -793,6 +793,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             Fields::Buffer { data, .. } if name.contains("_atomic_") || name.contains("_store_") => {
                 data.iter().copied().collect()
             }
+            Fields::Ds { data, gds: false, .. } if name.starts_with("ds_") && name.contains("_rtn_") => {
+                data.to_vec()
+            }
             _ => Vec::new(),
         };
         let kinds: Vec<Wave> = ops.iter().map(|o| of(kind, val(o))).collect();
@@ -881,19 +884,19 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
             }
             // the reservation: the first lane adds its wave's total to a shared counter
-            (_, [Wave::Total(op)]) if name.contains("_atomic_") => {
+            (_, [Wave::Total(op)]) if name.contains("_atomic_") || name.starts_with("ds_") && name.contains("_rtn_") => {
                 let want = match op {
-                    Op::AddU => "buffer_atomic_add",
-                    Op::MinU => "buffer_atomic_umin",
-                    Op::MaxU => "buffer_atomic_umax",
-                    Op::MinI => "buffer_atomic_smin",
-                    Op::MaxI => "buffer_atomic_smax",
-                    Op::Or => "buffer_atomic_or",
-                    Op::And => "buffer_atomic_and",
-                    Op::Xor => "buffer_atomic_xor",
-                    _ => "",
+                    Op::AddU => ("buffer_atomic_add", "ds_add_rtn_u32"),
+                    Op::MinU => ("buffer_atomic_umin", "ds_min_rtn_u32"),
+                    Op::MaxU => ("buffer_atomic_umax", "ds_max_rtn_u32"),
+                    Op::MinI => ("buffer_atomic_smin", "ds_min_rtn_i32"),
+                    Op::MaxI => ("buffer_atomic_smax", "ds_max_rtn_i32"),
+                    Op::Or => ("buffer_atomic_or", "ds_or_rtn_b32"),
+                    Op::And => ("buffer_atomic_and", "ds_and_rtn_b32"),
+                    Op::Xor => ("buffer_atomic_xor", "ds_xor_rtn_b32"),
+                    _ => ("", ""),
                 };
-                if name != want || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                if (name != want.0 && name != want.1) || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
                     return Err(TOTAL);
                 }
                 reserved = true;
@@ -1753,9 +1756,13 @@ impl<'a> Lower<'a> {
         let mut pair_waves = 0;
         // (and only around the LDS accesses whose order counts)
         let lds_order = {
-            let all = if PAIR_MEETINGS.get() || loop_atomics_on() { lds_order(p, x.st) } else { LdsOrder::default() };
+            let all = if PAIR_MEETINGS.get() || LOCAL_WAVES.get() || loop_atomics_on() {
+                lds_order(p, x.st)
+            } else {
+                LdsOrder::default()
+            };
             let looped = if loop_atomics_on() { all.looped } else { HashSet::new() };
-            if PAIR_MEETINGS.get() {
+            if PAIR_MEETINGS.get() || LOCAL_WAVES.get() {
                 LdsOrder { looped, unordered: all.unordered, unstable: all.unstable }
             } else {
                 LdsOrder { looped, ..LdsOrder::default() }
@@ -1845,8 +1852,11 @@ impl<'a> Lower<'a> {
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
+                                // (local waves never exchange across halves)
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                if !LOCAL_WAVES.get() {
+                                    s.lds_dwords += 2 * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -1892,8 +1902,10 @@ impl<'a> Lower<'a> {
             }
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+                if !LOCAL_WAVES.get() || s.lds_dwords < HOST_LDS_DWORDS {
+                    halves = Some(s.lds_dwords);
+                    s.lds_dwords += 1;
+                }
                 if PAIR_MEETINGS.get() && group > 64 && group % 64 == 0 && (split_lds || exchange.is_some()) {
                     // a counter per console wave, then two exchange buffers of four dwords each
                     pairs = Some(s.lds_dwords);
@@ -4562,7 +4574,7 @@ impl<'a> Lower<'a> {
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
     /// wave holds a 32-aligned run of console lanes. Without `exchange` or `halves`: the host lane.
     fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() && self.halves.is_none() {
+        if self.halves.is_none() && (self.local || self.exchange.is_none()) {
             return self.lane_index();
         }
         if let Some(v) = self.clane {
