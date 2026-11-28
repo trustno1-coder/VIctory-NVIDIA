@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod glyphs;
 mod inspect;
 #[cfg(windows)]
 mod play;
@@ -360,6 +361,23 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// PlayStation button prompts (and with --picture the Settings
+    /// controller picture) built from your copy of the game, written as a
+    /// VICTORY_FILE_PATCH list into the cache folder. Prompt symbols:
+    /// Kenney's Input Prompts (CC0); the picture is a PNG of yours (a
+    /// DualSense, any size, RGBA with transparency). A start with
+    /// VICTORY_PS_PROMPTS=1 builds the same list by itself.
+    Glyphs {
+        /// The game folder (default: the configured one).
+        #[arg(long)]
+        game: Option<PathBuf>,
+        /// The Settings controller picture: a PNG, any size, with transparency.
+        #[arg(long)]
+        picture: Option<PathBuf>,
+        /// Where to write (default: <cache>/file-patches/playstation).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Run a captured frame's GPU work again (diagnostics builds; see
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -528,6 +546,7 @@ fn main() -> Result<()> {
             victory_hle::runtime::set_title_args(title_args);
             run::run(&exe, unimplemented, strict, execute, console)
         }
+        Command::Glyphs { game, picture, out } => glyphs::run(game, picture, out),
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),

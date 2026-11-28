@@ -43,6 +43,10 @@ walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
+# PNG decoding (MIT/Apache-2.0, pure Rust): a picture the user supplies (the Settings controller picture).
+png = "0.18.1"
+# Zopfli deflate encoder (Apache-2.0, pure Rust): rebuilt archive entries must fit the original stream length.
+zopfli = { version = "0.8.4", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
