@@ -117,22 +117,58 @@ pub(crate) fn know(samplers: &[StaticSampler]) {
     sync(&host.device, &words);
 }
 
-fn aniso_point_mip(device: &ID3D12Device) -> bool {
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        // SAFETY: the feature query writes the structure of the given size
-        // (as `host::HostPipeline::new` asks it).
-        unsafe {
-            device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS19,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }
-        .is_ok()
-            && options.AnisoFilterWithPointMipSupported.as_bool()
-    })
+struct HeldDevice(#[allow(dead_code)] ID3D12Device);
+
+// SAFETY: `ID3D12Device` is a free-threaded COM object; held only to keep its
+// reference count positive so its raw pointer cannot be reused by a new device.
+unsafe impl Send for HeldDevice {}
+// SAFETY: as above.
+unsafe impl Sync for HeldDevice {}
+
+fn query_aniso_point_mip(device: &ID3D12Device) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    // SAFETY: the feature query writes the structure of the given size.
+    // Older runtimes may not recognize OPTIONS19; that means no support.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS19,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_ok()
+        && options.AnisoFilterWithPointMipSupported.as_bool()
+}
+
+/// Whether `device` supports `AnisoFilterWithPointMipSupported` (`D3D12_OPTIONS19`),
+/// cached per `ID3D12Device` while retaining a COM reference so raw device pointers
+/// cannot suffer ABA reuse across temporary test devices.
+pub(super) fn aniso_point_mip(device: &ID3D12Device) -> bool {
+    use windows::core::Interface;
+    static FIRST: OnceLock<(usize, HeldDevice, bool)> = OnceLock::new();
+    let raw = device.as_raw() as usize;
+    let &(first_raw, _, first_val) = FIRST.get_or_init(|| {
+        (raw, HeldDevice(device.clone()), query_aniso_point_mip(device))
+    });
+    if first_raw == raw {
+        return first_val;
+    }
+    static OTHERS: RwLock<Vec<(usize, HeldDevice, bool)>> = RwLock::new(Vec::new());
+    if let Some(&(_, _, val)) = OTHERS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|&&(d, _, _)| d == raw)
+    {
+        return val;
+    }
+    let val = query_aniso_point_mip(device);
+    let mut others = OTHERS.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, _, existing)) = others.iter().find(|&&(d, _, _)| d == raw) {
+        return existing;
+    }
+    others.push((raw, HeldDevice(device.clone()), val));
+    val
 }
 
 fn words(s: &StaticSampler, aniso_point_mip_supported: bool) -> Words {

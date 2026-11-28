@@ -560,6 +560,9 @@ pub(crate) struct State {
     recording: u64,
     /// See [`State::rebinds`].
     rebinds: [u64; 2],
+    /// Calls to `SetGraphicsRootSignature` / `SetComputeRootSignature` on the host list (tests).
+    #[cfg(test)]
+    pub(crate) root_binds: [u64; 2],
 }
 
 impl Drop for State {
@@ -1375,6 +1378,11 @@ impl State {
         self.rebinds
     }
 
+    #[cfg(test)]
+    pub(crate) fn host_roots(&self) -> [usize; 2] {
+        self.host_roots
+    }
+
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
         if compute {
             &mut self.compute
@@ -1931,6 +1939,10 @@ impl State {
         TESTED_DEPTH.set((tested, false));
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
+            #[cfg(test)]
+            {
+                self.root_binds[usize::from(compute)] += 1;
+            }
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
