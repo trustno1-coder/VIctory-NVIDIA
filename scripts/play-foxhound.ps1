@@ -7,13 +7,21 @@
 #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)
 #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
+#   .\scripts\play-foxhound.ps1 -Exe ... -LogDir D:\perf -LogTag baseline       log to that folder, named for the run
+#   .\scripts\play-foxhound.ps1 -Exe ... -Build diag -LogLevel debug -LogFileOnly
+#                                                             everything to files only (for measuring: see -LogFileOnly)
+#   .\scripts\play-foxhound.ps1 -Exe ... -LogFilter 'victory_gpu::host=debug,info'   one module at debug, the rest info
+#
+# The log options can come from the environment too, for the .cmd launchers: VICTORY_LOG_DIR (-LogDir),
+# VICTORY_LOG (-LogLevel or -LogFilter), VICTORY_LOG_TAG (-LogTag), VICTORY_LOG_FILE_ONLY=1 (-LogFileOnly).
 #
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
 # victory-settings.txt in the repository's folder and is applied here at every start, over the options above;
 # delete that file to go back to them.
 #
 # Build first (README). Run from a normal window, not as administrator. Each run writes a log to
-# %LOCALAPPDATA%\victory\logs. Every VICTORY_... switch is described in a comment where the code reads it.
+# %LOCALAPPDATA%\victory\logs (or -LogDir). It begins with the machine, the build and every switch, so that
+# two runs' logs can be compared. Every VICTORY_... switch is described in a comment where the code reads it.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [ValidateSet('diag', 'release')][string]$Build = 'release',
@@ -44,12 +52,36 @@ param(
     # Every shader and the loading pipelines made first (`victory preload`), then the game; the F1 menu's
     # PRELOAD SHADERS starts this again with it.
     [switch]$Preload,
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    # The folder the run's log goes to (made if it is not there). Default: %LOCALAPPDATA%\victory\logs.
+    [string]$LogDir = '',
+    # A word added to the log's name, to tell runs apart (letters, digits, - and _): baseline, pool-fix, ...
+    [ValidatePattern('^[A-Za-z0-9_-]*$')][string]$LogTag = '',
+    # How much is logged. Debug and trace exist only in the diag build (-Build diag): a release build logs info
+    # and above whatever is asked. Default: info.
+    [ValidateSet('off', 'error', 'warn', 'info', 'debug', 'trace')][string]$LogLevel = '',
+    # A whole filter in place of -LogLevel, as VICTORY_LOG takes it: 'victory_gpu::host=debug,info' logs that
+    # module at debug and the rest at info.
+    [string]$LogFilter = '',
+    # The game's output goes to files in the log folder only, not through this window. For measuring: every line
+    # shown here is passed through PowerShell and the console, and while that falls behind the game's threads
+    # that log wait for it (felt at debug and trace). The window then shows only where the files are.
+    [switch]$LogFileOnly
 )
 $repo = Split-Path $PSScriptRoot -Parent
 # The F1 menu's "PRELOAD SHADERS" restarts this with -Preload (and VICTORY_PRELOAD=1, read here before the
 # switches below are cleared).
 $preload = $Preload -or $env:VICTORY_PRELOAD -eq '1'
+# The log's options, from the environment where they were not given (read here, before the switches below are
+# cleared). A VICTORY_LOG set in this window is kept now (it was cleared with the other switches).
+if (-not $LogDir) { $LogDir = if ($env:VICTORY_LOG_DIR) { $env:VICTORY_LOG_DIR } else { Join-Path $env:LOCALAPPDATA 'victory\logs' } }
+if (-not $LogTag -and $env:VICTORY_LOG_TAG -match '^[A-Za-z0-9_-]+$') { $LogTag = $env:VICTORY_LOG_TAG }
+$logFilter = if ($LogFilter) { $LogFilter } elseif ($LogLevel) { $LogLevel } elseif ($env:VICTORY_LOG) { $env:VICTORY_LOG } else { '' }
+$fileOnly = $LogFileOnly -or $env:VICTORY_LOG_FILE_ONLY -eq '1'
+if ($logFilter -match '\b(debug|trace)\b' -and $Build -ne 'diag') {
+    Write-Host "Log filter '$logFilter': debug and trace lines exist only in the diag build (-Build diag); this"
+    Write-Host 'release build logs info and above.'
+}
 # What the F1 menu saved: its own choices (VICTORY_MENU_...) stand in for this script's options, and its
 # switches go over the settings below. An empty value unsets a switch.
 $menuFile = Join-Path $repo 'victory-settings.txt'
@@ -143,8 +175,9 @@ foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
 }
+if ($logFilter) { $settings.VICTORY_LOG = $logFilter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
-$console = if ($SeriesS) { 'series-s' } else { 'series-x' }
+$console =if ($SeriesS) { 'series-s' } else { 'series-x' }
 # For the menu: what it shows as the current choices, where it saves, and how it starts the game again
 # (-More is not carried over a restart from the menu).
 $settings.VICTORY_MENU_CONSOLE = $console
@@ -156,6 +189,10 @@ $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
 $settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
+# A restart keeps where and how much this run logs (the filter goes on in VICTORY_LOG, which this reads).
+$settings.VICTORY_MENU_ARGS += " -LogDir '$($LogDir -replace "'", "''")'"
+if ($LogTag) { $settings.VICTORY_MENU_ARGS += " -LogTag $LogTag" }
+if ($fileOnly) { $settings.VICTORY_MENU_ARGS += ' -LogFileOnly' }
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
@@ -175,10 +212,38 @@ $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DAT
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
-$logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
-$log = Join-Path $logs ('victory-nvidia-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
+try { New-Item -ItemType Directory -Force $LogDir -ErrorAction Stop | Out-Null }
+catch { Write-Host "No log folder ${LogDir} ($($_.Exception.Message))."; return }
+$stamp = '{0:yyyyMMdd-HHmmss}' -f (Get-Date)
+$name = if ($LogTag) { "victory-nvidia-$stamp-$LogTag" } else { "victory-nvidia-$stamp" }
+$log = Join-Path $LogDir "$name.log"
 $writer = [IO.StreamWriter]::new($log, $false, [Text.UTF8Encoding]::new($false)); $writer.AutoFlush = $true
 $writer.WriteLine("# console=$console build=$Build preload=$preload switches: " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '))
+# What the run ran on and with, for comparing logs: each line begins "# run:". A part that cannot be asked is
+# left out.
+$run = [ordered]@{ started = (Get-Date).ToString('o'); tag = $LogTag; log = if ($logFilter) { $logFilter } else { 'info (default)' } }
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    $run.windows = "$($os.Caption) build $($os.BuildNumber)"
+    $run.ram = '{0:N0} GB, {1:N0} GB free' -f ($os.TotalVisibleMemorySize / 1MB), ($os.FreePhysicalMemory / 1MB)
+} catch {}
+try { $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1; $run.cpu = "$($cpu.Name.Trim()), $($cpu.NumberOfCores) cores, $([Environment]::ProcessorCount) threads" } catch {}
+try {
+    $run.gpus = (Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object { "$($_.Name) (driver $($_.DriverVersion))" }) -join '; '
+} catch {}
+$hags = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -Name HwSchMode -ErrorAction SilentlyContinue).HwSchMode
+$run.hags = switch ($hags) { 2 { 'on' } 1 { 'off' } default { 'not set (on by default in Windows 11)' } }
+try { $plan = (powercfg /getactivescheme 2>$null) -replace '^.*\((.*)\)\s*$', '$1'; if ($plan) { $run.power = "$plan" } } catch {}
+if (Test-Path $victory) { $run.victory = '{0} (built {1:yyyy-MM-dd HH:mm})' -f $victory, (Get-Item $victory).LastWriteTime }
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $commit = git -C $repo rev-parse --short HEAD 2>$null
+    if ($commit) {
+        $branch = git -C $repo rev-parse --abbrev-ref HEAD 2>$null
+        $dirty = if (git -C $repo status --porcelain --untracked-files=no 2>$null) { ', with changes not committed' } else { '' }
+        $run.source = "$branch at $commit$dirty"
+    }
+}
+foreach ($k in $run.Keys) { if ($run[$k]) { $writer.WriteLine("# run: ${k}: $($run[$k])") } }
 Write-Host "Log: $log"
 Push-Location $repo   # victory.toml is read from here
 try {
@@ -194,6 +259,28 @@ try {
     }
 }
 finally { Pop-Location }
+if ($fileOnly) {
+    # The layer writes its own log lines into the log (VICTORY_LOG_FILE, appended after the lines above, without
+    # colours); what else the game prints (a panic, NVIDIA's and AMD's own lines) goes beside it in
+    # <name>.stdout.txt and <name>.stderr.txt (the latter has the layer's lines again).
+    $writer.Dispose()
+    $out = Join-Path $LogDir "$name.stdout.txt"; $err = Join-Path $LogDir "$name.stderr.txt"
+    Write-Host "Writing to files only: $out and $err. This window stays quiet until the game ends."
+    $env:VICTORY_LOG_FILE = $log
+    $noColor = $env:NO_COLOR; $env:NO_COLOR = '1'
+    Push-Location $repo
+    try {
+        $p = Start-Process -FilePath $victory -ArgumentList "run `"$Exe`" --console $console --execute" -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+        $code = $p.ExitCode
+    } finally {
+        Pop-Location
+        Remove-Item Env:VICTORY_LOG_FILE -ErrorAction SilentlyContinue
+        if ($null -eq $noColor) { Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue } else { $env:NO_COLOR = $noColor }
+    }
+    Write-Host "The game ended (code $code). Log: $log"
+    exit $code
+}
 Push-Location $repo
 try { & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line } }
 finally { Pop-Location; $writer.Dispose() }

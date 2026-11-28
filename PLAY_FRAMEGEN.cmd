@@ -3,6 +3,11 @@ rem One-click GTA VI on VIctory-NVIDIA (DLSS + frame generation). ASCII only.
 rem   PLAY_FRAMEGEN.cmd          menu
 rem   PLAY_FRAMEGEN.cmd 1..6     start that mode directly
 rem   PLAY_FRAMEGEN.cmd check    only show paths and what is ready
+rem Logs (set these first, in the same window):
+rem   set VICTORY_LOG_DIR=D:\perf       the folder the log goes to (else %LOCALAPPDATA%\victory\logs)
+rem   set VICTORY_LOG_TAG=baseline      a word added to the log's name
+rem   set VICTORY_LOG=warn              error, warn, info, debug, trace, or a filter such as victory_gpu::host=debug,info
+rem   set VICTORY_LOG_FILE_ONLY=1       the game's output to files only, not this window (for measuring)
 setlocal
 set "PS1=%~dp0scripts\play-gta6-framegen.ps1"
 set "PSH=powershell"

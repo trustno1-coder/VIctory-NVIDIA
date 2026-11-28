@@ -8,11 +8,18 @@
 #        2 same without frame generation
 #        3 Series S + DLSS Quality + frame generation 2x (faster, softer)
 #        4 Series X 1440p + DLSS Performance + frame generation 2x
+# Logs: -LogDir, -LogTag, -LogLevel, -LogFilter and -LogFileOnly go on to play-foxhound.ps1 (described there);
+# from PLAY_FRAMEGEN.cmd, set VICTORY_LOG_DIR, VICTORY_LOG_TAG, VICTORY_LOG or VICTORY_LOG_FILE_ONLY=1 first.
 param(
     [ValidateSet('1', '2', '3', '4', '5', '6')][string]$Mode = '1',
     [string]$GameDir = '',
     [switch]$Check,
-    [switch]$NoBackup
+    [switch]$NoBackup,
+    [string]$LogDir = '',
+    [string]$LogTag = '',
+    [ValidateSet('off', 'error', 'warn', 'info', 'debug', 'trace')][string]$LogLevel = '',
+    [string]$LogFilter = '',
+    [switch]$LogFileOnly
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
@@ -71,6 +78,8 @@ if ($Check) {
     Write-Host "DLSS:    $(if (Test-Path (Join-Path $sl 'sl.interposer.dll')) { 'present' } else { 'not yet (downloaded at first start)' })"
     Write-Host "built:   $(if (Test-Path $victory) { 'yes' } else { 'no (built at first start)' })"
     Write-Host "HAGS:    $hagsText"
+    $logWhere = if ($LogDir) { $LogDir } elseif ($env:VICTORY_LOG_DIR) { $env:VICTORY_LOG_DIR } else { Join-Path $env:LOCALAPPDATA 'victory\logs' }
+    Write-Host "logs:    $logWhere"
     exit 0
 }
 if (Get-Process victory -ErrorAction SilentlyContinue) { Write-Host 'The game is already running. Close it first.'; exit 1 }
@@ -121,6 +130,8 @@ if (($Mode -in @('5', '6')) -and $cpus -ge 24) { $more.VICTORY_LAND_THREADS = '1
 if ($env:GTA6_NO_TUNE -eq '1') { $more = @{}; Write-Host 'GTA6_NO_TUNE=1: foxhound defaults (no pool or placed-order tuning).' }
 else { Write-Host ("Tuning for {0} logical CPUs: {1}" -f $cpus, (($more.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')) }
 $opts.More = $more
+foreach ($k in 'LogDir', 'LogTag', 'LogLevel', 'LogFilter') { if ((Get-Variable $k -ValueOnly)) { $opts[$k] = Get-Variable $k -ValueOnly } }
+if ($LogFileOnly) { $opts.LogFileOnly = $true }
 # RTX 50 cards do multi frame generation: 4x there (the layer asks the driver and gives no more than it does).
 # GTA6_FRAMEGEN_X=2..6 overrides. RTX 40 stays at 2x.
 $gpuName = (Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1).Name

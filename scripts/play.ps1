@@ -4,14 +4,25 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# -LogDir       the folder this run's log goes to (default: %LOCALAPPDATA%\victory\logs, or VICTORY_LOG_DIR)
+# -LogTag       a word added to the log's name, to tell runs apart
+# -LogLevel     error, warn, info, debug or trace (debug and trace: the diag build only); -LogFilter a whole
+#               VICTORY_LOG filter instead ('victory_gpu::host=debug,info'). A VICTORY_LOG set in this window stays.
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [string]$LogDir = '',
+    [ValidatePattern('^[A-Za-z0-9_-]*$')][string]$LogTag = '',
+    [ValidateSet('off', 'error', 'warn', 'info', 'debug', 'trace')][string]$LogLevel = '',
+    [string]$LogFilter = ''
 )
+# (Read before the settings left over in this window are cleared below.)
+if (-not $LogDir) { $LogDir = if ($env:VICTORY_LOG_DIR) { $env:VICTORY_LOG_DIR } else { Join-Path $env:LOCALAPPDATA 'victory\logs' } }
+$logFilter = if ($LogFilter) { $LogFilter } elseif ($LogLevel) { $LogLevel } elseif ($env:VICTORY_LOG) { $env:VICTORY_LOG } else { '' }
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
@@ -24,6 +35,7 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($logFilter) { $settings.VICTORY_LOG = $logFilter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
@@ -34,5 +46,13 @@ $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DAT
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
+# The layer writes every line it shows into the log too (VICTORY_LOG_FILE), after these first lines.
+New-Item -ItemType Directory -Force $LogDir | Out-Null
+$stamp = '{0:yyyyMMdd-HHmmss}' -f (Get-Date)
+$log = Join-Path $LogDir $(if ($LogTag) { "victory-$stamp-$LogTag.log" } else { "victory-$stamp.log" })
+$header = "# build=$Build switches: " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
+[IO.File]::WriteAllText($log, "$header`n# run: started: $((Get-Date).ToString('o'))`n", [Text.UTF8Encoding]::new($false))
+$env:VICTORY_LOG_FILE = $log
+Write-Host "Log: $log"
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory run $Exe --execute } finally { Pop-Location }
