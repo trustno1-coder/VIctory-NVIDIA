@@ -3802,20 +3802,28 @@ impl State {
                 .unwrap_or(u32::MAX),
             _ => 0,
         };
-        // The alpha layer only with VICTORY_AMBIENT_SPECULAR_ALPHA=1: its pixels
-        // are of transparent surfaces (glass, foam, wakes on water) and the
-        // depth read is the opaque one behind them; outdoors on water that is
-        // the bottom, the reflected direction is wrong and the estimate dark
-        // (play session 2026-11-27: dark patches on the water around a boat).
-        // On again by default (2026-11-27): those dark patches were water tiles the tile
-        // list had dropped (`VICTORY_LOOPS_WAVE`), not this; without it glass in a dark room
-        // mirrors the bright sky (run fix2, spectacles 75 s into the opening). `=0`: off.
-        let alpha_too = !std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "0");
-        if role == Role::Miss
-            && !(layer == crate::ambient::MISS_OPAQUE || (alpha_too && layer == crate::ambient::MISS_ALPHA))
-        {
-            crate::ambient::note_miss(MissNote::Water);
-            return false;
+        // The alpha layer takes the estimate only with
+        // VICTORY_AMBIENT_SPECULAR_ALPHA=1: its pixels are of transparent
+        // surfaces (glass, foam, wakes on water) and the depth read is the
+        // opaque one behind them; outdoors on water that is the bottom, the
+        // reflected direction is wrong and the estimate dark (play session
+        // 2026-11-27: dark patches on the water around a boat). Otherwise its
+        // sky light is kept and bounded by the light around
+        // (`crate::ambient::alpha`), which needs neither depth nor normal.
+        // (Main gave this layer the estimate by default on 2026-11-27: those
+        // patches were water tiles the tile list had dropped, and without it
+        // glass in a dark room mirrored the bright sky. The bound dims that
+        // sky on the glass as well; `=1` is still the estimate.)
+        let mut bound = None;
+        if role == Role::Miss && layer != crate::ambient::MISS_OPAQUE {
+            match crate::ambient::alpha() {
+                crate::ambient::Alpha::Estimate if layer == crate::ambient::MISS_ALPHA => {}
+                crate::ambient::Alpha::Bound(multiple) if layer == crate::ambient::MISS_ALPHA => bound = Some(multiple),
+                _ => {
+                    crate::ambient::note_miss(MissNote::Water);
+                    return false;
+                }
+            }
         }
         let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
         else {
@@ -4010,16 +4018,52 @@ impl State {
             }),
             Role::Radiance | Role::Air => image,
         };
+        // A miss program with its rays' image but no depth of the picture
+        // in its tables (RTX 5080, Series S and X, 2026-11-27: variant
+        // 06bb6e728c7c99bf has a 1x1 texture at the depth's place and
+        // only textures of the rays' own size beside it, in every frame of
+        // the world; the estimate never ran and glossy surfaces indoors
+        // mirrored the sky). The opaque layer's sky light is bounded there
+        // as the alpha layer's is, which reads no depth.
+        if role == Role::Miss && image.is_some() && depth.is_none() && bound.is_none() {
+            bound = crate::ambient::opaque_bound();
+        }
+        let depth = if bound.is_some() { depth.or(image) } else { depth };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             if role == Role::Miss {
                 crate::ambient::note_miss(MissNote::NotReady);
                 // Once per program: what its tables hold, so one run names
                 // the place of the rays' image and of the depth.
-                static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                // Again at its 1024th and 8192nd such dispatch: the first is
+                // often before the world, with other textures in the tables
+                // than a frame of the world has (RTX 5080, 2026-11-27: the
+                // one listing of a run named a 1x1 texture at the depth's
+                // place, and the stand-in never ran afterwards).
+                static SEEN: std::sync::Mutex<Vec<(String, u32)>> = std::sync::Mutex::new(Vec::new());
                 let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-                if seen.len() < 16 && !seen.contains(&p.name) {
-                    seen.push(p.name.clone());
+                let nth = match seen.iter().position(|(name, _)| *name == p.name) {
+                    Some(at) => {
+                        seen[at].1 = seen[at].1.saturating_add(1);
+                        seen[at].1
+                    }
+                    None if seen.len() < 16 => {
+                        seen.push((p.name.clone(), 1));
+                        1
+                    }
+                    None => 0,
+                };
+                if matches!(nth, 1 | 1024 | 8192) {
+                    tracing::info!(
+                        program = %p.name,
+                        nth,
+                        layer,
+                        image = ?image.as_ref().map(|(d, _)| (d.Width, d.Height, d.Format.0)),
+                        depth = ?depth.as_ref().map(|(d, _)| (d.Width, d.Height, d.Format.0)),
+                        usual_depth = ?entry(ResourceType::Srv, MISS_DEPTH).map(|(d, _)| (d.Width, d.Height, d.Format.0)),
+                        usual_depth_stencil = stencil_at(MISS_DEPTH),
+                        "reflections stand-in: what was found of the miss program's rays' image and depth"
+                    );
                     let held: Vec<String> = t
                         .used
                         .iter()
@@ -4052,6 +4096,8 @@ impl State {
         // The miss program's image is of half the picture's size, its depth
         // (32-bit) of the whole.
         let sizes = match role {
+            // The bound reads the rays' image alone.
+            Role::Miss if bound.is_some() => true,
             Role::Miss => {
                 use windows::Win32::Graphics::Dxgi::Common::{
                     DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
@@ -4083,9 +4129,42 @@ impl State {
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
             depth_size: [seen.Width as u32, seen.Height],
-        });
+        }, bound);
+        // The resolve's second image of light, where it is another texture
+        // of the same kind and size as the first.
+        if ran && role == Role::Resolve
+            && let Some(multiple) = crate::ambient::second()
+        {
+            let host_at = |(slot, offset): (u8, u32)| {
+                let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                    return None;
+                };
+                let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+                let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+                match view {
+                    View::Shader(r, _) | View::Unordered(r, ..) => Some(r),
+                    _ => None,
+                }
+            };
+            let (first, other) = (host_at(LIGHT), host_at(crate::ambient::SECOND_LIGHT));
+            if let (Some(first), Some(other), Some((d, second))) =
+                (first, other, entry(ResourceType::Uav, crate::ambient::SECOND_LIGHT))
+                && first != other
+                && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && d.Format.0 == 42
+                && (d.Width, d.Height) == (of.Width, of.Height)
+            {
+                crate::ambient::cap_second(list, &Views {
+                    image: second,
+                    depth,
+                    size: [of.Width as u32, of.Height],
+                    slices: 1,
+                    depth_size: [seen.Width as u32, seen.Height],
+                }, multiple);
+            }
+        }
         if ran && role == Role::Miss {
-            crate::ambient::note_miss(MissNote::Ran(layer));
+            crate::ambient::note_miss(if bound.is_some() { MissNote::Bounded } else { MissNote::Ran(layer) });
         }
         ran
     }
