@@ -42,8 +42,15 @@ impl PreparedImage {
 ///   its base relocation is made a no-op so the 0 survives a rebase;
 /// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
-    let info = ImageInfo::parse(original)?;
-    let mut bytes = original.to_vec();
+    prepare_owned(original.to_vec())
+}
+
+/// [`prepare`], patching `original` in place: for bytes read only to be
+/// prepared (the title's 115 MB, no second copy of them).
+pub fn prepare_owned(original: Vec<u8>) -> Result<PreparedImage, PrepareError> {
+    let info = ImageInfo::parse(&original)?;
+    let original_hash = blake3::hash(&original);
+    let mut bytes = original;
 
     let fh = layout::file_header_offset(&bytes).ok_or(PrepareError::Patch("no file header"))?;
     let opt =
@@ -114,7 +121,7 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     Ok(PreparedImage {
         info,
         bytes,
-        original_hash: blake3::hash(original),
+        original_hash,
     })
 }
 
@@ -366,6 +373,16 @@ mod tests {
             Some(0),
             "the callback pointer is cleared"
         );
+    }
+
+    #[test]
+    fn prepared_in_place_as_from_a_copy() {
+        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let copied = prepare(&original).unwrap();
+        let owned = prepare_owned(original).unwrap();
+        assert_eq!(owned.bytes, copied.bytes);
+        assert_eq!(owned.original_hash, copied.original_hash);
+        assert_eq!(owned.file_name(), copied.file_name());
     }
 
     #[test]

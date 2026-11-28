@@ -16,7 +16,7 @@ use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
     DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, PreparedImage, Provenance, Resolution,
-    prepare,
+    prepare_owned,
 };
 
 /// A title image mapped into this process. A clone names the same mapping
@@ -49,14 +49,17 @@ pub struct BindReport {
     pub missing: Vec<MissingImport>,
 }
 
-/// Writes the prepared copy into `dir` and maps it with the Windows loader.
+/// Writes the prepared copy into `dir`, unless a start before wrote these
+/// bytes (`publish`: in a folder of `dir` named by their hash), and maps it
+/// with the Windows loader.
 ///
 /// `dir` receives derived game data, so it must be outside the repository.
 pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     victory_core::ensure_outside_repo(dir)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join(prepared.file_name());
-    write_if_changed(&path, &prepared.bytes)?;
+    let name = prepared.file_name();
+    let path = crate::publish::publish(dir, &name, &prepared.bytes)
+        .with_context(|| format!("publishing {name} in {}", dir.display()))?;
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // SAFETY: `wide` is a NUL-terminated path. The image has no entry point
@@ -152,7 +155,8 @@ fn map_dll(
         return Ok(());
     }
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
+    let prepared =
+        prepare_owned(original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((name, image));
@@ -180,11 +184,6 @@ impl ImportResolver for WithTitleDlls<'_> {
                 provenance: Provenance::Title,
             })
     }
-}
-
-fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    crate::publish::write_if_changed(path, bytes)
-        .with_context(|| format!("publishing {}", path.display()))
 }
 
 impl LoadedImage {
