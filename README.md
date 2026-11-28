@@ -49,6 +49,14 @@
 3. Double-click it. Windows may say the publisher is unknown (the file is not
    signed): "More info", then "Run anyway".
 
+Checking the download: a `victory.exe` made by the *Release build* workflow
+carries a build provenance attestation, and
+`gh attestation verify victory.exe --repo trustno1-coder/VIctory-NVIDIA`
+says which commit and workflow built it. The build is reproducible, so it can
+also be built again from that commit with
+`powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1`, which
+prints the SHA-256 to compare (with the same Rust and MSVC versions it prints).
+
 - The first start asks once whether to download NVIDIA's DLSS and frame
   generation files (about 70 MB) from NVIDIA's own GitHub. They are NVIDIA's
   and are not part of this program; say no and the game still runs, with its
