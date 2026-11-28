@@ -257,7 +257,7 @@ fn text(name: *const c_char) -> String {
         .into_owned()
 }
 
-static FACTORY_VTABLE: Methods<19> = with_spare([
+static FACTORY_VTABLE: Methods<24> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -459,7 +459,7 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     })
 }
 
-static FILE_VTABLE: Methods<11> = with_spare([
+static FILE_VTABLE: Methods<16> = with_spare([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
     release::<File> as *const (),
@@ -1796,22 +1796,22 @@ mod tests {
 
     #[test]
     fn the_factory_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::FACTORY_VTABLE, 0x50);
+        crate::modules::xgameruntime::assert_room(&super::FACTORY_VTABLE, 16);
     }
 
     #[test]
     fn the_file_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::FILE_VTABLE, 0x10);
+        crate::modules::xgameruntime::assert_room(&super::FILE_VTABLE, 8);
     }
 
     #[test]
     fn the_status_array_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::STATUS_VTABLE, 0x20);
+        crate::modules::xgameruntime::assert_room(&super::STATUS_VTABLE, 5);
     }
 
     #[test]
     fn the_queue_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::QUEUE_VTABLE, 0x58);
+        crate::modules::xgameruntime::assert_room(&super::QUEUE_VTABLE, 12);
     }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {

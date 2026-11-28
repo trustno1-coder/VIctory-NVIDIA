@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn the_accessibility_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0xa8);
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 22);
     }
 
     #[test]

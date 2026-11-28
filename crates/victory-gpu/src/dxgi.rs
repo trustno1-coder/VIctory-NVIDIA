@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn the_factory_table_has_room_after_its_last_method() {
-        crate::object::assert_room(&super::FACTORY_FUNCTIONS, 0xc0);
+        crate::object::assert_room::<{ crate::object::FACTORY }, 40>(&super::FACTORY_FUNCTIONS, 32);
     }
 
     type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;

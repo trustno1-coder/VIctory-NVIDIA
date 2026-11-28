@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn the_store_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0x260);
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 77);
     }
 
     fn block() -> AsyncBlock {

@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn the_storage_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0x38);
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 8);
     }
 
     #[test]

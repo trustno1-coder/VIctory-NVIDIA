@@ -372,12 +372,12 @@ mod tests {
 
     #[test]
     fn the_system_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0x28);
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 6);
     }
 
     #[test]
     fn the_analytics_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::ANALYTICS_VTABLE, 0x18);
+        crate::modules::xgameruntime::assert_room(&super::ANALYTICS_VTABLE, 4);
     }
 
     #[test]

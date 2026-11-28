@@ -332,17 +332,17 @@ mod tests {
 
     #[test]
     fn the_user_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0x110);
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 35);
     }
 
     #[test]
     fn the_gamertag_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::GAMERTAG_VTABLE, 0x18);
+        crate::modules::xgameruntime::assert_room(&super::GAMERTAG_VTABLE, 4);
     }
 
     #[test]
     fn the_devices_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::DEVICE_VTABLE, 0x28);
+        crate::modules::xgameruntime::assert_room(&super::DEVICE_VTABLE, 6);
     }
 
     #[test]

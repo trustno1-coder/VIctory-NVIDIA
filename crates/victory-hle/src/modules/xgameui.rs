@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn the_game_ui_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0x98);
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 20);
     }
 
     fn block() -> AsyncBlock {

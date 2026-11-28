@@ -387,18 +387,19 @@ pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
     unsafe { std::mem::transmute_copy(&f) }
 }
 
-/// The eight entries after `last` (the byte offset of a table's last known
-/// method) are there, log their slot and fail.
+/// The eight entries after the table's first `old_len` (what it had before
+/// they were added) are there, are all different and are the table's
+/// logging, failing ones, [`missing`]. They are compared, not called, so that
+/// the slots they stand for are not marked as reported.
 #[cfg(test)]
-pub(crate) fn assert_room<const N: usize>(table: &Table<N>, last: usize) {
-    assert!(
-        N >= last / 8 + 9,
-        "{N} entries, the last known method at {last:#x}"
-    );
-    for &entry in &table.0[last / 8 + 1..last / 8 + 9] {
-        // SAFETY: a spare entry, which reads no argument and returns a result.
-        let spare: extern "system" fn() -> HRESULT = unsafe { std::mem::transmute(entry) };
-        assert_eq!(spare(), E_NOTIMPL);
+pub(crate) fn assert_room<const KIND: usize, const N: usize>(table: &Table<N>, old_len: usize) {
+    assert!(N >= old_len + 8, "{N} entries, {old_len} before");
+    let all = missing_table::<KIND, N>();
+    let spare = &table.0[old_len..old_len + 8];
+    for (i, &entry) in spare.iter().enumerate() {
+        assert!(!entry.is_null(), "entry {}", old_len + i);
+        assert!(entry == all[old_len + i], "entry {}", old_len + i);
+        assert!(!spare[..i].contains(&entry), "entry {i} repeats");
     }
 }
 

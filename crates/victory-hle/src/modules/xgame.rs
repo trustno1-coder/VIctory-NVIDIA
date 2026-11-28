@@ -238,22 +238,22 @@ mod tests {
 
     #[test]
     fn the_title_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::TITLE_VTABLE, 0x20);
+        crate::modules::xgameruntime::assert_room(&super::TITLE_VTABLE, 5);
     }
 
     #[test]
     fn the_features_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::FEATURES_VTABLE, 0x18);
+        crate::modules::xgameruntime::assert_room(&super::FEATURES_VTABLE, 4);
     }
 
     #[test]
     fn the_invites_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::INVITES_VTABLE, 0x20);
+        crate::modules::xgameruntime::assert_room(&super::INVITES_VTABLE, 5);
     }
 
     #[test]
     fn the_events_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::EVENTS_VTABLE, 0x18);
+        crate::modules::xgameruntime::assert_room(&super::EVENTS_VTABLE, 4);
     }
 
     #[test]

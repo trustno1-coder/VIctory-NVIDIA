@@ -634,7 +634,9 @@ mod tests {
         // The last known method is at 0x60.
         let n = VTABLE.0.len();
         assert!(n >= 0x60 / 8 + 9, "{n} entries");
-        for &entry in &VTABLE.0[0x60 / 8 + 1..0x60 / 8 + 9] {
+        for (i, &entry) in VTABLE.0[0x60 / 8 + 1..0x60 / 8 + 9].iter().enumerate() {
+            let before = &VTABLE.0[0x60 / 8 + 1..0x60 / 8 + 1 + i];
+            assert!(!entry.is_null() && !before.contains(&entry), "entry {i}");
             // SAFETY: a spare entry, which takes the object and returns a result.
             let spare: extern "system" fn(This) -> HRESULT = unsafe { std::mem::transmute(entry) };
             assert_eq!(spare(std::ptr::null_mut()), E_NOTIMPL);

@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn the_package_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0x138);
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 40);
     }
 
     #[test]

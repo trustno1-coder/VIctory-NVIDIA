@@ -516,9 +516,13 @@ mod tests {
         let bytes = size_of::<Methods>();
         assert!(bytes >= (10 + 8) * 8, "{bytes} bytes of table");
         let table = std::ptr::from_ref(&METHODS).cast::<*const ()>();
+        let mut seen = Vec::new();
         for index in 10..10 + 8 {
             // SAFETY: a `repr(C)` table of function pointers, of at least this many.
             let entry = unsafe { table.add(index).read() };
+            assert!(!entry.is_null(), "entry {index}");
+            assert!(!seen.contains(&entry), "entry {index} repeats");
+            seen.push(entry);
             type Spare = extern "system" fn(*mut Resolver) -> HRESULT;
             // SAFETY: a spare entry, which takes the object and returns a result.
             let spare: Spare = unsafe { std::mem::transmute(entry) };

@@ -996,7 +996,7 @@ mod tests {
 
     #[test]
     fn the_game_save_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0xe8);
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 30);
     }
 
     fn block() -> AsyncBlock {

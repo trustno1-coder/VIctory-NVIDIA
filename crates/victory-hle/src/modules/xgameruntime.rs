@@ -204,21 +204,23 @@ pub(crate) fn method<F: Copy>(object: &Object, slot: usize) -> F {
     unsafe { std::mem::transmute_copy(&*object.vtable.add(slot / 8)) }
 }
 
-/// The eight entries after `last` (the byte offset of a table's last known
-/// method) are there, log their slot and answer `E_NOTIMPL`.
+/// The eight entries after the table's first `old_len` (what it had before
+/// they were added) are there, are all different, log their slot and answer
+/// `E_NOTIMPL`, like the table's other unwritten entries.
 #[cfg(test)]
-pub(crate) fn assert_room<const N: usize>(methods: &'static Methods<N>, last: usize) {
-    assert!(
-        N >= last / 8 + 9,
-        "{N} entries, the last known method at {last:#x}"
-    );
+pub(crate) fn assert_room<const N: usize>(methods: &'static Methods<N>, old_len: usize) {
+    assert!(N >= old_len + 8, "{N} entries, {old_len} before");
     let object = Object::new("test", methods);
-    for slot in (last + 8..=last + 64).step_by(8) {
+    let spare = &methods.0[old_len..old_len + 8];
+    for (i, &entry) in spare.iter().enumerate() {
+        assert!(!entry.is_null(), "entry {}", old_len + i);
+        assert!(!spare[..i].contains(&entry), "entry {i} repeats");
         type Spare = extern "system" fn(*const Object) -> HRESULT;
         assert_eq!(
-            method::<Spare>(&object, slot)(&object),
+            method::<Spare>(&object, (old_len + i) * 8)(&object),
             xasync::E_NOTIMPL,
-            "{slot:#x}"
+            "entry {}",
+            old_len + i
         );
     }
 }

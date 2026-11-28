@@ -155,7 +155,7 @@ static SHELL_VTABLE: Methods<14> = with_spare([
     close_deferral as *const (),   // 0x28
 ]);
 #[cfg(not(windows))]
-static SHELL_VTABLE: Methods<14> = with_spare([
+static SHELL_VTABLE: Methods<12> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -178,17 +178,20 @@ mod tests {
 
     #[test]
     fn the_hdr_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::HDR_VTABLE, 0x20);
+        crate::modules::xgameruntime::assert_room(&super::HDR_VTABLE, 5);
     }
 
     #[test]
     fn the_shell_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::SHELL_VTABLE, 0x28);
+        crate::modules::xgameruntime::assert_room(
+            &super::SHELL_VTABLE,
+            if cfg!(windows) { 6 } else { 4 },
+        );
     }
 
     #[test]
     fn the_capture_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::CAPTURE_VTABLE, 0x28);
+        crate::modules::xgameruntime::assert_room(&super::CAPTURE_VTABLE, 6);
     }
 
     #[test]

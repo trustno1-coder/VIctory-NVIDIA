@@ -1086,7 +1086,7 @@ extern "system" fn m_set_process_queue(_: This, q: *const Queue) {
 /// which every runtime call in a title makes first.
 extern "system" fn m_check_thread(_: This) {}
 
-static VTABLE: Methods<38> = with_spare([
+static VTABLE: Methods<39> = with_spare([
     missing::<0> as *const (),         // 0x00 QueryInterface
     add_ref as *const (),              // 0x08 AddRef
     add_ref as *const (),              // 0x10 Release: the object is static
@@ -1127,7 +1127,7 @@ mod tests {
 
     #[test]
     fn the_task_queue_table_has_room_after_its_last_method() {
-        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0xe8);
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 31);
     }
 
     fn slot<F: Copy>(offset: usize) -> F {
