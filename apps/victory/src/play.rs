@@ -810,12 +810,16 @@ fn mod_dlls(here: &Path) -> Vec<String> {
 /// counted from the first frame of the game's world (100 draws or more).
 const WARMUP_SECONDS: u32 = 10;
 
-/// The file that says this victory.exe (its bytes) had its warm-up start:
-/// `%LOCALAPPDATA%\victory\warmed\<hash>`. `None`: the exe could not be read.
+/// The file that says this victory.exe had its warm-up start:
+/// `%LOCALAPPDATA%\victory\warmed\<length>-<modified>`, the exe's length in
+/// bytes and its modified time (100 ns since 1970). A build writes the exe
+/// anew, so its time changes; a copy keeps it, as the driver keeps what it
+/// learnt of the bytes. (Read and hashed whole before, 11 MB at every start.)
+/// `None`: the exe's length or time could not be read.
 fn warmup_mark(home: &Path, program: &Path) -> Option<PathBuf> {
-    let bytes = std::fs::read(program).ok()?;
-    let hash = blake3::hash(&bytes).to_hex();
-    Some(home.join("warmed").join(&hash.as_str()[..16]))
+    let meta = std::fs::metadata(program).ok()?;
+    let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(home.join("warmed").join(format!("{}-{}", meta.len(), modified.as_nanos() / 100)))
 }
 
 /// What a start needs once its settings are in the environment.
@@ -994,6 +998,72 @@ mod tests {
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    /// A folder of its own in the system's temporary folder, removed after.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(what: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("victory-play-{what}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A rebuilt victory.exe (other bytes, written later) has a mark of its
+    /// own, even at the same length; the same exe keeps its mark.
+    #[test]
+    fn a_rebuilt_exe_has_a_warmup_mark_of_its_own() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = Scratch::new("rebuilt");
+        let exe = dir.path().join("victory.exe");
+        let write = |bytes: &[u8], secs: u64| {
+            std::fs::write(&exe, bytes).unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&exe).unwrap();
+            file.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+        };
+        write(b"first build", 1_800_000_000);
+        let first = warmup_mark(dir.path(), &exe).unwrap();
+        assert_eq!(warmup_mark(dir.path(), &exe), Some(first.clone()));
+        assert!(first.starts_with(dir.path().join("warmed")));
+        write(b"other build", 1_800_000_060);
+        let rebuilt = warmup_mark(dir.path(), &exe).unwrap();
+        assert_ne!(rebuilt, first, "same length, written later");
+        write(b"a longer build", 1_800_000_060);
+        assert_ne!(warmup_mark(dir.path(), &exe).unwrap(), rebuilt, "same time, another length");
+        assert_eq!(warmup_mark(dir.path(), &dir.path().join("none.exe")), None);
+    }
+
+    /// The warm-up mark at a play start, on a file of victory.exe's size (11
+    /// MB): `cargo test -p victory --release -- --ignored --exact
+    /// play::tests::bench_warmup_mark --nocapture`
+    #[test]
+    #[ignore = "a benchmark"]
+    fn bench_warmup_mark() {
+        let dir = Scratch::new("bench");
+        let exe = dir.path().join("victory.exe");
+        let bytes: Vec<u8> = (0..11u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        std::fs::write(&exe, bytes).unwrap();
+        let mut times: Vec<f64> = (0..21)
+            .map(|_| {
+                let at = std::time::Instant::now();
+                assert!(warmup_mark(dir.path(), &exe).is_some());
+                at.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        times.sort_by(f64::total_cmp);
+        println!("warm-up mark: median {:.3} ms, {times:.3?}", times[times.len() / 2]);
     }
 
     #[test]
