@@ -925,17 +925,54 @@ pub(crate) extern "system" fn allocation_info(
     out
 }
 
-/// The newer description: the plain one, then a sampler feedback mip
-/// region (width, height, depth).
+/// The newer description: the plain one's fields, then a sampler feedback
+/// mip region (width, height, depth). As a C structure the region follows
+/// the flags at once, in the 4 bytes the plain description ends with as
+/// padding: 64 bytes, as the host's `D3D12_RESOURCE_DESC1`, not the 72 of
+/// a plain description with the region after it. An array of them is read
+/// at that stride.
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceDesc1 {
-    desc: ResourceDesc,
+    dimension: u32,
+    alignment: u64,
+    width: u64,
+    height: u32,
+    depth_or_array_size: u16,
+    mip_levels: u16,
+    format: u32,
+    sample_count: u32,
+    sample_quality: u32,
+    layout: u32,
+    flags: u32,
     mip_region: [u32; 3],
 }
-const _: () = assert!(size_of::<ResourceDesc1>() == 72);
+const _: () = assert!(size_of::<ResourceDesc1>() == 64);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc1, flags) == 48);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc1, mip_region) == 52);
+
+impl ResourceDesc1 {
+    /// The plain description it starts with.
+    fn plain(&self) -> ResourceDesc {
+        ResourceDesc {
+            dimension: self.dimension,
+            alignment: self.alignment,
+            width: self.width,
+            height: self.height,
+            depth_or_array_size: self.depth_or_array_size,
+            mip_levels: self.mip_levels,
+            format: self.format,
+            sample_count: self.sample_count,
+            sample_quality: self.sample_quality,
+            layout: self.layout,
+            flags: self.flags,
+        }
+    }
+}
 
 /// Where one resource goes in [`allocation_info2`]'s placement.
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct AllocationInfo1 {
     offset: u64,
     alignment: u64,
@@ -958,7 +995,8 @@ pub(crate) extern "system" fn allocation_info2(
         // SAFETY: the title passes `count` descriptions.
         unsafe { std::slice::from_raw_parts(descs, count as usize) }
     };
-    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
+    let plain: Vec<ResourceDesc> = descs.iter().map(ResourceDesc1::plain).collect();
+    let total = place(plain.iter(), |i, info| {
         if !each.is_null() {
             // SAFETY: the title passes room for `count` entries.
             unsafe { each.add(i).write(info) };
@@ -4175,6 +4213,63 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    /// The newer description has the host's C layout: the mip region right
+    /// after the flags, 64 bytes in all, so an array of them is read at the
+    /// stride the caller wrote it with.
+    #[cfg(windows)]
+    #[test]
+    fn newer_descriptions_have_the_host_layout() {
+        use std::mem::offset_of;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC1;
+        assert_eq!(size_of::<ResourceDesc1>(), size_of::<D3D12_RESOURCE_DESC1>());
+        assert_eq!(
+            offset_of!(ResourceDesc1, flags),
+            offset_of!(D3D12_RESOURCE_DESC1, Flags)
+        );
+        assert_eq!(
+            offset_of!(ResourceDesc1, mip_region),
+            offset_of!(D3D12_RESOURCE_DESC1, SamplerFeedbackMipRegion)
+        );
+    }
+
+    /// Two newer descriptions, laid out one after another as a C array:
+    /// both are read whole, and placed as the plain ones are.
+    #[test]
+    fn newer_descriptions_place_as_the_plain_ones() {
+        let newer = |d: ResourceDesc| ResourceDesc1 {
+            dimension: d.dimension,
+            alignment: d.alignment,
+            width: d.width,
+            height: d.height,
+            depth_or_array_size: d.depth_or_array_size,
+            mip_levels: d.mip_levels,
+            format: d.format,
+            sample_count: d.sample_count,
+            sample_quality: d.sample_quality,
+            layout: d.layout,
+            flags: d.flags,
+            mip_region: [0; 3],
+        };
+        let plain = [buffer(100), texture(256, 256, 28, 0)];
+        let descs = plain.map(newer);
+        let no_info = AllocationInfo {
+            size: 0,
+            alignment: 0,
+        };
+        let (mut want, mut got) = (no_info, no_info);
+        allocation_info(&mut want, std::ptr::null(), 0, 2, plain.as_ptr());
+        let mut each = [AllocationInfo1 {
+            offset: 0,
+            alignment: 0,
+            size: 0,
+        }; 2];
+        allocation_info2(&mut got, std::ptr::null(), 0, 2, descs.as_ptr(), each.as_mut_ptr());
+        assert_eq!(got, want);
+        assert_eq!(each[0].offset, 0);
+        assert_eq!(each[1].offset, KIB_64);
+        assert_eq!(each[1].size, footprint(&plain[1]).unwrap().size);
     }
 
     #[test]
