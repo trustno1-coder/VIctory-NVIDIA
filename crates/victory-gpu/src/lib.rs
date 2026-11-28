@@ -50,6 +50,8 @@ pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
+mod hlsl;
+#[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
 mod port;

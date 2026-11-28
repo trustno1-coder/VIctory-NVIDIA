@@ -2,7 +2,6 @@
 //! (the interface) over the first (the scene), each scaled to the screen.
 //! The game presents so on Series S.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -43,25 +42,10 @@ unsafe impl Send for Composer {}
 unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
-    let mut code: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; the out pointer is
-    // ours.
-    unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("compose"),
-            None,
-            None,
-            entry,
-            target,
-            0,
-            0,
-            &mut code,
-            None,
-        )?;
-    }
-    code.ok_or_else(windows::core::Error::empty)
+    // The system's compiler, then DXC (`crate::hlsl::compile_for`).
+    // SAFETY: both are NUL-terminated literals of our own.
+    let (entry, target) = unsafe { (entry.to_string().unwrap_or_default(), target.to_string().unwrap_or_default()) };
+    crate::hlsl::blob(&crate::hlsl::compile_for("compose", SOURCE, &entry, &target)?)
 }
 
 impl Composer {
