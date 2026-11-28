@@ -130,6 +130,26 @@ tuned for **NVIDIA RTX** cards.
 > by the title's developer or publisher, nor by NVIDIA. See
 > [docs/asset-policy.md](docs/asset-policy.md).
 
+## Mouse and keyboard (experimental)
+
+Opt-in mouse and keyboard controls, ported from
+[ItsMK1/VIctory-MnK-patches](https://github.com/ItsMK1/VIctory-MnK-patches)
+(GPL-3.0). Keyboard and mouse are mapped to the game's controller input: mouse
+look turns the camera continuously, right-click aims, and keys and sensitivity
+come from `bindings.ini`. Off unless you set the variable:
+
+```powershell
+$env:VICTORY_MNK_BINDINGS = (Resolve-Path .\bindings.ini).Path
+```
+
+For a batch launcher, copy `bindings.ini` next to it and add
+`set "VICTORY_MNK_BINDINGS=%~dp0bindings.ini"` before the game starts. A valid
+profile takes priority over connected controllers; remove the variable to go
+back to standard input. Defaults: mouse = right stick, WASD = left stick, left
+mouse = RT, right mouse = LT, F = Y, Shift/Enter = A, R/Backspace = B,
+Space = X, Tab/Q = LB/RB, Ctrl/middle mouse = LS/RS, Esc/V = Menu/View,
+arrow keys = D-pad. Code: `crates/victory-hle/src/modules/mnk.rs`.
+
 ## Built from many projects, and from running every one of them
 
 This repository did not come from one place, and the base it stands on today

@@ -69,6 +69,10 @@ const RIGHT_SHOULDER: u32 = 0x800;
 const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 
+#[cfg(windows)]
+#[path = "mnk.rs"]
+pub(super) mod mnk;
+
 /// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
 const PADS: usize = 4;
 const FALLBACK: usize = PADS;
@@ -209,6 +213,10 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
+    #[cfg(windows)]
+    if let Some(state) = mnk::sample() {
+        return state;
+    }
     let on = |vk: u8| {
         if keys.iter().any(|k| pad_key(k) == vk) {
             1.0
@@ -1320,6 +1328,10 @@ mod host {
             Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            // With a mouse and keyboard profile (`VICTORY_MNK_BINDINGS`) no host pad is read.
+            if super::mnk::enabled() {
+                return None;
+            }
             // XInput first; HID PlayStation pads (PS4 and PS5) take the slots XInput leaves free
             // (`VICTORY_DUALSENSE`: 0 off, 1 both).
             if slot == 0 {
