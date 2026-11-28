@@ -221,6 +221,23 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
+/// The least size `VICTORY_CARD_BUFFERS_MIN_KB` may set, `asked` bytes, over
+/// the budget-scaled `default` minimum. Under 10 GiB of local budget (8 GB
+/// cards, budget about 7.1 GB) it keeps the default: the launchers set 64 KiB
+/// for every card, and on an RTX 5070 Laptop 8 GB, Series S, that put the
+/// title's small buffers on the card past its budget, frames went from about
+/// 220-290 ms to 310-340 ms and faces were missing and vehicles drawn several
+/// times over (the same overflow an RX 7600 8 GB saw, fxceless/victory-fork
+/// #1417). 12 GB cards (budget about 11 GB) keep what they asked for.
+fn min_kb_floor(default: u64, asked: u64, local_vram_budget: Option<u64>) -> u64 {
+    const SMALL_CARD: u64 = 10 << 30;
+    if local_vram_budget.is_some_and(|b| b < SMALL_CARD) {
+        asked.max(default)
+    } else {
+        asked
+    }
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
@@ -246,7 +263,15 @@ fn card_limits() -> (u64, u64) {
         if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
             && kib > 0
         {
-            min_bytes = kib << 10;
+            let asked = kib << 10;
+            min_bytes = min_kb_floor(min_bytes, asked, vram_budget);
+            if min_bytes != asked {
+                tracing::warn!(
+                    asked_kb = kib,
+                    kept_kb = min_bytes >> 10,
+                    "VICTORY_CARD_BUFFERS_MIN_KB left out: on a card with under 10 GiB of budget the small copies overflow it"
+                );
+            }
         }
         if card_all() {
             min_bytes = 0;
@@ -5963,9 +5988,23 @@ mod write_combined_tests {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, min_kb_floor,
+        resolve_card_limits, tail_of, window_of,
     };
+
+    /// `VICTORY_CARD_BUFFERS_MIN_KB` cannot take an 8 GB card under its
+    /// default minimum; 12 GB and larger cards, and unknown budgets, get it.
+    #[test]
+    fn small_cards_keep_their_buffer_floor() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let asked = 64 << 10;
+        assert_eq!(min_kb_floor(16 * MIB, asked, Some(7123 * MIB)), 16 * MIB);
+        assert_eq!(min_kb_floor(16 * MIB, 32 * MIB, Some(7123 * MIB)), 32 * MIB, "a larger floor is kept");
+        assert_eq!(min_kb_floor(16 * MIB, asked, Some(11229 * MIB)), asked);
+        assert_eq!(min_kb_floor(4 * MIB, asked, Some(16 * GIB)), asked);
+        assert_eq!(min_kb_floor(16 * MIB, asked, None), asked);
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {
