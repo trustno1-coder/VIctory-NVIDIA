@@ -893,7 +893,44 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
             std::env::set_var(k, v);
         }
     }
+    keep_ram();
     Ok(Ready { exe, series_s })
+}
+
+/// `VICTORY_KEEP_RAM_GB=<n>` (unset: nothing): a hard minimum of `n` GB for
+/// this process's working set, so that Windows does not trim the game's
+/// memory out to the page file under pressure. On a 32 GB PC the game
+/// commits about 28 GB; when the PC ran low, Windows cut its working set
+/// from 15 GB to 2 GB at once and the game ran at half speed for minutes
+/// while it read its memory back from disk. Other programs are paged out
+/// instead. Too large a number for the PC, and Windows refuses it (logged).
+fn keep_ram() {
+    let Some(gb) = std::env::var("VICTORY_KEEP_RAM_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|gb| *gb > 0)
+    else {
+        return;
+    };
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn SetProcessWorkingSetSizeEx(process: isize, min: usize, max: usize, flags: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+    // QUOTA_LIMITS_HARDWS_MIN_ENABLE: the minimum is kept even under
+    // pressure; QUOTA_LIMITS_HARDWS_MAX_DISABLE: the maximum is only a hint.
+    const FLAGS: u32 = 0x1 | 0x8;
+    let min = gb << 30;
+    // SAFETY: our own process's pseudo handle and plain sizes.
+    let (ok, error) = unsafe {
+        let ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), min, min.saturating_mul(2), FLAGS) != 0;
+        (ok, if ok { 0 } else { GetLastError() })
+    };
+    if ok {
+        println!("Memory: at least {gb} GB of the game's memory is kept in RAM (VICTORY_KEEP_RAM_GB).");
+    } else {
+        println!("Memory: Windows refused to keep {gb} GB in RAM (error {error}); running without it.");
+    }
 }
 
 /// A PowerShell word holding `text` as it is.
