@@ -6370,6 +6370,10 @@ float4 ps() : SV_Target { return float4(0, 1, 0, 1); }
             pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
             let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&pso_desc).unwrap();
 
+            let clear = D3D12_CLEAR_VALUE {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
+            };
             let mut target: Option<ID3D12Resource> = None;
             device
                 .CreateCommittedResource(
@@ -6387,7 +6391,7 @@ float4 ps() : SV_Target { return float4(0, 1, 0, 1); }
                         ..Default::default()
                     },
                     D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    None,
+                    Some(&clear),
                     &mut target,
                 )
                 .unwrap();
@@ -6456,7 +6460,7 @@ float4 ps() : SV_Target { return float4(0, 1, 0, 1); }
                     let mut buf = vec![0u64; size.div_ceil(8)];
                     let m = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
                     if q.GetMessage(i, Some(m), &mut size).is_ok()
-                        && ((*m).Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0
+                        && ((*m).Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
                             || (*m).ID == D3D12_MESSAGE_ID_DRAW_POTENTIALLY_OUTSIDE_OF_VALID_RENDER_AREA)
                     {
                         let text = std::slice::from_raw_parts((*m).pDescription, (*m).DescriptionByteLength);
