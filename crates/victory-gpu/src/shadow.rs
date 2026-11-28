@@ -1811,6 +1811,67 @@ pub(crate) fn take_snapshots() {
     wide(copy_jobs(snaps));
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_snapshot_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::{__m256i, _mm_sfence, _mm256_loadu_si256, _mm256_stream_si256};
+    let mut s = src;
+    let mut d = dst;
+    let mut rem = len;
+    let misalign = (d as usize) & 31;
+    if misalign != 0 {
+        let head = 32 - misalign;
+        // SAFETY: `head < 32 <= len` and ranges do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(s, d, head) };
+        // SAFETY: advancing within bounds.
+        unsafe {
+            s = s.add(head);
+            d = d.add(head);
+        }
+        rem -= head;
+    }
+    while rem >= 128 {
+        // SAFETY: `d` is 32-byte aligned and `rem >= 128`.
+        unsafe {
+            let v0 = _mm256_loadu_si256(s as *const __m256i);
+            let v1 = _mm256_loadu_si256(s.add(32) as *const __m256i);
+            let v2 = _mm256_loadu_si256(s.add(64) as *const __m256i);
+            let v3 = _mm256_loadu_si256(s.add(96) as *const __m256i);
+            _mm256_stream_si256(d as *mut __m256i, v0);
+            _mm256_stream_si256(d.add(32) as *mut __m256i, v1);
+            _mm256_stream_si256(d.add(64) as *mut __m256i, v2);
+            _mm256_stream_si256(d.add(96) as *mut __m256i, v3);
+            s = s.add(128);
+            d = d.add(128);
+        }
+        rem -= 128;
+    }
+    if rem > 0 {
+        // SAFETY: remaining tail within bounds.
+        unsafe { std::ptr::copy_nonoverlapping(s, d, rem) };
+    }
+    // SAFETY: ensure non-temporal stores are globally visible before job returns.
+    _mm_sfence();
+}
+
+/// Copies `len` bytes from `src` to `dst`, using AVX2 non-temporal stores
+/// (`VMOVNTDQ`) for large ranges (>= 64 KiB) so snapshot writes do not pollute
+/// L2/L3 cache or incur read-for-ownership DRAM traffic.
+///
+/// # Safety
+/// `src` and `dst` must be valid for `len` bytes and must not overlap.
+#[inline]
+unsafe fn copy_snapshot(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if len >= 64 * 1024 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 support verified at runtime; caller guarantees valid non-overlapping ranges.
+        unsafe { copy_snapshot_avx2(src, dst, len) };
+        return;
+    }
+    // SAFETY: caller guarantees valid non-overlapping `src` and `dst`.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+}
+
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
 /// bytes each: long ones cut, short ones together.
 fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
@@ -1824,7 +1885,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
                 for (src, dst, len) in group {
                     // SAFETY: the caller's ranges: a host copy's mapping and
                     // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    unsafe { copy_snapshot(src as *const u8, dst as *mut u8, len) };
                 }
             }));
         }
