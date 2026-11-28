@@ -324,28 +324,84 @@ pub(crate) fn part_opening(device: &ID3D12Device) -> bool {
     *CAPABLE.get_or_init(|| device.cast::<ID3D12Device13>().is_ok())
 }
 
-/// [`place_view`]'s work: our own view of the aligned run of the section that holds
-/// `[start, start + len)`, a heap opened on it, and one buffer placed over the run. `Err` is the
+/// The most bytes of one section run opened as a shared region: opening locks all its pages into
+/// the PC's memory, so a run larger than this is cut to the placement that asked for it.
+const REGION_MOST: u64 = 512 << 20;
+
+/// A heap opened on our own view of one run of a section, shared by the placements whose title
+/// addresses fall in it: one view and one heap per run, not per copy. The view is held here and by
+/// every placed buffer made over it; the run is forgotten when the title shows other pages there.
+struct Region {
+    /// The title addresses the run is shown at, 64 KiB aligned.
+    start: u64,
+    end: u64,
+    heap: ID3D12Heap,
+    view: std::sync::Arc<SectionView>,
+}
+
+static REGIONS: std::sync::Mutex<Vec<Region>> = std::sync::Mutex::new(Vec::new());
+
+/// How many section runs are open right now (for the tests).
+#[cfg(test)]
+pub(crate) fn region_count() -> usize {
+    REGIONS.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// The heap and our view of the section run that holds `[at, end)` (64 KiB aligned), opened if
+/// none does, and the title address the run starts at.
+fn region_for(device: &ID3D12Device, at: u64, end: u64) -> Result<(ID3D12Heap, std::sync::Arc<SectionView>, u64), (crate::residency::NoDirect, String)> {
+    use crate::residency::NoDirect;
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = regions.iter().find(|r| r.start <= at && end <= r.end) {
+        return Ok((r.heap.clone(), r.view.clone(), r.start));
+    }
+    // The whole run of the title's views, if it is one and small enough to keep open; else only
+    // the part asked for.
+    let Some((first, run_bytes, run_section, run_offset)) = stretch(at as usize, (end - at) as usize) else {
+        return Err((NoDirect::NotOpenable, format!("not one run of one section: {:?}", cover(at as usize, (end - at) as usize))));
+    };
+    let (area_start, area_bytes, section_offset) = if run_bytes as u64 <= REGION_MOST {
+        (first as u64, run_bytes as u64, run_offset)
+    } else {
+        let Cover::Run(section, offset) = cover(at as usize, (end - at) as usize) else {
+            return Err((NoDirect::NotOpenable, "not one run of one section".to_owned()));
+        };
+        debug_assert_eq!(section, run_section);
+        (at, end - at, offset)
+    };
+    let area_bytes = area_bytes as usize;
+    let Some(view) = SectionView::map(run_section, section_offset, area_bytes) else {
+        return Err((NoDirect::HostRefused, "no view of the run".to_owned()));
+    };
+    if !committed(view.base(), area_bytes) {
+        return Err((NoDirect::NotOpenable, "pages of the run are not committed".to_owned()));
+    }
+    let heap = match open(device, From::Part(view.base(), area_bytes)) {
+        Ok(heap) => heap,
+        Err(e) => return Err((NoDirect::HostRefused, format!("refused by the host: {e}"))),
+    };
+    regions.push(Region { start: area_start, end: area_start + area_bytes as u64, heap: heap.clone(), view: view.clone() });
+    Ok((heap, view, area_start))
+}
+
+/// The title shows other pages at `[at, at + len)`: the region heaps there are dropped (what was
+/// placed over them is let go by the caller); a view stays mapped while a placed buffer holds it.
+fn forget_regions(at: usize, len: usize) {
+    let (at, end) = (at as u64, (at as u64).saturating_add(len as u64));
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    regions.retain(|r| r.end <= at || r.start >= end);
+}
+
+/// [`place_view_checked`]'s work: the shared heap of the section run that holds
+/// `[start, start + len)`, and one buffer placed in it over the aligned range. `Err` is the
 /// reason a copy must be made and what the registry said.
 fn place_view_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, (crate::residency::NoDirect, String)> {
     use crate::residency::NoDirect;
     let at = start & !(K64 as u64 - 1);
     let end = (start + len.max(1)).next_multiple_of(K64 as u64);
     let bytes = end - at;
-    let Cover::Run(section, offset) = cover(at as usize, bytes as usize) else {
-        return Err((NoDirect::NotOpenable, format!("not one run of one section: {:?}", cover(at as usize, bytes as usize))));
-    };
-    let Some(view) = SectionView::map(section, offset, bytes as usize) else {
-        return Err((NoDirect::HostRefused, "no view of the run".to_owned()));
-    };
-    if !committed(view.base(), bytes as usize) {
-        return Err((NoDirect::NotOpenable, "pages of the run are not committed".to_owned()));
-    }
-    let heap = match open(device, From::Part(view.base(), bytes as usize)) {
-        Ok(heap) => heap,
-        Err(e) => return Err((NoDirect::HostRefused, format!("refused by the host: {e}"))),
-    };
-    let buffer = match place(device, &heap, 0, bytes) {
+    let (heap, view, region_start) = region_for(device, at, end)?;
+    let buffer = match place(device, &heap, at - region_start, bytes) {
         Ok(buffer) => buffer,
         Err(e) => return Err((NoDirect::HostRefused, format!("no buffer placed in the heap: {e}"))),
     };
@@ -440,6 +496,8 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // Our shared region heaps there: the title's addresses show other pages now.
+    forget_regions(at, len);
     // Renderer port 1's regions there: no longer what the title shows.
     crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
@@ -1940,6 +1998,8 @@ pub(crate) mod tests {
             let placed = place_view_part(&device, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
             assert_eq!(placed.bias, 0x40);
             let keep_base = placed.keep.as_ref().map(|view| view.base()).expect("our view is kept");
+            // One region (one view and one heap) for the run, shared by the placements in it.
+            assert_eq!(region_count(), 1);
             let mut rig = Rig::new(&device).unwrap();
             for (i, b) in std::slice::from_raw_parts_mut(start as *mut u8, len as usize).iter_mut().enumerate() {
                 *b = (i * 7 + 3) as u8;
@@ -1954,7 +2014,15 @@ pub(crate) mod tests {
             assert_ne!(mem::VirtualProtect(views[0].Value, 256, mem::PAGE_READWRITE, &mut old), 0);
             let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
             assert!(got == std::slice::from_raw_parts(start as *const u8, len as usize), "the card still reads the section's pages");
-            drop(placed);
+            // A second placement in the same run shares its view and heap.
+            let second = place_view_part(&device, base + 6 * K as u64, 100).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert_eq!(region_count(), 1, "the second placement shares the run's heap");
+            assert_eq!(rig.fetch(&second.buffer, second.bias, 100).unwrap().len(), 100);
+            // The title showing other pages there forgets the region; what was placed keeps it
+            // alive until it goes.
+            crate::inplace::title_memory_freeing(base as usize, 8 * K);
+            assert_eq!(region_count(), 0, "the run is forgotten");
+            drop((placed, second));
             // Our view went with the last holder: the address is free again.
             let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             let n = mem::VirtualQuery(keep_base as *const c_void, &mut info, std::mem::size_of_val(&info));
