@@ -637,6 +637,16 @@ fn offer_mfg(card: &str, menu_file: &Path) -> bool {
     true
 }
 
+/// What FORCE 3X ON RTX 40 turns on in the start's settings: MFG Unlocker, and 3x frame
+/// generation where it is on at 2x (off stays off; 4x to 6x stay).
+fn force_mfg(s: &mut std::collections::BTreeMap<String, String>) {
+    s.insert("VICTORY_MFG_UNLOCKER".to_owned(), "1".to_owned());
+    if s.get("VICTORY_FRAMEGEN_X").is_some_and(|x| x == "2") {
+        s.insert("VICTORY_FRAMEGEN_X".to_owned(), "3".to_owned());
+        s.insert("VICTORY_MENU_FRAMEGEN".to_owned(), "3".to_owned());
+    }
+}
+
 /// With MFG Unlocker on: the DLL, fetched first where it is missing (no question: turning it on
 /// was the choice). `None`: not there (the reason said).
 fn mfg_dll() -> Option<PathBuf> {
@@ -882,6 +892,15 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         && offer_mfg(&card, &menu_file)
     {
         s.insert("VICTORY_MFG_UNLOCKER".to_owned(), "1".to_owned());
+    }
+    // F1's FORCE 3X ON RTX 40 (`VICTORY_FORCE_MFG_RTX40=1`): MFG Unlocker on, and frame generation
+    // at 3x where it was on at 2x. The layer still asks Streamline how many frames the card gives
+    // and keeps 2x if the mod did not raise that (`streamline.rs`, "more frames asked").
+    let forced = s.get("VICTORY_FORCE_MFG_RTX40").map(String::as_str)
+        .or_else(|| menu.iter().find(|(k, _)| k == "VICTORY_FORCE_MFG_RTX40").map(|(_, v)| v.as_str()))
+        == Some("1");
+    if forced {
+        force_mfg(&mut s);
     }
     if s.get("VICTORY_MFG_UNLOCKER").is_some_and(|v| v == "1")
         && let Some(dll) = mfg_dll()
