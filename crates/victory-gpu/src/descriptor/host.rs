@@ -6175,8 +6175,15 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        let memory = vec![0u64; 1 << 13];
-        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // The host copy of this memory is the 4 MiB window over it
+        // (`crate::shadow`), and a view is off its elements by where it lies
+        // in that copy. The views are placed from a window's start, so that
+        // this does not depend on where the allocator put `memory`: from a
+        // page start, the 456-byte structured view at +8 lay on its elements
+        // in some runs (about one in ten), and got the window.
+        const WINDOW: u64 = 4 << 20;
+        let memory = vec![0u64; (2 * WINDOW / 8) as usize];
+        let start = (memory.as_ptr() as u64).next_multiple_of(WINDOW);
         // SAFETY: a plain CPU-side heap of one view.
         let cpu: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
