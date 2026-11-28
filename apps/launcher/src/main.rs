@@ -15,7 +15,7 @@ mod update;
 fn main() {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(paths::Repo::of_this_build())
+        .manage(paths::Repo::locate())
         .invoke_handler(tauri::generate_handler![
             commands::status,
             commands::pick_exe,

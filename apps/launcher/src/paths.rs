@@ -18,6 +18,27 @@ impl Repo {
         Self::at(root)
     }
 
+    /// The checkout the launcher sits in (it or one of its folders holds
+    /// `scripts\play-nvidia.ps1`), else the one it was built from.
+    pub(crate) fn locate() -> Self {
+        let beside_exe = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Self::containing(&exe));
+        beside_exe.unwrap_or_else(Self::of_this_build)
+    }
+
+    /// The nearest folder above `path` that is a checkout.
+    pub(crate) fn containing(path: &Path) -> Option<Self> {
+        path.ancestors()
+            .skip(1)
+            .map(|dir| Self::at(dir.to_path_buf()))
+            .find(Self::is_checkout)
+    }
+
+    pub(crate) fn is_checkout(&self) -> bool {
+        self.play_script().is_file()
+    }
+
     pub(crate) fn at(root: PathBuf) -> Self {
         Self { root }
     }
@@ -95,6 +116,16 @@ mod tests {
     #[test]
     fn this_build_finds_its_repository() {
         assert!(Repo::of_this_build().play_script().is_file());
+    }
+
+    #[test]
+    fn a_launcher_inside_a_checkout_finds_it() {
+        let repo = Repo::of_this_build();
+        let exe = repo.root().join(r"target\release\victory-launcher.exe");
+        let found = Repo::containing(&exe).unwrap();
+        assert_eq!(found.root(), repo.root());
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(Repo::containing(&elsewhere.path().join("victory-launcher.exe")).is_none());
     }
 
     #[test]

@@ -30,9 +30,16 @@ fn status_of(repo: &Repo) -> Status {
     let config = LauncherConfig::file()
         .map(|f| LauncherConfig::load(&f))
         .unwrap_or_default();
-    let exe_problem = match &config.exe {
-        Some(exe) => exe_problem(exe, repo),
-        None => Some("Choose the title's .exe in your own dump.".into()),
+    let exe_problem = if !repo.is_checkout() {
+        Some(
+            "Put the launcher in your VIctory-NVIDIA folder (the one with the scripts folder)."
+                .into(),
+        )
+    } else {
+        match &config.exe {
+            Some(exe) => exe_problem(exe, repo),
+            None => Some("Choose the title's .exe in your own dump.".into()),
+        }
     };
     Status {
         exe: config.exe,

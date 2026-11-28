@@ -41,13 +41,23 @@ if (Test-Path $victory) {
     if (-not $built) { Stop-WithMessage 'The layer did not build (see above).' }
 }
 
-# The launcher, into the folder and profile it was built with: <target>\<profile>\victory-launcher.exe.
+# The launcher. Built here before (<target>\debug or <target>\release\victory-launcher.exe): rebuilt into the
+# same folder and profile. Anywhere else (a downloaded release put in this folder): built for release here,
+# then copied over the old file.
 $profileDir = Split-Path $LauncherExe -Parent
-$env:CARGO_TARGET_DIR = Split-Path $profileDir -Parent
+$profile = Split-Path $profileDir -Leaf
 Write-Host 'Rebuilding the launcher ...'
-if ((Split-Path $profileDir -Leaf) -eq 'release') { cargo build --release --locked -p launcher }
-else { cargo build --locked -p launcher }
-if ($LASTEXITCODE -ne 0) { Stop-WithMessage 'The launcher did not build (see above).' }
+if ($profile -in 'debug', 'release') {
+    $env:CARGO_TARGET_DIR = Split-Path $profileDir -Parent
+    if ($profile -eq 'release') { cargo build --release --locked -p launcher }
+    else { cargo build --locked -p launcher }
+    if ($LASTEXITCODE -ne 0) { Stop-WithMessage 'The launcher did not build (see above).' }
+} else {
+    Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+    cargo build --release --locked -p launcher
+    if ($LASTEXITCODE -ne 0) { Stop-WithMessage 'The launcher did not build (see above).' }
+    Copy-Item -LiteralPath (Join-Path $repo 'target\release\victory-launcher.exe') -Destination $LauncherExe -Force
+}
 
 Write-Host 'Done. Starting the launcher again.'
 Start-Process -FilePath $LauncherExe
