@@ -443,7 +443,7 @@ fn commit_said(commit: &str, dirty: bool) -> String {
 /// ask git) runs while its checkout is at `checkout`: a run once measured a
 /// build older than the checkout it was logged as (2026-11-28). Nothing when
 /// they agree, or when both have changes not committed (whether the same ones
-/// is not known). scripts\play-foxhound.ps1 says the same.
+/// is not known). scripts\victory-build.ps1 says the same.
 fn source_warning(built: &str, built_dirty: bool, checkout: &str, checkout_dirty: bool) -> Option<String> {
     let short = |c: &str| c.get(..10).unwrap_or(c).to_owned();
     if built == "unknown" {

@@ -8,6 +8,8 @@
 # -LogTag       a word added to the log's name, to tell runs apart
 # -LogLevel     error, warn, info, debug or trace (debug and trace: the diag build only); -LogFilter a whole
 #               VICTORY_LOG filter instead ('victory_gpu::host=debug,info'). A VICTORY_LOG set in this window stays.
+# It builds target\<Build>\victory.exe from this checkout first, at every start (cargo: README; without cargo it
+# starts the one there with a warning). The log says which commit that build is of.
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -38,8 +40,13 @@ if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($logFilter) { $settings.VICTORY_LOG = $logFilter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
-$victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
-if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
+$repo = Split-Path $PSScriptRoot -Parent
+$victory = Join-Path $repo "target\$Build\victory.exe"
+# Built from this checkout at every start, not only when missing (victory-build.ps1 says why); seconds when
+# nothing changed.
+. (Join-Path $PSScriptRoot 'victory-build.ps1')
+$built = Build-Victory $repo $Build
+if (-not $built) { return }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
 # (Other settings left over in this window go; where your files are stays.)
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
@@ -51,8 +58,11 @@ New-Item -ItemType Directory -Force $LogDir | Out-Null
 $stamp = '{0:yyyyMMdd-HHmmss}' -f (Get-Date)
 $log = Join-Path $LogDir $(if ($LogTag) { "victory-$stamp-$LogTag.log" } else { "victory-$stamp.log" })
 $header = "# build=$Build switches: " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
-[IO.File]::WriteAllText($log, "$header`n# run: started: $((Get-Date).ToString('o'))`n", [Text.UTF8Encoding]::new($false))
+# What victory.exe was built from and what the checkout is at, with a warning when they differ.
+$source = Get-VictorySource $repo $victory ($built -eq 'stale')
+$sourceLines = ($source.Keys | ForEach-Object { "# run: ${_}: $($source[$_])`n" }) -join ''
+[IO.File]::WriteAllText($log, "$header`n# run: started: $((Get-Date).ToString('o'))`n$sourceLines", [Text.UTF8Encoding]::new($false))
 $env:VICTORY_LOG_FILE = $log
 Write-Host "Log: $log"
-Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
+Push-Location $repo   # victory.toml is looked for here
 try { & $victory run $Exe --execute } finally { Pop-Location }

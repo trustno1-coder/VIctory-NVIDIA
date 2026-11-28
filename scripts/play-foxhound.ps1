@@ -196,26 +196,10 @@ if ($LogTag) { $settings.VICTORY_MENU_ARGS += " -LogTag $LogTag" }
 if ($fileOnly) { $settings.VICTORY_MENU_ARGS += ' -LogFileOnly' }
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
-# Built at every start, not only when missing: a checkout changed since the last build ran the old program, and a
-# whole test run measured code from before the changes it was for (2026-11-28). With nothing changed, cargo is done
-# in a few seconds. Without cargo, a victory.exe already here is started, with a warning (and the log's header says
-# which commit it was built from).
-$stale = $false
-if (Get-Command cargo -ErrorAction SilentlyContinue) {
-    Write-Host $(if (Test-Path $victory) { 'Building the layer (only what changed since the last build) ...' } else { 'Building the layer (a few minutes the first time) ...' })
-    Push-Location $repo
-    try {
-        if ($Build -eq 'diag') { cargo build --locked --profile diag -p victory --features diagnostics }
-        else { cargo build --release --locked -p victory }
-        $built = $LASTEXITCODE -eq 0
-    } finally { Pop-Location }
-    # An older victory.exe is not started in place of one that would not build: its run would pass for this checkout's.
-    if (-not $built) { Write-Host "The build failed (see above), so the game is not started with an older $victory."; return }
-} elseif (Test-Path $victory) {
-    $stale = $true
-    Write-Host "No cargo to build with: starting $victory as it is, which may be older than this checkout." -ForegroundColor Yellow
-} else { Write-Host "No $victory, and no cargo to build it with: install Rust (README), then start this again."; return }
-if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
+# Built at every start, not only when missing (victory-build.ps1 says why); seconds when nothing changed.
+. (Join-Path $PSScriptRoot 'victory-build.ps1')
+$built = Build-Victory $repo $Build
+if (-not $built) { return }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
@@ -245,33 +229,10 @@ $hags = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDriver
 $run.hags = switch ($hags) { 2 { 'on' } 1 { 'off' } default { 'not set (on by default in Windows 11)' } }
 try { $plan = (powercfg /getactivescheme 2>$null) -replace '^.*\((.*)\)\s*$', '$1'; if ($plan) { $run.power = "$plan" } } catch {}
 if (Test-Path $victory) { $run.victory = '{0} (built {1:yyyy-MM-dd HH:mm})' -f $victory, (Get-Item $victory).LastWriteTime }
-# The commit victory.exe was built from (apps\victory\build.rs puts it into `victory --version`) and the one the
-# checkout is at: a run once logged as the checkout's ("source: hcx-in-progress at dec535f") was of a victory.exe
-# built hours before, from other code (2026-11-28). "Changes not committed": to the program's sources (apps, crates,
-# Cargo.toml, Cargo.lock), as build.rs counts them. apps\victory\src\play.rs (`victory play`) says the same.
-$programPaths = 'apps', 'crates', 'Cargo.toml', 'Cargo.lock'
-$builtFrom = $null; $builtDirty = $false
-$version = & $victory --version 2>$null | Where-Object { "$_" -match 'built from' } | Select-Object -First 1
-if ("$version" -match 'built from ([0-9a-f]{40})') {
-    $builtFrom = $Matches[1]; $builtDirty = "$version" -match 'not committed'
-    $run['built from'] = "$builtFrom$(if ($builtDirty) { ', with changes not committed' })"
-} else { $run['built from'] = 'not known' }
-$warning = $null
-if (Get-Command git -ErrorAction SilentlyContinue) {
-    $commit = git -C $repo rev-parse HEAD 2>$null
-    if ($commit) {
-        $branch = git -C $repo rev-parse --abbrev-ref HEAD 2>$null
-        $dirty = [bool](git -C $repo status --porcelain --untracked-files=no -- @programPaths 2>$null)
-        $run.checkout = "$branch at $commit$(if ($dirty) { ', with changes not committed' })"
-        $short = { param($c) $c.Substring(0, [Math]::Min(10, $c.Length)) }
-        if (-not $builtFrom) { $warning = "this victory.exe does not know the commit it was built from; the checkout is at $(& $short $commit)" }
-        elseif ($builtFrom -ne $commit) {
-            $warning = "this victory.exe was built from $(& $short $builtFrom), but the checkout is at $(& $short $commit): this run is of the build, not the checkout"
-        } elseif ($dirty -and -not $builtDirty) { $warning = 'the checkout has changes not committed that this victory.exe was built without' }
-    }
-}
-if (-not $warning -and $stale -and -not $commit) { $warning = 'victory.exe was not built again before this run (no cargo)' }
-if ($warning) { $run.warning = $warning; Write-Host "Warning: $warning." -ForegroundColor Yellow }
+# What victory.exe was built from and what the checkout is at ("built from", "checkout", and "warning" when they
+# differ: victory-build.ps1).
+$source = Get-VictorySource $repo $victory ($built -eq 'stale')
+foreach ($k in $source.Keys) { $run[$k] = $source[$k] }
 foreach ($k in $run.Keys) { if ($run[$k]) { $writer.WriteLine("# run: ${k}: $($run[$k])") } }
 Write-Host "Log: $log"
 Push-Location $repo   # victory.toml is read from here

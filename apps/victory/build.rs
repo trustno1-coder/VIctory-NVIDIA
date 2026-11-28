@@ -26,7 +26,7 @@ fn main() {
 
 /// The program's sources, as paths from the workspace's root: what a change
 /// not committed is counted in, and what has this asked again. (The
-/// launchers count the same: scripts\play-foxhound.ps1, src\play.rs.)
+/// launchers count the same: scripts\victory-build.ps1, src\play.rs.)
 const SOURCES: [&str; 4] = ["apps", "crates", "Cargo.toml", "Cargo.lock"];
 
 /// What `git` says in `root`, or nothing (no git, or not a checkout: a source archive).
