@@ -284,10 +284,11 @@ impl HostList {
     }
 
     /// A buffer on the card for this recording alone.
-    fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
-        let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
+    pub(super) fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
+        let size = uav_pool::uav_bucket_size(len);
+        let buffer = uav_pool::take_uav(host, size)?;
         name(&buffer, || "bytes between copies".into());
-        self.keep(&buffer);
+        self.deferred().between_uavs.push((buffer.clone(), size));
         Some(buffer)
     }
 }
