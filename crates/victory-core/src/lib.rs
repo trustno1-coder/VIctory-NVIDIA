@@ -4,8 +4,10 @@
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
+//! * [`fs`]: files on the disk before they are renamed, and replaced whole.
 
 pub mod config;
+pub mod fs;
 pub mod logging;
 pub mod policy;
 

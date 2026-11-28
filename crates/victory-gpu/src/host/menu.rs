@@ -691,7 +691,9 @@ impl Menu {
         for (k, v) in &kept {
             text.push_str(&format!("{k}={v}\r\n"));
         }
-        match std::fs::write(&path, text) {
+        // Replaced whole: written in place, a crash while saving left the file
+        // empty or cut short, and every setting saved before it was gone.
+        match victory_core::fs::replace(&path, text.as_bytes()) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "settings menu: saved");
                 self.started = self.values.clone();

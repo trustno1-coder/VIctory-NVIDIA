@@ -23,6 +23,14 @@ pub const PARTS: [&str; 2] = ["saves", "storage"];
 const NEEDED: &str = "saves";
 /// Where an import waits for the next start, in `<data>\<title id>`.
 const PENDING: &str = "import-pending";
+/// Where an import is staged before it waits ([`stage`]): renamed to
+/// [`PENDING`] once all of it is on the disk.
+const STAGING: &str = "import-pending.part";
+/// Added to a part's name while an import takes its place ([`apply`]).
+const ASIDE: &str = ".replaced";
+/// In [`PENDING`] once an apply has begun to move parts: the backup's path
+/// (empty: none), for the apply that finishes it.
+const APPLYING: &str = "applying";
 /// Backups go here when the game folder cannot be written.
 const BACKUPS: &str = "save-backups";
 /// The game keeps its own settings (picture, controls, sound) in a save container of this name
@@ -350,6 +358,7 @@ fn copy_dir(from: &Path, to: &Path, settings: bool) -> io::Result<()> {
             copy_dir(&entry.path(), &target, settings)?;
         } else {
             std::fs::copy(entry.path(), &target)?;
+            victory_core::fs::sync(&target)?;
         }
     }
     Ok(())
@@ -374,29 +383,39 @@ fn unzip(bytes: &[u8], to: &Path) -> io::Result<()> {
             if let Some(up) = path.parent() {
                 std::fs::create_dir_all(up)?;
             }
-            std::fs::write(&path, data)?;
+            victory_core::fs::write_synced(&path, &data)?;
+            crash_point("stage:file");
         }
     }
     Ok(())
 }
 
 /// Stages the save `name` of `share` (a zip, or a save folder) to be put in
-/// place at the next start ([`start`]).
+/// place at the next start ([`start`]). It is written whole, and on the disk,
+/// under another name first: an import cut short (the game closed, a crash)
+/// waited half written, and the next start put the half in place.
 pub fn stage(data: &Path, share: &Path, name: &str) -> io::Result<()> {
     let from = share.join(name);
     let pending = data.join(PENDING);
-    if pending.exists() {
-        std::fs::remove_dir_all(&pending)?;
+    let staging = data.join(STAGING);
+    for old in [&pending, &staging] {
+        if old.exists() {
+            std::fs::remove_dir_all(old)?;
+        }
     }
     let done = if from.is_file() {
-        std::fs::read(&from).and_then(|bytes| unzip(&bytes, &pending))
+        std::fs::read(&from).and_then(|bytes| unzip(&bytes, &staging))
     } else if from.join(NEEDED).is_dir() {
-        PARTS.iter().filter(|p| from.join(p).is_dir()).try_for_each(|p| copy_dir(&from.join(p), &pending.join(p), false))
+        PARTS.iter().filter(|p| from.join(p).is_dir()).try_for_each(|p| copy_dir(&from.join(p), &staging.join(p), false))
     } else {
         Err(io::Error::new(io::ErrorKind::NotFound, format!("{} has no save", from.display())))
     };
+    let done = done.and_then(|()| {
+        crash_point("stage:written");
+        std::fs::rename(&staging, &pending)
+    });
     if done.is_err() {
-        let _ = std::fs::remove_dir_all(&pending);
+        let _ = std::fs::remove_dir_all(&staging);
     }
     done
 }
@@ -424,29 +443,48 @@ fn keep_settings(old: &Path, new: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether an import waits for the next start.
+/// Whether an import waits for the next start: one staged whole, or one an
+/// apply began to put in place.
 pub fn staged(data: &Path) -> bool {
-    data.join(PENDING).join(NEEDED).is_dir()
+    let pending = data.join(PENDING);
+    pending.join(NEEDED).is_dir() || pending.join(APPLYING).is_file()
 }
 
 /// Puts a staged import in place: the save there now is zipped first (into
 /// `share`, else `<data>\save-backups`), then each part of the import takes
 /// the place of the one it replaces (a part the import lacks is kept). The
 /// backup, or `None` when nothing was staged.
+///
+/// A part replaced is renamed aside ([`ASIDE`]) and removed only once the
+/// import's part has its name: removed first, a crash in between left no
+/// save at all. An apply cut short is finished by the next start's, with
+/// the backup the first one made ([`APPLYING`]): the save is then the old
+/// one or the import, whole, never one part of each.
 pub fn apply(data: &Path, share: &Path, stamp: &str) -> io::Result<Option<PathBuf>> {
     let pending = data.join(PENDING);
+    tidy(data);
     if !staged(data) {
         return Ok(None);
     }
-    let name = format!("backup before import {stamp}");
-    let backup = if data.join(NEEDED).is_dir() {
-        match export(data, share, &name) {
-            Ok(to) => Some(to),
-            // (A game folder that cannot be written, such as one under Program Files.)
-            Err(_) => Some(export(data, &data.join(BACKUPS), &name)?),
+    let marker = pending.join(APPLYING);
+    let backup = match std::fs::read_to_string(&marker) {
+        Ok(path) => (!path.is_empty()).then(|| PathBuf::from(path)),
+        Err(_) => {
+            let name = format!("backup before import {stamp}");
+            let backup = if data.join(NEEDED).is_dir() {
+                match export(data, share, &name) {
+                    Ok(to) => Some(to),
+                    // (A game folder that cannot be written, such as one under Program Files.)
+                    Err(_) => Some(export(data, &data.join(BACKUPS), &name)?),
+                }
+            } else {
+                None
+            };
+            crash_point("apply:backed-up");
+            let text = backup.as_deref().map(|b| b.to_string_lossy().into_owned()).unwrap_or_default();
+            victory_core::fs::write_synced(&marker, text.as_bytes())?;
+            backup
         }
-    } else {
-        None
     };
     for part in PARTS {
         let new = pending.join(part);
@@ -454,18 +492,69 @@ pub fn apply(data: &Path, share: &Path, stamp: &str) -> io::Result<Option<PathBu
             continue;
         }
         let old = data.join(part);
-        if old.is_dir() {
-            keep_settings(&old, &new)?;
-        }
+        let aside = data.join(format!("{part}{ASIDE}"));
         if old.exists() {
-            std::fs::remove_dir_all(&old)?;
+            if old.is_dir() {
+                keep_settings(&old, &new)?;
+            }
+            if aside.exists() {
+                std::fs::remove_dir_all(&aside)?;
+            }
+            std::fs::rename(&old, &aside)?;
+            crash_point(&format!("apply:{part}-aside"));
         }
-        if std::fs::rename(&new, &old).is_err() {
-            copy_dir(&new, &old, true)?;
+        // (Without `old` and with `aside`: an apply cut short after that rename;
+        // this one goes on from there.)
+        if std::fs::rename(&new, &old).is_err()
+            && let Err(e) = copy_dir(&new, &old, true)
+        {
+            // The part as it was, the player's settings moved back into it too.
+            let _ = std::fs::remove_dir_all(&old);
+            let _ = std::fs::rename(&aside, &old);
+            let _ = keep_settings(&new, &old);
+            return Err(e);
         }
+        crash_point(&format!("apply:{part}-placed"));
+        let _ = std::fs::remove_dir_all(&aside);
     }
+    crash_point("apply:placed");
     std::fs::remove_dir_all(&pending)?;
     Ok(Some(backup.unwrap_or_else(|| data.join(PARTS[0]))))
+}
+
+/// Where the crash tests stop the process (`VICTORY_TEST_CRASH_AT=<name>`), at
+/// once, the rest of the work undone, as a crash or a closed game would.
+#[cfg(test)]
+fn crash_point(name: &str) {
+    if std::env::var("VICTORY_TEST_CRASH_AT").is_ok_and(|at| at == name) {
+        std::process::exit(tests::CRASHED);
+    }
+}
+
+#[cfg(not(test))]
+fn crash_point(_: &str) {}
+
+/// What an import cut short left behind, with nothing staged to finish it: a
+/// part set aside goes back where its place is still empty, and is removed
+/// where the import's part took it; a half-staged import is removed.
+fn tidy(data: &Path) {
+    let pending = data.join(PENDING);
+    for part in PARTS {
+        let aside = data.join(format!("{part}{ASIDE}"));
+        if !aside.exists() || pending.join(part).is_dir() {
+            continue;
+        }
+        let old = data.join(part);
+        if old.exists() {
+            let _ = std::fs::remove_dir_all(&aside);
+        } else {
+            let _ = std::fs::rename(&aside, &old);
+        }
+    }
+    let _ = std::fs::remove_dir_all(data.join(STAGING));
+    if pending.exists() && !staged(data) {
+        let _ = std::fs::remove_dir_all(&pending);
+    }
 }
 
 /// At start, before the title runs: the folders the menu uses (`data`,
@@ -648,6 +737,167 @@ mod tests {
         for f in [mine, theirs, share] {
             let _ = std::fs::remove_dir_all(f);
         }
+    }
+
+    /// An import cut short leaves the old save or the new one: a half-staged
+    /// import is never put in place, and an apply stopped after setting a part
+    /// aside is finished by the next start.
+    #[test]
+    fn an_import_cut_short_leaves_one_save_whole() {
+        let (from, data, share) = (folder("cut-from"), folder("cut-data"), folder("cut-share"));
+        put(&from.join(SLOT), "new progress");
+        export(&from, &share, "new").unwrap();
+        put(&data.join(SLOT), "old progress");
+        // Staging stopped before the rename: nothing waits, and the next start removes it.
+        put(&data.join(STAGING).join(SLOT), "half");
+        assert!(!staged(&data));
+        assert_eq!(apply(&data, &share, "c0").unwrap(), None);
+        assert!(!data.join(STAGING).exists());
+        assert_eq!(read(&data.join(SLOT)), "old progress");
+        // An apply stopped after the old save was set aside: finished at the next start.
+        stage(&data, &share, "new.zip").unwrap();
+        assert!(!data.join(STAGING).exists());
+        std::fs::rename(data.join("saves"), data.join(format!("saves{ASIDE}"))).unwrap();
+        apply(&data, &share, "c1").unwrap();
+        assert_eq!(read(&data.join(SLOT)), "new progress");
+        assert!(!data.join(format!("saves{ASIDE}")).exists());
+        // Stopped after the import took the name, before the part set aside was removed.
+        put(&data.join(format!("saves{ASIDE}")).join(SLOT), "old");
+        assert_eq!(apply(&data, &share, "c2").unwrap(), None);
+        assert!(!data.join(format!("saves{ASIDE}")).exists());
+        assert_eq!(read(&data.join(SLOT)), "new progress");
+        // Set aside with nothing to take its place: put back.
+        std::fs::rename(data.join("saves"), data.join(format!("saves{ASIDE}"))).unwrap();
+        apply(&data, &share, "c3").unwrap();
+        assert_eq!(read(&data.join(SLOT)), "new progress");
+        for f in [from, data, share] {
+            let _ = std::fs::remove_dir_all(f);
+        }
+    }
+
+    /// The exit code of a process a crash test stopped.
+    pub(super) const CRASHED: i32 = 86;
+
+    /// A save of both parts, `what` in each file.
+    fn save_of(data: &Path, what: &str) {
+        put(&data.join(SLOT), &format!("{what} progress"));
+        put(&data.join("storage/settings/a"), &format!("{what} storage"));
+    }
+
+    /// Which save `data` holds: "old" or "new", the same in every file, or a
+    /// panic.
+    fn whole_save(data: &Path) -> &'static str {
+        let (slot, storage) = (read(&data.join(SLOT)), read(&data.join("storage/settings/a")));
+        match (slot.as_str(), storage.as_str()) {
+            ("old progress", "old storage") => "old",
+            ("new progress", "new storage") => "new",
+            _ => panic!("a save of two: {slot:?} and {storage:?}"),
+        }
+    }
+
+    /// The child of [`a_game_that_dies_anywhere_in_an_import_leaves_one_save_whole`]:
+    /// stages the import in `VICTORY_TEST_CRASH_SHARE` into the save in
+    /// `VICTORY_TEST_CRASH_DATA`, then puts it in place (the next start's
+    /// work), stopped where `VICTORY_TEST_CRASH_AT` says.
+    #[test]
+    #[ignore = "run by the crash tests in a process of its own"]
+    fn crash_child_import() {
+        let var = |name| PathBuf::from(std::env::var_os(name).expect(name));
+        let (data, share) = (var("VICTORY_TEST_CRASH_DATA"), var("VICTORY_TEST_CRASH_SHARE"));
+        stage(&data, &share, "new.zip").unwrap();
+        apply(&data, &share, "crash").unwrap();
+    }
+
+    /// Acceptance: the game dies (killed, crashed, closed) at each step of
+    /// importing a save: while the import is written, before it is marked as
+    /// waiting, after the backup, with each part set aside, with each part in
+    /// place, and before the import's folder is removed. Whatever the step, the
+    /// next start leaves the save whole, old or new and never a part of each,
+    /// with the player's own game settings, and nothing behind; once the
+    /// import was marked as waiting, the save is the new one.
+    #[test]
+    fn a_game_that_dies_anywhere_in_an_import_leaves_one_save_whole() {
+        let settings = format!("saves/{USER}/{SCID}/{SETTINGS}~1/v1/0");
+        let steps = [
+            ("stage:file", "old"),
+            ("stage:written", "old"),
+            ("apply:backed-up", "new"),
+            ("apply:saves-aside", "new"),
+            ("apply:saves-placed", "new"),
+            ("apply:storage-aside", "new"),
+            ("apply:storage-placed", "new"),
+            ("apply:placed", "new"),
+        ];
+        for (step, after) in steps {
+            let base = folder(&format!("crash-{}", step.replace(':', "-")));
+            let (from, data, share) = (base.join("from"), base.join("data"), base.join("share"));
+            save_of(&from, "new");
+            export(&from, &share, "new").unwrap();
+            save_of(&data, "old");
+            put(&data.join(&settings), "my picture settings");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "save_share::tests::crash_child_import", "--ignored", "--test-threads=1"])
+                .env("VICTORY_TEST_CRASH_AT", step)
+                .env("VICTORY_TEST_CRASH_DATA", &data)
+                .env("VICTORY_TEST_CRASH_SHARE", &share)
+                .stdout(std::process::Stdio::null()).status()
+                .unwrap();
+            assert_eq!(status.code(), Some(CRASHED), "{step}: the child stopped there");
+            // The next start.
+            let applied = apply(&data, &share, "next").unwrap();
+            assert_eq!(whole_save(&data), after, "{step}");
+            assert_eq!(read(&data.join(&settings)), "my picture settings", "{step}: the player's settings");
+            if after == "new" {
+                let backup = applied.expect("finished at the next start");
+                // (Stopped before the apply was marked as begun, the next start backs
+                // the old save up again.)
+                let first = if step == "apply:backed-up" { "next" } else { "crash" };
+                let name = format!("backup before import {first}.zip");
+                assert_eq!(backup.file_name().unwrap().to_string_lossy(), name, "{step}: the backup");
+                let check = base.join("check");
+                stage(&check, &share, &name).unwrap();
+                apply(&check, &share, "check").unwrap();
+                assert_eq!(whole_save(&check), "old", "{step}: the backup is the old save");
+            }
+            let mut left: Vec<String> =
+                std::fs::read_dir(&data).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            left.sort();
+            assert_eq!(left, ["saves", "storage"], "{step}: nothing left behind");
+            assert!(!staged(&data));
+            assert_eq!(apply(&data, &share, "again").unwrap(), None, "{step}");
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    /// A part of the import that can be neither moved nor copied (a file of it
+    /// held open by another program) fails the apply with the save as it was,
+    /// the player's settings in it; the next start puts the import in place.
+    #[test]
+    fn an_import_that_cannot_be_put_in_place_leaves_the_save_as_it_was() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let base = folder("held");
+        let (from, data, share) = (base.join("from"), base.join("data"), base.join("share"));
+        let settings = format!("saves/{USER}/{SCID}/{SETTINGS}~1/v1/0");
+        save_of(&from, "new");
+        export(&from, &share, "new").unwrap();
+        save_of(&data, "old");
+        put(&data.join(&settings), "my picture settings");
+        stage(&data, &share, "new.zip").unwrap();
+        // Not shared at all: the folder cannot be renamed, nor the file read.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(data.join(PENDING).join(SLOT))
+            .unwrap();
+        assert!(apply(&data, &share, "h1").is_err());
+        assert_eq!(whole_save(&data), "old");
+        assert_eq!(read(&data.join(&settings)), "my picture settings");
+        assert!(staged(&data), "still waits for the next start");
+        drop(held);
+        apply(&data, &share, "h2").unwrap().unwrap();
+        assert_eq!(whole_save(&data), "new");
+        assert_eq!(read(&data.join(&settings)), "my picture settings");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
