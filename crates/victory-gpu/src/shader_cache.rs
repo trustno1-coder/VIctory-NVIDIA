@@ -99,6 +99,16 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
             bytes.push(0);
         }
+        // And whether the LDS regions that need no order between a console
+        // wave's two host waves are taken (`VICTORY_LDS_EXACT=1`), likewise
+        // only while it is on.
+        if victory_shader::emit::lds_exact() {
+            tracing::info!(
+                "VICTORY_LDS_EXACT=1: console wave64 compute programs whose LDS regions need no order between the halves run in waves of 32"
+            );
+            bytes.extend_from_slice(b"VICTORY_LDS_EXACT=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes

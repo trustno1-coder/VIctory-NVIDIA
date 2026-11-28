@@ -233,6 +233,15 @@ pub(crate) fn early_depth_of(db_shader_control: u32, outputs: &[container::SigEl
 static EARLY_DEPTH_COUNTS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// `VICTORY_LDS_EXACT=1`: a console wave64 compute program whose LDS is read
+/// and written inside lane-branch regions that need no order between its two
+/// host waves ([`lds_exact`]) runs in waves of 32 on a host of 32-lane waves
+/// instead of being refused. Off by default. Part of the translation: the
+/// shader cache keys on it (`victory-gpu`'s does, while it is on).
+pub fn lds_exact() -> bool {
+    lds_exact::switch()
+}
+
 /// Pixel programs translated since the start whose console code tests depth
 /// before them ([`early_depth`]): given D3D12's early test, left with the
 /// late one because the switch is off, left with it because they write
