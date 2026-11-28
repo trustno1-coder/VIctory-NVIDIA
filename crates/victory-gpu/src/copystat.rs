@@ -404,6 +404,7 @@ fn big_blocks() -> String {
 
 /// The system's allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
+#[allow(dead_code)]
 struct Counting;
 
 // SAFETY: every call goes to the system's allocator unchanged; only
@@ -449,6 +450,9 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 }
 
+// Only in diagnostics builds, as the doc above states: every allocation and
+// release in the process otherwise pays for the counters.
+#[cfg(feature = "diagnostics")]
 #[global_allocator]
 static HEAP: Counting = Counting;
 
