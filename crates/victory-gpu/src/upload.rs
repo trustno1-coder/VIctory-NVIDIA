@@ -22,8 +22,26 @@ const ARENA: usize = 4 << 20;
 
 struct Arena {
     at: usize,
-    /// Per block whether it is handed out.
-    taken: Vec<bool>,
+    /// Per block, the upload's exclusive end offset plus one. Zero means free.
+    ends: Vec<usize>,
+}
+
+impl Arena {
+    fn take(&mut self, first: usize, blocks: usize, len: usize) {
+        let end = first * BLOCK + len;
+        self.ends[first..first + blocks].fill(end + 1);
+    }
+
+    fn block_at(&self, address: usize) -> Option<(usize, usize)> {
+        let offset = address.checked_sub(self.at)?;
+        let first = offset / BLOCK;
+        let end = self.ends.get(first)?.checked_sub(1)?;
+        if offset >= end {
+            return None;
+        }
+        let start = first * BLOCK;
+        Some((self.at + start, end - start))
+    }
 }
 
 static ARENAS: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
@@ -43,10 +61,10 @@ fn low() -> bool {
 }
 
 /// The first place of `n` free blocks side by side.
-fn gap(taken: &[bool], n: usize) -> Option<usize> {
+fn gap(ends: &[usize], n: usize) -> Option<usize> {
     let mut free = 0;
-    for (i, &t) in taken.iter().enumerate() {
-        free = if t { 0 } else { free + 1 };
+    for (i, &end) in ends.iter().enumerate() {
+        free = if end == 0 { free + 1 } else { 0 };
         if free == n {
             return Some(i + 1 - n);
         }
@@ -130,10 +148,19 @@ fn from_early(len: usize) -> Option<usize> {
     if len != EARLY_PIECE {
         return None;
     }
-    let at = EARLY.lock().unwrap_or_else(|e| e.into_inner()).pop()?;
-    // SAFETY: a reservation of our own, not committed before.
-    let done = unsafe { VirtualAlloc(at as *const _, len, MEM_COMMIT, PAGE_READWRITE) } as usize;
-    (done == at).then_some(at)
+    commit_early_piece(&EARLY, |at| {
+        // SAFETY: a reservation of our own, not committed before.
+        (unsafe { VirtualAlloc(at as *const _, len, MEM_COMMIT, PAGE_READWRITE) } as usize) == at
+    })
+}
+
+fn commit_early_piece(pieces: &Mutex<Vec<usize>>, commit: impl FnOnce(usize) -> bool) -> Option<usize> {
+    let mut pieces = pieces.lock().unwrap_or_else(|e| e.into_inner());
+    let &at = pieces.last()?;
+    if commit(at) {
+        return pieces.pop();
+    }
+    None
 }
 
 /// The address space every run reserves first thing ([`reserve_space`]),
@@ -169,7 +196,7 @@ pub fn reserve_space() {
 fn from_pool(len: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
     static TOLD: std::sync::Once = std::sync::Once::new();
-    let len = len.div_ceil(BLOCK) * BLOCK;
+    let len = len.div_ceil(BLOCK).checked_mul(BLOCK)?;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     TOLD.call_once(|| {
         let lowest = pool.iter().map(|p| p.0).min().unwrap_or(0);
@@ -230,32 +257,40 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
 }
 
 impl Upload {
+    fn from_heap(len: usize) -> Option<Self> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).ok()?;
+        bytes.resize(len, 0);
+        Some(Upload(Kind::Heap(bytes)))
+    }
+
     pub(crate) fn new(len: usize) -> Option<Upload> {
         if !low() {
-            return Some(Upload(Kind::Heap(vec![0; len])));
+            return Self::from_heap(len);
         }
         let n = len.max(1).div_ceil(BLOCK);
         let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-        let found = arenas.iter().enumerate().find_map(|(a, arena)| Some((a, gap(&arena.taken, n)?)));
+        let found = arenas.iter().enumerate().find_map(|(a, arena)| Some((a, gap(&arena.ends, n)?)));
         let (a, first) = match found {
             Some(place) => place,
             None => {
                 let blocks = n.max(ARENA / BLOCK);
-                let Some(at) = reserve(blocks * BLOCK) else {
+                let bytes = blocks.checked_mul(BLOCK)?;
+                let Some(at) = reserve(bytes) else {
                     // Better than null, which the title throws on, ending
                     // the game: its shaders may read zeros from this.
                     static TOLD: std::sync::Once = std::sync::Once::new();
                     TOLD.call_once(|| tracing::warn!(bytes = len, "an upload from the process heap instead: ray tracing may miss some of it"));
-                    return Some(Upload(Kind::Heap(vec![0; len])));
+                    return Self::from_heap(len);
                 };
-                crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
-                tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
-                arenas.push(Arena { at, taken: vec![false; blocks] });
+                crate::shadow::register(at, at as u64, bytes as u64);
+                tracing::info!(at = format_args!("{at:#x}"), bytes, "memory for lists' uploads, where shaders reach it by address");
+                arenas.push(Arena { at, ends: vec![0; blocks] });
                 (arenas.len() - 1, 0)
             }
         };
         let arena = &mut arenas[a];
-        arena.taken[first..first + n].fill(true);
+        arena.take(first, n, len);
         let at = arena.at + first * BLOCK;
         // SAFETY: the blocks are the arena's and nobody else's now.
         unsafe { std::ptr::write_bytes(at as *mut u8, 0, len) };
@@ -274,26 +309,77 @@ impl Drop for Upload {
     fn drop(&mut self) {
         let Kind::Low(at, len) = self.0 else { return };
         let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(arena) = arenas.iter_mut().find(|a| (a.at..a.at + a.taken.len() * BLOCK).contains(&at)) {
+        if let Some(arena) = arenas.iter_mut().find(|a| (a.at..a.at + a.ends.len() * BLOCK).contains(&at)) {
             let first = (at - arena.at) / BLOCK;
-            arena.taken[first..first + len.max(1).div_ceil(BLOCK)].fill(false);
+            arena.ends[first..first + len.max(1).div_ceil(BLOCK)].fill(0);
         }
     }
 }
 
-/// The block handed out that holds `address`: its start and bytes (whole
-/// [`BLOCK`]s).
+/// Initialized bytes from the block containing `address` to the end of
+/// that upload.
 pub(crate) fn block(address: usize) -> Option<(usize, usize)> {
     let arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-    let arena = arenas.iter().find(|a| (a.at..a.at + a.taken.len() * BLOCK).contains(&address))?;
-    let first = (address - arena.at) / BLOCK;
-    let n = arena.taken[first..].iter().take_while(|t| **t).count();
-    (n > 0).then_some((arena.at + first * BLOCK, n * BLOCK))
+    arenas.iter().find_map(|arena| arena.block_at(address))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_commit_can_retry_the_same_reservation() {
+        let pieces = Mutex::new(vec![0x10000, 0x20000]);
+        assert_eq!(
+            commit_early_piece(&pieces, |at| {
+                assert_eq!(at, 0x20000);
+                false
+            }),
+            None,
+        );
+        assert_eq!(commit_early_piece(&pieces, |at| at == 0x20000), Some(0x20000));
+        assert_eq!(commit_early_piece(&pieces, |_| true), Some(0x10000));
+    }
+
+    #[test]
+    fn an_unrepresentable_upload_returns_none() {
+        assert!(Upload::new(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn an_unrepresentable_pool_size_returns_none() {
+        assert!(from_pool(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn the_heap_fallback_allocates_zeroed_bytes_and_rejects_unrepresentable_capacity() {
+        let upload = Upload::from_heap(100).unwrap();
+        let Kind::Heap(bytes) = &upload.0 else {
+            panic!("expected a heap upload");
+        };
+        assert_eq!(bytes.as_slice(), [0; 100]);
+        assert!(Upload::from_heap(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn an_upload_scan_stops_before_the_next_allocation() {
+        let at = 1 << 32;
+        let mut arena = Arena { at, ends: vec![0; 4] };
+        arena.take(0, 2, 2 * BLOCK);
+        arena.take(2, 1, BLOCK);
+
+        assert_eq!(arena.block_at(at + BLOCK + 8), Some((at + BLOCK, BLOCK)));
+    }
+
+    #[test]
+    fn an_upload_scan_excludes_uninitialized_block_padding() {
+        let at = 1 << 32;
+        let mut arena = Arena { at, ends: vec![0; 2] };
+        arena.take(0, 1, 24);
+
+        assert_eq!(arena.block_at(at + 8), Some((at, 24)));
+        assert_eq!(arena.block_at(at + 24), None);
+    }
 
     #[test]
     fn blocks_lie_below_40_bits_and_are_used_again_zeroed() {
@@ -338,8 +424,8 @@ mod tests {
 
     #[test]
     fn a_gap_is_blocks_side_by_side() {
-        assert_eq!(gap(&[true, false, true, false, false, true], 1), Some(1));
-        assert_eq!(gap(&[true, false, true, false, false, true], 2), Some(3));
-        assert_eq!(gap(&[true, false, true, false, false, true], 3), None);
+        assert_eq!(gap(&[1, 0, 1, 0, 0, 1], 1), Some(1));
+        assert_eq!(gap(&[1, 0, 1, 0, 0, 1], 2), Some(3));
+        assert_eq!(gap(&[1, 0, 1, 0, 0, 1], 3), None);
     }
 }
