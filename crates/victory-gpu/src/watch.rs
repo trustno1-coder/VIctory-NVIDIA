@@ -59,6 +59,9 @@ impl Journal {
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.insert(page, now).unwrap_or(0);
+        if self.sync_epochs {
+            WRITTEN_EPOCHS.set(page, now);
+        }
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
             return before;
@@ -134,7 +137,152 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// Mirror writes into lock-free [`WRITTEN_EPOCHS`] (true for global `JOURNAL`, false for isolated unit tests).
+    sync_epochs: bool,
 }
+
+/// Lock-free mirror of [`Journal::kept`] so callers can skip redundant `ask_ahead`/`ask_ahead_done` locks.
+static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the submission's one asking ([`ask_once`]) currently stands.
+pub(crate) fn is_kept() -> bool {
+    KEPT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Snapshot of the current `ahead` page ranges into a reusable buffer so
+/// batched `nothing_new_with` checks avoid locking [`JOURNAL`] or allocating.
+pub(crate) fn ahead_snapshot_into(out: &mut Vec<(usize, usize)>) {
+    out.clear();
+    out.extend_from_slice(&journal().ahead);
+}
+
+/// 3-level lock-free page-write epoch table mirroring [`Journal::written`] for 128 TiB of 64 KiB pages.
+/// Level 0: 32,768 × 4 GiB; Level 1: 64 × 64 MiB; Level 2: 1,024 × 64 KiB.
+struct PageEpochs([std::sync::atomic::AtomicPtr<EpochMid>; PageEpochs::L0_LEN]);
+
+type EpochLeaf = [std::sync::atomic::AtomicU64; PageEpochs::L2_LEN];
+type EpochMid = [std::sync::atomic::AtomicPtr<EpochLeaf>; PageEpochs::L1_LEN];
+
+impl PageEpochs {
+    const L0_LEN: usize = 1 << 15;
+    const L1_LEN: usize = 1 << 6;
+    const L2_LEN: usize = 1 << 10;
+    const L1_SHIFT: usize = 10;
+    const L0_SHIFT: usize = 16;
+    const MAX_PAGES: usize = Self::L0_LEN * Self::L1_LEN * Self::L2_LEN;
+
+    const fn new() -> Self {
+        Self([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Self::L0_LEN])
+    }
+
+    fn set(&self, page: usize, now: u64) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let l0 = page >> Self::L0_SHIFT;
+        let Some(slot0) = self.0.get(l0) else {
+            return;
+        };
+        let mut mid_ptr = slot0.load(Acquire);
+        if mid_ptr.is_null() {
+            let fresh = Box::into_raw(Box::new([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Self::L1_LEN]));
+            match slot0.compare_exchange(std::ptr::null_mut(), fresh, AcqRel, Acquire) {
+                Ok(_) => mid_ptr = fresh,
+                Err(existing) => {
+                    // SAFETY: allocated just above, lost race and not shared.
+                    drop(unsafe { Box::from_raw(fresh) });
+                    mid_ptr = existing;
+                }
+            }
+        }
+        // SAFETY: `mid_ptr` is non-null and permanently allocated.
+        let mid = unsafe { &*mid_ptr };
+        let l1 = (page >> Self::L1_SHIFT) & (Self::L1_LEN - 1);
+        let slot1 = &mid[l1];
+        let mut leaf_ptr = slot1.load(Acquire);
+        if leaf_ptr.is_null() {
+            let fresh = Box::into_raw(Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Self::L2_LEN]));
+            match slot1.compare_exchange(std::ptr::null_mut(), fresh, AcqRel, Acquire) {
+                Ok(_) => leaf_ptr = fresh,
+                Err(existing) => {
+                    // SAFETY: allocated just above, lost race and not shared.
+                    drop(unsafe { Box::from_raw(fresh) });
+                    leaf_ptr = existing;
+                }
+            }
+        }
+        // SAFETY: `leaf_ptr` is non-null and permanently allocated.
+        // Exclusive `JOURNAL` write lock serializes writers; plain Release store avoids x86 CAS loop.
+        let leaf = unsafe { &*leaf_ptr };
+        leaf[page & (Self::L2_LEN - 1)].store(now, Release);
+    }
+
+    fn all_within(&self, first: usize, last: usize, taken: &[std::sync::atomic::AtomicU64], ranged: u64) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        if last > Self::MAX_PAGES {
+            return false;
+        }
+        // Ultra-common fast path (~95% of buffers): single 64 KiB page.
+        if last == first + 1 {
+            let t = taken[0].load(Acquire).max(ranged);
+            if t == 0 {
+                return false;
+            }
+            let l0 = first >> Self::L0_SHIFT;
+            let mid_ptr = self.0[l0].load(Acquire);
+            if mid_ptr.is_null() {
+                return true;
+            }
+            // SAFETY: non-null and permanently allocated.
+            let mid = unsafe { &*mid_ptr };
+            let leaf_ptr = mid[(first >> Self::L1_SHIFT) & (Self::L1_LEN - 1)].load(Acquire);
+            if leaf_ptr.is_null() {
+                return true;
+            }
+            // SAFETY: non-null and permanently allocated.
+            let leaf = unsafe { &*leaf_ptr };
+            let w = leaf[first & (Self::L2_LEN - 1)].load(Acquire);
+            return w <= t;
+        }
+        if ranged == 0 && taken.iter().any(|at| at.load(Acquire) == 0) {
+            return false;
+        }
+        let mut page = first;
+        while page < last {
+            let l0 = page >> Self::L0_SHIFT;
+            let mid_ptr = self.0[l0].load(Acquire);
+            if mid_ptr.is_null() {
+                page = ((l0 + 1) << Self::L0_SHIFT).min(last);
+                continue;
+            }
+            // SAFETY: non-null and permanently allocated.
+            let mid = unsafe { &*mid_ptr };
+            let l0_end = ((l0 + 1) << Self::L0_SHIFT).min(last);
+            while page < l0_end {
+                let l1 = (page >> Self::L1_SHIFT) & (Self::L1_LEN - 1);
+                let l1_end = (((page >> Self::L1_SHIFT) + 1) << Self::L1_SHIFT).min(l0_end);
+                let leaf_ptr = mid[l1].load(Acquire);
+                if leaf_ptr.is_null() {
+                    page = l1_end;
+                    continue;
+                }
+                // SAFETY: non-null and permanently allocated.
+                let leaf = unsafe { &*leaf_ptr };
+                while page < l1_end {
+                    let w = leaf[page & (Self::L2_LEN - 1)].load(Acquire);
+                    if w != 0 {
+                        let t = taken[page - first].load(Acquire).max(ranged);
+                        if w > t {
+                            return false;
+                        }
+                    }
+                    page += 1;
+                }
+            }
+        }
+        true
+    }
+}
+
+static WRITTEN_EPOCHS: PageEpochs = PageEpochs::new();
 
 /// Read by many threads at once (a submission's refreshes run on several),
 /// written only to note an answer: the kernel is asked, and view memory
@@ -148,6 +296,7 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    sync_epochs: true,
 });
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
@@ -587,6 +736,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         j.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
+    KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
     j.ahead = ahead;
 }
 
@@ -596,6 +746,7 @@ pub(crate) fn ask_once_end() {
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
+        KEPT.store(false, std::sync::atomic::Ordering::Release);
         j.ahead.clear();
     }
 }
@@ -751,28 +902,57 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 }
 
 /// Whether nothing of `[start, end)` was written that a copy with the notes
-/// `copied` (the asking after which each page from page `base` on was taken)
-/// and `ranged` (the asking after which a range that holds this one was
-/// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
-/// asked: the submission's asking covers the range, or its blocks are known
-/// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+/// `copied_at` (the asking after which each page from page `base` on was taken)
+/// and `ranged` (the asking after which a range that holds this one was taken
+/// whole, or 0) does not hold, using a pre-snapshotted `ahead` list and
+/// [`WRITTEN_EPOCHS`]. Acquires zero locks; `false` if something would have to
+/// be asked.
+pub(crate) fn nothing_new_with(
+    ahead: &[(usize, usize)],
+    start: usize,
+    end: usize,
+    base: usize,
+    copied_at: &[std::sync::atomic::AtomicU64],
+    ranged: u64,
+) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
     #[cfg(feature = "diagnostics")]
     if known {
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
-    let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return false;
     }
-    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+    let Some(taken) = first.checked_sub(base).and_then(|from| copied_at.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    WRITTEN_EPOCHS.all_within(first, last, taken, ranged)
+}
+
+/// Zero-allocation single-range lock-free [`nothing_new_with`]: skips [`JOURNAL`]
+/// entirely when `published(start, end)` is true, otherwise borrows `j.ahead`
+/// without cloning.
+pub(crate) fn nothing_new_single(
+    start: usize,
+    end: usize,
+    base: usize,
+    copied_at: &[std::sync::atomic::AtomicU64],
+    ranged: u64,
+) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let known = published(start, end);
+    #[cfg(feature = "diagnostics")]
+    if known {
+        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+    }
+    if !known && !journal().ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        return false;
+    }
+    let Some(taken) = first.checked_sub(base).and_then(|from| copied_at.get(from..last - base)) else {
+        return false;
+    };
+    WRITTEN_EPOCHS.all_within(first, last, taken, ranged)
 }
 
 impl Tracked {
@@ -3251,6 +3431,7 @@ mod parts_tests {
             ahead: Vec::new(),
             ahead_asked: 0,
             kept: false,
+            sync_epochs: false,
         };
         assert_eq!(j.parts_since(7, 0), WHOLE);
         assert_eq!(j.note(7, WHOLE, 3), 0);
@@ -3268,6 +3449,32 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+
+    #[test]
+    fn page_epochs_checks_single_and_multi_page_ranges() {
+        use std::sync::atomic::AtomicU64;
+        let table = PageEpochs::new();
+        let taken = [AtomicU64::new(5), AtomicU64::new(5), AtomicU64::new(5), AtomicU64::new(5)];
+        // Untouched region: all within when taken != 0.
+        assert!(table.all_within(100, 101, &taken[..1], 0));
+        assert!(table.all_within(100, 104, &taken, 0));
+        // Untaken page (0) with ranged == 0 returns false; with ranged >= write returns true.
+        let untaken = [AtomicU64::new(0)];
+        assert!(!table.all_within(100, 101, &untaken, 0));
+        assert!(table.all_within(100, 101, &untaken, 5));
+        // Writing page 102 at epoch 6 invalidates [100, 104) and [102, 103), not [100, 102).
+        table.set(102, 6);
+        assert!(table.all_within(100, 102, &taken[..2], 0));
+        assert!(!table.all_within(102, 103, &taken[2..3], 0));
+        assert!(!table.all_within(100, 104, &taken, 0));
+        assert!(table.all_within(100, 104, &taken, 6));
+        // Cross-L1 / L0 boundary page (beyond 64 MiB and 4 GiB) works cleanly.
+        let high = (1usize << 16) + 1025;
+        table.set(high, 12);
+        let one = [AtomicU64::new(11)];
+        assert!(!table.all_within(high, high + 1, &one, 0));
+        assert!(table.all_within(high, high + 1, &one, 12));
     }
 }
 

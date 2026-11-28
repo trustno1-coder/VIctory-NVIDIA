@@ -4811,7 +4811,7 @@ impl Host {
             }) {
                 whole.push(shadow.clone());
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                    dirty.push((shadow.clone(), Vec::new()));
+                    dirty.push((shadow.clone(), Arc::new(Vec::new())));
                 }
             }
         }
@@ -4850,7 +4850,7 @@ impl Host {
                             continue;
                         };
                         if own.is_none() {
-                            for &(a, b) in ranges {
+                            for &(a, b) in ranges.iter() {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }
                         }
@@ -8536,6 +8536,8 @@ struct Batch {
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
     ahead: ByCopy<(usize, usize)>,
+    /// Reusable snapshot of `watch`'s `ahead` ranges across flushes (zero alloc).
+    ahead_snap: Vec<(usize, usize)>,
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
@@ -8961,31 +8963,52 @@ impl Batch {
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
         const FEW: usize = 256;
+        const MANY_CHUNK: usize = 8;
         let mut spans = spans;
         let many = spans.len() > FEW;
+        let kept = crate::watch::is_kept();
         if !many {
+            crate::watch::ahead_snapshot_into(&mut self.ahead_snap);
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let ahead_snap = &self.ahead_snap;
+            spans.retain(|(shadow, from, to)| !shadow.nothing_new_with(ahead_snap, *from, *to - *from));
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = !kept && spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
+        if many || ahead {
+            crate::watch::ahead_snapshot_into(&mut self.ahead_snap);
+        }
+        let ahead_snap = &self.ahead_snap;
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+        // When `!many`, no-ops were already filtered out so every remaining span
+        // is real copy work: schedule 1 per task for maximum parallelism.
+        let chunk = if many { MANY_CHUNK } else { 1 };
+        let span_chunks = spans.len().div_ceil(chunk);
+        crate::shadow::wide_each_scoped(due.len() + span_chunks, 1, &|lo, hi| {
+            let mut noops = 0u64;
+            for job in lo..hi {
+                // The textures first: they are the longer pieces.
+                let Some(ci) = job.checked_sub(due.len()) else {
+                    due[job].refresh();
+                    continue;
+                };
+                let start = ci * chunk;
+                let end = (start + chunk).min(spans.len());
+                for (shadow, from, to) in &spans[start..end] {
+                    if many && shadow.nothing_new_with(ahead_snap, *from, *to - *from) {
+                        noops += 1;
+                        continue;
+                    }
+                    Self::update(shadow, *from, *to);
+                }
             }
-            Self::update(shadow, *from, *to);
+            if noops > 0 {
+                FLUSHES[2].fetch_add(noops, Ordering::Relaxed);
+            }
         });
         if ahead {
             crate::watch::ask_ahead_done();
@@ -9028,10 +9051,13 @@ impl Batch {
         }
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
-            let (shadow, from, to) = &due[i];
-            if !shadow.nothing_new(*from, *to - *from) {
-                Self::update(shadow, *from, *to);
+        crate::watch::ahead_snapshot_into(&mut self.ahead_snap);
+        let ahead_snap = &self.ahead_snap;
+        crate::shadow::wide_each_scoped(due.len(), if due.len() > 256 { 8 } else { 1 }, &|lo, hi| {
+            for (shadow, from, to) in &due[lo..hi] {
+                if !shadow.nothing_new_with(ahead_snap, *from, *to - *from) {
+                    Self::update(shadow, *from, *to);
+                }
             }
         });
         // The time counted is the time it took, not the threads' sum.
@@ -9056,12 +9082,12 @@ impl Batch {
                 copy_mapped(dst as *mut u8, src as *const u8, len, false);
             }
         } else {
-            let fills = std::mem::take(&mut self.fills);
-            crate::shadow::wide_each(fills.len().div_ceil(PART), move |i| {
-                for &(dst, src, len) in fills.iter().skip(i * PART).take(PART) {
+            crate::shadow::wide_each_scoped(self.fills.len(), PART, &|lo, hi| {
+                for &(dst, src, len) in &self.fills[lo..hi] {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                 }
             });
+            self.fills.clear();
         }
         let took = started.elapsed();
         PREPARING[0].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
@@ -9078,8 +9104,12 @@ impl Batch {
         // The time counted is the time it took, not the threads' sum.
         let started = std::time::Instant::now();
         let before = PREPARING[2].load(Ordering::Relaxed);
-        let due = std::mem::take(&mut self.due);
-        crate::shadow::wide_each(due.len(), move |i| due[i].refresh());
+        crate::shadow::wide_each_scoped(self.due.len(), 1, &|lo, hi| {
+            for staging in &self.due[lo..hi] {
+                staging.refresh();
+            }
+        });
+        self.due.clear();
         let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
         PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
     }
@@ -9104,17 +9134,21 @@ impl Batch {
         // and any thread woken. (Thousands of them, the heap's buffer views
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
+        const MANY_CHUNK: usize = 8;
         let light = crate::watch::light();
+        let kept = crate::watch::is_kept();
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
+            crate::watch::ahead_snapshot_into(&mut self.ahead_snap);
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let ahead_snap = &self.ahead_snap;
+            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new_with(ahead_snap, *from, *to - *from));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = !kept && self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -9134,16 +9168,28 @@ impl Batch {
             let before = PREPARING[0].load(Ordering::Relaxed);
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
-                // A number to a free thread, not a job to each copy.
-                let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
+                // Zero-alloc scoped pass: grain 1 when no-ops were already filtered out,
+                // grain 8 when checking thousands of no-ops in parallel.
+                let check_noop = self.refreshes.len() > FEW;
+                if check_noop || ahead {
+                    crate::watch::ahead_snapshot_into(&mut self.ahead_snap);
+                }
+                let ahead_snap = &self.ahead_snap;
+                let grain = if check_noop { MANY_CHUNK } else { 1 };
+                crate::shadow::wide_each_scoped(self.refreshes.len(), grain, &|lo, hi| {
+                    let mut noops = 0u64;
+                    for (shadow, from, to) in &self.refreshes[lo..hi] {
+                        if check_noop && shadow.nothing_new_with(ahead_snap, *from, *to - *from) {
+                            noops += 1;
+                            continue;
+                        }
+                        Self::update(shadow, *from, *to);
                     }
-                    Self::update(shadow, *from, *to);
+                    if noops > 0 {
+                        FLUSHES[2].fetch_add(noops, Ordering::Relaxed);
+                    }
                 });
+                self.refreshes.clear();
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes

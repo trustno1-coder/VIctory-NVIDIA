@@ -155,7 +155,7 @@ static STALE: Mutex<BTreeMap<(u64, u64), Stale>> = Mutex::new(BTreeMap::new());
 pub(super) fn record(
     host: &Host,
     list: &ID3D12GraphicsCommandList,
-    dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+    dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc<Vec<(usize, usize)>>)],
 ) -> Option<Looks> {
     let mut noted = std::mem::take(&mut *NOTED.lock().unwrap_or_else(|e| e.into_inner()));
     let mut all: Vec<(std::sync::Arc<Shadow>, Taken)> = Vec::new();
