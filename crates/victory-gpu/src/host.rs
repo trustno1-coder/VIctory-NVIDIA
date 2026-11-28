@@ -3747,11 +3747,34 @@ fn host_fence_completion_rejects_removed_device() {
     assert!(fence_reached(8, 7));
 }
 
+#[cfg(test)]
+#[test]
+fn a_lost_device_is_named_not_its_fence_value() {
+    let lost = fence_short("relay", u64::MAX, 312_701);
+    assert!(lost.starts_with("relay: the device was lost before fence value 312701"), "{lost}");
+    assert!(!lost.contains("18446744073709551615"), "{lost}");
+    assert_eq!(fence_short("relay", 6, 7), "relay: fence 6 did not reach 7");
+}
+
 /// Whether a fence's completed value shows `target` run. `u64::MAX` is not
 /// a value the card reaches: it is what `GetCompletedValue` answers when the
 /// device is gone.
 fn fence_reached(completed: u64, target: u64) -> bool {
     completed != u64::MAX && completed >= target
+}
+
+/// What [`wait_host_fence`] says when `target` was not reached. A lost
+/// device is named as such: its fences all read `u64::MAX`, and printed as
+/// a value (`fence 18446744073709551615 did not reach 312701`) it read as
+/// an underflow of ours (#972). Why it was lost, hung or reset, is not asked
+/// here: [`fail`] adds the device's removal reason to the same line
+/// (`; device removed: ... (0x887A0006)`).
+fn fence_short(context: &str, completed: u64, target: u64) -> String {
+    if completed == u64::MAX {
+        format!("{context}: the device was lost before fence value {target} was reached (once it is, every fence reads u64::MAX)")
+    } else {
+        format!("{context}: fence {completed} did not reach {target}")
+    }
 }
 
 /// Waits for `target` on `fence` and reports what went wrong instead of
@@ -3775,9 +3798,7 @@ unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, conte
     }
     let completed = unsafe { fence.GetCompletedValue() };
     if !fence_reached(completed, target) {
-        fail(format_args!(
-            "{context}: fence {completed} did not reach {target}"
-        ));
+        fail(format_args!("{}", fence_short(context, completed, target)));
     }
 }
 
