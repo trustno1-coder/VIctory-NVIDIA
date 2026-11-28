@@ -92,6 +92,53 @@ This got past the first shader only to stop at the second.
   of a preload is kept under Proton has not been measured.
 - A full `PROTON_LOG=1` log reached about 290 MB in one short run.
   `PROTON_LOG='-seh,-unwind'` kept it far smaller.
+- Code that reads Linux's books from inside Wine: `Z:\proc\self` is the
+  wineserver's, not the reading process's (a file opened through drive Z: is
+  looked up by it). A process's own entry is `/proc/<its Linux pid>`.
+- The sampling profiler (`VICTORY_PROFILE`) stopped the title within minutes
+  under Wine: it suspends the title's threads to read their stacks. `perf
+  record -p <pid>` samples from the kernel and pauses nothing.
+
+## Compiled pipelines between runs
+
+Under `umu-run` nothing sets NVIDIA's shader disk cache (Steam does, for its
+own games), and vkd3d-proton's cache keeps only SPIR-V, so every run compiles
+every pipeline again: three minutes into play, NVIDIA's compiler
+(`libnvidia-gpucomp`) was 46 % of the CPU samples (`perf`), 17 % of them on
+the title's own threads. Give the driver a folder of its own and a size it
+takes:
+
+```sh
+export __GL_SHADER_DISK_CACHE=1
+export __GL_SHADER_DISK_CACHE_PATH="$HOME/.cache/victory/nvidia"
+export __GL_SHADER_DISK_CACHE_SIZE=4294967295   # under 4 GiB
+export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
+export VKD3D_SHADER_CACHE_PATH="$HOME/.cache/victory/vkd3d"   # a writable folder
+```
+
+A size of 16 GiB (`17179869184`, 2^34) left the cache unwritten, as if read
+into 32 bits as 0. With the cache, the second run had 237 pipelines still
+being made at 90 seconds where the first had 508 at two minutes, and none left
+a minute sooner (RTX 3080 Ti, driver 620.73.04).
+
+## The picture is soft unless the window is borderless
+
+Without `VICTORY_FULLSCREEN=1` the title's window is fitted to the work area
+(the screen less the taskbar: 2488x1400 for a 2560x1440 picture on a 1440p
+screen) and the swap chain is stretched into it, so every frame is resampled.
+`VICTORY_FULLSCREEN=1` makes it borderless at the screen's size and the
+picture is shown pixel for pixel.
+
+## Wine's own HLSL compiler
+
+Wine's builtin `d3dcompiler_47` refuses several of the helper shaders victory
+compiles at run time, and accepts `[RootSignature(...)]` but leaves it out of
+the code, so vkd3d-proton fails `CreateRootSignature` with `E_FAIL` (no `RTS0`
+part). The helpers that read their root signature from their code are then
+off: the depth planes' pass, keeping the card awake, the scatter, the upload
+check, the tiles' look. A DXC fallback for them is in a pull request of its
+own. Don't install `d3dcompiler_47` with winetricks either: it is too old for
+these shaders.
 
 ## Not tested
 
