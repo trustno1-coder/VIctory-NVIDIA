@@ -387,6 +387,21 @@ pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
     unsafe { std::mem::transmute_copy(&f) }
 }
 
+/// The eight entries after `last` (the byte offset of a table's last known
+/// method) are there, log their slot and fail.
+#[cfg(test)]
+pub(crate) fn assert_room<const N: usize>(table: &Table<N>, last: usize) {
+    assert!(
+        N >= last / 8 + 9,
+        "{N} entries, the last known method at {last:#x}"
+    );
+    for &entry in &table.0[last / 8 + 1..last / 8 + 9] {
+        // SAFETY: a spare entry, which reads no argument and returns a result.
+        let spare: extern "system" fn() -> HRESULT = unsafe { std::mem::transmute(entry) };
+        assert_eq!(spare(), E_NOTIMPL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

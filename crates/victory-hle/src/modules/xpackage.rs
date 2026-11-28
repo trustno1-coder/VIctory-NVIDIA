@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 
 use super::xasync::{self, AsyncBlock};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text,
+    token, with_spare,
 };
 use crate::runtime;
 
@@ -278,7 +279,7 @@ extern "system" fn enumerate(
     S_OK
 }
 
-static VTABLE: Methods<40> = Methods([
+static VTABLE: Methods<48> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -325,6 +326,11 @@ static VTABLE: Methods<40> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn the_package_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0x138);
+    }
 
     #[test]
     fn completed_installation_unregisters_progress_immediately() {

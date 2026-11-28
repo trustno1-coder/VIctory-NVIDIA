@@ -9,7 +9,7 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock, E_ABORT};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, with_spare,
 };
 
 pub const PROVIDER: Guid = Guid::new(
@@ -265,7 +265,7 @@ mod dialog {
     }
 }
 
-static VTABLE: Methods<20> = Methods([
+static VTABLE: Methods<28> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -292,6 +292,11 @@ static VTABLE: Methods<20> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn the_game_ui_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0x98);
+    }
 
     fn block() -> AsyncBlock {
         AsyncBlock {

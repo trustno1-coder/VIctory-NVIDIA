@@ -8,7 +8,8 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock, ProviderData};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text,
+    token, with_spare,
 };
 
 /// The user provider.
@@ -269,7 +270,7 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
 
 // Unset slots (no title seen calls them): maximum users, gamer pictures,
 // the UTF-16 token calls, issue resolution.
-static VTABLE: Methods<35> = Methods([
+static VTABLE: Methods<43> = with_spare([
     missing::<0> as *const (),             // 0x00 QueryInterface
     add_ref as *const (),                  // 0x08 AddRef
     add_ref as *const (),                  // 0x10 Release: the object is static
@@ -307,14 +308,14 @@ static VTABLE: Methods<35> = Methods([
     unregister as *const (),               // 0x110
 ]);
 
-static GAMERTAG_VTABLE: Methods<4> = Methods([
+static GAMERTAG_VTABLE: Methods<12> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
     get_gamertag as *const (), // 0x18
 ]);
 
-static DEVICE_VTABLE: Methods<6> = Methods([
+static DEVICE_VTABLE: Methods<14> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -328,6 +329,21 @@ mod tests {
     use super::*;
     use crate::modules::xasync::E_NOT_SUFFICIENT_BUFFER;
     use crate::modules::xgameruntime::method as slot;
+
+    #[test]
+    fn the_user_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0x110);
+    }
+
+    #[test]
+    fn the_gamertag_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::GAMERTAG_VTABLE, 0x18);
+    }
+
+    #[test]
+    fn the_devices_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::DEVICE_VTABLE, 0x28);
+    }
 
     #[test]
     fn a_gamertag_without_a_suffix_has_an_empty_modern_suffix() {

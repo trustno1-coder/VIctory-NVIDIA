@@ -6,7 +6,7 @@
 use std::ffi::{CStr, c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, token, with_spare,
 };
 use crate::runtime;
 
@@ -201,7 +201,7 @@ extern "system" fn write_event(
     S_OK
 }
 
-static TITLE_VTABLE: Methods<5> = Methods([
+static TITLE_VTABLE: Methods<13> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -209,14 +209,14 @@ static TITLE_VTABLE: Methods<5> = Methods([
     launch_new_game as *const (), // 0x20
 ]);
 
-static FEATURES_VTABLE: Methods<4> = Methods([
+static FEATURES_VTABLE: Methods<12> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
     is_feature_available as *const (), // 0x18
 ]);
 
-static INVITES_VTABLE: Methods<5> = Methods([
+static INVITES_VTABLE: Methods<13> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -224,7 +224,7 @@ static INVITES_VTABLE: Methods<5> = Methods([
     unregister as *const (), // 0x20
 ]);
 
-static EVENTS_VTABLE: Methods<4> = Methods([
+static EVENTS_VTABLE: Methods<12> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -235,6 +235,26 @@ static EVENTS_VTABLE: Methods<4> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn the_title_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::TITLE_VTABLE, 0x20);
+    }
+
+    #[test]
+    fn the_features_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::FEATURES_VTABLE, 0x18);
+    }
+
+    #[test]
+    fn the_invites_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::INVITES_VTABLE, 0x20);
+    }
+
+    #[test]
+    fn the_events_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::EVENTS_VTABLE, 0x18);
+    }
 
     #[test]
     fn a_relaunch_keeps_our_options() {

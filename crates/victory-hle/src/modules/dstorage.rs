@@ -32,7 +32,9 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use victory_formats::bcpack::{self, Tables};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
-use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
+use super::xgameruntime::{
+    Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put, with_spare,
+};
 use crate::{HleModule, hle_export};
 
 /// The factory interface the title asks for.
@@ -255,7 +257,7 @@ fn text(name: *const c_char) -> String {
         .into_owned()
 }
 
-static FACTORY_VTABLE: Methods<16> = Methods([
+static FACTORY_VTABLE: Methods<19> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -457,7 +459,7 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     })
 }
 
-static FILE_VTABLE: Methods<8> = Methods([
+static FILE_VTABLE: Methods<11> = with_spare([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
     release::<File> as *const (),
@@ -503,7 +505,7 @@ extern "system" fn is_complete(this: Array, index: u32) -> bool {
     done
 }
 
-static STATUS_VTABLE: Methods<5> = Methods([
+static STATUS_VTABLE: Methods<13> = with_spare([
     missing::<0> as *const (),
     add_ref_instance::<StatusArray> as *const (),
     release::<StatusArray> as *const (),
@@ -1761,7 +1763,7 @@ fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
 
 /// Slots by the 2020 order, which the argument shapes at
 /// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
-static QUEUE_VTABLE: Methods<12> = Methods([
+static QUEUE_VTABLE: Methods<20> = with_spare([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
@@ -1791,6 +1793,26 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn the_factory_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::FACTORY_VTABLE, 0x50);
+    }
+
+    #[test]
+    fn the_file_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::FILE_VTABLE, 0x10);
+    }
+
+    #[test]
+    fn the_status_array_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::STATUS_VTABLE, 0x20);
+    }
+
+    #[test]
+    fn the_queue_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::QUEUE_VTABLE, 0x58);
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.

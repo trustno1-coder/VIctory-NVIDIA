@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use super::xasync::{self, AsyncBlock, E_INVALIDARG};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, with_spare,
 };
 use super::{storage, xuser};
 use crate::runtime;
@@ -953,7 +953,7 @@ extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast())
 }
 
-static VTABLE: Methods<30> = Methods([
+static VTABLE: Methods<38> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -993,6 +993,11 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn the_game_save_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 0xe8);
+    }
 
     fn block() -> AsyncBlock {
         AsyncBlock {
