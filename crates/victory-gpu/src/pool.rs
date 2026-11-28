@@ -28,6 +28,7 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
+const GROWTH_BACKOFF_MS: u64 = 500;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
@@ -51,7 +52,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
-    if let Ok(mut pool) = STAGING.try_lock() {
+    if let Ok(mut staging) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
             0
         } else if pressure {
@@ -59,7 +60,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else {
             limit
         };
-        pool.reclaim(tick, staging_limit, true);
+        staging.pool.reclaim(tick, staging_limit, true);
     }
     if stats_on() {
         static ASKED: AtomicU64 = AtomicU64::new(0);
@@ -186,6 +187,7 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
+    size: u64,
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
@@ -214,6 +216,7 @@ impl<B: Clone> Pool<B> {
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
+    #[cfg(test)]
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
         self.take_ripe(len, align, now, Ripe::ALL, make)
     }
@@ -227,6 +230,17 @@ impl<B: Clone> Pool<B> {
         now: u64,
         ripe: Ripe,
         mut make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        self.take_sized(len, align, now, ripe, || make().map(|memory| (memory, BLOCK)))
+    }
+
+    fn take_sized(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        ripe: Ripe,
+        mut make: impl FnMut() -> Option<(B, u64)>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
@@ -256,8 +270,8 @@ impl<B: Clone> Pool<B> {
         let (i, start) = match found {
             Some(found) => found,
             None => {
-                let memory = self.grow(now, &mut make)?;
-                let i = self.add(memory, ripe.started);
+                let (memory, size) = self.grow(now, &mut make)?;
+                let i = self.add(memory, size, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
@@ -268,11 +282,11 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(b.size)).count();
             if empty < ripe.ahead
-                && let Some(memory) = self.grow(now, &mut make)
+                && let Some((memory, size)) = self.grow(now, &mut make)
             {
-                self.add(memory, ripe.started);
+                self.add(memory, size, ripe.started);
             }
         }
         let block = self.blocks[i].as_mut()?;
@@ -281,18 +295,18 @@ impl<B: Clone> Pool<B> {
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
-    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
+    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<(B, u64)>) -> Option<(B, u64)> {
         if now < self.retry_growth_at {
             return None;
         }
         let block = make();
         if block.is_none() {
-            self.retry_growth_at = now.saturating_add(500);
+            self.retry_growth_at = now.saturating_add(GROWTH_BACKOFF_MS);
         }
         block
     }
 
-    fn add(&mut self, memory: B, made: u64) -> usize {
+    fn add(&mut self, memory: B, size: u64, made: u64) -> usize {
         let i = match self.blocks.iter().position(Option::is_none) {
             Some(i) => i,
             None => {
@@ -300,7 +314,7 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(size), size, used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
@@ -322,7 +336,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                any |= block.free.whole(block.size);
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -331,7 +345,7 @@ impl<B: Clone> Pool<B> {
         if sweep || any || most < previous {
             let mut spare = 0;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                if block.as_ref().is_some_and(|b| b.free.whole(b.size)) {
                     spare += 1;
                     if spare > most {
                         *block = None;
@@ -350,7 +364,7 @@ impl<B: Clone> Pool<B> {
         let mut c = Census::default();
         for block in self.blocks.iter().flatten() {
             c.blocks += 1;
-            c.empty += u64::from(block.free.whole(BLOCK));
+            c.empty += u64::from(block.free.whole(block.size));
             let mut free = 0;
             for &len in block.free.0.values() {
                 free += len;
@@ -362,7 +376,7 @@ impl<B: Clone> Pool<B> {
             }
             c.free += free;
             // (Pieces that rest count as taken: they are not free yet.)
-            c.full[((BLOCK - free) * 4 / BLOCK).min(3) as usize] += 1;
+            c.full[((block.size - free) * 4 / block.size).min(3) as usize] += 1;
         }
         c.resting = self.resting.iter().map(|(_, piece)| piece.len).sum();
         c
@@ -392,7 +406,15 @@ struct Upload(ID3D12Resource, *mut u8);
 unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+struct StagingPool {
+    pool: Pool<Upload>,
+    growth: StagingGrowth,
+}
+
+static STAGING: Mutex<StagingPool> = Mutex::new(StagingPool {
+    pool: Pool::new(STAGING_KEPT),
+    growth: StagingGrowth { preferred: BLOCK, retry_full_at: 0 },
+});
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -410,7 +432,9 @@ pub(crate) fn texture_room() -> u64 {
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    let textures = lock(&TEXTURES).blocks() as u64 * BLOCK;
+    let staging = lock(&STAGING).pool.blocks.iter().flatten().map(|block| block.size).sum::<u64>();
+    [textures >> 20, staging >> 20]
 }
 
 /// Whether the texture blocks are counted in the log every five seconds
@@ -515,7 +539,50 @@ pub(crate) struct StagingPiece(Piece);
 
 impl Drop for StagingPiece {
     fn drop(&mut self) {
-        lock(&STAGING).give(self.0, now());
+        lock(&STAGING).pool.give(self.0, now());
+    }
+}
+
+struct StagingGrowth {
+    preferred: u64,
+    retry_full_at: u64,
+}
+
+impl StagingGrowth {
+    /// Reuse a successful smaller size during the pool's backoff interval.
+    /// Below 16 MiB, try just the rounded request to bound driver calls.
+    fn make<T>(
+        &mut self,
+        bytes: u64,
+        now: u64,
+        mut make: impl FnMut(u64) -> windows::core::Result<T>,
+    ) -> Result<(T, u64), (u64, windows::core::Error)> {
+        let minimum = bytes.next_multiple_of(64 << 10);
+        let mut size = if now >= self.retry_full_at {
+            BLOCK
+        } else if self.preferred >= minimum {
+            self.preferred
+        } else {
+            minimum.next_power_of_two()
+        };
+        let starting_size = size;
+        loop {
+            match make(size) {
+                Ok(memory) => {
+                    if size < starting_size {
+                        self.preferred = size;
+                        self.retry_full_at = now.saturating_add(GROWTH_BACKOFF_MS);
+                    }
+                    return Ok((memory, size));
+                }
+                Err(error)
+                    if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY && size > minimum =>
+                {
+                    size = if size > (16 << 20) { (size / 2).max(minimum) } else { minimum };
+                }
+                Err(error) => return Err((size, error)),
+            }
+        }
     }
 }
 
@@ -526,8 +593,11 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         return None;
     }
     // Copies from a buffer begin at multiples of 512.
-    let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let bytes = bytes.checked_next_multiple_of(512)?;
+    let mut staging = lock(&STAGING);
+    let StagingPool { pool, growth } = &mut *staging;
+    let now = now();
+    let (piece, memory, again) = pool.take_sized(bytes, 512, now, Ripe::ALL, || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -535,10 +605,18 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
-        crate::host::name(&buffer, || "staging of textures (a block)".into());
-        Some(Upload(buffer, data))
+        match growth.make(bytes, now, |size| host.try_upload_buffer(size)) {
+            Ok(((buffer, data), size)) => {
+                crate::host::name(&buffer, || "staging of textures (a block)".into());
+                Some((Upload(buffer, data), size))
+            }
+            Err((size, error)) => {
+                crate::host::Host::report_upload_error(size, &error);
+                None
+            }
+        }
     })?;
+    drop(staging);
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -946,13 +1024,64 @@ mod tests {
     }
 
     #[test]
+    fn staging_reuses_a_smaller_block_after_out_of_memory() {
+        use windows::Win32::Foundation::E_OUTOFMEMORY;
+
+        let mib = 1 << 20;
+        let mut attempts = Vec::new();
+        let mut pool = Pool::new(0);
+        let mut growth = StagingGrowth { preferred: BLOCK, retry_full_at: 0 };
+        let (first, size, _) = pool.take_sized(8 * mib, 512, 0, Ripe::ALL, || {
+            growth.make(8 * mib, 0, |size| {
+                attempts.push(size);
+                if size > 16 * mib { Err(E_OUTOFMEMORY.into()) } else { Ok(size) }
+            }).ok()
+        }).unwrap();
+        assert_eq!(attempts, [64 * mib, 32 * mib, 16 * mib]);
+        assert_eq!(size, 16 * mib);
+        let (second, _, _) = pool.take_sized(8 * mib, 512, 0, Ripe::ALL, || panic!("reuse the smaller block")).unwrap();
+        assert_eq!(first.block, second.block);
+        assert_eq!(second.start, 8 * mib);
+        assert_eq!(pool.census().full, [0, 0, 0, 1]);
+        pool.give(first, 0);
+        pool.give(second, 0);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.blocks(), 0);
+        assert_eq!(growth.make(8 * mib, 100, Ok).unwrap().1, 16 * mib);
+        assert_eq!(growth.make(8 * mib, 500, Ok).unwrap().1, BLOCK);
+    }
+
+    #[test]
+    fn staging_only_retries_out_of_memory_and_keeps_room_for_the_request() {
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+
+        let mib = 1 << 20;
+        let mut attempts = Vec::new();
+        let mut growth = StagingGrowth { preferred: BLOCK, retry_full_at: 0 };
+        let (size, error) = growth.make::<()>(17 * mib, 0, |size| {
+            attempts.push(size);
+            Err(E_OUTOFMEMORY.into())
+        }).unwrap_err();
+        assert_eq!((size, error.code()), (17 * mib, E_OUTOFMEMORY));
+        assert_eq!(attempts, [64 * mib, 32 * mib, 17 * mib]);
+
+        attempts.clear();
+        let (size, error) = growth.make::<()>(mib, 0, |size| {
+            attempts.push(size);
+            Err(E_INVALIDARG.into())
+        }).unwrap_err();
+        assert_eq!((size, error.code()), (64 * mib, E_INVALIDARG));
+        assert_eq!(attempts, [64 * mib]);
+    }
+
+    #[test]
     fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces() {
         let mut pool = Pool::new(STAGING_KEPT);
         let (held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
         let (resting, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(2)).unwrap();
         pool.give(resting, 0);
         for i in 0..12 {
-            pool.add(i, 0);
+            pool.add(i, BLOCK, 0);
         }
         pool.reclaim(0, SPARE_KEPT, true);
         assert_eq!(pool.blocks(), STAGING_KEPT + 1);
@@ -1067,7 +1196,7 @@ mod tests {
             assert!(at.is_multiple_of(512));
             std::ptr::write_bytes(data, 0xAB, 4096);
             drop(piece);
-            lock(&STAGING).rested(u64::MAX);
+            lock(&STAGING).pool.rested(u64::MAX);
             let (_piece, _, _, data) = staging(host, 4096).unwrap();
             assert!((0..4096).all(|i| *data.add(i) == 0));
             // SAFETY: plain query.
