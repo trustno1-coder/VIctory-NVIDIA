@@ -996,7 +996,7 @@ impl Tells<'_> {
     /// Few slots' work (some microseconds each), so that a pass that takes
     /// the slots due meanwhile on another thread finds few of these told
     /// late.
-    const BATCH: usize = 16;
+    const BATCH: usize = 64;
 
     fn tell(&mut self, index: u32, write: u64, what: crate::descriptor::host::Told) {
         use crate::descriptor::host::Told;
@@ -3242,6 +3242,13 @@ impl State {
                 served = false;
                 break;
             }
+            let mark = if queue_batch() { host.texture_slot_write(index) } else { None };
+            if !baking && sync.is_none() && mark == Some(0) {
+                // Already left the queue (finished by a concurrent pass, read
+                // through a table, made stale, or overwritten with a non-texture):
+                // nothing to tell back (`TextureQueue::same` would drop it).
+                continue;
+            }
             outcome(slot_outcome::TAKEN);
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
@@ -3271,8 +3278,9 @@ impl State {
             // What the queue knew of it when the slots due were taken, while
             // its marks say it holds the write handed out still; else (or with
             // `VICTORY_QUEUE_BATCH=0`) asked now.
-            let checked = match knew {
-                knew if queue_batch() && host.texture_slot_write(index) == Some(write) => knew,
+            let checked = match mark {
+                Some(cur) if cur == write => knew,
+                Some(0) => None,
                 _ => rest(0, || host.texture_slot_checked(index)),
             };
             if let Some((at, len, print, looks, uploaded)) = checked {

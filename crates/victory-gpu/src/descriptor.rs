@@ -149,9 +149,12 @@ impl Heap {
         self.host
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
-                for i in pending.drain(..) {
-                    h.mirror(i, self.start + u64::from(i) * step, false);
+                let mut h = host::HostHeap::new(self.samplers(), self.desc.count)?;
+                {
+                    let mut batch = host::QueueFlusher::new_unpublished(&mut h);
+                    for i in pending.drain(..) {
+                        batch.mirror(i, self.start + u64::from(i) * step, false);
+                    }
                 }
                 Some(h)
             })
@@ -204,6 +207,12 @@ fn mirror(handle: u64) {
     let Some(index) = heap.index(handle) else {
         return;
     };
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            host.mirror(index, handle, false);
+        }
+        return;
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -211,6 +220,85 @@ fn mirror(handle: u64) {
             drop(pending);
             if let Some(host) = host {
                 host.mirror(index, handle, false);
+            }
+        }
+    }
+}
+
+/// Mirrors `count` consecutive descriptors of stride `step` starting at `dst`,
+/// hoisting the `SHADER_HEAPS` lookup when
+/// `count > 1` and the range lies inside a single shader-visible heap.
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    if count == 0 {
+        return;
+    }
+    if count == 1 {
+        mirror(dst);
+        return;
+    }
+    let Some(len) = u64::from(count).checked_mul(step) else {
+        return;
+    };
+    let Some(range_end) = dst.checked_add(len) else {
+        return;
+    };
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut overlaps = heaps.iter().filter(|&&(start, end, _)| dst < end && start < range_end);
+    let Some(&(start, end, at)) = overlaps.next() else {
+        return;
+    };
+    if dst < start || range_end > end || overlaps.next().is_some() {
+        drop(heaps);
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    };
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+    // the `SHADER_HEAPS` lock we hold here.
+    let heap = unsafe { &*(at as *const Heap) };
+    let Some(first) = heap.index(dst) else {
+        return;
+    };
+    let Some(heap_step) = increment(heap.desc.kind).map(u64::from) else {
+        return;
+    };
+    if heap_step != step || dst - start != u64::from(first) * step {
+        drop(heaps);
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    }
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            for i in 0..count {
+                let index = first + i;
+                if index >= heap.desc.count {
+                    break;
+                }
+                host.mirror(index, dst + u64::from(i) * step, false);
+            }
+        }
+        return;
+    }
+    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+    match heap.host.get() {
+        None => {
+            let avail = heap.desc.count.saturating_sub(first).min(count);
+            pending.extend(first..first + avail);
+        }
+        Some(host) => {
+            drop(pending);
+            if let Some(host) = host {
+                for i in 0..count {
+                    let index = first + i;
+                    if index >= heap.desc.count {
+                        break;
+                    }
+                    host.mirror(index, dst + u64::from(i) * step, false);
+                }
             }
         }
     }
@@ -1901,9 +1989,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
         };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_range(dst, count, step);
     }
 }
 
@@ -2507,5 +2593,51 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod audit_regressions {
+    use super::*;
+    #[test]
+    fn audit_range_matches_individual_with_aliases() {
+        let memory = [0u64; 16];
+        let start = memory.as_ptr() as u64;
+        let register = |start, count| {
+            let h = Box::new(Heap {
+                object: Object::new(&FUNCTIONS),
+                desc: HeapDesc {
+                    kind: 0,
+                    count,
+                    flags: SHADER_VISIBLE,
+                    nodes: 0,
+                },
+                start,
+                memory: None,
+                host: Default::default(),
+                pending: Default::default(),
+                written: None,
+            });
+            SHADER_HEAPS.write().unwrap().push((
+                start,
+                start + u64::from(count) * 32,
+                &*h as *const Heap as usize,
+            ));
+            h
+        };
+        let earlier = register(start + 32, 1);
+        let later = register(start, 3);
+        for i in 0..3 {
+            mirror(start + i * 32);
+        }
+        let take = || {
+            (
+                std::mem::take(&mut *earlier.pending.lock().unwrap()),
+                std::mem::take(&mut *later.pending.lock().unwrap()),
+            )
+        };
+        let expected = take();
+        mirror_range(start, 3, 32);
+        assert_eq!(take(), expected);
     }
 }
