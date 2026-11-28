@@ -184,7 +184,8 @@ pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr());
 #[derive(Parser)]
 #[command(
     name = "victory",
-    version,
+    // The package's version and the commit built from (build.rs); the launchers read it.
+    version = env!("VICTORY_BUILD_VERSION"),
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {

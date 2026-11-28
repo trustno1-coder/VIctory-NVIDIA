@@ -337,11 +337,18 @@ fork has always had; its options:
 | `-FgType auto` / `dlss` / `fsr` | which frame generation (see the top of this page); FSR 3's DLLs from `VICTORY_FIDELITYFX_DIR`, else `amd-sdk\FidelityFX\bin` here |
 | `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
 | `-More @{VICTORY_X='1'}` | add or override any switch |
+| `-LogDir D:\perf`, `-LogTag baseline` | the folder the log goes to, and a word in its name to tell runs apart |
+| `-LogLevel warn` / `debug` / ..., `-LogFilter 'victory_gpu::host=debug,info'` | how much is logged (debug and trace need `-Build diag`) |
+| `-LogFileOnly` | the game's output to files only, not the window (for measuring: at high log levels the window slows the game) |
 
 What the F1 menu saved (`victory-settings.txt`) goes over these at every start;
 delete that file to go back to them. Full screen: start the game, then run
 `.\scripts\fullscreen.ps1` in another window. Logs go to
-`%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
+`%LOCALAPPDATA%\victory\logs` (or `-LogDir`; from the `.cmd` launchers, set
+`VICTORY_LOG_DIR`, `VICTORY_LOG_TAG`, `VICTORY_LOG` or `VICTORY_LOG_FILE_ONLY=1`
+first), saves to `%LOCALAPPDATA%\victory\data`. Each script launcher's log
+begins with `# run:` lines: Windows, CPU, memory, GPUs and drivers, HAGS, power
+plan, the build and its commit, and the log filter.
 
 If the menu works but loading a scene closes the game, see the
 [Windows memory troubleshooting guide](docs/windows-memory.md). It shows how

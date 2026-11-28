@@ -36,5 +36,13 @@ if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
+rem set VICTORY_LOG_DIR=<folder> first: the run's log is written there too (victory-<date>-<time>.log), and
+rem VICTORY_LOG sets how much (error, warn, info, debug, trace; debug and trace in the diag build only).
+if not defined VICTORY_LOG_DIR goto :nolog
+if defined VICTORY_LOG_FILE goto :nolog
+if not exist "%VICTORY_LOG_DIR%\" mkdir "%VICTORY_LOG_DIR%"
+for /f %%t in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set "VICTORY_LOG_FILE=%VICTORY_LOG_DIR%\victory-%%t.log"
+echo Log: %VICTORY_LOG_FILE%
+:nolog
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-s --execute
 exit /b %errorlevel%
