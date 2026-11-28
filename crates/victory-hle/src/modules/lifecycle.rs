@@ -16,6 +16,7 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F11;
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
 use windows_sys::core::{PCSTR, PCWSTR, w};
 
@@ -105,6 +106,10 @@ pub(super) fn enabled(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| v == "1")
 }
 
+/// The window rect and style saved before going fullscreen, so F11 can restore
+/// it. `[left, top, right, bottom, GWL_STYLE, GWL_EXSTYLE]`.
+static BEFORE_F11: Mutex<Option<[i32; 6]>> = Mutex::new(None);
+
 fn fullscreen(hwnd: HWND) {
     if !enabled("VICTORY_FULLSCREEN") {
         return;
@@ -114,12 +119,59 @@ fn fullscreen(hwnd: HWND) {
         let (width, height) = std::env::var("VICTORY_FULLSCREEN_RES")
             .ok().as_deref().and_then(parse_window_limit)
             .unwrap_or_else(|| (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)));
-        let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32;
-        let ex = wm::GetWindowLongW(hwnd, wm::GWL_EXSTYLE) as u32;
-        wm::SetWindowLongW(hwnd, wm::GWL_STYLE, ((style & !wm::WS_OVERLAPPEDWINDOW) | wm::WS_POPUP) as i32);
-        wm::SetWindowLongW(hwnd, wm::GWL_EXSTYLE, (ex & !(wm::WS_EX_CLIENTEDGE | wm::WS_EX_WINDOWEDGE | wm::WS_EX_DLGMODALFRAME | wm::WS_EX_STATICEDGE)) as i32);
+        let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE);
+        let ex = wm::GetWindowLongW(hwnd, wm::GWL_EXSTYLE);
+        let mut rect = RECT::default();
+        wm::GetWindowRect(hwnd, &mut rect);
+        *BEFORE_F11.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some([rect.left, rect.top, rect.right, rect.bottom, style, ex]);
+        wm::SetWindowLongW(hwnd, wm::GWL_STYLE, ((style as u32 & !wm::WS_OVERLAPPEDWINDOW) | wm::WS_POPUP) as i32);
+        wm::SetWindowLongW(hwnd, wm::GWL_EXSTYLE, (ex as u32 & !(wm::WS_EX_CLIENTEDGE | wm::WS_EX_WINDOWEDGE | wm::WS_EX_DLGMODALFRAME | wm::WS_EX_STATICEDGE)) as i32);
         wm::SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, width, height,
             wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE);
+    }
+}
+
+/// Toggle between fullscreen (no border) and windowed on F11. Restores to the
+/// state before the last fullscreen if one was saved; otherwise saves the current
+/// state and applies fullscreen.
+fn toggle_on_f11(hwnd: HWND) {
+    // Only the title's top-level window.
+    // SAFETY: plain window handle query.
+    if unsafe { !wm::GetParent(hwnd).is_null() } {
+        return;
+    }
+    // SAFETY: called on the title's window thread from window_proc.
+    unsafe {
+        let mut before = BEFORE_F11.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some([left, top, right, bottom, style, ex_style]) = before.take() {
+            // Restore to windowed.
+            wm::SetWindowLongW(hwnd, wm::GWL_STYLE, style);
+            wm::SetWindowLongW(hwnd, wm::GWL_EXSTYLE, ex_style);
+            wm::SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                left,
+                top,
+                right - left,
+                bottom - top,
+                wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+            );
+        } else {
+            // Go fullscreen: save current state first.
+            let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE);
+            let ex_style = wm::GetWindowLongW(hwnd, wm::GWL_EXSTYLE);
+            let mut rect = RECT::default();
+            wm::GetWindowRect(hwnd, &mut rect);
+            let (width, height) = std::env::var("VICTORY_FULLSCREEN_RES")
+                .ok().as_deref().and_then(parse_window_limit)
+                .unwrap_or_else(|| (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)));
+            *before = Some([rect.left, rect.top, rect.right, rect.bottom, style, ex_style]);
+            wm::SetWindowLongW(hwnd, wm::GWL_STYLE, ((style as u32 & !wm::WS_OVERLAPPEDWINDOW) | wm::WS_POPUP) as i32);
+            wm::SetWindowLongW(hwnd, wm::GWL_EXSTYLE, (ex_style as u32 & !(wm::WS_EX_CLIENTEDGE | wm::WS_EX_WINDOWEDGE | wm::WS_EX_DLGMODALFRAME | wm::WS_EX_STATICEDGE)) as i32);
+            wm::SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, width, height,
+                wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE);
+        }
     }
 }
 
@@ -385,6 +437,11 @@ extern "system" fn window_proc(
     // the title aborts itself about half a minute later. A console has no window
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
+        return 0;
+    }
+    // F11: toggle between fullscreen (no border) and windowed.
+    if (message == wm::WM_KEYDOWN || message == wm::WM_SYSKEYDOWN) && wparam == usize::from(VK_F11) {
+        toggle_on_f11(hwnd);
         return 0;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
