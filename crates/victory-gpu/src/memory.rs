@@ -103,9 +103,36 @@ const BUILT: u64 = 4 << 20;
 const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
-/// pages there are in the first seconds (run light-4).
+/// pages there are in the first seconds (run light-4). 2,048 in all was used
+/// up ~50 s into Jason's House, after which 260-310 pages a frame of the
+/// title's own committed memory read zeros (run ph-final2-3); with 16,384
+/// and the pages asked for again ([`faults_confirm`]) 6,131 were taken in
+/// eight minutes and none of the title's was left out (run ph-fb1-big16k).
 const FAULTS: usize = 128;
-const FAULTS_ALL: usize = 2048;
+const FAULTS_ALL: usize = 16384;
+
+/// Pages taken from the faults in all (`VICTORY_BVH_FAULTS_ALL=<n>`; unset:
+/// [`FAULTS_ALL`]). With ray tracing the bound is met in the first minute
+/// (run play-1126-0921: at 63 s), and from then on 130-500 pages a frame that
+/// the walking programs touch have no copy for the rest of the run.
+fn faults_all() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_BVH_FAULTS_ALL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL)
+    })
+}
+/// Within how many frames a faulted page must be asked for a second time to
+/// be taken (`VICTORY_BVH_FAULTS_CONFIRM=<frames>`); unset or 0 keeps
+/// immediate first-ask mapping. Requiring a second ask within 16 frames filters
+/// one-frame stray bursts, though in testing about half of Jason's House starts
+/// skipped intermittently-read bedroom GI pages (leaving bounced light dark);
+/// immediate first-ask mapping lit four starts in four.
+fn faults_confirm() -> Option<u64> {
+    static ON: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_BVH_FAULTS_CONFIRM").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &u64| n > 0)
+    })
+}
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -171,6 +198,8 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
+    /// Pages from the faults asked for once so far: the frame they were.
+    waiting: HashMap<u64, u64>,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -203,6 +232,12 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
+    /// Pages found without a copy that were left so because of the bounds on
+    /// pages taken from faults, and the different pages faulted.
+    left: u64,
+    distinct: std::collections::HashSet<u64>,
+    /// Pages from the faults put off until they are asked for again.
+    waiting: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -250,6 +285,7 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
+            waiting: HashMap::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -710,14 +746,65 @@ impl Memory {
         }
         pages.sort_unstable();
         let mut made = 0;
+        let all = faults_all();
+        let confirm = faults_confirm();
+        if self.waiting.len() > 1 << 16 {
+            let frame = self.frame;
+            self.waiting.retain(|_, f| frame.saturating_sub(*f) <= confirm.unwrap_or(0));
+        }
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
-                made += 1;
-                self.faulted += 1;
-                self.bring(page, page + 1);
+            self.stats.distinct.insert(page);
+            if self.copy_of(page).is_some() {
+                continue;
+            }
+            // Never the title's memory ([`Memory::possible`]): stray pointers
+            // under 4 GiB, ~900 a frame in some starts, would only churn the
+            // pages waiting.
+            if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 {
+                continue;
+            }
+            if made < FAULTS && self.faulted < all {
+                // A page asked for in one frame only is a stray pointer's
+                // more often than not (a burst of junk at a scene change took
+                // 5,700 pages in ten seconds, run ph-fa1-faults).
+                if let Some(window) = confirm {
+                    match self.waiting.get(&page) {
+                        Some(&f) if f != self.frame && self.frame.saturating_sub(f) <= window => {
+                            self.waiting.remove(&page);
+                        }
+                        Some(&f) if f == self.frame => continue,
+                        _ => {
+                            self.waiting.insert(page, self.frame);
+                            self.stats.waiting += 1;
+                            continue;
+                        }
+                    }
+                }
+                if self.map(page) {
+                    made += 1;
+                    self.faulted += 1;
+                    self.bring(page, page + 1);
+                }
+            } else {
+                self.stats.left += 1;
             }
         }
         self.stats.faults += pages.len() as u64;
+        // The first frames that leave pages without a copy: all of them, and
+        // which of them hold a packed structure's first bytes or lie in a
+        // title buffer (to tell walked structures from stray pointers).
+        static WHOLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if made < pages.len() && self.faulted >= faults_all() && WHOLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+            let mut text = String::new();
+            for &page in pages.iter().filter(|&&p| self.copy_of(p).is_none()) {
+                let at = page * PAGE;
+                let committed = crate::texture::committed(at as *const u8, PAGE as usize);
+                let buffer = crate::shadow::in_buffer(at, 1).is_some();
+                let packed = committed && self.packed_at(at).is_some();
+                text += &format!(" {at:#x}{}{}{}", if committed { "" } else { "?" }, if buffer { "b" } else { "" }, if packed { "p" } else { "" });
+            }
+            tracing::warn!(frame = self.frame, "title memory by address: pages left without a copy by the bounds (?: not committed, b: in a title buffer, p: a packed structure there):{text}");
+        }
         // Each is an access that read 0 or was dropped.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -800,7 +887,9 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; \
+             since the last line {} different pages faulted, {:.1} a frame left without a copy by the bounds ({} in all), \
+             {:.1} a frame put off until asked for again ({} waiting)",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -822,7 +911,12 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.faulted,
+            s.distinct.len(),
+            s.left as f64 / frames,
+            faults_all(),
+            s.waiting as f64 / frames,
+            self.waiting.len()
         );
         self.stats.from = Some((now, self.frame));
     }
