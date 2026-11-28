@@ -603,32 +603,28 @@ unsafe impl Send for Job {}
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
-    static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let scheduler = SCHEDULER
-        .get_or_init(|| {
-            Some(Scheduler {
-                lanes: Mutex::new(Lanes {
-                    lanes: HashMap::new(),
-                    next_id: 0,
-                    next_seq: 0,
-                    staged: 0,
-                    staging: STAGING,
-                    starved: false,
-                    clock: [0; 3],
-                    now: 0,
-                    lane_now: [0; 3],
-                    done: Default::default(),
-                    refused: 0,
-                    bcpack: Default::default(),
-                    since: None,
-                }),
-                work: Condvar::new(),
-                finished: Condvar::new(),
-            })
-        })
-        .as_ref()?;
-    STARTED.call_once(|| {
+    static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    let scheduler = SCHEDULER.get_or_init(|| Scheduler {
+        lanes: Mutex::new(Lanes {
+            lanes: HashMap::new(),
+            next_id: 0,
+            next_seq: 0,
+            staged: 0,
+            staging: STAGING,
+            starved: false,
+            clock: [0; 3],
+            now: 0,
+            lane_now: [0; 3],
+            done: Default::default(),
+            refused: 0,
+            bcpack: Default::default(),
+            since: None,
+        }),
+        work: Condvar::new(),
+        finished: Condvar::new(),
+    });
+    let started = STARTED.get_or_init(|| {
         // As many workers as processors (`VICTORY_DSTORAGE_WORKERS=<n>`: that many), below
         // normal priority (`VICTORY_DSTORAGE_PRIORITY=<-2..2>`, 0: normal, as before
         // 2026-11-27). While a scene streams in, all of them unpack at once: in a crowded
@@ -660,9 +656,14 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
+        if started == 0 {
+            tracing::warn!("dstorage: no worker thread could start");
+            return false;
+        }
         tracing::info!(workers = started, priority, "dstorage: workers (VICTORY_DSTORAGE_WORKERS, VICTORY_DSTORAGE_PRIORITY)");
+        true
     });
-    Some(scheduler)
+    started.then_some(scheduler)
 }
 
 impl Scheduler {
