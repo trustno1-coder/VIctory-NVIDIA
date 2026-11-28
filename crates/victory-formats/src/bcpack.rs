@@ -276,7 +276,11 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     let stride = widths.len() * per;
     let mut records = vec![0u8; blocks * stride];
     let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+    if c_lanes() {
+        lanes_c(tables, widths, per, blocks, src, &mut records)?;
+    } else {
+        lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+    }
     let records = records.chunks_exact(stride);
     let out = dst.chunks_exact_mut(block);
     let t = tables;
@@ -473,6 +477,53 @@ fn lanes(
         }
     }
     Ok(())
+}
+
+unsafe extern "C" {
+    fn victory_bcpack_lanes(
+        freq: *const u32,
+        start: *const u32,
+        bucket: *const u8,
+        recip: *const u64,
+        widths: *const u8,
+        nl: usize,
+        per: usize,
+        blocks: usize,
+        src: *const u8,
+        srclen: usize,
+        records: *mut u8,
+    ) -> i32;
+}
+
+/// Whether [`lanes_c`] decodes the lanes (`VICTORY_BCPACK_C=0`: [`lanes`]).
+fn c_lanes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BCPACK_C").is_none_or(|v| v != "0"))
+}
+
+/// [`lanes`] in C (`csrc/bcpack_lanes.c`), the input taken from `src` in
+/// order: the same records. The C compiler's code for this loop ran ahead of
+/// rustc's (measured in the module's benchmark).
+fn lanes_c(t: &Tables, widths: &[u8], per: usize, blocks: usize, src: &[u8], records: &mut [u8]) -> Result<(), Error> {
+    assert!(widths.len() <= 16 && records.len() >= blocks * widths.len() * per);
+    // SAFETY: the tables are plain arrays of the sizes the C side reads; the
+    // records hold every symbol the lanes deliver (asserted).
+    let rc = unsafe {
+        victory_bcpack_lanes(
+            t.freq.as_ptr().cast(),
+            t.start.as_ptr().cast(),
+            t.bucket.as_ptr().cast(),
+            t.recip.as_ptr().cast(),
+            widths.as_ptr(),
+            widths.len(),
+            per,
+            blocks,
+            src.as_ptr(),
+            src.len(),
+            records.as_mut_ptr(),
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(Error("the stream ends early or is corrupt")) }
 }
 
 // Blocks.
@@ -1687,6 +1738,10 @@ mod tests {
                 let mut next = src.iter().copied();
                 lanes(&t, widths, per, blocks, |_| next.next(), &mut got).unwrap();
                 assert_eq!(got, records.concat(), "{widths:?} x{per}, {blocks} blocks");
+                let mut from_c = vec![0u8; got.len()];
+                lanes_c(&t, widths, per, blocks, &src, &mut from_c).unwrap();
+                assert_eq!(from_c, got, "C: {widths:?} x{per}, {blocks} blocks");
+                assert!(lanes_c(&t, widths, per, blocks, &src[..src.len() / 2], &mut from_c).is_err());
             }
         }
     }

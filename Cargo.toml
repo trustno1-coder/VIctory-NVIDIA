@@ -44,6 +44,8 @@ zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
 libdeflater = "1.26"
 # Real-input FFTs (pure Rust, MIT/Apache-2.0) for the DSP's convolutions.
 realfft = "3.5"
+# C compiler driver for the few C sources (victory-formats csrc).
+cc = "1.2"
 walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).

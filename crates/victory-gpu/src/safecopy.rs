@@ -170,6 +170,57 @@ std::arch::global_asm!(
     "victory_safe_changed_failed:",
     "vzeroupper",
     "xor eax, eax",
+    "ret",    ".globl victory_safe_copy_hash",
+    ".globl victory_safe_copy_hash_at",
+    ".globl victory_safe_copy_hash_after",
+    ".globl victory_safe_copy_hash_failed",
+    // rcx destination, rdx source, r8 blocks of 128 bytes, r9 the AES digest's
+    // state (four 32-byte lanes, then the 32-byte round key): copies the
+    // blocks and takes each through the digest's round (texture.rs
+    // `digest_vaes`), reading the source once; the lanes go back to the
+    // state. eax: whether all could be read. Only ymm0-ymm5 (volatile).
+    "victory_safe_copy_hash:",
+    "vmovdqu ymm1, ymmword ptr [r9]",
+    "vmovdqu ymm2, ymmword ptr [r9 + 32]",
+    "vmovdqu ymm3, ymmword ptr [r9 + 64]",
+    "vmovdqu ymm4, ymmword ptr [r9 + 96]",
+    "vmovdqu ymm5, ymmword ptr [r9 + 128]",
+    "test r8, r8",
+    "jz 3f",
+    "2:",
+    "victory_safe_copy_hash_at:",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vmovdqu ymmword ptr [rcx], ymm0",
+    "vpxor ymm1, ymm1, ymm0",
+    "vaesenc ymm1, ymm1, ymm5",
+    "vmovdqu ymm0, ymmword ptr [rdx + 32]",
+    "vmovdqu ymmword ptr [rcx + 32], ymm0",
+    "vpxor ymm2, ymm2, ymm0",
+    "vaesenc ymm2, ymm2, ymm5",
+    "vmovdqu ymm0, ymmword ptr [rdx + 64]",
+    "vmovdqu ymmword ptr [rcx + 64], ymm0",
+    "vpxor ymm3, ymm3, ymm0",
+    "vaesenc ymm3, ymm3, ymm5",
+    "vmovdqu ymm0, ymmword ptr [rdx + 96]",
+    "vmovdqu ymmword ptr [rcx + 96], ymm0",
+    "vpxor ymm4, ymm4, ymm0",
+    "vaesenc ymm4, ymm4, ymm5",
+    "victory_safe_copy_hash_after:",
+    "add rcx, 128",
+    "add rdx, 128",
+    "dec r8",
+    "jnz 2b",
+    "3:",
+    "vmovdqu ymmword ptr [r9], ymm1",
+    "vmovdqu ymmword ptr [r9 + 32], ymm2",
+    "vmovdqu ymmword ptr [r9 + 64], ymm3",
+    "vmovdqu ymmword ptr [r9 + 96], ymm4",
+    "vzeroupper",
+    "mov eax, 1",
+    "ret",
+    "victory_safe_copy_hash_failed:",
+    "vzeroupper",
+    "xor eax, eax",
     "ret",
 );
 
@@ -190,6 +241,25 @@ unsafe extern "system" {
     fn victory_safe_changed_at();
     fn victory_safe_changed_after();
     fn victory_safe_changed_failed();
+    fn victory_safe_copy_hash(dst: *mut u8, src: *const u8, blocks: usize, state: *mut [u8; 160]) -> u32;
+    fn victory_safe_copy_hash_at();
+    fn victory_safe_copy_hash_after();
+    fn victory_safe_copy_hash_failed();
+}
+
+/// Copies `blocks` blocks of 128 bytes and takes each through the AES
+/// digest's round (`crate::texture::digest`, VAES), reading the source once:
+/// `state` holds the digest's four lanes (updated) and its round key. False
+/// if a page of the source cannot be read; then the destination and the
+/// lanes are partly done (the caller starts again another way).
+///
+/// # Safety
+/// As [`copy`]'s, for `blocks * 128` bytes; the processor has VAES and AVX2.
+/// [`on`] must have been asked.
+pub(crate) unsafe fn copy_hash(dst: *mut u8, src: *const u8, blocks: usize, state: &mut [u8; 160]) -> bool {
+    // SAFETY: a fault reading the source leaves through the failing exit
+    // ([`failing_exit`]); the rest is the caller's.
+    unsafe { victory_safe_copy_hash(dst, src, blocks, state) != 0 }
 }
 
 /// The records of 32 bytes at `title` (`records` of them) that differ from
@@ -416,6 +486,10 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     if (from..to).contains(&at) {
         return Some(victory_safe_changed_failed as *const () as usize);
     }
+    let (from, to) = (victory_safe_copy_hash_at as *const () as usize, victory_safe_copy_hash_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_copy_hash_failed as *const () as usize);
+    }
     let (from, to) = (victory_safe_merge_at as *const () as usize, victory_safe_merge_after as *const () as usize);
     (from..to).contains(&at).then_some(victory_safe_merge_failed as *const () as usize)
 }
@@ -469,6 +543,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The copy with the digest's round: the bytes and the digest of a copy
+    /// then `digest`, every length; a page that is not there fails.
+    #[test]
+    fn copies_with_the_digest_and_fails_on_a_missing_page() {
+        assert!(on());
+        if !std::arch::is_x86_feature_detected!("vaes") {
+            return;
+        }
+        let pages = Pages::new(1 << 16);
+        pages.fill();
+        // SAFETY: inside the allocation.
+        let title = unsafe { std::slice::from_raw_parts(pages.0, pages.1) }.to_vec();
+        for len in [0usize, 1, 127, 128, 129, 4095, 4096, 4097, 40_000, 1 << 16] {
+            let mut read = vec![0xEEu8; len];
+            let got = crate::texture::copy_digest(&mut read, pages.0);
+            assert_eq!(read[..], title[..len], "{len} bytes");
+            assert_eq!(got, crate::texture::digest(&title[..len]), "{len} bytes");
+        }
+        // SAFETY: a page of our allocation.
+        unsafe { VirtualFree(pages.0.add(8192).cast(), 4096, MEM_DECOMMIT) };
+        let mut state = [0u8; 160];
+        let mut read = vec![0u8; 3 << 12];
+        // SAFETY: the third page is not there: the call fails, nothing faults.
+        assert!(!unsafe { copy_hash(read.as_mut_ptr(), pages.0, (3 << 12) / 128, &mut state) });
     }
 
     /// The records that differ get their bits and go over those last seen;

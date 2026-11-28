@@ -794,6 +794,78 @@ unsafe fn digest_aesni(bytes: &[u8]) -> u128 {
     }
 }
 
+/// Copies the title memory at `src` into `read` and gives its [`digest`]:
+/// with VAES and the safe copy, in one pass over the source (copy and the
+/// digest's round together, `crate::safecopy::copy_hash`: 1.2-1.4 times the
+/// copy then the digest, measured); else, or where a page cannot be read,
+/// the copy (`crate::host::copy_mapped`) then [`digest`], as before.
+/// `VICTORY_COPY_DIGEST=0`: always that way.
+pub(crate) fn copy_digest(read: &mut [u8], src: *const u8) -> Digest {
+    #[cfg(target_arch = "x86_64")]
+    if fused_copy_digest() && crate::watch::soft().is_none() {
+        crate::watch::materialize(src as usize, read.len());
+        // SAFETY: `read` is ours; VAES and the safe copy are there
+        // (`fused_copy_digest`); a source page that is not there fails.
+        if let Some(h) = unsafe { copy_digest_vaes(read, src) } {
+            return Digest(h);
+        }
+    }
+    crate::host::copy_mapped(read.as_mut_ptr(), src, read.len(), false);
+    digest(read)
+}
+
+fn fused_copy_digest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        let can = std::arch::is_x86_feature_detected!("vaes") && std::arch::is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let can = false;
+        can && crate::safecopy::on() && std::env::var_os("VICTORY_COPY_DIGEST").is_none_or(|v| v != "0")
+    })
+}
+
+/// [`copy_digest`]'s pass: whole blocks of 128 bytes in assembly, the rest
+/// copied, then [`digest_vaes`]'s last block and fold; the same digest.
+///
+/// # Safety
+/// VAES and AVX2; the safe copy is on; `src` as `crate::safecopy::copy`'s.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,vaes,aes")]
+#[allow(clippy::incompatible_msrv)]
+unsafe fn copy_digest_vaes(read: &mut [u8], src: *const u8) -> Option<u128> {
+    use std::arch::x86_64::*;
+    let n = read.len();
+    let mut state = [0u8; 160];
+    // SAFETY: stores inside `state`; the copies' faults fail them.
+    unsafe {
+        let k = _mm256_loadu_si256(AES_KEYS.as_ptr().cast());
+        for i in 0..4 {
+            let lane = _mm256_xor_si256(k, _mm256_set_epi64x(0, 2 * i as i64 + 1, 0, 2 * i as i64));
+            _mm256_storeu_si256(state.as_mut_ptr().add(32 * i).cast(), lane);
+        }
+        _mm256_storeu_si256(state.as_mut_ptr().add(128).cast(), k);
+        let whole = n / 128 * 128;
+        if !crate::safecopy::copy_hash(read.as_mut_ptr(), src, n / 128, &mut state)
+            || !crate::safecopy::copy(read.as_mut_ptr().add(whole), src.add(whole), n - whole)
+        {
+            return None;
+        }
+        let mut h: [__m256i; 4] = std::array::from_fn(|i| _mm256_loadu_si256(state.as_ptr().add(32 * i).cast()));
+        let mut last = [0u8; 128];
+        last[..n - whole].copy_from_slice(&read[whole..]);
+        for (i, h) in h.iter_mut().enumerate() {
+            *h = _mm256_aesenc_epi128(_mm256_xor_si256(*h, _mm256_loadu_si256(last.as_ptr().add(32 * i).cast())), k);
+        }
+        let mut out = [[0u8; 16]; 8];
+        for (i, h) in h.iter().enumerate() {
+            _mm_storeu_si128(out[2 * i].as_mut_ptr().cast(), _mm256_castsi256_si128(*h));
+            _mm_storeu_si128(out[2 * i + 1].as_mut_ptr().cast(), _mm256_extracti128_si256::<1>(*h));
+        }
+        Some(aes_finish(&out, n))
+    }
+}
+
 /// The eight lanes and the length, folded to 128 bits (folded products, as
 /// [`digest`] ends).
 fn aes_finish(lanes: &[[u8; 16]; 8], len: usize) -> u128 {
@@ -1663,8 +1735,7 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = digest(read);
+                let hash = copy_digest(read, self.memory);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1906,8 +1977,7 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         read.resize(3 * WINDOW, 0);
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
-            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
-            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+            print = print.rotate_left(37) ^ copy_digest(&mut read[..bytes], (at as usize + from) as *const u8).0;
         };
         if len <= 3 * WINDOW {
             take(0, len);

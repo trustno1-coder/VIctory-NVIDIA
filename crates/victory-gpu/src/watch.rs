@@ -26,6 +26,8 @@
 //! it has nothing). `VICTORY_VIEW_GUARD=0`: each address for itself, as
 //! before.
 
+mod pages;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
@@ -120,7 +122,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 
 struct Journal {
     /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    written: pages::Pages,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -189,7 +191,7 @@ impl Ahead {
 }
 
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
-    written: BTreeMap::new(),
+    written: pages::Pages::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: Ahead::new(),
     ahead_asked: 0,
@@ -721,7 +723,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     let j = journal();
     j.ahead
         .holds(first, last)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, j.written.range(first, last)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -737,7 +739,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         materialize(start, end.saturating_sub(start));
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first, last) };
     // Asked ahead with the submission's other ranges: the journal has it.
     let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
@@ -830,7 +832,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         return false;
     };
     (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+        && j.written.none_newer(first, last, taken, ranged)
 }
 
 impl Tracked {
@@ -3337,7 +3339,7 @@ mod parts_tests {
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
-            written: BTreeMap::new(),
+            written: pages::Pages::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: Ahead::new(),
             ahead_asked: 0,
@@ -3752,7 +3754,7 @@ mod tests {
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
         ask_rest(&ranges);
-        let last = journal().written.get(&(p / PAGE + 1)).copied();
+        let last = journal().written.get(p / PAGE + 1);
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         // SAFETY: our allocation.
