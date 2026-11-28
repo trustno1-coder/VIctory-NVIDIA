@@ -3380,7 +3380,7 @@ impl State {
                         // (`most`), or until the card has room; the pass
                         // goes on, within a count that bounds one pass.
                         tells.tell(index, write, Told::Held(frame + most));
-                        if refused > 1024 {
+                        if refused > held_cap() {
                             break;
                         }
                     } else if refused > 256 {
@@ -5954,6 +5954,18 @@ fn texspk_pass_ms() -> Option<u64> {
 fn pass_span_left(span: std::time::Duration, cap_ms: u64, spent_ns: u64) -> std::time::Duration {
     let cap = std::time::Duration::from_millis(cap_ms);
     span.min(cap.saturating_sub(std::time::Duration::from_nanos(spent_ns)))
+}
+
+/// Slots a pass holds back for room before it stops (`VICTORY_TEXTURE_HELD_CAP`,
+/// default 128; 1024 before). Each such look costs the thread that records
+/// the frame some 15-20 us and makes nothing: in a cutscene with the card at
+/// its texture line, passes held 6,000-35,000 slots a second and took 150-550
+/// ms a second. The slots not reached stay due for the next pass.
+fn held_cap() -> i32 {
+    static CAP: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_HELD_CAP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128)
+    })
 }
 
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM
