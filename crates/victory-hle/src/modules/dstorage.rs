@@ -61,9 +61,53 @@ pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT
         }
         iid => {
             tracing::warn!(iid = ?iid.map(Guid::to_string), "DStorageGetFactory: unknown interface");
-            E_NOINTERFACE
+            no_interface(out)
         }
     }
+}
+
+/// `IUnknown`.
+const IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+
+/// A failed `QueryInterface`: `*out` null, as COM callers expect.
+fn no_interface(out: Out) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: checked non-null; the title passes room for a pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    E_NOINTERFACE
+}
+
+/// The factory's `QueryInterface`: itself for `IUnknown` and the factory's
+/// id. (The ids of the factory's older levels are not public.)
+extern "system" fn query_factory(this: Factory, iid: *const Guid, out: Out) -> HRESULT {
+    // SAFETY: the title passes a GUID (null tolerated).
+    match unsafe { iid.as_ref() } {
+        Some(&iid) if iid == FACTORY || iid == IUNKNOWN => put(out, this.cast_mut().cast()),
+        _ => no_interface(out),
+    }
+}
+
+/// `QueryInterface` of our other objects: itself, with a reference, for
+/// `IUnknown`. (Their interface ids are not public.)
+extern "system" fn query_instance<T>(this: *const Instance<T>, iid: *const Guid, out: Out) -> HRESULT {
+    // SAFETY: as above.
+    match unsafe { iid.as_ref() } {
+        Some(&iid) if iid == IUNKNOWN => {
+            add_ref_instance(this);
+            put(out, this.cast_mut().cast())
+        }
+        _ => no_interface(out),
+    }
+}
+
+/// Method `slot` (byte offset) of one of the title's COM objects (a
+/// D3D12 fence).
+fn com<F: Copy>(object: usize, slot: usize) -> F {
+    assert_eq!(size_of::<F>(), size_of::<usize>());
+    // SAFETY: a live COM object: its first field is its method table, which
+    // has the slot.
+    unsafe { std::mem::transmute_copy(&*(*(object as *const *const usize)).add(slot / 8)) }
 }
 
 /// One of our objects with state: the runtime's object header (method
@@ -221,10 +265,36 @@ extern "system" fn create_queue(
     let lane = Lane::new(desc.priority, desc.capacity);
     lanes.lanes.insert(id, lane);
     drop(lanes);
+    let queue = Queue {
+        id,
+        source_type: desc.source_type,
+        capacity: desc.capacity,
+        priority: desc.priority,
+        name: desc.name,
+    };
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), queue),
     )
+}
+
+/// `IDStorageFactoryX::CreateQueue`: `DSTORAGE_QUEUE_DESC` is the newer
+/// description without its options (the first 0x18 bytes), so the queue
+/// has the default options.
+extern "system" fn create_queue_legacy(
+    factory: Factory,
+    desc: *const u8,
+    iid: *const Guid,
+    out: Out,
+) -> HRESULT {
+    if desc.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: zero is a valid description (null name, no options).
+    let mut full: QueueDesc = unsafe { std::mem::zeroed() };
+    // SAFETY: the title passes a DSTORAGE_QUEUE_DESC, 0x18 bytes.
+    unsafe { desc.copy_to_nonoverlapping((&raw mut full).cast::<u8>(), 0x18) };
+    create_queue(factory, &full, iid, out)
 }
 
 /// The title asks for 32 MiB and stops if this fails. Give PC worker threads
@@ -256,10 +326,10 @@ fn text(name: *const c_char) -> String {
 }
 
 static FACTORY_VTABLE: Methods<16> = Methods([
-    missing::<0> as *const (),
+    query_factory as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),            // 0x18 (2020: queue creation)
+    create_queue_legacy as *const (),     // 0x18
     open_file as *const (),               // 0x20
     create_status_array as *const (),     // 0x28
     missing::<6> as *const (),            // 0x30 (2020: CPU affinity)
@@ -457,8 +527,10 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     })
 }
 
-static FILE_VTABLE: Methods<8> = Methods([
-    missing::<0> as *const (),
+/// Padded past the slots known, so a later interface's method logs
+/// instead of jumping through whatever follows the table.
+static FILE_VTABLE: Methods<12> = Methods([
+    query_instance::<File> as *const (),
     add_ref_instance::<File> as *const (),
     release::<File> as *const (),
     missing::<3> as *const (),
@@ -466,6 +538,10 @@ static FILE_VTABLE: Methods<8> = Methods([
     missing::<5> as *const (),
     missing::<6> as *const (),
     missing::<7> as *const (),
+    missing::<8> as *const (),
+    missing::<9> as *const (),
+    missing::<10> as *const (),
+    missing::<11> as *const (),
 ]);
 
 // Status arrays.
@@ -503,19 +579,28 @@ extern "system" fn is_complete(this: Array, index: u32) -> bool {
     done
 }
 
-static STATUS_VTABLE: Methods<5> = Methods([
-    missing::<0> as *const (),
+/// Padded as `FILE_VTABLE`.
+static STATUS_VTABLE: Methods<8> = Methods([
+    query_instance::<StatusArray> as *const (),
     add_ref_instance::<StatusArray> as *const (),
     release::<StatusArray> as *const (),
     is_complete as *const (),   // 0x18
     status_result as *const (), // 0x20
+    missing::<5> as *const (),
+    missing::<6> as *const (),
+    missing::<7> as *const (),
 ]);
 
 // Queues.
 
-/// A queue object: its lane in the scheduler.
+/// A queue object: its lane in the scheduler, and its description for
+/// `Query`.
 struct Queue {
     id: u64,
+    source_type: u64,
+    capacity: u16,
+    priority: i8,
+    name: *const c_char,
 }
 
 impl Drop for Queue {
@@ -572,12 +657,18 @@ struct Lane {
     capacity: usize,
     /// Bytes started, for round robin among the lanes of a class.
     clock: u64,
+    /// Failures since the error record was last retrieved, and the first;
+    /// the error event (made when the title first asks for it, 0 before) is
+    /// set at each.
+    errors: u32,
+    first_error: HRESULT,
+    error_event: usize,
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Read)>,
-    statuses: VecDeque<(u64, Status)>,
+    statuses: VecDeque<(u64, Notice)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
@@ -898,6 +989,7 @@ impl Lanes {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
+                lane.failed(hr);
             }
             lane.flush();
         }
@@ -933,7 +1025,8 @@ impl Lanes {
                     read.note.submitted(&read.request, early);
                     lane.reads.push_back((seq, read));
                 }
-                Command::Status(status) => lane.statuses.push_back((seq, status)),
+                Command::Status(status) => lane.statuses.push_back((seq, Notice::Status(status))),
+                Command::Signal(signal) => lane.statuses.push_back((seq, Notice::Signal(signal))),
             }
         }
         lane.flush();
@@ -946,6 +1039,9 @@ impl Lane {
             class: priority.clamp(-1, 1).wrapping_add(1) as usize,
             capacity: usize::from(capacity),
             clock: 0,
+            errors: 0,
+            first_error: S_OK,
+            error_event: 0,
             unsubmitted: Vec::new(),
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
@@ -967,13 +1063,23 @@ impl Lane {
             if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
                 return;
             }
-            let Some((_, status)) = self.statuses.pop_front() else {
+            let Some((_, notice)) = self.statuses.pop_front() else {
                 return;
             };
             let later = self.failures.split_off(&seq);
             let first = std::mem::replace(&mut self.failures, later)
                 .into_values()
                 .next();
+            let status = match notice {
+                Notice::Status(status) => status,
+                // A fence closes the failure window too: a status entry
+                // reports failures since the "previous status entry or
+                // fence" (`IDStorageStatusArrayX::GetHResult`).
+                Notice::Signal(signal) => {
+                    signal_later(signal);
+                    continue;
+                }
+            };
             if stream_log::on() {
                 let at = stream_log::now();
                 stream_log::line(format_args!("S\t{:x}\t{seq}\t{}\t{at}", status.array as usize, status.enqueued));
@@ -984,6 +1090,49 @@ impl Lane {
                 .store(first.unwrap_or(S_OK), Ordering::Release);
         }
     }
+
+    /// A request failed: counted for the error record, and the error event
+    /// is set.
+    fn failed(&mut self, hr: HRESULT) {
+        if self.errors == 0 {
+            self.first_error = hr;
+        }
+        self.errors = self.errors.saturating_add(1);
+        if self.error_event != 0 {
+            // SAFETY: our event, open while the lane is.
+            unsafe { windows_sys::Win32::System::Threading::SetEvent(self.error_event as *mut c_void) };
+        }
+    }
+}
+
+impl Drop for Lane {
+    fn drop(&mut self) {
+        if self.error_event != 0 {
+            // SAFETY: our event; the queue is gone.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.error_event as *mut c_void) };
+        }
+    }
+}
+
+/// Fences are signalled on a thread of ours, in the order their turns come,
+/// not under the scheduler's lock: a signal runs what GPU queues held behind
+/// the fence.
+fn signal_later(signal: Signal) {
+    static LINE: OnceLock<std::sync::mpsc::Sender<Signal>> = OnceLock::new();
+    let line = LINE.get_or_init(|| {
+        let (line, signals) = std::sync::mpsc::channel::<Signal>();
+        let _ = std::thread::Builder::new()
+            .name("dstorage signals".into())
+            .spawn(move || {
+                for signal in signals {
+                    // ID3D12Fence::Signal; the reference goes with `signal`.
+                    com::<extern "system" fn(usize, u64) -> HRESULT>(signal.fence, 0x50)(signal.fence, signal.value);
+                }
+            });
+        line
+    });
+    // Without the thread the signal is dropped, and its reference with it.
+    let _ = line.send(signal);
 }
 
 /// Staging bytes a request holds while it runs: what it buffers between
@@ -1060,6 +1209,7 @@ const PAGE: usize = 64 * 1024;
 enum Command {
     Read(Read),
     Status(Status),
+    Signal(Signal),
 }
 
 /// An enqueued request, and what the trace knows of it.
@@ -1143,7 +1293,7 @@ fn trace_batch(queue: u64, commands: &[Command], early: bool) {
     let reads = || {
         commands.iter().filter_map(|c| match c {
             Command::Read(read) => Some(read),
-            Command::Status(_) => None,
+            Command::Status(_) | Command::Signal(_) => None,
         })
     };
     let (mut to_pages, mut filled, mut empty) = (0, 0, 0);
@@ -1258,6 +1408,24 @@ impl Traced {
             ok = result.is_ok(),
             "dstorage trace: a request"
         );
+    }
+}
+
+/// What completes in queue order once every earlier read is done.
+enum Notice {
+    Status(Status),
+    Signal(Signal),
+}
+
+/// A fence to signal (the title's `ID3D12Fence`), holding a reference on it.
+struct Signal {
+    fence: usize,
+    value: u64,
+}
+
+impl Drop for Signal {
+    fn drop(&mut self) {
+        com::<extern "system" fn(usize) -> u32>(self.fence, 0x10)(self.fence);
     }
 }
 
@@ -1393,6 +1561,112 @@ extern "system" fn submit(this: QueueRef) {
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
+}
+
+/// `EnqueueSignal`: the fence is signalled with `value` "when all requests
+/// enqueued before the fence complete" ([`Notice`]).
+extern "system" fn enqueue_signal(this: QueueRef, fence: *mut c_void, value: u64) {
+    if fence.is_null() {
+        return;
+    }
+    let fence = fence as usize;
+    com::<extern "system" fn(usize) -> u32>(fence, 0x08)(fence);
+    queue(this, Command::Signal(Signal { fence, value }));
+}
+
+/// `GetErrorEvent`: an event set when a request of the queue fails, made on
+/// first use; the queue owns it. Null once the queue is closed.
+extern "system" fn error_event(this: QueueRef) -> *mut c_void {
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let Some(scheduler) = scheduler() else {
+        return std::ptr::null_mut();
+    };
+    let mut lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get_mut(&id) else {
+        return std::ptr::null_mut();
+    };
+    if lane.error_event == 0 {
+        // SAFETY: a manual-reset event, set already if a request failed.
+        let event = unsafe {
+            windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 1, i32::from(lane.errors > 0), std::ptr::null())
+        };
+        lane.error_event = event as usize;
+    }
+    lane.error_event as *mut c_void
+}
+
+/// `RetrieveErrorRecord`: the number of failures since the last call and
+/// the first one's HRESULT; the error event is reset. The record's layout
+/// is not public: this writes its start as DirectStorage for the PC lays
+/// it out (a 32-bit count, then at 8 the first failure's HRESULT and
+/// command type, -1 for none, 0 for a request) and leaves the rest.
+extern "system" fn error_record(this: QueueRef, record: *mut u8) {
+    if record.is_null() {
+        return;
+    }
+    // SAFETY: as above.
+    let id = unsafe { &*this }.state.id;
+    let (count, first) = scheduler()
+        .and_then(|scheduler| {
+            let mut lanes = scheduler.lock();
+            let lane = lanes.lanes.get_mut(&id)?;
+            if lane.error_event != 0 {
+                // SAFETY: our event.
+                unsafe { windows_sys::Win32::System::Threading::ResetEvent(lane.error_event as *mut c_void) };
+            }
+            Some((std::mem::take(&mut lane.errors), std::mem::replace(&mut lane.first_error, S_OK)))
+        })
+        .unwrap_or((0, S_OK));
+    let command: i32 = if count == 0 { -1 } else { 0 };
+    // SAFETY: the title passes its record, larger than these 16 bytes.
+    unsafe {
+        record.cast::<u32>().write_unaligned(count);
+        record.add(4).cast::<u32>().write_unaligned(0);
+        record.add(8).cast::<HRESULT>().write_unaligned(first);
+        record.add(12).cast::<i32>().write_unaligned(command);
+    }
+}
+
+/// `DSTORAGE_QUEUE_INFO`: the description (`DSTORAGE_QUEUE_DESC`, 0x18
+/// bytes), then the empty slots and the entries still to enqueue before the
+/// queue submits itself (a 16-bit count each). The layout is DirectStorage
+/// for the PC's with the console's description.
+#[repr(C)]
+struct QueueInfo {
+    source_type: u64,
+    capacity: u16,
+    priority: i8,
+    name: *const c_char,
+    empty_slots: u16,
+    until_auto_submit: u16,
+}
+
+/// `Query`.
+extern "system" fn query_queue(this: QueueRef, out: *mut QueueInfo) {
+    // SAFETY: as above.
+    let queue = &unsafe { &*this }.state;
+    let (empty_slots, until_auto_submit) = scheduler()
+        .and_then(|scheduler| {
+            let lanes = scheduler.lock();
+            let lane = lanes.lanes.get(&queue.id)?;
+            // One slot stays free ([`queue`]).
+            let empty = lane.capacity.max(2).saturating_sub(lane.entries() + 1);
+            let until = (lane.capacity / 2).max(1).saturating_sub(lane.unsubmitted.len());
+            Some((empty as u16, until as u16))
+        })
+        .unwrap_or((0, 0));
+    put(
+        out,
+        QueueInfo {
+            source_type: queue.source_type,
+            capacity: queue.capacity,
+            priority: queue.priority,
+            name: queue.name,
+            empty_slots,
+            until_auto_submit,
+        },
+    );
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
@@ -1761,19 +2035,25 @@ fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
 
 /// Slots by the 2020 order, which the argument shapes at
 /// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
-static QUEUE_VTABLE: Methods<12> = Methods([
-    missing::<0> as *const (),
+/// Padded past them, so a later interface's method (`EnqueueSetEvent`)
+/// logs instead of jumping through whatever follows the table.
+static QUEUE_VTABLE: Methods<16> = Methods([
+    query_instance::<Queue> as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
     enqueue_request as *const (), // 0x18
     enqueue_status as *const (),  // 0x20
-    missing::<5> as *const (),    // 0x28 (2020: fence signal)
+    enqueue_signal as *const (),  // 0x28
     submit as *const (),          // 0x30
     missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
     close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
+    error_event as *const (),     // 0x48
+    error_record as *const (),    // 0x50
+    query_queue as *const (),     // 0x58
+    missing::<12> as *const (),   // 0x60 (X1: event)
+    missing::<13> as *const (),
+    missing::<14> as *const (),
+    missing::<15> as *const (),
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -2573,5 +2853,150 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    /// A D3D12 fence of ours, as the title's device makes it.
+    fn d3d12_fence() -> usize {
+        type CreateFence = extern "system" fn(usize, u64, u32, *const [u8; 16], *mut usize) -> HRESULT;
+        let mut device = std::ptr::null();
+        let version = victory_gpu::device::CHECKED_VERSION;
+        assert_eq!(victory_gpu::device::create(std::ptr::null(), &version, &victory_gpu::device::IID, &mut device), S_OK);
+        let device = device as usize;
+        // ID3D12Fence.
+        let iid = victory_gpu::object::guid(0x0a753dcf, 0xc4d8, 0x4b91, [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76]);
+        let mut fence = 0;
+        assert_eq!(com::<CreateFence>(device, 0x120)(device, 0, 0, &iid, &mut fence), S_OK);
+        fence
+    }
+
+    fn completed(fence: usize) -> u64 {
+        com::<extern "system" fn(usize) -> u64>(fence, 0x40)(fence)
+    }
+
+    /// The tables reach past every slot a title is known to call, so a
+    /// newer method logs instead of jumping through what follows them.
+    #[test]
+    fn method_tables_are_padded() {
+        assert!(QUEUE_VTABLE.0.len() >= 16);
+        assert!(FILE_VTABLE.0.len() >= 12);
+        assert!(STATUS_VTABLE.0.len() >= 8);
+        let queue = new_queue(1);
+        let set_event: extern "system" fn(*mut c_void, *mut c_void) -> HRESULT = call(queue, 0x60);
+        assert_eq!(set_event(queue, std::ptr::null_mut()), E_NOTIMPL);
+        void(queue, 0x40);
+    }
+
+    /// EnqueueSignal sets the fence once every request enqueued before it is
+    /// done, in queue order, and closes the failure window as a status
+    /// entry does.
+    #[test]
+    fn a_signal_is_set_once_the_reads_before_it_are_done() {
+        let data = pattern(64);
+        let (_dir, file) = file_with(&data);
+        let fence = d3d12_fence();
+        let (queue, array) = (new_queue(0), status_array(1));
+        let signal: extern "system" fn(*mut c_void, usize, u64) = call(queue, 0x28);
+        let mut out = [0u8; 16];
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
+        // Past the end of the file: fails.
+        let mut bad = [0u8; 16];
+        enqueue(queue, &request(0, bad.as_mut_ptr().cast(), 16, file, 1 << 20, 16));
+        signal(queue, fence, 5);
+        enqueue_status(queue, array, 0);
+        assert_eq!(completed(fence), 0, "not before the submit");
+        void(queue, 0x30);
+        let start = Instant::now();
+        while completed(fence) < 5 {
+            assert!(start.elapsed() < Duration::from_secs(10), "never signalled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(out, data[..16]);
+        // The failure was before the fence: not this entry's.
+        assert_eq!(wait(array, 0), S_OK);
+        void(queue, 0x40);
+        com::<extern "system" fn(usize) -> u32>(fence, 0x10)(fence);
+    }
+
+    /// GetErrorEvent, RetrieveErrorRecord and Query answer through their
+    /// real signatures.
+    #[test]
+    fn errors_are_reported_and_the_queue_described() {
+        let data = pattern(64);
+        let (_dir, file) = file_with(&data);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let event: extern "system" fn(*mut c_void) -> *mut c_void = call(queue, 0x48);
+        let record: extern "system" fn(*mut c_void, *mut [u32; 8]) = call(queue, 0x50);
+        let query: extern "system" fn(*mut c_void, *mut QueueInfo) = call(queue, 0x58);
+        let handle = event(queue);
+        assert!(!handle.is_null());
+        assert_eq!(event(queue), handle, "the queue's one event");
+        // SAFETY (below): our event.
+        let set = || unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(handle, 0) } == 0;
+        assert!(!set());
+        let mut r = [0xffff_ffff_u32; 8];
+        record(queue, &mut r);
+        assert_eq!((r[0], r[2], r[3] as i32), (0, 0, -1), "no failure");
+
+        let mut info: QueueInfo = unsafe { std::mem::zeroed() };
+        enqueue(queue, &request(0, std::ptr::null_mut(), 16, file, 1 << 20, 16));
+        query(queue, &mut info);
+        assert_eq!((info.source_type, info.capacity), (0, 0x80));
+        assert_eq!(text(info.name), "test");
+        assert_eq!(info.empty_slots, 0x80 - 2);
+
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        let failed = wait(array, 0);
+        assert!(failed < 0);
+        assert!(set(), "set at the failure");
+        record(queue, &mut r);
+        assert_eq!((r[0], r[2] as i32, r[3]), (1, failed, 0));
+        assert!(!set(), "reset by the retrieve");
+        record(queue, &mut r);
+        assert_eq!(r[0], 0);
+        void(queue, 0x40);
+        assert!(event(queue).is_null(), "closed");
+    }
+
+    /// The legacy CreateQueue (factory 0x18) takes the description without
+    /// options; QueryInterface answers for IUnknown and nulls `*out`
+    /// otherwise, and so does DStorageGetFactory for an unknown id.
+    #[test]
+    fn the_legacy_queue_creation_and_query_interface() {
+        let data = pattern(64);
+        let (_dir, file) = file_with(&data);
+        let create: extern "system" fn(*mut c_void, *const u8, *const Guid, Out) -> HRESULT = call(factory(), 0x18);
+        // DSTORAGE_QUEUE_DESC: source type, capacity, priority, name.
+        let mut desc = [0u8; 0x18];
+        desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+        desc[16..].copy_from_slice(&(c"old".as_ptr() as usize).to_le_bytes());
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), desc.as_ptr(), std::ptr::null(), &mut queue), S_OK);
+        let array = status_array(1);
+        let mut out = [0u8; 16];
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, data[..16]);
+
+        type Query = extern "system" fn(*mut c_void, *const Guid, Out) -> HRESULT;
+        let other = Guid::new(1, 2, 3, [4; 8]);
+        for object in [factory(), queue, array] {
+            let mut found = std::ptr::null_mut();
+            assert_eq!(call::<Query>(object, 0)(object, &IUNKNOWN, &mut found), S_OK);
+            assert_eq!(found, object);
+            let mut found = object;
+            assert_eq!(call::<Query>(object, 0)(object, &other, &mut found), E_NOINTERFACE);
+            assert!(found.is_null());
+        }
+        let mut found = factory();
+        assert_eq!(call::<Query>(found, 0)(found, &FACTORY, &mut found), S_OK);
+        assert_eq!(found, factory());
+        let mut f = factory();
+        assert_eq!(DStorageGetFactory(&other, &mut f), E_NOINTERFACE);
+        assert!(f.is_null());
+        void(queue, 0x40);
+        void(queue, 0x10); // the reference QueryInterface took
     }
 }
