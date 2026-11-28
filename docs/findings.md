@@ -260,3 +260,88 @@ used a stale size, or the trace does not tie them to their ask, is not settled b
 198 containers without a vertex, pixel, compute or mesh program, 22 wave64 programs with no
 wave32 lowering, 5 with a descriptor read only as data. Two of the 22 were created in these
 runs (`6b82bc7d22016cb5`, `a10179ab7eda0dc3`, both compute).
+
+# What was learned on an RTX 5090 D (2026-11-28)
+
+One PC: Ryzen 7 9800X3D (8 cores, 16 threads), 48 GB, RTX 5090 D 32 GB (driver 621.14),
+Windows 11 28000, NVMe SSD. Series X profile, 3840x2160 output, DLSS Balanced (Preset K),
+DLSS Frame Generation 4x (Streamline 2.14.16, NGX 310.9.16), release build at `a4d05e7`,
+25,758 shaders translated ahead (`victory shaders`) and 4,010 used pipelines warmed ahead
+(`victory warm --used`) on one shared `victory.exe` path so every run hits the same driver
+cache.
+
+Three runs over the same outdoor stretch from the Jason's House post-first-mission save
+(discussion #573), restored from an identical snapshot before each start and driven by the
+same 120 s `VICTORY_KEYS_FILE` camera and walk sequence. Run A is unmodified `a4d05e7`;
+run B adds #666 (splitting `VIEW_SHAPES` out of `VIEWS`, 64-bit `FxHasher` maps and a
+read-check in `forget`); run C combines #548 (gating the `Counting` global allocator on
+`diagnostics`) with #542 (`VICTORY_CARD_AWAKE=0`). All 51 `VICTORY_*` switches are identical
+across A and B; only `VICTORY_CARD_AWAKE` differs in C.
+
+Run A ran first while `host-pipelines.bin` grew from 17 KB to 35.5 MB; runs B and C loaded
+the saved 35.5-36.0 MB library at start. To keep first-run library saves out of the frame
+comparison, "clean" figures below skip the first 25 s and exclude every five-second line
+within 10 s of a library save or with GPU wait >= 1.0 ms (0 pipeline waits >= 50 ms in all
+three runs).
+
+## At 4K on a 32 GB card, the submitting thread and locks hold the frame
+
+In this 7,500-10,000 `draws/frame` outdoor stretch at 3840x2160, the card wait reported on
+the frame line stays at 0.0-0.2 ms in clean windows (`preparing` 35.9-38.9 ms, `copying
+back` 6.9-8.9 ms). In the warm tail (last 100 s of each run), the submitting thread averages
+47.6 ms a frame in A, 46.5 ms in B, and 42.8 ms in C:
+
+| Submitting thread work (warm tail, per frame) | Run B (`a4d05e7` + #666) | Run C (`a4d05e7` + #548 + #542) |
+|---|---|---|
+| Total in submissions | 46.5 ms | 42.8 ms |
+| Lists' steps (refreshes inside it) | 24.6 ms (16.7 ms) | 23.0 ms (15.0 ms) |
+| Planning steps done on the card | 7.8 ms | 6.7 ms |
+| Copies in the card's memory | 7.0 ms | 6.5 ms |
+| Asking the write watch | 4.7 ms | 4.2 ms |
+| Putting the title's bytes under flights' writes | 3.4 ms | 2.5 ms |
+| Sending the lists | 1.5 ms | 1.3 ms |
+
+Roughly 85-88 % of the refresh flushes (6,100-8,400 of 7,150-9,600 per frame) are logged as
+"known to copy nothing".
+
+## What moved the outdoor frame (#666 and #548 + #542)
+
+| Clean metric (no library save within 10 s, GPU < 1.0 ms) | A (`a4d05e7`) | B (+ #666) | C (+ #548, #542) |
+|---|---|---|---|
+| All clean ticks (avg 7,513 / 7,517 / 7,651 draws) | 20.15 fps / 51.1 ms (med 18.60) | 21.78 fps / 47.7 ms (med 19.70) | 22.07 fps / 46.8 ms (med 21.45) |
+| Heavy `draws >= 9,000` (avg 9,642 / 9,542 / 9,539) | 18.16 fps / 55.3 ms (max 62.6) | 19.06 fps / 52.5 ms (max 57.4) | 18.93 fps / 53.1 ms (max 57.8) |
+| Medium-heavy `7,000-8,999` draws | 17.60 fps / 56.9 ms | 18.77 fps / 53.4 ms | 21.39 fps / 46.8 ms |
+| `the views' lock` wait (warm last 100 s) | 38.3 ms / 5 s (max 96) | 18.4 ms / 5 s (max 83) | 29.9 ms / 5 s (max 92) |
+| DLSS FG 4x output (warm run average) | 72.3 fps | 80.4 fps | 86.7 fps |
+
+The two changes hit different bottlenecks. In B, splitting `VIEW_SHAPES` and switching
+`VIEWS` maps from `BTreeMap` to 64-bit `FxHasher` halves `the views' lock` wait (-52 % in the
+warm tail, -51 % over the full run) and gives the largest drop in the heaviest `9,000+`
+bucket (-2.8 ms). In C, removing the unconditional `Counting` global allocator from release
+builds (#548, paired with `VICTORY_CARD_AWAKE=0`) cuts submitting-thread work by 4.8 ms a
+frame (-10.1 %) while leaving `the views' lock` at 29.9 ms / 5 s — confirming the lock
+reduction in B is independent of library warmth and that B and C are complementary.
+
+## The biggest lock left: the texture queue
+
+In the same outdoor runs, `the texture queue's lock` (`TextureQueue` in
+`crates/victory-gpu/src/descriptor/host.rs`) dwarfs `the views' lock` by 6-10x:
+
+- Warm tail average wait: **226.4 ms / 5 s** in run B (73.0 ms pass + 153.4 ms other
+  threads, peak **666 ms**) and **277.6 ms / 5 s** in run C (75.3 ms pass + 202.3 ms other
+  threads, peak **593 ms**).
+- In busy five-second windows, the lock is taken **34,000-78,591 times** (up to 63,666
+  `noting a slot's record` calls even with `QueueMarks` skipping ~2.0 million no-op calls).
+- Most of the wait (up to 286 ms of 365 ms in a single 5 s window) is recording threads
+  piling up behind `due_and_census`, which holds the `Mutex` for **51-70 ms / 5 s** (~200
+  calls) scanning `BTreeMap<u32, Waiting>`. Replacing `BTreeMap` with a contiguous dense
+  array and `O(1)` index (and separating the cold 40-byte `Checked` tuple from the hot scan
+  fields) is an uncontested next target.
+
+## Shaders on 32-lane waves (`a4d05e7`)
+
+`victory shaders` with `VICTORY_EARLY_DEPTH=1` on RTX 5090 D (`Wave32`): 25,758 in the
+cache, 227 do not translate (198 non-graphics/compute containers, 24 wave64 programs with no
+wave32 lowering, 5 with a descriptor read only as data), finished in 155 s on the 9800X3D.
+`victory warm --used --jobs 8` compiled 4,010 used pipelines in 567 s (0 crashes, 6 without
+a host pipeline; median 202 ms, p90 2,977 ms, p99 10,764 ms, max 19,421 ms).
