@@ -246,6 +246,7 @@ impl Recording {
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+            crate::lab::burn(crate::lab::C);
             let mut inner = held(&self.inner);
             inner.kept.push(chunk);
             if closed {
@@ -256,6 +257,7 @@ impl Recording {
                 drop(inner);
                 give_back(kept);
                 STATS[2].fetch_add(1, Relaxed);
+                crate::lab::note("a list is translated to its end", std::ptr::from_ref(self) as u64, 0);
                 crate::queue::line_moved();
             }
         }
@@ -299,22 +301,55 @@ fn back_list(kind: u32) -> This {
     list
 }
 
+/// The most threads that translate lists while the lab file can change
+/// their number: so many are made, and [`in_use`] of them take work.
+const MOST: usize = 12;
+
+/// How many of the threads that translate lists take work
+/// (`VICTORY_THIN_THREADS`, 1 to 32; eight without it). Lab: switch `lists`
+/// of the lab file gives the number while the title runs (0: as above).
+fn in_use() -> usize {
+    static ASKED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let asked =
+        *ASKED.get_or_init(|| std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32));
+    match crate::lab::knob(crate::lab::LISTS) {
+        n if n > 0 => (n as usize).min(asked.max(MOST)),
+        _ => asked,
+    }
+}
+
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
-    for i in 0..threads {
+    let threads = in_use();
+    for i in 0..threads.max(MOST) {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
             crate::queue::no_drain_here();
             loop {
+                crate::lab::priority(crate::lab::G);
+                // Not one of those in use now ([`in_use`]): it looks again
+                // in a while, and is told of no work.
+                if i >= in_use() {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
                 let recording = {
                     let mut ready = held(&READY);
                     loop {
-                        match ready.pop_front() {
-                            Some(r) => break r,
-                            None => ready = WORK.wait(ready).unwrap_or_else(|e| e.into_inner()),
+                        if let Some(r) = ready.pop_front() {
+                            break Some(r);
+                        }
+                        ready = WORK.wait(ready).unwrap_or_else(|e| e.into_inner());
+                        // Woken, and out of use since it went to sleep: the
+                        // word goes on to one that is in use.
+                        if i >= in_use() {
+                            if !ready.is_empty() {
+                                WORK.notify_one();
+                            }
+                            break None;
                         }
                     }
                 };
+                let Some(recording) = recording else { continue };
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run())).is_err() {
                     crate::host::fail(format_args!("a thread that translates lists panicked"));
                 }

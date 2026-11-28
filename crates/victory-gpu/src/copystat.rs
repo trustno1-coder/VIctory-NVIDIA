@@ -212,17 +212,89 @@ static WAITS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(No
 /// With `VICTORY_GPU_TIMING`: the commands' time on the card since the last
 /// line by what they ran (a pipeline, or the kind of command): how many,
 /// their microseconds, and the longest one's.
-static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
+static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64, String)>>> = Mutex::new(None);
+
+/// As [`COMMANDS_BY_WORK`], by the size the commands write at
+/// ([`written_size`]): how many, and their microseconds.
+static COMMANDS_BY_SIZE: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(None);
+
+/// Frame lines with command times so far: every fourth has the heaviest
+/// commands' notes in full.
+static COMMAND_LINES: AtomicU64 = AtomicU64::new(0);
 
 /// A command took `ms` on the card (timing run). `op` is its note: the
 /// kind and size first, then the pipeline in brackets, then what it binds.
 pub(crate) fn command_took(op: &str, ms: f64) {
     let us = (ms * 1e3) as u64;
-    let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
+    {
+        let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0, String::new()));
+        e.0 += 1;
+        e.1 += us;
+        // The note of the longest one, whole: what it binds and at what
+        // size (the key drops both).
+        if us > e.2 || e.3.is_empty() {
+            e.2 = e.2.max(us);
+            e.3 = op.to_owned();
+        }
+    }
+    let mut by = COMMANDS_BY_SIZE.lock().unwrap_or_else(|e| e.into_inner());
+    let e = by.get_or_insert_with(HashMap::new).entry(written_size(op)).or_insert((0, 0));
     e.0 += 1;
     e.1 += us;
-    e.2 = e.2.max(us);
+}
+
+/// `1706x960` and the like, as a width and height.
+fn width_height(token: &str) -> Option<(u64, u64)> {
+    let (w, h) = token.split_once('x')?;
+    let (w, h) = (w.parse::<f64>().ok()?, h.parse::<f64>().ok()?);
+    (w >= 1.0 && h >= 1.0).then_some((w as u64, h as u64))
+}
+
+/// What a command's note says of the size it writes at, with its kind: a
+/// draw's viewport (and its first target's size, or its depth's, where that
+/// is another), a compute pass's largest texture written through a view of
+/// its tables; the first word alone for what has neither (copies).
+fn written_size(op: &str) -> String {
+    let head = op.split(" | ").next().unwrap_or(op);
+    if head.contains("[compute ") {
+        let mut most: Option<(u64, u64)> = None;
+        let tables = op.rfind(" tables ").map_or("", |at| &op[at..]);
+        for mark in ["uav texture ", "placed uav=true dim "] {
+            for (at, _) in tables.match_indices(mark) {
+                let mut words = tables[at + mark.len()..].split(' ');
+                if mark.starts_with("placed") {
+                    words.next();
+                }
+                if let Some(size) = words.next().and_then(width_height)
+                    && most.is_none_or(|m| size.0 * size.1 > m.0 * m.1)
+                {
+                    most = Some(size);
+                }
+            }
+        }
+        return match most {
+            Some((w, h)) => format!("compute {w}x{h}"),
+            None => "compute (buffers only)".into(),
+        };
+    }
+    if let Some(at) = head.find(" targets ") {
+        let rest = &head[at..];
+        let target = rest[..rest.find(" state [").unwrap_or(rest.len())]
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .find_map(width_height);
+        let viewport = rest.find(" viewport [").and_then(|at| {
+            let mut v = rest[at + " viewport [".len()..].split(' ').skip(2);
+            width_height(&format!("{}x{}", v.next()?, v.next()?))
+        });
+        let text = |s: Option<(u64, u64)>| s.map_or("?".to_owned(), |(w, h)| format!("{w}x{h}"));
+        return if viewport.is_none() || viewport == target {
+            format!("draws {}", text(target))
+        } else {
+            format!("draws {} of {}", text(viewport), text(target))
+        };
+    }
+    command_key(op)
 }
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
@@ -469,6 +541,36 @@ mod command_tests {
         );
         assert_eq!(command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"), "texture upload");
         assert_eq!(command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
+    }
+
+    /// The size a command writes at: a compute pass's largest texture
+    /// written, a draw's viewport and target.
+    #[test]
+    fn commands_are_sized_by_what_they_write() {
+        use super::written_size;
+        assert_eq!(
+            written_size(
+                "indirect kind 2 max 1 at 0xd9358fce0 groups in title memory (160 90 1) [compute 919bafe017d59512] | 919bafe017d59512: u4=0xa6b080 [heap 341380: x] tables [\"919bafe017d59512 Texture s2+0: 3840x2160 f10 flags 0x0 of 0x12f\", \"919bafe017d59512 Uav s2+8: uav texture 1280x720 f10 flags 0x4 of 0x130\", \"919bafe017d59512 Uav s2+16: uav texture 2560x1440 f10 flags 0x4 of 0x131\"]"
+            ),
+            "compute 2560x1440"
+        );
+        assert_eq!(
+            written_size("dispatch 182x1x1 [compute 24f989b98dcb03f0] | 24f989b98dcb03f0: u4=0xa6b080 tables [\"24f989b98dcb03f0 Uav s2+0: uav resource 0x1 buffer None\"]"),
+            "compute (buffers only)"
+        );
+        assert_eq!(
+            written_size(
+                "draw 3x1 [vertex 25ebc92075b62822, pixel 085d374c5a795549] targets [\"0x1309f5ad860 3840x2160 f10\"] depth None state [x] scissor [0 0 2560 1440] viewport [0 0 2560 1440 depth 0..1] | 25ebc92075b62822: tables []"
+            ),
+            "draws 2560x1440 of 3840x2160"
+        );
+        assert_eq!(
+            written_size(
+                "mesh 12 [mesh 0750cb2d975c7563, pixel 085d374c5a795549] targets [] depth Some(\"0x1309f5ad860 2048x2048 f40\") state [x] viewport [0 0 2048 2048 depth 0..1] | t"
+            ),
+            "draws 2048x2048"
+        );
+        assert_eq!(written_size("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
     }
 }
 
@@ -1334,14 +1436,26 @@ pub(crate) fn log(frames: f64) {
     }
     let by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut by: Vec<_> = by.into_iter().flatten().collect();
-    by.sort_by_key(|&(_, (_, us, _))| std::cmp::Reverse(us));
+    by.sort_by_key(|(_, (_, us, _, _))| std::cmp::Reverse(*us));
+    let sizes = COMMANDS_BY_SIZE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut sizes: Vec<_> = sizes.into_iter().flatten().collect();
+    sizes.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
+    if !sizes.is_empty() {
+        let text: Vec<String> = sizes
+            .iter()
+            .take(40)
+            .map(|(what, (n, us))| format!("{what}: {:.2} ms in {:.1}", *us as f64 / 1e3 / frames, *n as f64 / frames))
+            .collect();
+        tracing::info!("  the card's time by the size written (timing run), a frame: {}", text.join("; "));
+    }
+    let whole = !by.is_empty() && COMMAND_LINES.fetch_add(1, Relaxed) % 4 == 3;
     // All of them together, and by their first word: the forty lines below
     // are the heaviest only (100 of 226 ms waited in run 102), and what the
     // commands do not account for is the layer's own lists (the card
     // copies' passes, preludes) and the waits themselves.
     if !by.is_empty() {
         let mut kinds: Vec<(String, u64, u64)> = Vec::new();
-        for (what, (n, us, _)) in &by {
+        for (what, (n, us, _, _)) in &by {
             let word = what.split(' ').next().unwrap_or("").to_owned();
             match kinds.iter_mut().find(|k| k.0 == word) {
                 Some(k) => (k.1, k.2) = (k.1 + n, k.2 + us),
@@ -1359,13 +1473,16 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    for (what, (n, us, longest, text)) in by.into_iter().take(40) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,
             n as f64 / frames,
             longest as f64 / 1e3
         );
+        if whole && us as f64 / 1e3 / frames >= 0.15 {
+            tracing::info!("    the longest one's note in full: {}", text.chars().take(16_000).collect::<String>());
+        }
     }
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \

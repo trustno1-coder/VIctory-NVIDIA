@@ -54,6 +54,7 @@ mod inplace;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
+mod lab;
 mod land;
 pub mod list;
 pub mod object;
@@ -114,6 +115,10 @@ pub use host::on_failure;
 #[cfg(windows)]
 pub use upload::reserve_space as reserve_upload_space;
 
+/// Lab: what a title import is bound to (its sleeps: `lab::import`).
+#[cfg(windows)]
+pub use lab::import as lab_import;
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -138,6 +143,7 @@ pub use shadow::title_memory_write_combined;
 #[cfg(windows)]
 pub use watch::{
     SoftViews, kernel_writing, soft_view_guards, title_memory_allocated, title_memory_freed, title_memory_made_real,
+    title_memory_protecting,
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
     title_memory_written, use_lazy_views, use_soft_views, writing as kernel_will_write,
 };

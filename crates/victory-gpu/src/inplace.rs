@@ -233,6 +233,13 @@ pub(crate) enum From {
 
 /// Opens a heap on memory the process has.
 pub(crate) fn open(device: &ID3D12Device, from: From) -> windows::core::Result<ID3D12Heap> {
+    // (A seal of the write watch's there, lab switch `seal`: the memory as
+    // the title made it before the card takes it.)
+    match from {
+        From::Region(at) => crate::watch::opening_in_place(at, 0),
+        From::Part(at, bytes) => crate::watch::opening_in_place(at, bytes),
+        From::Section(_) => {}
+    }
     // SAFETY: the calls take an address or a handle and check both
     // themselves; a refusal is an error code.
     unsafe {

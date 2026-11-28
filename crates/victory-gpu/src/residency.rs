@@ -90,9 +90,19 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     has_growth_reserve(sample_commit(now), bake)
 }
 
+/// Lab: `VICTORY_LIMITED_RAM=0` or `1` says it outright. A PC with 32 GB
+/// counts as limited, which cuts what is kept (128 MB of spare scratch chunks
+/// for 1 GiB, ten seconds for five minutes of idle windows and staging
+/// buffers, 16 submissions for 64 before what was let go is dropped): run 34
+/// had 65 scratch chunks made and destroyed per frame for it, with 27 GB of
+/// the PC's memory free.
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
-    *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+    *LIMITED.get_or_init(|| match std::env::var("VICTORY_LIMITED_RAM").ok().as_deref().map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB),
+    })
 }
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {

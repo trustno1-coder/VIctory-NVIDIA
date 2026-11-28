@@ -315,6 +315,15 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 /// list's bottom-of-pipe write may be into a fence), never from inside
 /// one.
 #[cfg(windows)]
+pub(crate) fn wake_behind() {
+    if behind::on() {
+        behind::wake();
+    }
+}
+
+/// Runs what waiting queues hold as far as their fences have been reached
+/// (see above).
+#[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
     if behind::on() {
         // What queues stand at is looked at by the thread that runs them.

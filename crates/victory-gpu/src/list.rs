@@ -1982,6 +1982,7 @@ mod state {
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     DRAWS_EVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::lab::DRAWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Every draw recorded since the start (the warm-up start watches it).

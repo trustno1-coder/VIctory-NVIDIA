@@ -86,6 +86,11 @@ impl HostPolicy {
             if ours != address {
                 return Some(ours);
             }
+            // Lab: the title's sleeps (its waits for the card are woken).
+            let ours = victory_gpu::lab_import(name, address);
+            if ours != address {
+                return Some(ours);
+            }
         }
         // With a timeline asked for, what threads wait with is wrapped.
         #[cfg(all(windows, feature = "diagnostics"))]

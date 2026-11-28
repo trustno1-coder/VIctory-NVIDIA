@@ -171,6 +171,12 @@ pub(crate) fn set(this: This, value: u64) {
     unsafe {
         windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
     }
+    // (Lab: and the title's own waits for the value, which look at it in memory.)
+    #[cfg(windows)]
+    {
+        crate::lab::note("a fence is set (the fence, its value)", this as u64, value);
+        crate::lab::told();
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let _called = crate::timeline::span("a fence set");
