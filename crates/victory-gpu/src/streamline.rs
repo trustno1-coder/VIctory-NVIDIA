@@ -274,8 +274,10 @@ static PRESENT_HOOKED: AtomicBool = AtomicBool::new(false);
 /// between frames, one caller at a time.
 #[derive(Default)]
 struct Calls {
-    /// Optimal render sizes by output size and mode.
-    optimal: Vec<([u32; 2], u32, Option<[u32; 2]>)>,
+    /// What DLSS answered by output size and mode: the optimal render size and the
+    /// mode's minimum and maximum (none where it answered no size). Which size a scene
+    /// gets is decided from these each frame, with that frame's render size.
+    optimal: Vec<([u32; 2], u32, Option<[[u32; 2]; 3]>)>,
     /// The mode, sizes and preset the last options named.
     last: Option<(u32, [u32; 2], [u32; 2])>,
     /// Frame generation: on, the frames for each rendered one last asked of it (0 off), and
@@ -1366,18 +1368,56 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
         spent(T_UPSCALE_LOCK, began);
     }
     let output = camera.output;
-    let optimal = |calls: &mut Calls, mode: u32| -> Option<[u32; 2]> {
-        if let Some(&(_, _, size)) = calls.optimal.iter().find(|(o, m, _)| *o == output && *m == mode) {
-            return size;
+    let answered = |calls: &mut Calls, mode: u32| -> Option<[[u32; 2]; 3]> {
+        if let Some(&(_, _, sizes)) = calls.optimal.iter().find(|(o, m, _)| *o == output && *m == mode) {
+            return sizes;
         }
         let options = abi::DlssOptions::new(mode, output, plan.asked.preset);
         let mut settings = abi::DlssOptimalSettings::default();
         // SAFETY: filled options and a structure to fill.
         let code = unsafe { optimal_of(&options, &mut settings) };
-        let size = (code == 0 && settings.optimal_render_width > 0)
-            .then_some([settings.optimal_render_width, settings.optimal_render_height]);
-        calls.optimal.push((output, mode, size));
-        size
+        tracing::info!(
+            mode = plan::sl_mode_name(mode),
+            ?output,
+            code,
+            result = abi::result_name(code),
+            width = settings.optimal_render_width,
+            height = settings.optimal_render_height,
+            min = ?[settings.render_width_min, settings.render_height_min],
+            max = ?[settings.render_width_max, settings.render_height_max],
+            "DLSS: slDLSSGetOptimalSettings"
+        );
+        let sizes = (code == 0 && settings.optimal_render_width > 0).then_some([
+            [settings.optimal_render_width, settings.optimal_render_height],
+            [settings.render_width_min, settings.render_height_min],
+            [settings.render_width_max, settings.render_height_max],
+        ]);
+        calls.optimal.push((output, mode, sizes));
+        sizes
+    };
+    // A driver-side DLSS override (NVIDIA App) answers every mode with its own optimal
+    // size (960x540 for 1080p on an RTX 3060 here), so a 1280x720 scene fit none and every
+    // upscaling was dropped (a black picture). DLSS takes any render between the mode's
+    // minimum and maximum: where the optimal size is smaller than the scene but the range
+    // holds it, the mode is offered at its maximum. `VICTORY_DLSS_RANGE=0`: as before.
+    // Decided here, not cached: the same output and mode see other render sizes.
+    let range = std::env::var_os("VICTORY_DLSS_RANGE").is_none_or(|v| v != "0");
+    let render = camera.render;
+    let optimal = |calls: &mut Calls, mode: u32| -> Option<[u32; 2]> {
+        let [opt, min, max] = answered(calls, mode)?;
+        let smaller = opt[0] < render[0] || opt[1] < render[1];
+        let held = min[0] <= render[0] && min[1] <= render[1] && max[0] >= render[0] && max[1] >= render[1];
+        if range && smaller && held {
+            once!(
+                info,
+                ?render,
+                optimal = ?opt,
+                ?max,
+                "DLSS: the scene is larger than the optimal size (a driver override?); offered at the mode's maximum"
+            );
+            return Some(max);
+        }
+        Some(opt)
     };
     let sizes: Vec<(u32, Option<[u32; 2]>)> = plan::MODES.iter().map(|&m| (m, optimal(&mut calls, m))).collect();
     let optimal_of_mode = |m: u32| sizes.iter().find(|s| s.0 == m).and_then(|s| s.1);
@@ -1693,11 +1733,25 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     // Where the interface is no plane of its own (Series X): the copy of
     // this texture taken in front of the title's interface composite.
     let hudless = if planes.overlay.is_none() && hudless_wanted() { hudless_for(planes.base.0) } else { None };
-    let (sl, functions) = (SL.get()?, FUNCTIONS.get()?);
-    let (set_options, marker) = (functions.dlssg_set_options?, functions.pcl_set_marker?);
+    let (Some(sl), Some(functions)) = (SL.get(), FUNCTIONS.get()) else {
+        once!(warn, "DLSS Frame Generation: present_begins: Streamline or its functions not set");
+        return None;
+    };
+    let (Some(set_options), Some(marker)) = (functions.dlssg_set_options, functions.pcl_set_marker) else {
+        once!(
+            warn,
+            "DLSS Frame Generation: present_begins: slDLSSGSetOptions {} / slPCLSetMarker {}",
+            functions.dlssg_set_options.is_some(),
+            functions.pcl_set_marker.is_some()
+        );
+        return None;
+    };
     let began = std::time::Instant::now();
     let frame = frame as u32;
-    let token = frame_token(sl, frame)?;
+    let Some(token) = frame_token(sl, frame) else {
+        once!(warn, frame, "DLSS Frame Generation: present_begins: no frame token");
+        return None;
+    };
     let mark = |m: u32| {
         let began = std::time::Instant::now();
         // SAFETY: a marker for a token of ours.
@@ -1992,6 +2046,22 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         // SAFETY: a structure to fill, no options (no estimate asked).
         let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
         spent(T_STATE, asked);
+        {
+            static ASKED: AtomicU32 = AtomicU32::new(0);
+            let n = ASKED.fetch_add(1, Relaxed);
+            if n < 4 || n % 120 == 0 {
+                tracing::info!(
+                    n,
+                    code,
+                    status = format_args!("{:#x}", state.status),
+                    presented = state.num_frames_actually_presented,
+                    generate_max = state.num_frames_to_generate_max,
+                    min_size = state.min_width_or_height,
+                    vram_mb = state.estimated_vram_usage_in_bytes >> 20,
+                    "DLSS Frame Generation: slDLSSGGetState after the present"
+                );
+            }
+        }
         if code == 0 {
             FG_PER.store(state.num_frames_actually_presented.max(1), Relaxed);
             FG_SHOWN.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
