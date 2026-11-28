@@ -382,6 +382,8 @@ A tree of other people's work with a little on top; the history is kept.
   [discussion #520](https://github.com/trustno1-coder/VIctory-NVIDIA/discussions/520):
   [DueTonight](https://github.com/DueTonight) and
   [mikan123pro](https://github.com/mikan123pro).
+- The graphical launcher (`apps/launcher`): designed by
+  [Alexx307](https://github.com/alexx307).
 - NVIDIA Streamline, DLSS and Reflex are NVIDIA's; they are loaded at run time
   from a folder you supply.
 - Much of this fork's code was written with

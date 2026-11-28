@@ -26,6 +26,7 @@ use crate::{HleExport, HleModule};
 // PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy);
 // PS4 pads (DualShock 4) and rumble from FrancescoGelosoEterea/VIscosity (d8db7a0).
 #[cfg(any(windows, test))]
+mod keymap;
 mod playstation;
 
 /// Stops the motors of the PlayStation pads read over HID, before the
@@ -80,10 +81,11 @@ const DEVICES: usize = PADS + 3;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. The letters are
-/// where a US keyboard has them ([`pad_key`]): the same keys under the
-/// fingers on every layout (Z/Q/S/D on AZERTY).
+/// The keyboard's stand-in gamepad's buttons by default (key, button); README
+/// lists it. Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. The
+/// letters are where a US keyboard has them ([`pad_key`]): the same keys under
+/// the fingers on every layout (Z/Q/S/D on AZERTY). `VICTORY_KEYMAP` changes
+/// any of them ([`keymap`]); scripted keys keep this table.
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
@@ -101,18 +103,24 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'H', RIGHT_STICK),
 ];
 
-/// Where the stand-in pad's letters are on the keyboard: scan code (set 1)
-/// and the letter a US layout prints there.
-const LETTER_POSITIONS: [(u32, u8); 16] = [
+/// Where letters are on the keyboard: scan code (set 1) and the letter a US
+/// layout prints there. All of them, so that `VICTORY_KEYMAP` can use any.
+const LETTER_POSITIONS: [(u32, u8); 26] = [
     (0x10, b'Q'),
     (0x11, b'W'),
     (0x12, b'E'),
+    (0x13, b'R'),
+    (0x14, b'T'),
     (0x15, b'Y'),
+    (0x16, b'U'),
     (0x17, b'I'),
+    (0x18, b'O'),
+    (0x19, b'P'),
     (0x1E, b'A'),
     (0x1F, b'S'),
     (0x20, b'D'),
     (0x21, b'F'),
+    (0x22, b'G'),
     (0x23, b'H'),
     (0x24, b'J'),
     (0x25, b'K'),
@@ -120,6 +128,10 @@ const LETTER_POSITIONS: [(u32, u8); 16] = [
     (0x2C, b'Z'),
     (0x2D, b'X'),
     (0x2E, b'C'),
+    (0x2F, b'V'),
+    (0x30, b'B'),
+    (0x31, b'N'),
+    (0x32, b'M'),
 ];
 
 /// The scan code of the stand-in pad's letter `vk` on a US layout.
@@ -131,7 +143,7 @@ fn letter_position(vk: u8) -> Option<u32> {
 /// it is, not by what the layout prints on it: with the virtual key, an
 /// AZERTY keyboard had forward on the key marked W, in the bottom row. Other
 /// keys (Esc, Enter, the arrows) are the same key on every layout. 0: a
-/// letter key in none of the pad's places.
+/// letter key in none of the US letters' places.
 fn pad_key(key: &KeyState) -> u8 {
     match LETTER_POSITIONS.iter().find(|(scan, _)| *scan == key.scan_code) {
         Some(&(_, letter)) => letter,
@@ -209,25 +221,7 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| pad_key(k) == vk) {
-            1.0
-        } else {
-            0.0
-        }
-    };
-    PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
-    }
+    keymap::current().pad(|vk| keys.iter().any(|k| pad_key(k) == vk))
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
