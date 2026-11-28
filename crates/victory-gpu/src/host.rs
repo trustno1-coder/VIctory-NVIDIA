@@ -1358,6 +1358,12 @@ pub(crate) struct HostList {
     /// ([`HostList::leave_open`]): that reset finds nothing to undo. The
     /// list's title calls and epoch then, each plus one (0: not left open).
     left_open: [std::sync::atomic::AtomicU64; 2],
+    /// A mesh pipeline is bound on the list ([`HostList::leave_mesh`]).
+    mesh_bound: std::sync::atomic::AtomicBool,
+    /// The times the rest pipeline was bound in place of a mesh pipeline
+    /// ([`crate::mesh_rest`]): a draw state that saw another number binds
+    /// its pipeline and root signature again.
+    rests: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4634,6 +4640,8 @@ impl Host {
                 upscale: std::sync::atomic::AtomicU64::new(0),
                 hudless: std::sync::atomic::AtomicU64::new(0),
                 left_open: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
+                mesh_bound: std::sync::atomic::AtomicBool::new(false),
+                rests: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6833,6 +6841,7 @@ impl HostList {
         let _closing = crate::timeline::span("closing a host list");
         self.left_open[0].store(0, Ordering::Release);
         self.flush_indirect();
+        self.leave_mesh();
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6957,6 +6966,7 @@ impl HostList {
         let left_open = self.still_left_open();
         self.changed_something();
         self.holding.store(false, Ordering::Relaxed);
+        self.mesh_bound.store(false, Ordering::Relaxed);
         *self.indirect_run.lock().unwrap_or_else(|e| e.into_inner()) = None;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -7025,8 +7035,47 @@ impl HostList {
     /// binds, `crate::list`): the indirect execution held back, if one is,
     /// is recorded first ([`crate::indirect::merge`]).
     pub(crate) fn title_call(&self) {
+        self.title_call_keeping_mesh();
+        self.leave_mesh();
+    }
+
+    /// As [`HostList::title_call`], for a call that records no work of its
+    /// own past a bound mesh pipeline (a mesh dispatch, state that goes
+    /// straight onto the list): the mesh pipeline stays bound.
+    pub(crate) fn title_call_keeping_mesh(&self) {
         self.title_calls.fetch_add(1, Ordering::Relaxed);
         self.flush_indirect();
+    }
+
+    /// A mesh pipeline was just bound on the list.
+    pub(crate) fn mesh_bound(&self) {
+        crate::mesh_rest::note_mesh_bind();
+        if crate::mesh_rest::mode() != crate::mesh_rest::Mode::Off {
+            self.mesh_bound.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// If a mesh pipeline is bound, the rest pipeline in its place
+    /// ([`crate::mesh_rest`]): before anything else is recorded. An indirect
+    /// execution held back is recorded first, with the pipeline it was
+    /// bound with, and the list's run is no longer one the next execution
+    /// joins without binding again ([`crate::indirect::merge`]).
+    pub(crate) fn leave_mesh(&self) {
+        if !self.mesh_bound.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        self.flush_indirect();
+        if let Some((run, _)) = self.indirect_run().as_mut() {
+            run.settled = false;
+        }
+        if crate::mesh_rest::record(&self.list) {
+            self.rests.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The times the rest pipeline took a mesh pipeline's place in the list.
+    pub(crate) fn rests(&self) -> u64 {
+        self.rests.load(Ordering::Relaxed)
     }
 
     /// The title calls recorded into the list so far.
@@ -9802,6 +9851,7 @@ impl Meter {
         crate::shadow::back_line(frames);
         submit_split_line(frames);
         fresh_open_line(frames);
+        crate::mesh_rest::line(frames);
         crate::heap_marks::line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);

@@ -163,6 +163,19 @@ fn with_binding(this: This, f: impl FnOnce(&mut crate::draw::State)) {
     with_state_on(host_list_held(this), this, |_, s| f(s));
 }
 
+/// As [`with_state`], for a call that sets state straight onto the host
+/// list and records no work (viewports, scissors, targets, the topology): a
+/// mesh pipeline bound stays bound (`crate::mesh_rest`), so the state set
+/// between mesh dispatches binds nothing again.
+#[cfg(windows)]
+fn with_set_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    let list = host_list_held(this);
+    if let Some(list) = list {
+        list.title_call_keeping_mesh();
+    }
+    with_state_on(list, this, f);
+}
+
 /// As [`with_state`], with `list`, the host list of `this` as it was taken.
 #[cfg(windows)]
 fn with_state_on(
@@ -1768,7 +1781,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_binding, with_state};
+    use super::{This, with_binding, with_set_state, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1783,7 +1796,7 @@ mod state {
     }
 
     pub(super) extern "system" fn topology(this: This, topology: u32) {
-        with_state(this, |list, s| s.set_topology(list, topology));
+        with_set_state(this, |list, s| s.set_topology(list, topology));
     }
     pub(super) extern "system" fn viewports(
         this: This,
@@ -1792,22 +1805,22 @@ mod state {
     ) {
         // (Through the draw state, which keeps them for the host list
         // that continues this one after a cut: `State::replay`.)
-        with_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
+        with_set_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
+        with_set_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        with_state(this, |list, s| {
+        with_set_state(this, |list, s| {
             // SAFETY: the title passes four floats or null.
             s.set_blend_factor(list, unsafe { factor.as_ref() })
         });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        with_state(this, |list, s| s.set_stencil_ref(list, reference));
+        with_set_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
-        with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+        with_set_state(this, |list, s| s.set_depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_binding(this, |s| s.set_heaps(items(heaps, count)));
@@ -1890,7 +1903,7 @@ mod state {
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_set_state(this, |list, s| s.set_targets(list, &handles, depth));
     }
     pub(super) extern "system" fn draw(
         this: This,

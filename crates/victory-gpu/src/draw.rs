@@ -540,6 +540,10 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
+    /// The host list's [`HostList::rests`] when this state last bound: a
+    /// rest pipeline since replaced the pipeline and graphics root
+    /// signature it bound (`crate::mesh_rest`).
+    host_rests: u64,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1345,6 +1349,21 @@ impl State {
         };
     }
 
+    /// The rest pipeline was bound on `list` since this state last bound
+    /// (`crate::mesh_rest`): what it replaced is set again by the next bind.
+    fn rested(&mut self, list: &HostList) {
+        let rests = list.rests();
+        if self.host_rests == rests {
+            return;
+        }
+        self.host_rests = rests;
+        self.host_pipeline = 0;
+        self.host_roots[0] = 0;
+        if crate::mesh_rest::mode() == crate::mesh_rest::Mode::Draw && self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+    }
+
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.rebound(OTHERS, self.pipeline != pipeline as usize);
         self.pipeline = pipeline as usize;
@@ -1929,6 +1948,14 @@ impl State {
             0
         };
         TESTED_DEPTH.set((tested, false));
+        // A mesh pipeline is not left bound under a pipeline of another
+        // kind (`crate::mesh_rest`); one the rest pipeline took the place of
+        // is bound again, with its root signature (and the topology, which a
+        // rest draw sets).
+        if !p.mesh {
+            list.leave_mesh();
+        }
+        self.rested(list);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -1947,6 +1974,9 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
+            if p.mesh {
+                list.mesh_bound();
+            }
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
@@ -5187,6 +5217,10 @@ impl State {
             ));
             return false;
         }
+        // The copies and clamp passes below are recorded past no mesh
+        // pipeline (`crate::mesh_rest`; an execution's own one is bound
+        // again by its bind).
+        list.leave_mesh();
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
