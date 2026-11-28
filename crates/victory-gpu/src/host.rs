@@ -327,6 +327,10 @@ pub(crate) fn log_waits() {
             ));
         }
     }
+    let ahead = crate::pool::MADE_AHEAD.swap(0, Ordering::Relaxed);
+    if ahead > 0 {
+        parts.push(format!("{ahead} texture blocks made ahead by a thread of ours (VICTORY_BLOCK_AHEAD=0: none)"));
+    }
     if !parts.is_empty() {
         tracing::info!(
             "new memory waited for in the last 5 seconds (VICTORY_WAIT_RESIDENT=0: none): {frame_ms:.1} ms by the title's threads and ours, \

@@ -865,7 +865,56 @@ fn take_unlocked(device: &ID3D12Device, len: u64, align: u64) -> Option<(Piece, 
             (i, pool.blocks[i].as_mut()?.free.take(len, align)?)
         }
     };
-    pool.finish(i, start, len, now(), ripe, &mut || make_block(device))
+    let taken = pool.finish(i, start, len, now(), ripe, &mut || make_block(device));
+    // (Blocks made ahead by `finish` itself, with `VICTORY_RIPE_BLOCKS`,
+    // leave this to it.)
+    let none_empty = ripe.ahead == 0 && !pool.blocks.iter().flatten().any(|b| b.free.whole(BLOCK));
+    drop(pool);
+    if none_empty {
+        make_one_ahead();
+    }
+    taken
+}
+
+/// Whether one empty block of textures is kept made by a thread of ours,
+/// for the next texture no block has room for (`VICTORY_BLOCK_AHEAD=0`:
+/// none, the thread that needs it makes it, as before). Made when a
+/// texture took the last empty one, while the texture queue has room
+/// (`crate::resource::room_lately`): at most one block more than the
+/// textures hold, which the pool keeps as a spare in any case ([`SPARE`]).
+fn block_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BLOCK_AHEAD").is_none_or(|v| v != "0"))
+}
+
+/// Whether a block is being made ahead now.
+static MAKING_AHEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Blocks made ahead ([`make_one_ahead`]) since the last 5-second lines.
+pub(crate) static MADE_AHEAD: AtomicU64 = AtomicU64::new(0);
+
+/// Makes one empty block of textures on a thread of ours ([`block_ahead`]),
+/// unless one is being made.
+fn make_one_ahead() {
+    if !block_ahead() || !crate::resource::room_lately() || MAKING_AHEAD.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let made = std::thread::Builder::new().name("victory-block-ahead".into()).spawn(|| {
+        if let Some(host) = crate::host::host()
+            && let Some(heap) = make_block(&host.device)
+        {
+            let mut pool = lock(&TEXTURES);
+            // (One made meanwhile by a thread that could not wait for this:
+            // this one would be a second spare.)
+            if !pool.blocks.iter().flatten().any(|b| b.free.whole(BLOCK)) {
+                pool.add(heap, crate::host::submissions().0);
+                MADE_AHEAD.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        MAKING_AHEAD.store(false, Ordering::Release);
+    });
+    if made.is_err() {
+        MAKING_AHEAD.store(false, Ordering::Release);
+    }
 }
 
 /// A texture of `desc` (no target, depth or unordered access) in a block;
@@ -1230,6 +1279,52 @@ mod tests {
         // SAFETY: plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None, "the debug layer found an error");
+    }
+
+    /// Once textures have taken every empty block, one is made ahead by a
+    /// thread of ours ([`block_ahead`]), and the next texture that no block
+    /// with pieces has room for lies in it.
+    #[test]
+    fn an_empty_block_is_made_ahead_once_none_is_left() {
+        let Some(host) = crate::host::host() else { return };
+        // (With `VICTORY_RIPE_BLOCKS` above 0, `Pool::finish` makes blocks
+        // ahead itself: run with the launcher's `VICTORY_RIPE_BLOCKS=0`.)
+        if !block_ahead() || ahead() != 0 || !crate::resource::room_lately() {
+            return;
+        }
+        let made_before = MADE_AHEAD.load(Ordering::Relaxed);
+        // 16 MiB each: four fill a block.
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2048,
+            Height: 2048,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let empty = || lock(&TEXTURES).blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+        let mut held = Vec::new();
+        // Until a texture took the last empty block (or 64 of them).
+        for _ in 0..64 {
+            // SAFETY: a valid description.
+            held.extend(unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) });
+            if empty() == 0 {
+                break;
+            }
+        }
+        let began = std::time::Instant::now();
+        while empty() == 0 && began.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(empty() >= 1, "no block was made ahead");
+        while MAKING_AHEAD.load(Ordering::Acquire) && began.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!MAKING_AHEAD.load(Ordering::Acquire), "the thread that makes it ahead did not end");
+        assert!(MADE_AHEAD.load(Ordering::Relaxed) > made_before, "the empty block is not one made ahead");
+        drop(held);
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not
