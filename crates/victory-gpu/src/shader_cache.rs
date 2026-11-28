@@ -123,7 +123,7 @@ pub(crate) fn translation() -> [u8; 32] {
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
-    host_shader_with_cache(container, CacheWrite::Required)?;
+    host_shader_with_cache(container, CACHE.get(), CacheWrite::Required)?;
     // (Counts other threads' misses too: the caller only adds them up.)
     Ok(MISSES.load(Ordering::Relaxed) == misses)
 }
@@ -131,7 +131,7 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    host_shader_with_cache(container, CacheWrite::BestEffort)
+    host_shader_with_cache(container, CACHE.get(), CacheWrite::BestEffort)
 }
 
 enum CacheWrite {
@@ -139,10 +139,17 @@ enum CacheWrite {
     Required,
 }
 
-fn host_shader_with_cache(container: &[u8], write: CacheWrite) -> Result<HostShader, String> {
+fn host_shader_with_cache(
+    container: &[u8],
+    cache: Option<&Cache>,
+    write: CacheWrite,
+) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    let shader = match CACHE.get() {
+    let shader = match cache {
         Some(cache) => cached(cache, &build(), container, write, translate),
+        None if matches!(write, CacheWrite::Required) => {
+            Err("the shader cache is unavailable".to_owned())
+        }
         None => translate(container),
     }?;
     // Its static samplers into the list every process makes them from.
@@ -493,6 +500,12 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("synthetic translation failure"));
         assert_eq!(runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn precompilation_requires_an_open_cache() {
+        let error = host_shader_with_cache(b"", None, CacheWrite::Required).unwrap_err();
+        assert_eq!(error, "the shader cache is unavailable");
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
