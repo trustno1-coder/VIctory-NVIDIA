@@ -311,6 +311,18 @@ fn kind(index: usize) -> u32 {
     }
 }
 
+/// Whether `id` is one of our devices' (`APP_LOCAL_DEVICE_ID`), for
+/// `XUserFindForDevice`.
+pub(crate) fn is_device_id(id: &[u8; 32]) -> bool {
+    (0..DEVICES).any(|i| Device::new(i).info.id == *id)
+}
+
+/// A device id of ours, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn a_device_id() -> [u8; 32] {
+    Device::new(0).info.id
+}
+
 impl Device {
     fn new(index: usize) -> Device {
         let mut id = [0; 32];

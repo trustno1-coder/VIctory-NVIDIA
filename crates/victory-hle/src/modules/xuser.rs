@@ -1,7 +1,7 @@
 //! XUser: one offline local user, signed in, never a guest, with every
 //! privilege. Served as the user provider's objects from `QueryApiImpl`;
-//! adding a user completes through `xasync` like any other async call. No
-//! input device is associated with the user (there are none, `gameinput`).
+//! adding a user completes through `xasync` like any other async call. The
+//! input devices `gameinput` hands out are the user's.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -247,8 +247,8 @@ extern "system" fn token_result(
     xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used)
 }
 
-/// The user never changes and no device is ever associated, so these
-/// callbacks are never called.
+/// The user never changes, and its devices are its from the start, so
+/// these callbacks are never called.
 extern "system" fn register(
     _: This,
     _queue: *const c_void,
@@ -262,9 +262,14 @@ extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true
 }
 
-/// No input device belongs to a user.
-extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Handle) -> HRESULT {
-    USER_NOT_FOUND
+/// The default user is signed in silently, and the system's devices are
+/// that user's (`XUserAddAsync`): every device `gameinput` hands out.
+extern "system" fn find_for_device(_: This, device: *const [u8; 32], out: *mut Handle) -> HRESULT {
+    // SAFETY: the title passes its APP_LOCAL_DEVICE_ID (null tolerated).
+    match unsafe { device.as_ref() } {
+        Some(id) => found(super::gameinput::is_device_id(id), out),
+        None => xasync::E_INVALIDARG,
+    }
 }
 
 // Unset slots (no title seen calls them): maximum users, gamer pictures,
@@ -421,5 +426,20 @@ mod tests {
             xasync::XAsyncGetStatus(&mut block, true),
             FAILED_TO_GET_TOKEN
         );
+    }
+
+    /// The user owns every input device `gameinput` hands out, and no other.
+    #[test]
+    fn the_user_owns_the_input_devices() {
+        type Find = extern "system" fn(This, *const [u8; 32], *mut Handle) -> HRESULT;
+        let this: This = &DEVICE_OBJECT;
+        let find = slot::<Find>(&DEVICE_OBJECT, 0x18);
+        let mut owner = std::ptr::null();
+        let id = crate::modules::gameinput::a_device_id();
+        assert_eq!(find(this, &id, &mut owner), S_OK);
+        assert_eq!(owner, user());
+        let mut none = std::ptr::null();
+        assert_eq!(find(this, &[0xab; 32], &mut none), USER_NOT_FOUND);
+        assert!(none.is_null());
     }
 }
