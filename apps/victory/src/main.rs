@@ -301,6 +301,12 @@ enum Command {
         /// The title's folder (default: the configured game folder).
         paths: Vec<PathBuf>,
     },
+    /// Delete the shaders and pipelines made so far from the cache (the F1
+    /// menu's "CLEAR SHADER CACHE" has the launcher do this before the title
+    /// starts again). The translated title, settings, saves and logs stay;
+    /// shaders are made again as the game goes, or with `preload`.
+    #[cfg(windows)]
+    ClearShaders,
     /// Play: the title with this fork's settings, as a start with no
     /// command at all does (a double click on the program beside the
     /// title's `game_scarlett_master.exe`). F1 in the game is the settings
@@ -414,7 +420,12 @@ fn main() -> Result<()> {
     if let Command::Play(options) = &cli.command {
         // (Read before `prepare` clears the `VICTORY_...` variables: the menu's restart sets it.)
         let preload = options.preload || std::env::var_os("VICTORY_PRELOAD").is_some_and(|v| v == "1");
+        let clear = std::env::var_os("VICTORY_CLEAR_SHADERS").is_some_and(|v| v == "1");
         let done = play::prepare(options).and_then(|ready| {
+            // Not clearing is said and the start goes on: the game makes what it finds missing.
+            if clear && let Err(e) = play::clear_shaders() {
+                println!("The shader cache was not cleared: {e:#}. Starting the game.");
+            }
             if preload {
                 play::preload(&ready.exe);
             }
@@ -481,6 +492,8 @@ fn main() -> Result<()> {
             warm::run(None, None, false, false, None)?;
             warm::into_library(None)
         }
+        #[cfg(windows)]
+        Command::ClearShaders => play::clear_shaders(),
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),
         #[cfg(windows)]
