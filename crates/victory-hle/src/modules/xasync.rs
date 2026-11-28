@@ -1848,7 +1848,10 @@ mod tests {
         assert_eq!(XAsyncRun(&mut run, Some(work)), S_OK);
         assert_eq!(begin(&mut scheduled, std::ptr::null_mut(), provider), S_OK);
         let none = std::ptr::null_mut();
-        assert_eq!(XTaskQueueTerminate(q, true, none, None), S_OK);
+        // Without waiting: a manual queue's canceled callbacks may run only
+        // when dispatched, and nothing else here dispatches it.
+        assert_eq!(XTaskQueueTerminate(q, false, none, None), S_OK);
+        while XTaskQueueDispatch(q, WORK, 0) || XTaskQueueDispatch(q, COMPLETION, 0) {}
         assert_eq!(XAsyncGetStatus(&mut run, false), E_ABORT);
         assert_eq!(XAsyncGetStatus(&mut scheduled, false), E_ABORT);
         assert_eq!(CANCELS.load(Ordering::SeqCst), 1);
