@@ -566,9 +566,11 @@ fn mfg_home() -> Result<PathBuf> {
 
 /// A GeForce RTX of the 20 or 30 series ("NVIDIA GeForce RTX 3080", "... RTX 2060 SUPER"): DLSS
 /// runs, DLSS Frame Generation only with MFG Unlocker. (Its model number is read as the layer
-/// reads it, past a mark in the name.)
+/// reads it, past a mark in the name.) Not an Ada workstation card, whose number also starts
+/// with 20 or 30 ("NVIDIA RTX 2000 Ada Generation"): it has DLSS Frame Generation of its own.
 fn older_rtx(name: &str) -> bool {
     victory_hle::streamline::rtx_model(name).is_some_and(|model| matches!(model / 100, 20 | 30))
+        && !victory_hle::streamline::dlss_framegen_card(name)
 }
 
 /// Runs the fetcher: MFG Unlocker from its author's GitHub release into `to`.
@@ -1186,6 +1188,8 @@ mod tests {
         assert!(!older_rtx("NVIDIA RTX A2000") && !older_rtx("AMD Radeon RX 7900 XTX") && !older_rtx(""));
         // A mark in the name (#1028).
         assert!(older_rtx("NVIDIA GeForce RTX\u{2122} 3080") && !older_rtx("NVIDIA GeForce RTX\u{2122} 5080"));
+        // Ada workstation cards numbered 2000 and 3000 have DLSS Frame Generation of their own.
+        assert!(!older_rtx("NVIDIA RTX 2000 Ada Generation") && !older_rtx("NVIDIA RTX 3000 Ada Generation Laptop GPU"));
     }
 
     /// Settings read again after `prepare` clears the others survive it.
