@@ -135,6 +135,7 @@ const KEPT: &[&str] = &[
     "VICTORY_STREAMLINE_DIR",
     "VICTORY_FIDELITYFX_DIR",
     "VICTORY_LOG",
+    "VICTORY_ALLOW_MODDED",
 ];
 
 const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];

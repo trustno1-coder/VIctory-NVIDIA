@@ -24,6 +24,12 @@ fn same(bytes: &[u8], hash: &str) -> bool {
 }
 
 pub(super) const RETAIL_BUILD: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
+const ALLOW_MODDED_ENV: &str = "VICTORY_ALLOW_MODDED";
+
+fn allow_modded() -> bool {
+    std::env::var(ALLOW_MODDED_ENV).as_deref() == Ok("1")
+}
+
 pub(super) const WIDTH: u32 = 2560;
 pub(super) const HEIGHT: u32 = 1440;
 const SDR_MODE: u32 = 0x0615_c100;
@@ -36,8 +42,8 @@ const UI_VIEWPORT_LOAD: u32 = 0x0580_48d4;
 /// or at 1920x1080 with `render_1080p`. Returns the scene's size.
 pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(u32, u32)> {
     ensure!(
-        image.original_hash.to_hex().as_str() == RETAIL_BUILD,
-        "1440p output is only known for the retail build {RETAIL_BUILD}"
+        allow_modded() || image.original_hash.to_hex().as_str() == RETAIL_BUILD,
+        "1440p output is only known for the retail build {RETAIL_BUILD} (set {ALLOW_MODDED_ENV}=1 to allow a modded copy)"
     );
 
     let mode = field::<16>(image, SDR_MODE)?;
@@ -116,8 +122,8 @@ const UPSCALER_SCALE: u32 = 0x0615_d95c;
 /// with the 1440p one.
 pub(super) fn prepare_upscaler(image: &mut PreparedImage, mode: Mode) -> Result<()> {
     ensure!(
-        image.original_hash.to_hex().as_str() == RETAIL_BUILD,
-        "the upscaler path is only known for the retail build {RETAIL_BUILD}"
+        allow_modded() || image.original_hash.to_hex().as_str() == RETAIL_BUILD,
+        "the upscaler path is only known for the retail build {RETAIL_BUILD} (set {ALLOW_MODDED_ENV}=1 to allow a modded copy)"
     );
     ensure!(same(&field::<8>(image, RENDERER_SELECTION)?[..], STOCK_RENDERER_SELECTION), "unexpected renderer selection");
     ensure!(same(&field::<14>(image, UPSCALER_SIZING)?[..], STOCK_UPSCALER_SIZING), "unexpected upscaler render size selection");
