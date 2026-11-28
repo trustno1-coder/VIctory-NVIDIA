@@ -109,8 +109,12 @@ fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
     Some(code)
 }
 
-/// Room for [`clzero_stub`]s near the title's code: where it is and the bytes used.
-static STUBS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
+/// Room for [`clzero_stub`]s near the title's code: where each region is and the bytes used
+/// of it. A loop takes its stub from the first region within a `jmp rel32`'s reach that has
+/// room, else from a new one [`near`] it: with one region, put near the first loop replaced,
+/// a loop more than 2 GiB from it (in another image) was never replaced and was emulated at
+/// every pass.
+static STUBS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 pub(crate) const STUBS_LEN: usize = 64 << 10;
 
 /// Memory for code within reach of a `jmp rel32` at `at`.
@@ -135,18 +139,30 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
         return false;
     };
-    let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
-    if stubs.is_none() {
-        *stubs = near(at).map(|place| (place, 0));
+    // (a form the stub has, and a jump inside the aligned 16 bytes, before any room is taken)
+    if (at & 15) + 5 > 16 || clzero_stub(at, at, [x, y, z]).is_none() {
+        return false;
     }
-    let Some((place, used)) = stubs.as_mut() else {
-        return false;
+    // The stub's code and the jump to it, for a stub at `stub`, where both reach.
+    let reach = |stub: usize| Some((clzero_stub(at, stub, [x, y, z])?, jump(at, stub)?));
+    let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
+    let fits = |&(place, used): &(usize, usize)| reach(place + used).is_some_and(|(body, _)| used + body.len() <= STUBS_LEN);
+    let region = match stubs.iter().position(fits) {
+        Some(region) => region,
+        None => {
+            let Some(place) = near(at) else {
+                return false;
+            };
+            stubs.push((place, 0));
+            stubs.len() - 1
+        }
     };
+    let (place, used) = &mut stubs[region];
     let stub = *place + *used;
-    let (Some(body), Some(jump)) = (clzero_stub(at, stub, [x, y, z]), jump(at, stub)) else {
+    let Some((body, jump)) = reach(stub) else {
         return false;
     };
-    if *used + body.len() > STUBS_LEN || (at & 15) + 5 > 16 {
+    if *used + body.len() > STUBS_LEN {
         return false;
     }
     // SAFETY: inside the memory made for it, which nothing runs yet; then the title's code.
@@ -649,5 +665,49 @@ mod tests {
         }
         assert!(clzero_stub(0x1000, 0x2000, [0x48, 0x39, 0xc0]).is_none(), "against rax itself");
         assert!(jump(0x1000, 0x9000_0000_0000).is_none(), "out of reach");
+    }
+
+    /// `clzero` loops more than 2 GiB apart (in two images, say) are each replaced. The room
+    /// for the stubs was one region, put near the first loop replaced, and a loop out of a
+    /// `jmp rel32`'s reach of it was emulated at every pass. (On an Intel CPU,
+    /// `crash::tests::clzero_loops_end_like_their_last_pass` runs such a loop in the test
+    /// program's image: when it was replaced first, `a_clzero_loop_becomes_plain_stores`,
+    /// whose loop is in memory of its own, failed, about one run of this crate's tests in
+    /// seven.)
+    #[test]
+    fn clzero_loops_far_apart_are_each_replaced() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
+        /// Memory at the highest free address (winnt.h; `windows-sys` has it in a module this
+        /// crate does not ask for).
+        const MEM_TOP_DOWN: u32 = 0x0010_0000;
+        if !std::is_x86_feature_detected!("cmpxchg16b") {
+            return; // nothing is replaced without it
+        }
+        // A function of (start, end): mov rax, rcx; the loop against rdx at 16; what rax became.
+        let mut code = vec![0x48, 0x89, 0xc8];
+        code.resize(16, 0x90);
+        code.extend([0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xd0, 0x72, 0xf4, 0xc3]);
+        // SAFETY: memory of our own, written and run inside it.
+        unsafe {
+            let low = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+            let high = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_EXECUTE_READWRITE) as usize;
+            assert!(low != 0 && high != 0);
+            assert!(high.abs_diff(low) > 1 << 32, "{low:#x} and {high:#x} are within reach of each other");
+            for page in [high, low] {
+                std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+                assert!(patch_clzero(page + 16, &code[16..28]), "the loop at {:#x}", page + 16);
+                assert_eq!(*((page + 16) as *const u8), 0xe9, "a jump at {:#x}", page + 16);
+                let mut block = vec![0xaau8; 64 * 4];
+                let base = block.as_mut_ptr() as usize;
+                let first = base.next_multiple_of(64);
+                let run: extern "system" fn(usize, usize) -> usize = std::mem::transmute(page);
+                assert_eq!(run(first, first + 128), first + 128);
+                let at = first - base;
+                assert!(block[at..at + 128].iter().all(|&b| b == 0));
+                assert!(block[..at].iter().chain(&block[at + 128..]).all(|&b| b == 0xaa));
+            }
+            VirtualFree(low as *mut _, 0, MEM_RELEASE);
+            VirtualFree(high as *mut _, 0, MEM_RELEASE);
+        }
     }
 }
