@@ -29,7 +29,8 @@ fn run(output: [u32; 2], iterations: u32) -> Result<Vec<String>, String> {
     asked.framegen = false;
     asked.fsr_framegen = false;
     asked.present_hook = true;
-    if !load_and_init(&asked, false)?.dlss {
+    load_and_init(&asked, false)?;
+    if !PLAN.get().is_some_and(|plan| plan.dlss) {
         return Err("DLSS SR unsupported".into());
     }
     let host = crate::host::host().ok_or("no host device")?;

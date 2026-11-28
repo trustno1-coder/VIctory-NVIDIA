@@ -52,3 +52,39 @@ output, poisoned output, wrong channel values and incomplete readbacks.
 This is a bounded SR data-path and coarse colour-reference check. It does not
 validate moving scenes, jitter conventions, edge reconstruction, presentation,
 temporal image quality, device-loss recovery or compatibility with any title.
+
+## Recorded validation (2026-11-28)
+
+On upstream main `64d4931b3dd90305134512b805fc98f04119fb6e`, implementation
+`f9eecdf37fdaaa0f8a2a3012582460c950199e07` was tested on Windows 26300,
+RTX 5090 (driver 621.24), Ryzen 9 9950X3D, Streamline 2.14.16 / NGX 310.9.16
+(official release; all 16 runtime DLL signatures valid).
+
+- 1920x1080, 2560x1440 and 3840x2160, each with DLAA, Quality, Balanced,
+  Performance and Ultra Performance: 15/15 passes, 12 evaluations per run.
+- Two additional 1080p Quality processes passed: 17 successful processes and
+  204 evaluations total, final full-output readback per process. All successful
+  processes shut down cleanly, without runtime WARN/ERROR messages or timeouts.
+- Missing runtime and skipped evaluation each returned 1 as expected. The latter
+  detected NaN at pixel 0 and still shut down cleanly. Capability-only query
+  returned 0 and reported successful shutdown. All 20 case expectations passed.
+- The three independent 1080p Quality readbacks had identical BLAKE3
+  `66afde1c27fdb5af577813bbb2951134bb6c69da3dbf5e129affffa7adf39d75`.
+  Their synchronized host p50/p95 milliseconds were 0.585/0.832, 0.537/0.617
+  and 0.545/0.608. These nine-sample measurements are not comparative FPS claims.
+- The 15-case matrix's p50 values ranged from 0.484 to 1.108 ms. Initialization
+  was about 9.9–10.0 seconds; first evaluation/model startup is reported separately
+  and excluded from those p50s. This change amortizes setup within the probe; it
+  does not claim to accelerate NVIDIA's initialization or application rendering.
+- `cargo test -p victory-gpu --lib --locked streamline:: -- --test-threads=1`:
+  15 passed, including two new checker tests. Scoped all-targets Clippy exited 0
+  with existing warnings, none in the new probe modules. Asset policy passed.
+
+Related #237 addresses FG option switching and refusal messages. This change
+does not include those fixes. A merge-tree check against #237 retained only its
+existing conflict with main in `streamline/fsr.rs`; the probe reads shared plan
+state so it does not depend on #237's changed initialization return type.
+After that return-type decoupling, the final source was rebuilt: all 15 focused
+unit tests passed again, and a fresh 1080p Quality process passed 12 evaluations,
+full readback (the same digest above) and shutdown. The full 15-mode/size matrix
+was not repeated for this capability-state lookup change.
