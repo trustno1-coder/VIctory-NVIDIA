@@ -62,12 +62,17 @@
 //! A packed structure is gone when title memory has no header of it any more
 //! (looked at over [`SWEEP`] frames); the pages it alone has are given back.
 //!
+//! Pages taken by a fault are kept under a byte budget
+//! (`VICTORY_RT_FAULT_MB`): the oldest that no structure owns and no shader
+//! has looked at lately go back first, so later faults can still be mapped.
+//! `VICTORY_RT_FAULT_KEEP=0` keeps the old, once-only budget.
+//!
 //! shortcut: a page held for anything else is kept for the rest of the run.
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -101,13 +106,40 @@ const VIEW: u64 = 256 << 10;
 const BUILT: u64 = 4 << 20;
 /// The biggest title buffer whose builder results come back.
 const BACK: u64 = 256 << 10;
-/// Pages taken from the faults, of one frame and in all, at most: a ray in a
-/// structure that is not right goes anywhere, and 2,048 a frame took all the
-/// pages there are in the first seconds (run light-4).
+/// Pages taken from the faults in one frame, at most: a ray in a structure
+/// that is not right goes anywhere.
 const FAULTS: usize = 128;
+/// The once-only budget, when recycling is switched off.
 const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
+/// The faulted pages' budget in MiB when none is given.
+const FAULT_MB: u64 = 1024;
+
+/// The number of pages `VICTORY_RT_FAULT_MB` asks for (1024 MiB by default).
+fn fault_pages(value: Option<&str>) -> usize {
+    let mb = value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(FAULT_MB);
+    (mb.saturating_mul(1 << 20) / PAGE) as usize
+}
+
+fn fault_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| fault_pages(std::env::var("VICTORY_RT_FAULT_MB").ok().as_deref()))
+}
+
+/// Whether faulted pages are recycled under a budget. `=0` keeps the old,
+/// once-only budget ([`FAULTS_ALL`]).
+fn recycle_faults(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+fn fault_recycle() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| recycle_faults(std::env::var("VICTORY_RT_FAULT_KEEP").ok().as_deref()))
+}
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
@@ -169,8 +201,8 @@ struct Memory {
     free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
     open: std::collections::HashSet<usize>,
-    /// Pages taken from faults.
-    faulted: usize,
+    /// Pages still held after a fault.
+    fault_held: Faults,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -203,6 +235,53 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
+}
+
+/// Pages taken from faults and still held. The order is only a hint: a page
+/// given back with its packed structure leaves a stale entry, and one that is
+/// protected goes to the back for the next pass.
+#[derive(Default)]
+struct Faults {
+    live: HashSet<u64>,
+    order: VecDeque<u64>,
+}
+
+impl Faults {
+    fn add(&mut self, page: u64) {
+        if self.live.insert(page) {
+            self.order.push_back(page);
+        }
+    }
+
+    fn forgot(&mut self, page: u64) {
+        self.live.remove(&page);
+    }
+
+    fn len(&self) -> usize {
+        self.live.len()
+    }
+
+    /// The oldest pages to let go while over `limit`, leaving the protected
+    /// ones in the ring. Each page is looked at at most once per call.
+    fn retire(&mut self, limit: usize, mut protected: impl FnMut(u64) -> bool) -> Vec<u64> {
+        let mut gone = Vec::new();
+        for _ in 0..self.order.len() {
+            if self.live.len() <= limit {
+                break;
+            }
+            let Some(page) = self.order.pop_front() else { break };
+            if !self.live.contains(&page) {
+                continue;
+            }
+            if protected(page) {
+                self.order.push_back(page);
+                continue;
+            }
+            self.live.remove(&page);
+            gone.push(page);
+        }
+        gone
+    }
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -249,7 +328,7 @@ impl Memory {
             packed_sweep: 0,
             free: Vec::new(),
             open: Default::default(),
-            faulted: 0,
+            fault_held: Faults::default(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -444,6 +523,15 @@ impl Memory {
         fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
     }
 
+    /// Give `page`'s arena place back and clear its directory entry.
+    fn release(&mut self, page: u64) {
+        self.fault_held.forgot(page);
+        let Some(held) = self.pages.remove(&page) else { return };
+        self.free.push((held.copy, held.at));
+        // SAFETY: an entry of the directory, under the mutex.
+        unsafe { self.entry(page).write_volatile(0) };
+    }
+
     /// The packed structure at `address` is gone: the pages it alone had are
     /// given back.
     fn gone(&mut self, address: u64) {
@@ -452,13 +540,29 @@ impl Memory {
             let Some(held) = self.pages.get_mut(&page) else { continue };
             held.owners = held.owners.saturating_sub(1);
             if held.owners == 0 && held.theirs {
-                self.free.push((held.copy, held.at));
-                self.pages.remove(&page);
-                // SAFETY: an entry of the directory, under the mutex.
-                unsafe { self.entry(page).write_volatile(0) };
+                self.release(page);
             }
         }
         self.stats.gone += 1;
+    }
+
+    /// Faulted pages the builder may still store to stay: those of a packed
+    /// structure, and ones taken or looked at in the last [`YOUNG`] frames.
+    /// The rest go back oldest first until the budget is met.
+    fn retire_faults(&mut self) {
+        let frame = self.frame;
+        let pages = &self.pages;
+        let gone = self.fault_held.retire(fault_limit(), |page| {
+            pages.get(&page).is_some_and(|held| {
+                held.owners != 0
+                    || held.theirs
+                    || held.born.saturating_add(YOUNG) >= frame
+                    || held.looked.saturating_add(YOUNG) >= frame
+            })
+        });
+        for page in gone {
+            self.release(page);
+        }
     }
 
     /// Whether the packed structure at `address` is still in title memory.
@@ -710,12 +814,26 @@ impl Memory {
         }
         pages.sort_unstable();
         let mut made = 0;
+        let limit = if fault_recycle() { fault_limit() } else { FAULTS_ALL };
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
+            if made < FAULTS
+                && self.fault_held.len() < limit
+                && self.copy_of(page).is_none()
+                && self.map(page)
+            {
                 made += 1;
-                self.faulted += 1;
+                if self.pages.contains_key(&page) {
+                    self.fault_held.add(page);
+                }
+            }
+            // A page may be faulted again before what it holds is on the
+            // card. What the title wrote since it was taken goes up here.
+            if self.pages.contains_key(&page) {
                 self.bring(page, page + 1);
             }
+        }
+        if fault_recycle() {
+            self.retire_faults();
         }
         self.stats.faults += pages.len() as u64;
         // Each is an access that read 0 or was dropped.
@@ -822,7 +940,7 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.fault_held.len()
         );
         self.stats.from = Some((now, self.frame));
     }
@@ -1335,5 +1453,36 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    #[test]
+    fn fault_budget_and_switch_have_sane_defaults() {
+        assert_eq!(fault_pages(None), 16 << 10);
+        assert_eq!(fault_pages(Some(" 2 ")), 32);
+        assert_eq!(fault_pages(Some("0")), 16 << 10);
+        assert_eq!(fault_pages(Some("nope")), 16 << 10);
+        assert!(recycle_faults(None));
+        assert!(recycle_faults(Some("1")));
+        assert!(!recycle_faults(Some(" 0 ")));
+    }
+
+    #[test]
+    fn the_oldest_idle_fault_pages_go_back_first() {
+        let mut held = Faults::default();
+        for page in 1..=4 {
+            held.add(page);
+        }
+        let gone = held.retire(2, |page| page == 2);
+        assert_eq!(gone, [1, 3]);
+        assert_eq!(held.len(), 2);
+        assert!(held.live.contains(&2) && held.live.contains(&4));
+
+        // A page given back with its packed structure is not counted twice.
+        held.forgot(4);
+        held.add(5);
+        let gone = held.retire(1, |page| page == 5);
+        assert_eq!(gone, [2]);
+        assert_eq!(held.len(), 1);
+        assert!(held.live.contains(&5));
     }
 }

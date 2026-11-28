@@ -97,6 +97,8 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
+| `VICTORY_RT_FAULT_MB` | the budget for pages taken by faults (1024 MiB) |
+| `VICTORY_RT_FAULT_KEEP=0` | keep the old, once-only count of 2048 faulted pages |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
@@ -130,7 +132,9 @@ dispatches, faults and what came.
   to give a table of addresses by slot). The title did not create them in any
   run so far.
 - An access to a page that is not there is lost (a read gives zero, a store is
-  dropped).
+  dropped). Pages taken by faults are now kept under a byte budget: the oldest
+  that no structure owns and no shader has looked at lately go back first, so
+  later faults can still be mapped.
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.
