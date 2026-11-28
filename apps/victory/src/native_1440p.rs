@@ -1,8 +1,4 @@
-<<<<<<< Updated upstream
-//! A 2560x1440 SDR display for the supported Series X retail image (the game,
-=======
 //! Reduced-resolution SDR output for the supported Series X retail image (GTA VI
->>>>>>> Stashed changes
 //! 1.0.2.1): the title presents at 3840x2160 on Series X, its scene drawn at
 //! 2560x1440 and scaled up by its own temporal pass. The native 1080p and
 //! 1440p profiles change the SDR mode list, scanout reservation, temporal
@@ -18,7 +14,6 @@ use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
 use victory_hle::streamline::Mode;
 use victory_loader::PreparedImage;
 
-<<<<<<< Updated upstream
 /// Whether `bytes` are the stock ones whose BLAKE3 hash (hex) is `hash`.
 /// The stock bytes of each place patched are kept as their hash only: no
 /// bytes of the title are in this repository.
@@ -27,12 +22,7 @@ fn same(bytes: &[u8], hash: &str) -> bool {
 }
 
 pub(super) const RETAIL_BUILD: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
-pub(super) const WIDTH: u32 = 2560;
-pub(super) const HEIGHT: u32 = 1440;
-const SDR_MODE: u32 = 0x0615_c100;
 const STOCK_SDR_MODE: &str = "abfb5438d8153b6a0b8d08f33f4f0066e5383925b55aacc5f669131f3f51d4cf";
-=======
-const RETAIL_BUILD: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
 #[derive(Clone, Copy)]
 pub(super) enum Output {
     Hd1080,
@@ -48,11 +38,9 @@ impl Output {
     }
 }
 const SDR_MODE: u32 = 0x0615_c100;
-const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 0, 0];
 // The preceding entry in the SDR mode list is 2560x1440 at 60 Hz.
 const QHD_MODE: u32 = SDR_MODE - 16;
 const STOCK_QHD_MODE: [u8; 16] = [0, 10, 0, 0, 160, 5, 0, 0, 60, 0, 0, 0, 1, 0, 0, 0];
->>>>>>> Stashed changes
 const SCANOUT_RESERVATION: u32 = 0x0247_ad4a;
 const TEMPORAL_SCALE: u32 = 0x028f_1e7e;
 const UI_VIEWPORT_LOAD: u32 = 0x0580_48d4;
@@ -82,12 +70,7 @@ pub(super) fn prepare(image: &mut PreparedImage, output: Output, scene: Output) 
     );
 
     let mode = field::<16>(image, SDR_MODE)?;
-<<<<<<< Updated upstream
     ensure!(same(&mode[..], STOCK_SDR_MODE), "unexpected Series X SDR mode");
-    mode[..4].copy_from_slice(&WIDTH.to_le_bytes());
-    mode[4..8].copy_from_slice(&HEIGHT.to_le_bytes());
-=======
-    ensure!(*mode == STOCK_SDR_MODE, "unexpected Series X SDR mode");
     mode[..4].copy_from_slice(&width.to_le_bytes());
     mode[4..8].copy_from_slice(&height.to_le_bytes());
     if matches!(output, Output::Hd1080) {
@@ -98,7 +81,6 @@ pub(super) fn prepare(image: &mut PreparedImage, output: Output, scene: Output) 
         qhd[..4].copy_from_slice(&width.to_le_bytes());
         qhd[4..8].copy_from_slice(&height.to_le_bytes());
     }
->>>>>>> Stashed changes
 
     // Two 64 KiB-aligned, tiled RGBA8 scanout buffers. The reservation is
     // rounded to 2 MiB, matching the title's allocation check.

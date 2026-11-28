@@ -160,6 +160,9 @@ pub(crate) struct Play {
     /// to a 1080p window with a 1080p scene (an external upscaler uses its own scene size).
     #[arg(long, default_value = "1440", value_parser = RESOLUTIONS)]
     res: String,
+    /// AMD FSR Quality uses the bundled FidelityFX upscaler at 720p to 1080p.
+    #[arg(long, default_value = "game", value_parser = ["game", "fsr-quality"])]
+    upscaler: String,
     /// DLSS in place of the title's upscaling (needs NVIDIA's files).
     #[arg(long, default_value = "quality", value_parser = DLSS_MODES)]
     dlss: String,
@@ -292,7 +295,9 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     let saved = |k: &str| menu.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     let series_s = saved("VICTORY_MENU_CONSOLE").map_or(o.series_s, |c| c == "series-s");
     let res = saved("VICTORY_MENU_RES").filter(|r| RESOLUTIONS.contains(r)).unwrap_or(&o.res);
+    let upscaler = saved("VICTORY_MENU_UPSCALER").filter(|v| matches!(*v, "game" | "fsr-quality")).unwrap_or(&o.upscaler);
     let mut dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
+    if upscaler == "fsr-quality" { dlss = "off"; }
     // Series S picture: the scene's size, which with DLSS on is its mode (the menu keeps the
     // two matched); not saved yet, it is the DLSS mode's.
     let s_res = saved("VICTORY_MENU_S_RES")
@@ -314,6 +319,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
             times = n;
         }
     }
+    if upscaler == "fsr-quality" { framegen = false; }
     let fg_type = saved("VICTORY_MENU_FG_TYPE").filter(|t| FG_TYPES.contains(t)).unwrap_or(&o.fg_type);
     let fps = saved("VICTORY_MENU_FPS")
         .and_then(|f| f.parse::<u32>().ok())
@@ -323,7 +329,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     let mut s: BTreeMap<String, String> = SETTINGS.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     if !series_s {
-        match res {
+        match if upscaler == "fsr-quality" { "1080" } else { res } {
             "1080" => set("VICTORY_NATIVE_1080P", "1"),
             "1080stockui" => {
                 set("VICTORY_1080P_STOCK_UI", "1");
@@ -388,6 +394,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     }
     // For the menu: what it shows as the current choices.
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
+    set("VICTORY_MENU_UPSCALER", upscaler);
     set("VICTORY_MENU_CONSOLE", if series_s { "series-s" } else { "series-x" });
     set("VICTORY_MENU_RES", res);
     set("VICTORY_MENU_S_RES", if dlss_on { s_res } else { "720" });
@@ -858,11 +865,19 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     let menu_file = home.join("victory-settings.txt");
     let menu = parse_menu(&std::fs::read_to_string(&menu_file).unwrap_or_default());
     let picked = menu.iter().rev().find(|(k, _)| k == "VICTORY_MENU_DLSS").map(|(_, v)| v.as_str());
-    if picked.unwrap_or(o.dlss.as_str()) != "off" && streamline_dir(&here).is_none() {
+    let radeon = victory_hle::streamline::radeon_adapter();
+    let fsr = menu.iter().rev().find(|(k, _)| k == "VICTORY_MENU_UPSCALER")
+        .map_or(o.upscaler.as_str(), |(_, v)| v.as_str()) == "fsr-quality";
+    if !radeon && !fsr && picked.unwrap_or(o.dlss.as_str()) != "off" && streamline_dir(&here).is_none() {
         offer_dlss(picked.is_some_and(|d| DLSS_MODES.contains(&d)));
     }
-    let streamline = streamline_dir(&here);
+    let streamline = if radeon || fsr { None } else { streamline_dir(&here) };
     let (mut s, series_s) = settings(o, &menu, streamline.as_deref());
+    if radeon || fsr {
+        s.retain(|k, _| !k.starts_with("VICTORY_DLSS") && !matches!(k.as_str(), "VICTORY_FRAMEGEN" | "VICTORY_FSR_FRAMEGEN" | "VICTORY_MFG_UNLOCKER" | "VICTORY_MFG_UNLOCKER_DLL" | "VICTORY_STREAMLINE_PRESENT"));
+        s.insert("VICTORY_MENU_FRAMEGEN".into(), "0".into());
+        if radeon { s.insert("VICTORY_MENU_RADEON".into(), "1".into()); }
+    }
     // FSR 3 made ready: AMD's files, asked for only where they would be used (FSR 3 chosen,
     // or a card without DLSS Frame Generation).
     if s.contains_key("VICTORY_FSR_FRAMEGEN") {
@@ -958,6 +973,7 @@ fn restart_args(o: &Play, exe: &Path) -> String {
     if o.series_s {
         args.push("--series-s".to_owned());
     }
+    if o.upscaler != "game" { args.extend(["--upscaler".to_owned(), quoted(&o.upscaler)]); }
     args.extend(["--res".to_owned(), quoted(&o.res), "--dlss".to_owned(), quoted(&o.dlss)]);
     if let Some(x) = o.framegen {
         args.extend(["--framegen".to_owned(), x.to_string()]);
@@ -991,6 +1007,7 @@ mod tests {
             exe: None,
             series_s: false,
             res: "1440".to_owned(),
+            upscaler: "game".into(),
             dlss: "quality".to_owned(),
             framegen: None,
             framegen_ready: false,
@@ -1130,7 +1147,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< Updated upstream
     fn the_series_s_picture_sets_the_scene() {
         let get = |s: &BTreeMap<String, String>, k: &str| s.get(k).cloned();
         let s_menu = |more: &str| parse_menu(&format!("VICTORY_MENU_CONSOLE=series-s\r\n{more}"));
@@ -1159,7 +1175,28 @@ mod tests {
         let (s, series_s) = settings(&options(), &parse_menu("VICTORY_MENU_S_RES=540\r\n"), Some(Path::new("x")));
         assert!(!series_s);
         assert_eq!((get(&s, "VICTORY_DLSS_MODE").as_deref(), get(&s, "VICTORY_FSR_PATH")), (Some("quality"), None));
-=======
+    }
+
+    #[test]
+    fn bundled_fsr_uses_the_shipping_dimensions_with_no_vendor_sdk() {
+        let mut o = options();
+        o.framegen = Some(2);
+        let menu = parse_menu("VICTORY_MENU_UPSCALER=fsr-quality\nVICTORY_MENU_RES=1080stockui\nVICTORY_MENU_DLSS=performance");
+        for console_s in [false, true] {
+            o.series_s = console_s;
+            let (s, series_s) = settings(&o, &menu, Some(Path::new("unused")));
+            assert_eq!(console_s, series_s);
+            assert_eq!(s["VICTORY_MENU_UPSCALER"], "fsr-quality");
+            assert_eq!(s.contains_key("VICTORY_NATIVE_1080P"), !series_s);
+            for unused in ["VICTORY_1080P_STOCK_UI", "VICTORY_DLSS", "VICTORY_FRAMEGEN", "VICTORY_FSR_FRAMEGEN"] {
+                assert!(!s.contains_key(unused), "{unused}");
+            }
+        }
+        o.upscaler = "fsr-quality".into();
+        assert!(restart_args(&o, Path::new("game.exe")).contains("--upscaler 'fsr-quality'"));
+    }
+
+    #[test]
     fn native_1080p_selects_only_its_own_display_switch() {
         let mut o = options();
         o.res = "1080".to_owned();
@@ -1180,7 +1217,6 @@ mod tests {
         assert!(!s.contains_key("VICTORY_NATIVE_1080P") && !s.contains_key("VICTORY_NATIVE_1440P"));
         o.series_s = true;
         assert!(!settings(&o, &[], None).0.contains_key("VICTORY_1080P_STOCK_UI"));
->>>>>>> Stashed changes
     }
 
     #[test]

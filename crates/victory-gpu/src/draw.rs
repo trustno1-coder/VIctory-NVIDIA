@@ -6022,7 +6022,6 @@ mod tests {
     use super::staging_budget_per_frame;
 
     #[test]
-<<<<<<< Updated upstream
     fn a_frames_pass_runs_share_the_texspk_cap() {
         use super::pass_span_left;
         use std::time::Duration;
@@ -6034,7 +6033,9 @@ mod tests {
         assert_eq!(pass_span_left(ms(16), 8, 5_000_000), ms(3));
         // Spent: nothing (the run stops at its first slot).
         assert_eq!(pass_span_left(ms(16), 8, 9_000_000), Duration::ZERO);
-=======
+    }
+
+    #[test]
     fn legacy_ui_composite_uses_the_pixel_extent_per_uv() {
         fn triangle(width: f32, height: f32, uv_span: f32, flipped: bool) -> [[u8; 24]; 3] {
             [(0., 0.), (uv_span, 0.), (0., uv_span)].map(|(u, v)| {
@@ -6054,7 +6055,6 @@ mod tests {
         }
         assert!(!covers_ui_canvas(&triangle(1920., 1080., 0.5, false), 1920., 1080.));
         assert!(!covers_ui_canvas(&triangle(1920., f32::NAN, 1., false), 1920., 1080.));
->>>>>>> Stashed changes
     }
 
     #[test]

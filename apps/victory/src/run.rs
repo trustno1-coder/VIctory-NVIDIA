@@ -126,6 +126,14 @@ pub fn run(
     // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
     let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
     asked.series_s = matches!(console, Console::SeriesS);
+    let fsr_quality = std::env::var("VICTORY_MENU_UPSCALER").as_deref() == Ok("fsr-quality");
+    if fsr_quality {
+        // The bundled FidelityFX kernels take a 720p scene and a 1080p output.
+        asked.mode = victory_hle::streamline::Mode::Quality;
+        asked.dlss = false;
+        asked.framegen = false;
+        asked.fsr_framegen = false;
+    }
     let available = victory_hle::streamline::init(&asked);
     // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
     // scale with its own FidelityFX upscaling (no Streamline): DLSS's
@@ -133,12 +141,15 @@ pub fn run(
     let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
     // (FSR 3 frame generation reads the upscaling's inputs as DLSS Frame
     // Generation does: the title renders through its FidelityFX path too.)
-    let upscaler = (available.dlss || available.framegen || available.fsr_framegen || fsr_path).then_some(asked.mode);
+    let upscaler = (available.dlss || available.framegen || available.fsr_framegen || fsr_path || fsr_quality).then_some(asked.mode);
     // What this card does for frame generation (also on the picture for the first seconds).
     for (i, line) in victory_hle::streamline::notice_at_start().iter().enumerate() {
         println!("{}{line}", if i == 0 { "frame gen      " } else { "               " });
     }
-    if fsr_path && !asked.any() {
+    if fsr_quality {
+        println!("upscaling      AMD FSR Quality, 1280x720 to 1920x1080 through the bundled FidelityFX upscaler");
+    }
+    if fsr_path && !fsr_quality && !asked.any() {
         println!("upscaling      the title's own FidelityFX at the {} scale (VICTORY_FSR_PATH=1)", asked.mode.name());
     }
     if asked.any() {
@@ -163,19 +174,11 @@ pub fn run(
 
     // Each display profile needs its own copy of the prepared image.
     use native_1440p::Output;
-    let stock_ui = std::env::var("VICTORY_1080P_STOCK_UI").as_deref() == Ok("1");
+    let stock_ui = !fsr_quality && std::env::var("VICTORY_1080P_STOCK_UI").as_deref() == Ok("1");
     let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
-<<<<<<< Updated upstream
-    let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
-    let images = if native_1440p {
-        anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
-        if upscaler.is_some() && render_1080p {
-            println!("display        VICTORY_RENDER_1080P is left out: VICTORY_DLSS_MODE sets the scene's size");
-        }
-        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())
-            .map_err(|e| if victory_game::identify(&hash).is_some() { e } else { e.context(changed_copy(exe)) })?;
-=======
-    let output = if std::env::var("VICTORY_NATIVE_1080P").as_deref() == Ok("1") {
+    let output = if fsr_quality {
+        matches!(console, Console::SeriesX).then_some(Output::Hd1080)
+    } else if std::env::var("VICTORY_NATIVE_1080P").as_deref() == Ok("1") {
         Some(Output::Hd1080)
     } else if render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1") {
         Some(Output::Qhd1440)
@@ -191,8 +194,8 @@ pub fn run(
         anyhow::ensure!(matches!(console, Console::SeriesX), "custom SDR output needs the Series X profile");
         let [width, height] = output.size();
         let scene = if render_1080p && upscaler.is_none() { Output::Hd1080 } else { output };
-        native_1440p::prepare(&mut prepared, output, scene)?;
->>>>>>> Stashed changes
+        native_1440p::prepare(&mut prepared, output, scene)
+            .map_err(|e| if victory_game::identify(&hash).is_some() { e } else { e.context(changed_copy(exe)) })?;
         // SAFETY: nothing else runs yet; the title and the display mode list
         // read these later.
         unsafe {
@@ -209,6 +212,7 @@ pub fn run(
             }
             other => {
                 if let Some((_, Err(e))) = other {
+                    if fsr_quality { return Err(e.context("preparing AMD FSR Quality")); }
                     println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
                 }
                 let [w, h] = scene.size();
@@ -227,6 +231,7 @@ pub fn run(
                 cfg.cache_subdir(&format!("images/upscaler-{}", mode.name()))?
             }
             Err(e) => {
+                if fsr_quality { return Err(e.context("preparing AMD FSR Quality")); }
                 println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
                 cfg.cache_subdir("images")?
             }

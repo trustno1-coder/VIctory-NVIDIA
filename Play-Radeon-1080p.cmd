@@ -1,6 +1,11 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 rem Accept a game folder as an argument, VICTORY_GAME_DIR, or a single sibling dump.
+set "recovery="
+if /i "%~1"=="--recover" (
+  set "recovery=-Recovery"
+  shift /1
+)
 set "game=%VICTORY_GAME_DIR%"
 if not "%~1"=="" set "game=%~1"
 if defined game goto launch
@@ -18,7 +23,7 @@ if defined VICTORY_CONFIG goto play
 if exist "%~dp0victory.toml" goto play
 if exist "%~dp0..\Victory-UI-Scale\Medium.pending" powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "%~dp0..\Victory-UI-Scale\Apply-Medium-UI.ps1" -Once
 :play
-powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "%~dp0scripts\play-foxhound.ps1" -Exe "%game%\game_scarlett_master.exe" -Radeon1080p
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "%~dp0scripts\play-foxhound.ps1" -Exe "%game%\game_scarlett_master.exe" -Radeon1080p %recovery%
 exit /b %errorlevel%
 :prepare
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "%~dp0scripts\play-foxhound.ps1" -Exe "%game%\game_scarlett_master.exe" -Radeon1080p -PrepareOnly -FullPreload

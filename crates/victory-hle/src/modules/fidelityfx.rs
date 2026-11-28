@@ -140,7 +140,7 @@ pub struct Interpose<'a> {
 impl ImportResolver for Interpose<'_> {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         let found = self.inner.resolve(dll, symbol);
-        if !dll.eq_ignore_ascii_case(LOADER_DLL) || !streamline::serving() {
+        if !dll.eq_ignore_ascii_case(LOADER_DLL) || (!streamline::serving() && !native_fsr()) {
             return found;
         }
         match (&found, symbol) {
@@ -151,6 +151,11 @@ impl ImportResolver for Interpose<'_> {
             _ => found,
         }
     }
+}
+
+fn native_fsr() -> bool {
+    static ACTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ACTIVE.get_or_init(|| std::env::var("VICTORY_MENU_UPSCALER").as_deref() == Ok("fsr-quality"))
 }
 
 /// Keeps `original` as the title's `name` and gives ours, if we have one.
@@ -312,6 +317,15 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     // SAFETY: an upscaling, by its type.
     let d = unsafe { desc.cast::<DispatchUpscale>().read() };
     first_dispatch(&d, &created);
+    if native_fsr() && !streamline::serving() {
+        let code = own();
+        if code == OK {
+            once!(info, render = ?d.render_size, output = ?created.max_output, "AMD FSR Quality: first native upscale completed");
+        } else {
+            once!(error, code, "AMD FSR Quality: native upscale failed");
+        }
+        return code;
+    }
     let up = upscale(&d, &created, handle);
     match streamline::upscale(&up) {
         Taken::Dlss => OK,

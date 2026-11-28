@@ -49,6 +49,8 @@ param(
     [switch]$FullPreload,
     # 1080p scene and window, stock UI, 60 rendered FPS target and preloading for a Radeon PC.
     [switch]$Radeon1080p,
+    [ValidateSet('game','fsr-quality')][string]$Upscaler = 'game',
+    [switch]$Recovery,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -73,6 +75,16 @@ if (Test-Path -LiteralPath $menuFile) {
         if ($line -match '^\s*(VICTORY_[A-Z0-9_]+)\s*=(.*)$') { $menu[$Matches[1]] = $Matches[2].Trim() }
     }
 }
+if ($Recovery) {
+    if (!$Radeon1080p) { throw 'Recovery requires the Radeon profile.' }
+    if ([IO.File]::Exists($menuFile)) {
+        $backup = Join-Path $repo "victory-settings.radeon-backup-$([guid]::NewGuid()).txt"
+        [IO.File]::Move($menuFile, $backup)
+        Write-Host "Previous graphics choices saved to $backup"
+    }
+    $menu.Clear()
+}
+if ($menu['VICTORY_MENU_UPSCALER'] -in 'game','fsr-quality') { $Upscaler = $menu['VICTORY_MENU_UPSCALER'] }
 $fpsWanted = $Fps
 if ($menu.Contains('VICTORY_MENU_CONSOLE')) { $SeriesS = $menu['VICTORY_MENU_CONSOLE'] -eq 'series-s' }
 if ($menu['VICTORY_MENU_RES'] -in '1440', '1080', '1080stockui', '1080to1440', '4k') { $Res = $menu['VICTORY_MENU_RES'] }
@@ -85,6 +97,12 @@ if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
 }
 if ($menu['VICTORY_MENU_FG_TYPE'] -in 'auto', 'dlss', 'fsr') { $FgType = $menu['VICTORY_MENU_FG_TYPE'] }
 if ($menu['VICTORY_MENU_FPS'] -match '^\d+$' -and [int]$menu['VICTORY_MENU_FPS'] -ge 1 -and [int]$menu['VICTORY_MENU_FPS'] -le 1000) { $fpsWanted = [int]$menu['VICTORY_MENU_FPS'] }
+if ($Radeon1080p -or $Upscaler -eq 'fsr-quality') {
+    $Dlss = 'off'
+    # The current frame generation integration requires DLSS as its input.
+    $FrameGen = $false
+    $FrameGenReady = $false
+}
 $settings = @{
     # Submission and copy machinery
     VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_RELAY = '2'; VICTORY_RELAY_COPY = '1'; VICTORY_WIDE_BACK = '1'
@@ -119,7 +137,9 @@ $settings = @{
 if ($Radeon1080p) {
     # Each line also passes through PowerShell and is flushed to disk.
     # Keep frame timings and warnings, and avoid logging every shader and view.
-    $settings.VICTORY_LOG = if ($env:VICTORY_LOG) { $env:VICTORY_LOG } else { 'warn,victory_gpu::host=info' }
+    $settings.VICTORY_LOG = if ($env:VICTORY_LOG) { $env:VICTORY_LOG } else { 'warn,victory_gpu::host=info,victory_hle::modules::fidelityfx=info' }
+    $settings.VICTORY_MENU_RADEON = '1'
+    $settings.VICTORY_WATER_LIGHT = '0'
     $settings.VICTORY_DISPLAY_WATCH = '1'
     $settings.VICTORY_RECORD_ASSET_READS = '1'
     # RX 9070 XT: the driver faulted compiling this tree-animation velocity variant
@@ -127,7 +147,8 @@ if ($Radeon1080p) {
     $settings.VICTORY_LEAVE_OUT += ',f16876929fa64f9f'
 }
 if (-not $SeriesS) {
-    if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
+    if ($Upscaler -eq 'fsr-quality') { $settings.VICTORY_NATIVE_1080P = '1' }
+    elseif ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080') { $settings.VICTORY_NATIVE_1080P = '1' }
     elseif ($Res -eq '1080stockui') {
         $settings.VICTORY_1080P_STOCK_UI = '1'
@@ -170,12 +191,14 @@ if ($FgType -ne 'dlss' -and ($FrameGen -or ($FrameGenReady -and -not $NoFrameGen
 if ($fpsWanted -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
 foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
+    if (($Radeon1080p -or $Upscaler -eq 'fsr-quality') -and ($k -like 'VICTORY_DLSS*' -or $k -in 'VICTORY_FRAMEGEN','VICTORY_FSR_FRAMEGEN','VICTORY_MFG_UNLOCKER','VICTORY_MFG_UNLOCKER_DLL','VICTORY_STREAMLINE_PRESENT')) { continue }
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 # For the menu: what it shows as the current choices, where it saves, and how it starts the game again
 # (-More is not carried over a restart from the menu).
+$settings.VICTORY_MENU_UPSCALER = $Upscaler
 $settings.VICTORY_MENU_CONSOLE = $console
 $settings.VICTORY_MENU_RES = $Res
 $settings.VICTORY_MENU_DLSS = if ($settings.VICTORY_DLSS -eq '1') { $Dlss } else { 'off' }
@@ -184,11 +207,7 @@ $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-<<<<<<< Updated upstream
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
-=======
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Radeon1080p) { ' -Radeon1080p' })"
->>>>>>> Stashed changes
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build -Upscaler '$Upscaler'$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Radeon1080p) { ' -Radeon1080p' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 # A release built during play can be staged beside the running executable.
@@ -275,7 +294,7 @@ try {
         } elseif (!$dataDir) { $dataDir = Join-Path $env:LOCALAPPDATA 'victory\data' }
         $videoFile = if ($dataDir) { Join-Path $dataDir '7952987A\storage\settings\settings.xml' }
         if ($videoFile -and (Test-Path -LiteralPath $videoFile)) {
-            if (($stockCanvas -or $settings.VICTORY_NATIVE_1080P -eq '1') -and !$customConfig) {
+            if (($stockCanvas -or $settings.VICTORY_NATIVE_1080P -eq '1' -or $Upscaler -eq 'fsr-quality') -and !$customConfig) {
                 try {
                     & (Join-Path $PSScriptRoot 'set-radeon-ui-resolution.ps1') -SettingsFile $videoFile -StockCanvas:$stockCanvas
                 } catch { Write-Warning "Could not update the UI canvas. $($_.Exception.Message)" }

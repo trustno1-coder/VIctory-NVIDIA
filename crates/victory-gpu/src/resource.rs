@@ -121,11 +121,7 @@ pub(crate) struct AllocationInfo {
 
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
-<<<<<<< Updated upstream
 // normal_placed (descriptor.rs) clears the padding words on either side of these spans.
-=======
-// placed_resource_words copies the two field spans on either side of the padding.
->>>>>>> Stashed changes
 const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
 const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
@@ -2413,14 +2409,11 @@ pub(crate) fn let_go_idle() {
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
                 r.host.wanted.store(u32::MAX, Relaxed);
-<<<<<<< Updated upstream
                 // Not used since: the looks pass it by (`used == 0`) until
                 // a use makes its copy again. Kept, it stayed idle and every
                 // look over the line sorted and locked it, finding nothing
                 // to let go: a look cost 3 ms after a minute and 14 ms after
                 // 30 (issue #12). The next use stamps it under this lock.
-=======
->>>>>>> Stashed changes
                 r.host.used.store(0, Relaxed);
                 made.take()
             } else {

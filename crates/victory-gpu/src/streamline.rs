@@ -692,10 +692,15 @@ pub fn dlss_framegen_card(name: &str) -> bool {
 
 /// The card the host device is made on (`hardware_adapter`; else the first
 /// adapter, where a device made with no adapter named is), its name and LUID.
-fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
+/// PCI vendor of the same DXGI adapter used by the renderer.
+pub fn radeon_adapter() -> bool {
+    default_adapter().is_some_and(|(_, _, vendor)| vendor == 0x1002)
+}
+
+fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID, u32)> {
     if let Some((adapter, name, _)) = victory_shader::emit::host::hardware_adapter() {
         // SAFETY: a plain DXGI query.
-        return unsafe { adapter.GetDesc1() }.ok().map(|d| (name, d.AdapterLuid));
+        return unsafe { adapter.GetDesc1() }.ok().map(|d| (name, d.AdapterLuid, d.VendorId));
     }
     // SAFETY: plain DXGI queries.
     unsafe {
@@ -703,7 +708,7 @@ fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
         let adapter = factory.EnumAdapters1(0).ok()?;
         let desc = adapter.GetDesc1().ok()?;
         let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-        Some((String::from_utf16_lossy(&desc.Description[..len]), desc.AdapterLuid))
+        Some((String::from_utf16_lossy(&desc.Description[..len]), desc.AdapterLuid, desc.VendorId))
     }
 }
 

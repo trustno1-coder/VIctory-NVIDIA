@@ -29,6 +29,19 @@ Use **F1** on the Radeon launcher to open **Game Graphics**. Up and Down pick a
 setting. Left and Right change it. **Tab** opens the existing Victory settings.
 The game graphics page appears once this title has created its settings file.
 
+For AMD FSR on either console profile, open **F1 → Tab → Upscaling** and select
+**AMD FSR Quality**. Save and restart. The game supplies the FidelityFX upscaler
+and its fixed Quality configuration, rendering 1280×720 into 1920×1080. **Game
+Default** restores the previous console and scene settings. The command-line
+equivalent is `victory play --upscaler fsr-quality`. The play log records the
+first completed native upscale. Frame generation is a separate feature. The
+current frame generation integration requires DLSS and stays off on Radeon.
+
+If a graphics choice prevents startup, run `Play-Radeon-1080p.cmd --recover`.
+The launcher backs up the F1 profile beside the launcher, restores the original
+values of the game graphics fields Victory changed, and starts with Radeon defaults. Save slots and shader
+caches are independent of that profile.
+
 - **Temporal upscale source (p)** sets the Series X 3D scene to 720p, 900p,
   1080p (the Radeon default), 1440p, or 2160p. The 2160p option renders at the
   full size of the game's UI canvas. The window still fits your display.
@@ -36,7 +49,7 @@ The game graphics page appears once this title has created its settings file.
 - Press **Tab** for **Post anti-aliasing**. Select **Game + FXAA** to smooth
   edges immediately, or **Game only** to remove the extra pass. On a single
   display plane FXAA also filters game text. Series S composites its separate
-  UI plane after FXAA. **Console / Upscaler** lets you compare the Series X
+  UI plane after FXAA. **Console** lets you compare the Series X
   temporal path with the Series S FidelityFX path when DLSS is off. Switching
   console also changes the game's quality profile.
 - **Display mode** offers windowed, borderless and exclusive fullscreen after
@@ -98,7 +111,7 @@ stalls. The play log records the player's exit code when it returns.
 | --- | --- | --- |
 | GeForce RTX 40 and RTX 50 | **DLSS frame generation** | 2x on RTX 40; more than 2x (up to 6x) needs an RTX 50 |
 | GeForce RTX 20 and RTX 30 | **AMD FSR 3 frame generation** (DLSS frame generation needs an RTX 40 or later) | **2x at most**. DLSS upscaling still works on these cards, so the Series X profile is fine |
-| Other cards (no DLSS) | **AMD FSR 3 frame generation** | **2x at most, Series S profile only** (F1 menu, CONSOLE): without DLSS the game's own upscaler, which FSR 3 needs, only takes the Series S sizes. Not tested here |
+| Radeon | Frame generation off | AMD FSR Quality provides 720p-to-1080p upscaling through the bundled game files. |
 
 - **At every start the game tells you** which one your card runs, and why
   not if it can't, at the top of the picture for the first 30 seconds (and
@@ -108,7 +121,7 @@ stalls. The play log records the player's exit code when it returns.
   switches it off or on.
 - FSR 3 needs AMD's FidelityFX DLLs (`amd_fidelityfx_loader_dx12.dll` and
   `amd_fidelityfx_framegeneration_dx12.dll`, about 30 MB). They are AMD's and
-  not part of this program. On a card without DLSS frame generation (or with
+  not part of this program. On a DLSS-capable card without DLSS frame generation (or with
   FSR 3 chosen in F1) the first start of `victory.exe` asks once whether to
   download them from AMD's own GitHub (the FidelityFX SDK);
   `victory.exe get-fsr` does it later, and `Get-AMD-FSR.cmd` does it for the

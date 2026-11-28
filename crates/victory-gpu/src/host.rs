@@ -10669,23 +10669,19 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-<<<<<<< Updated upstream
-            let shown = p.swap_chain.Present(0, if p.presents_tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) });
-            if shown.is_err() && p.presents_tearing {
-                // A white window on an RTX 5070 at 1440p (2026-11-28): presents that may tear
-                // were not shown. The rest of the run presents at the next refresh.
-                tracing::warn!(code = %shown, frame, "a present shown at once was refused; presenting at the next refresh for the rest of the run");
-                p.presents_tearing = false;
-                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            } else if shown.is_err() && !p.present_refused {
-                p.present_refused = true;
-                tracing::warn!(code = %shown, frame, "a present was refused (logged once)");
-            }
-=======
             display_watch::begin_present();
-            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let mut status = p.swap_chain.Present(0, if p.presents_tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) });
+            if status.is_err() && p.presents_tearing {
+                // A white window on an RTX 5070 at 1440p (2026-11-28): presents that may tear
+                // were not status. The rest of the run presents at the next refresh.
+                tracing::warn!(code = %status, frame, "a present shown at once was refused; presenting at the next refresh for the rest of the run");
+                p.presents_tearing = false;
+                status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            } else if status.is_err() && !p.present_refused {
+                p.present_refused = true;
+                tracing::warn!(code = %status, frame, "a present was refused (logged once)");
+            }
             display_watch::end_present(status == windows::Win32::Foundation::S_OK);
->>>>>>> Stashed changes
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             if status != p.last_status {
@@ -10743,7 +10739,7 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let tearing = tearing(&factory);
+            let tearing = std::env::var("VICTORY_FULLSCREEN").as_deref() != Ok("exclusive") && tearing(&factory);
             tracing::info!(tearing, "swap chain: frames shown as soon as presented (VICTORY_TEARING=0: at the next refresh)");
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,

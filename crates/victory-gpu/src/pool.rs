@@ -432,6 +432,7 @@ fn stats_on() -> bool {
 
 /// The live textures by their piece's bytes (64 KiB and less, to 256 KiB, to
 /// 1 MiB, to 4 MiB, more): how many, and the bytes.
+static HELD: AtomicU64 = AtomicU64::new(0);
 static LIVE: [[AtomicU64; 2]; 5] = [const { [const { AtomicU64::new(0) }; 2] }; 5];
 /// The live textures that could lie at multiples of 4 KiB and do not: how
 /// many, the bytes their pieces hold, and the bytes they would hold there.
@@ -596,11 +597,8 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-<<<<<<< Updated upstream
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             counted(gone.piece, gone.small, false);
-=======
->>>>>>> Stashed changes
             lock(&TEXTURES).give(gone.piece, now());
         }
         left
@@ -853,13 +851,9 @@ pub(crate) unsafe fn texture(
     let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
     match (result, made) {
         (Ok(()), Some(made)) => {
-<<<<<<< Updated upstream
             HELD.fetch_add(piece.len, Ordering::Relaxed);
             counted(piece, small, true);
             give_back_with(&made, piece, small);
-=======
-            give_back_with(&made, piece);
->>>>>>> Stashed changes
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -909,7 +903,7 @@ mod tests {
 
     #[test]
     fn the_census_counts_what_is_free_resting_and_how_full_blocks_are() {
-        let mut pool: Pool<u32> = Pool::new(2);
+        let mut pool: Pool<u32> = Pool::new(2, &SPARES);
         let (kept, ..) = pool.take(BLOCK / 2, 64 << 10, 0, || Some(1)).unwrap();
         let (given, ..) = pool.take(1 << 20, 64 << 10, 0, || Some(1)).unwrap();
         assert_eq!((kept.start, given.start), (0, BLOCK / 2));

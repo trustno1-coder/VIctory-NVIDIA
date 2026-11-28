@@ -194,7 +194,6 @@ impl Pending {
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
-<<<<<<< Updated upstream
     }
 
     fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
@@ -209,10 +208,7 @@ impl Pending {
                 }
             }
         });
-        let (lock, done) = &DONE;
-=======
         let (lock, done) = &self.finished;
->>>>>>> Stashed changes
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }

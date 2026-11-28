@@ -1822,12 +1822,8 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-<<<<<<< Updated upstream
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        let (resource, desc) = normal_placed(false, resource, desc);
-=======
     if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, false)) {
->>>>>>> Stashed changes
+        let (resource, desc) = normal_placed(false, resource, desc);
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1838,12 +1834,8 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-<<<<<<< Updated upstream
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        let (resource, desc) = normal_placed(true, resource, desc);
-=======
     if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
->>>>>>> Stashed changes
+        let (resource, desc) = normal_placed(true, resource, desc);
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -2280,13 +2272,9 @@ mod tests {
         ] {
             create(null, &resource, &desc, handle);
             let first = slot;
-<<<<<<< Updated upstream
             // Kept as `normal_placed` makes it (a buffer view's first element folded into its address).
             let (r, d) = normal_placed(unordered, resource, desc);
             assert_eq!(view(handle), Some(View::Placed(unordered, r, d)));
-=======
-            assert_eq!(view(handle), Some(View::Placed(unordered, resource, desc)));
->>>>>>> Stashed changes
             let mut noisy = desc;
             for w in unused {
                 noisy[w] = 0xdead_beef;
