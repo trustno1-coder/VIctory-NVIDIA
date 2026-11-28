@@ -1299,6 +1299,9 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Shared memory for root constant buffers (`fill_scratch`) that the card
+    /// may fill too ([`card_steps`]), reused after a reset.
+    shared_scratch: Mutex<Scratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -2215,21 +2218,34 @@ struct Chunk {
 // written only by the list that holds the chunk.
 unsafe impl Send for Chunk {}
 
-/// Upload chunks handed out front to back: the chunks (each with its
-/// bytes), the one in use and the bytes used in it.
+/// Scratch chunks handed out front to back: the chunks (each with its
+/// bytes), the one in use, the bytes used in it, and whether the chunks lie
+/// in [`Host::shared_buffer`] memory instead of upload memory.
 #[derive(Default)]
 struct Scratch {
     chunks: Vec<(Chunk, u64)>,
     current: usize,
     used: u64,
+    shared: bool,
 }
 
-// SAFETY: the chunk pointers are persistent mappings of upload buffers.
+impl Scratch {
+    fn shared() -> Self {
+        Scratch {
+            chunks: Vec::new(),
+            current: 0,
+            used: 0,
+            shared: true,
+        }
+    }
+}
+
+// SAFETY: the chunk pointers are persistent mappings of D3D12 buffers.
 unsafe impl Send for Scratch {}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        give_chunks(std::mem::take(&mut self.chunks));
+        give_chunks_to(std::mem::take(&mut self.chunks), self.shared);
     }
 }
 
@@ -2309,21 +2325,38 @@ impl<T> Spare<T> {
     }
 }
 
-/// Scratch chunks no list holds.
+/// Whether [`HostList::fill_scratch`] uses shared memory so [`card_steps`]
+/// can fill root constant buffers on the card (`VICTORY_SCRATCH_SHARED=0`:
+/// upload memory, as before).
+fn scratch_shared() -> bool {
+    crate::toggled!("VICTORY_SCRATCH_SHARED")
+}
+
+/// Scratch chunks no list holds: upload memory, then shared memory.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+static SPARE_SHARED: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
+    take_chunk_kind(host, size, false)
+}
+
+fn take_chunk_kind(host: &Host, size: u64, shared: bool) -> Option<Chunk> {
+    let pool = if shared { &SPARE_SHARED } else { &SPARE };
     if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
+        && let Some(chunk) = pool.lock().unwrap_or_else(|e| e.into_inner()).take(size)
     {
         ALIVE[3].fetch_sub(1, Ordering::Relaxed);
         ALIVE[4].fetch_sub(size, Ordering::Relaxed);
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
-    name(&buffer, || "list scratch".into());
+    let (buffer, data) = if shared {
+        host.shared_buffer(size)?
+    } else {
+        host.upload_buffer(size)?
+    };
+    name(&buffer, || if shared { "list shared scratch" } else { "list scratch" }.into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
@@ -2336,12 +2369,17 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
 /// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
+    give_chunks_to(chunks, false);
+}
+
+fn give_chunks_to(chunks: Vec<(Chunk, u64)>, shared: bool) {
     if chunks.is_empty() {
         return;
     }
     let mut freed = Vec::new();
     {
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let pool = if shared { &SPARE_SHARED } else { &SPARE };
+        let mut spare = pool.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
                 let limit = if keep_freed() && !crate::residency::limited_host_ram() {
@@ -2349,7 +2387,8 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
                 } else {
                     SPARE_MOST
                 };
-                spare.give(chunk, size, limit)
+                let other = ALIVE[4].load(Ordering::Relaxed).saturating_sub(spare.bytes);
+                spare.give(chunk, size, limit.saturating_sub(other))
             } else {
                 Some(chunk)
             };
@@ -2374,14 +2413,16 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let now = now_ms();
         let last = LAST.load(Ordering::Relaxed);
         if now >= last + 10_000 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-            let trimmed = SPARE.lock().unwrap_or_else(|e| e.into_inner()).trim();
-            for (chunk, size) in trimmed {
-                ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-                ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-                ALIVE[1].fetch_sub(1, Ordering::Relaxed);
-                ALIVE[2].fetch_sub(size, Ordering::Relaxed);
-                SPARE_TRIMMED.fetch_add(size, Ordering::Relaxed);
-                freed.push(chunk);
+            for pool in [&SPARE, &SPARE_SHARED] {
+                let trimmed = pool.lock().unwrap_or_else(|e| e.into_inner()).trim();
+                for (chunk, size) in trimmed {
+                    ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+                    ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+                    ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+                    ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+                    SPARE_TRIMMED.fetch_add(size, Ordering::Relaxed);
+                    freed.push(chunk);
+                }
             }
         }
     }
@@ -2395,15 +2436,16 @@ pub(crate) static SPARE_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomi
 
 /// Drops spare scratch chunks kept idle when host memory is pressured.
 fn trim_spare_chunks() {
-    let freed: Vec<(Chunk, u64)> = {
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.kept.is_empty() {
-            return;
-        }
+    let mut freed: Vec<(Chunk, u64)> = Vec::new();
+    for pool in [&SPARE, &SPARE_SHARED] {
+        let mut spare = pool.lock().unwrap_or_else(|e| e.into_inner());
         spare.bytes = 0;
         spare.low = 0;
-        std::mem::take(&mut spare.kept)
-    };
+        freed.append(&mut spare.kept);
+    }
+    if freed.is_empty() {
+        return;
+    }
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
     ALIVE[1].fetch_sub(count, Ordering::Relaxed);
@@ -4616,6 +4658,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                shared_scratch: Mutex::new(Scratch::shared()),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -6973,14 +7016,20 @@ impl HostList {
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
-            // Every submission of the list has run: nothing reads its
-            // scratch memory any more, and the next list to ask takes it.
-            if scratch_pool() {
-                give_chunks(std::mem::take(&mut scratch.chunks));
-            }
+        for scratch in [&self.scratch, &self.shared_scratch] {
+            let (chunks, shared) = {
+                let mut s = scratch.lock().unwrap_or_else(|e| e.into_inner());
+                (s.current, s.used) = (0, 0);
+                // Every submission of the list has run: nothing reads its
+                // scratch memory any more, and the next list to ask takes it.
+                let chunks = if scratch_pool() {
+                    std::mem::take(&mut s.chunks)
+                } else {
+                    Vec::new()
+                };
+                (chunks, s.shared)
+            };
+            give_chunks_to(chunks, shared);
         }
         // Nor runs its prelude: the next submission to need one takes it.
         self.give_prelude();
@@ -7622,9 +7671,26 @@ impl HostList {
         if known.is_some() {
             return known;
         }
+        if card_steps::stage() > 0
+            && scratch_shared()
+            && let Some(gpu) = self.fill_scratch_shared(key, src, len)
+        {
+            return Some(gpu);
+        }
         let (gpu, to) = self.scratch(len)?;
         self.defer_fill(to, src, len as usize);
         self.deferred().filled.insert(key, gpu);
+        Some(gpu)
+    }
+
+    fn fill_scratch_shared(&self, key: (usize, usize), src: *const u8, len: u64) -> Option<u64> {
+        let (buffer, at, to) = self.scratch_from(&self.shared_scratch, len)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
+        let fill = card_steps::FillTo::Buffer(buffer, at);
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Fill(to as usize, src as usize, len as usize, Some(fill)));
+        deferred.filled.insert(key, gpu);
         Some(gpu)
     }
 
@@ -7639,7 +7705,7 @@ impl HostList {
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
-        let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
+        let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone(), 0));
         self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
     }
 
@@ -7724,12 +7790,18 @@ impl HostList {
     /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
     /// pointer.
     fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_from(&self.scratch, len)
+    }
+
+    fn scratch_from(&self, scratch: &Mutex<Scratch>, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let shared = s.shared;
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
+            drop(s);
+            let (buffer, data) = if shared { host.shared_buffer(len)? } else { host.upload_buffer(len)? };
+            name(&buffer, || format!("list {}scratch {len:#x}", if shared { "shared " } else { "" }));
             self.deferred().hold_upload(buffer.clone(), len);
             return Some((buffer, 0, data));
         }
@@ -7744,7 +7816,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let chunk = take_chunk_kind(host, size, shared)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -7757,8 +7829,10 @@ impl HostList {
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
     pub(crate) fn scratch_kept(&self) -> u64 {
-        let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        scratch.chunks.iter().map(|c| c.1).sum()
+        [&self.scratch, &self.shared_scratch]
+            .into_iter()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).chunks.iter().map(|c| c.1).sum::<u64>())
+            .sum()
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
