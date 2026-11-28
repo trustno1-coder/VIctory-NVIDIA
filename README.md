@@ -210,12 +210,15 @@ speed, in the picture and in simply being able to play it:
 - **The F3 stats panel**, in every build: frame rate and frame time, frames
   shown with frame generation, draws, how busy the GPU and the submitting
   thread are, copies, RAM and VRAM. The menu switches it too.
-- **Open water without dark blocks.** Two of the title's water light programs
-  run on 32-lane cards only in a form that left whole tiles of the sea dark
-  (around boats, along shores, under bridges) and cost about 15 ms of the
-  card a frame. They are left out there: no blocks and 30 fps instead of 25
-  on the first boat ride (RTX 5070), with water that is darker and bluer.
-  WATER LIGHT in the menu (`VICTORY_WATER_LIGHT=1`) runs them again.
+- **Open water without dark blocks.** Two of the title's water light programs,
+  written for 64-lane waves, once left whole tiles of the sea dark on 32-lane
+  cards (around boats, along shores, under bridges). They run by default now:
+  each of their waves is kept together through loops (`VICTORY_LOOPS_WAVE`)
+  and their shared memory is set up from the first thread
+  (`VICTORY_LDS_FIRST_INIT`). Where blocks still show (#739), WATER LIGHT OFF
+  in the menu (`VICTORY_WATER_LIGHT=0`) leaves the two out: no blocks, and
+  water that is darker and bluer. Before that fix, leaving them out also took
+  the first boat ride from 25 to 30 fps on an RTX 5070.
 - **One command to play**: the launcher builds the layer the first time and
   applies what the menu saved.
 - **`Get-NVIDIA-DLSS.cmd`**: the eight NVIDIA files that are loaded, about
