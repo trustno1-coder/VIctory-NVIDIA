@@ -57,7 +57,7 @@ fn layout(d: &ID3D12Device, t: &ID3D12Resource) -> (D3D12_PLACED_SUBRESOURCE_FOO
     (f, size)
 }
 
-fn transition(l: &ID3D12GraphicsCommandList, t: &ID3D12Resource, before: u32, after: u32) {
+pub(super) fn transition(l: &ID3D12GraphicsCommandList, t: &ID3D12Resource, before: u32, after: u32) {
     // SAFETY: borrowed resource remains alive; union is a transition; no COM reference is consumed.
     unsafe {
         l.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {

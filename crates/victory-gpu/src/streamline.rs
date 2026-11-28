@@ -34,6 +34,7 @@ pub(crate) mod abi;
 pub mod plan;
 mod probe;
 pub use probe::verified_check;
+pub use probe::fg::framegen_check;
 
 pub use plan::Mode;
 

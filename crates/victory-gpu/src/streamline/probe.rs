@@ -1,6 +1,7 @@
 //! Original, deterministic SR fixture. No title inputs; only the check command uses it.
 use super::*;
 mod io;
+pub mod fg;
 use io::{readback, upload};
 use std::time::Instant;
 use windows::Win32::Graphics::Dxgi::Common::*;

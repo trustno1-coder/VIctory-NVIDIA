@@ -368,8 +368,21 @@ enum Command {
     #[cfg(windows)]
     UpscalerCheck {
         /// Validate deterministic SR input/output and measure synchronized host latency.
-        #[arg(long, conflicts_with = "present")]
+        #[arg(long, conflicts_with_all = ["present", "validate_framegen"])]
         validate: bool,
+        /// Strict initialized FG probe; checks SDK frame counts, not physical scanout.
+        #[arg(long, conflicts_with = "present")]
+        validate_framegen: bool,
+        /// Exercise off/on, resize and swap-chain recreation in the FG probe.
+        #[arg(long, requires = "validate_framegen")]
+        lifecycle: bool,
+        /// Base presents per FG phase, including 10 warm-up frames.
+        #[arg(long, default_value_t = 90, requires = "validate_framegen", value_parser = clap::value_parser!(u32).range(30..=600))]
+        frames: u32,
+        /// Seconds the FG probe keeps warming up for its window to be focused
+        /// (DLSS-G makes no frames otherwise; click the window if Windows keeps it behind).
+        #[arg(long, default_value_t = 20, requires = "validate_framegen", value_parser = clap::value_parser!(u32).range(0..=300))]
+        focus_wait: u32,
         /// Evaluation count for --validate (3 warm-up evaluations, then measurements).
         #[arg(long, default_value_t = 12, requires = "validate", value_parser = clap::value_parser!(u32).range(4..=48))]
         iterations: u32,
@@ -524,12 +537,14 @@ fn main() -> Result<()> {
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
         #[cfg(windows)]
-        Command::UpscalerCheck { output, device, present, validate, iterations } => {
+        Command::UpscalerCheck { output, device, present, validate, iterations, validate_framegen, lifecycle, frames, focus_wait } => {
             let size = output
                 .split_once(['x', 'X'])
                 .and_then(|(w, h)| Some([w.trim().parse().ok()?, h.trim().parse().ok()?]))
                 .ok_or_else(|| anyhow::anyhow!("--output {output}: not <width>x<height>"))?;
-            let lines = if validate {
+            let lines = if validate_framegen {
+                victory_hle::streamline::framegen_check(size, frames, lifecycle, focus_wait).map_err(anyhow::Error::msg)?
+            } else if validate {
                 victory_hle::streamline::verified_check(size, iterations).map_err(anyhow::Error::msg)?
             } else {
                 victory_hle::streamline::check(size, device || present, present)
