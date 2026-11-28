@@ -10096,13 +10096,18 @@ impl Meter {
             );
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
+                // (in place of a line for each copy made)
+                let [made, made_bytes, largest, largest_at] = crate::shadow::take_card_made();
                 tracing::info!(
-                    "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
+                    "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; made since the \
+                     last such line: {made} copies, {} MB, the largest {} MB at {largest_at:#x}; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
                      ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,
+                    made_bytes >> 20,
+                    largest >> 20,
                     per_frame(0) / 1e6,
                     per_frame(1),
                     per_frame(2),
@@ -10144,6 +10149,11 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            log_budget_changes();
+            // In place of a line per pipeline and shader (`crate::pipeline::tally`).
+            if let Some(line) = crate::pipeline::tally_line() {
+                tracing::info!(target: "victory_gpu::pipeline", "{line}");
+            }
             #[cfg(feature = "diagnostics")]
             {
                 let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -10750,6 +10760,104 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// Changes of the card's memory budget ([`Host::video_memory`]): one is said
+/// at once when none was in the 5 seconds before, the others counted and
+/// said together, with the frame-rate line or before the next said at once.
+#[derive(Default)]
+struct BudgetChanges {
+    said: Option<std::time::Instant>,
+    unsaid: Option<BudgetUnsaid>,
+}
+
+/// Changes of the budget not said one by one: how many, the lowest and the
+/// highest budget they made, and the last, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BudgetUnsaid {
+    changes: u64,
+    low: u64,
+    high: u64,
+    last: u64,
+}
+
+static BUDGET_CHANGES: Mutex<BudgetChanges> = Mutex::new(BudgetChanges { said: None, unsaid: None });
+
+impl BudgetChanges {
+    /// The budget changed to `budget` at `now`: `Some` if that is said at
+    /// once, with the changes counted before it if any; `None` if it is
+    /// counted.
+    fn changed(&mut self, now: std::time::Instant, budget: u64) -> Option<Option<BudgetUnsaid>> {
+        if self.said.is_none_or(|at| now.saturating_duration_since(at) >= std::time::Duration::from_secs(5)) {
+            self.said = Some(now);
+            return Some(self.unsaid.take());
+        }
+        let u = self.unsaid.get_or_insert(BudgetUnsaid { changes: 0, low: budget, high: budget, last: budget });
+        u.changes += 1;
+        u.low = u.low.min(budget);
+        u.high = u.high.max(budget);
+        u.last = budget;
+        None
+    }
+
+    /// The changes counted and not said yet, said now (`now`).
+    fn unsaid(&mut self, now: std::time::Instant) -> Option<BudgetUnsaid> {
+        let unsaid = self.unsaid.take()?;
+        self.said = Some(now);
+        Some(unsaid)
+    }
+}
+
+/// Logs changes of the budget that were counted, not said one by one.
+fn log_budget_unsaid(u: BudgetUnsaid) {
+    tracing::info!(
+        "the system changed the budget of the card's memory {} more times since the last such line, between {} MB \
+         and {} MB, the last to {} MB (one line in 5 seconds at most)",
+        u.changes,
+        u.low >> 20,
+        u.high >> 20,
+        u.last >> 20
+    );
+}
+
+/// Logs the budget changes left unsaid ([`BudgetChanges`]); with the
+/// frame-rate line.
+fn log_budget_changes() {
+    let unsaid = BUDGET_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).unsaid(std::time::Instant::now());
+    if let Some(u) = unsaid {
+        log_budget_unsaid(u);
+    }
+}
+
+#[cfg(test)]
+mod budget_change_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn budget_changes_are_said_once_in_5_seconds_and_the_rest_counted() {
+        let mut c = BudgetChanges::default();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mb = |n: u64| n << 20;
+        // The first is said at once, with nothing before it.
+        assert_eq!(c.changed(at(0), mb(13_960)), Some(None));
+        // Back and forth within 5 seconds: counted.
+        assert_eq!(c.changed(at(300), mb(14_250)), None);
+        assert_eq!(c.changed(at(600), mb(13_940)), None);
+        assert_eq!(c.changed(at(900), mb(14_230)), None);
+        // Said with the frame-rate line.
+        let three = BudgetUnsaid { changes: 3, low: mb(13_940), high: mb(14_250), last: mb(14_230) };
+        assert_eq!(c.unsaid(at(1_000)), Some(three));
+        assert_eq!(c.unsaid(at(1_100)), None);
+        // That line counts as said: the next within 5 seconds is counted ...
+        assert_eq!(c.changed(at(5_000), mb(13_960)), None);
+        // ... and one 5 seconds after the last line is said at once, after
+        // the one counted before it.
+        let one = BudgetUnsaid { changes: 1, low: mb(13_960), high: mb(13_960), last: mb(13_960) };
+        assert_eq!(c.changed(at(6_000), mb(14_250)), Some(Some(one)));
+        assert_eq!(c.unsaid(at(6_100)), None);
+    }
+}
+
 impl Host {
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
@@ -10777,7 +10885,16 @@ impl Host {
         static LAST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
         let now = [own.Budget, own.CurrentUsage, shared.CurrentUsage];
         let last = [0, 1, 2].map(|i| LAST[i].swap(now[i], Ordering::Relaxed));
-        if last[0] != 0 && last[0].abs_diff(own.Budget) >= (256u64 << 20) {
+        // At most one such line in 5 seconds ([`BudgetChanges`]): the budget
+        // went back and forth between 13,960 and 14,250 MB three times a
+        // second for minutes in a run of 2026-11-28 (two lines each).
+        let said = (last[0] != 0 && last[0].abs_diff(own.Budget) >= (256u64 << 20))
+            .then(|| BUDGET_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).changed(std::time::Instant::now(), own.Budget))
+            .flatten();
+        if let Some(earlier) = said {
+            if let Some(earlier) = earlier {
+                log_budget_unsaid(earlier);
+            }
             tracing::info!(
                 "the system changed the budget of the card's memory from {} MB to {} MB (frame {}); at the last look {} MB of the card's and {} MB of the PC's shared memory were in use",
                 last[0] >> 20,
