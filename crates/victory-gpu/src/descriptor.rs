@@ -1116,6 +1116,12 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
 /// was written with for a frame or a few, so the oldest of a million are
 /// long out of use; one naming a freed entry reads as stale (no view).
 /// `VICTORY_OWNERLESS_VIEWS=<n>` keeps `n` (0: all, as before).
+///
+/// The eviction is FIFO by the time an entry was made, not LRU: a view
+/// written once and still read a million new views later goes stale like any
+/// other, however often it is used. Two counters tell whether that happens
+/// (the memory line, "ownerless views"): [`OWNERLESS_EVICTED`], and
+/// [`STALE_VIEWS`], the lookups that found a generation gone.
 fn ownerless_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
@@ -1125,6 +1131,15 @@ fn ownerless_cap() -> usize {
             .unwrap_or(1 << 20)
     })
 }
+/// Entries of views without a resource freed by the cap since the start.
+static OWNERLESS_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lookups of a table entry by a record whose generation is no longer the
+/// entry's, since the start: the view was freed (by the cap, or with its
+/// resource: the two are not told apart) and the descriptor still names it, so
+/// it reads as no view.
+static STALE_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -1319,6 +1334,18 @@ impl Views {
         self.index.remove(&view);
         self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
         self.free.push(i);
+        OWNERLESS_EVICTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The view of table entry `i` if `generation` is still its own.
+    fn entry_at(&self, i: u32, generation: u32) -> Option<View> {
+        let (view, current) = self.list.get(i as usize)?;
+        if *current == generation {
+            Some(view.clone())
+        } else {
+            STALE_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
     }
 
     fn entry_made(&mut self, view: View) -> [u32; 2] {
@@ -1413,9 +1440,11 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// buffer views and views of placed memory (those that did not fit a
 /// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
 /// placed views kept, and the views named whole in their records since the
-/// start: constant buffer views, views of placed memory.
+/// start: constant buffer views, views of placed memory; then the entries of
+/// views without a resource freed by [`ownerless_cap`], and the lookups that
+/// found a generation gone ([`STALE_VIEWS`]).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn views_kept() -> [u64; 8] {
+pub(crate) fn views_kept() -> [u64; 10] {
     use std::sync::atomic::Ordering::Relaxed;
     let views = views_read();
     let each = size_of::<(View, u32)>() as u64;
@@ -1440,6 +1469,8 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.shapes.len() as u64,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
+        OWNERLESS_EVICTED.load(Relaxed),
+        STALE_VIEWS.load(Relaxed),
     ]
 }
 
@@ -1681,11 +1712,7 @@ pub(crate) fn forget(resource: usize) {
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
-        0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
-        }
+        0 => views_read().entry_at(i, generation),
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => views_read().placed_of(i, generation),
         _ => None,
@@ -2359,6 +2386,47 @@ mod tests {
             views.entry_kept(placed(n), 0);
         }
         assert_eq!(views.index.len(), 1 + 4 + 20);
+    }
+
+    /// A descriptor naming an ownerless view the cap has freed reads as no
+    /// view, never as the view that took its entry (FIFO: even if the view
+    /// was just in use), and both are counted.
+    #[test]
+    fn an_evicted_ownerless_view_in_use_reads_as_none() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut views = Views {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            by_resource: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            shapes: Vec::new(),
+            shape_index: std::collections::BTreeMap::new(),
+            ownerless: std::collections::VecDeque::new(),
+        };
+        let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
+        let (evicted, stale) = (OWNERLESS_EVICTED.load(Relaxed), STALE_VIEWS.load(Relaxed));
+        // The view the title keeps reading, written first.
+        let in_use = views.entry_kept(placed(0), 4);
+        assert_eq!(views.entry_at(in_use[0], in_use[1]), Some(placed(0)), "named while kept");
+        // Four more fill the cap; the fifth frees the oldest, the one in use.
+        for n in 1..=4 {
+            views.entry_kept(placed(n), 4);
+        }
+        assert_eq!(OWNERLESS_EVICTED.load(Relaxed) - evicted, 1, "one freed");
+        assert_eq!(views.entry_at(in_use[0], in_use[1]), None, "the old record reads as no view");
+        assert_eq!(STALE_VIEWS.load(Relaxed) - stale, 1, "the stale read is counted");
+        // The next new view takes the freed entry under another generation:
+        // the old record must not read that one.
+        let next = views.entry_kept(placed(5), 4);
+        assert_eq!(next[0], in_use[0], "the entry was reused");
+        assert_ne!(next[1], in_use[1]);
+        assert_eq!(views.entry_at(in_use[0], in_use[1]), None, "still no view, not the new one");
+        assert_eq!(STALE_VIEWS.load(Relaxed) - stale, 2);
+        assert_eq!(views.entry_at(next[0], next[1]), Some(placed(5)));
+        // Writing the view again makes it an entry under a new generation.
+        let again = views.entry_kept(placed(0), 4);
+        assert_eq!(views.entry_at(again[0], again[1]), Some(placed(0)));
+        assert_ne!(again, in_use);
     }
 
     /// The leak of run 65: a title that writes constant buffer views and
