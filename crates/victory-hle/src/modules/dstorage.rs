@@ -960,6 +960,11 @@ impl Lane {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
     }
 
+    /// Every read run and every status entry written.
+    fn drained(&self) -> bool {
+        self.unsubmitted.is_empty() && self.reads.is_empty() && self.running.is_empty() && self.statuses.is_empty()
+    }
+
     /// Writes the status entries whose earlier reads have all finished.
     fn flush(&mut self) {
         while let Some(&(seq, _)) = self.statuses.front() {
@@ -998,8 +1003,10 @@ fn staging_bytes(request: &Request) -> u64 {
     }
 }
 
-/// Ends a queue: what was not started is dropped, and this waits for the
-/// reads already running (they write title memory).
+/// Ends a queue. Close "blocks until all enqueued requests either complete
+/// or fail" (`IDStorageQueueX::Close`): what was enqueued and not submitted
+/// is submitted, and this waits until every read has run and every status
+/// entry is written. Nothing more is taken from then on.
 fn close_lane(id: u64) {
     let Some(scheduler) = scheduler() else {
         return;
@@ -1009,10 +1016,11 @@ fn close_lane(id: u64) {
         return;
     };
     lane.closed = true;
-    lane.unsubmitted.clear();
-    lane.reads.clear();
-    lane.statuses.clear(); // releases their arrays
-    while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
+    if !lane.unsubmitted.is_empty() {
+        lanes.submit(id, true);
+        scheduler.work.notify_all();
+    }
+    while lanes.lanes.get(&id).is_some_and(|l| !l.drained()) {
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -1387,9 +1395,8 @@ extern "system" fn submit(this: QueueRef) {
     scheduler.work.notify_all();
 }
 
-/// Ends the queue whatever its reference count: what was not started never
-/// completes, and this returns once the reads already running have
-/// finished. The title calls this, not `Release`.
+/// Ends the queue whatever its reference count, once everything enqueued
+/// on it is done ([`close_lane`]). The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
@@ -2403,18 +2410,32 @@ mod tests {
         assert_eq!(out, bc4_blocks());
     }
 
+    /// Close blocks until what was enqueued is done, submitted or not: no
+    /// status entry is left pending, and the data is written. A queue
+    /// closed takes nothing more.
     #[test]
-    fn a_closed_queue_completes_nothing() {
-        let (_dir, file) = file_with(&pattern(64));
-        let (queue, array) = (new_queue(0), status_array(1));
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
+    fn close_finishes_what_was_enqueued() {
+        let data = pattern(64);
+        let (_dir, file) = file_with(&data);
+        let (queue, array) = (new_queue(0), status_array(3));
+        let mut out = [[0u8; 16]; 3];
+        // Submitted, then enqueued and not submitted.
+        enqueue(queue, &request(0, out[0].as_mut_ptr().cast(), 16, file, 0, 16));
         enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        enqueue(queue, &request(0, out[1].as_mut_ptr().cast(), 16, file, 16, 16));
+        enqueue_status(queue, array, 1);
         void(queue, 0x40);
+        assert_eq!(result(array, 0), S_OK);
+        assert_eq!(result(array, 1), S_OK);
+        assert_eq!(out[0], data[..16]);
+        assert_eq!(out[1], data[16..32]);
+        // After Close: dropped, as before.
+        enqueue(queue, &request(0, out[2].as_mut_ptr().cast(), 16, file, 32, 16));
+        enqueue_status(queue, array, 2);
         void(queue, 0x30);
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(result(array, 0), E_PENDING);
-        assert_eq!(out, [0; 16]);
+        assert_eq!(out[2], [0; 16]);
     }
 
     #[test]
