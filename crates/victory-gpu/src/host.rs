@@ -12412,15 +12412,18 @@ mod placement_tests {
 #[cfg(test)]
 mod separation_switch_tests {
     /// The warning uses the values `inplace::level()` parses, not spellings a
-    /// reader might expect: "02", " 2" and "3" are level 2/3 like "2".
+    /// reader might expect: "02", " 2" and "3" are level 2/3 like "2". Levels 1 and 2 are the
+    /// early mechanisms, unsupported with submissions in the air; 3 and more is the fallback
+    /// substitution, which declares its writes and is therefore not that combination.
     #[test]
     fn inplace_warnings_use_the_parsed_level() {
         assert_eq!(super::inplace_notes(0, true), (false, false));
         assert_eq!(super::inplace_notes(1, false), (true, false));
-        assert_eq!(super::inplace_notes(1, true), (true, false));
+        assert_eq!(super::inplace_notes(1, true), (true, true));
         assert_eq!(super::inplace_notes(2, false), (true, false));
         assert_eq!(super::inplace_notes(2, true), (true, true));
-        assert_eq!(super::inplace_notes(3, true), (true, true));
+        assert_eq!(super::inplace_notes(3, false), (true, false));
+        assert_eq!(super::inplace_notes(3, true), (true, false));
     }
 }
 
