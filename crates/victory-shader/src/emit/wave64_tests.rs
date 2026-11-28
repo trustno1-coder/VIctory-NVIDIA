@@ -146,6 +146,87 @@ fn lowered_counted(
 }
 
 #[test]
+fn backward_permute_wraps_within_its_half_and_zeros_inactive_sources() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).ok();
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    if let Some(host) = &host {
+        // SAFETY: the feature, output type and size agree.
+        unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut waves).cast(),
+                    size_of_val(&waves) as u32,
+                )
+                .unwrap();
+        }
+    }
+    for threads in [64, 128] {
+        let code = [
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0x3A04_00A0, // v_xor_b32 v2, 32, v0
+            0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x4A08_008D, // v_add_nc_u32 v4, 13, v0
+            0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xDACC_0004,
+            0x0300_0402, // ds_bpermute_b32 v3, v2, v4 offset:4
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0xE070_1000,
+            0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0
+        ];
+        let native = native_of(&code, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        for width in [32, 64] {
+            let shader = lowered_on(&native, &p, &HashSet::new(), width).expect("permute translation");
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                v.validate(&mut shader.dxil.clone()).expect("permute DXIL");
+            }
+            let Some(host) = &host else { continue };
+            if !waves.WaveOps.as_bool()
+                || !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&width)
+            {
+                continue;
+            }
+            let (root, pso) = host.compute_pipeline(&shader).expect("permute pipeline");
+            for threshold in [0, 10, 31, 32, 53, 63, 101] {
+                let mut words = vec![0; shader.user_data_dwords() as usize];
+                words[0] = threshold;
+                let actual = host
+                    .dispatch(&root, &pso, &Dispatch {
+                        roots: vec![(0, Root::Constants(words))],
+                        views: &[View::RawUav(threads)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    })
+                    .unwrap();
+                let expected: Vec<_> = (0..threads)
+                    .map(|lane| {
+                        let source = (lane & !31) | ((lane + 1) & 31);
+                        if lane > threshold && source > threshold {
+                            source + 13
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    actual[0], expected,
+                    "threshold {threshold}, {threads} threads, wave {width}"
+                );
+            }
+            eprintln!("permute GPU readback passed for {threads} threads at width {width}");
+        }
+    }
+}
+
+#[test]
 fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     // thread t holds the 16-bit float with bits 0x3C00 + 37 t (1.0 and up, with odd
     // mantissas, so that additions round); all of them store the wave's sum
