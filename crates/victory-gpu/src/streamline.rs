@@ -1847,9 +1847,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             calls.framegen_on = on;
             // What was asked (the driver may give fewer): not set again until that changes.
             calls.framegen_times = times;
-            if !on {
-                FG_PER.store(1, Relaxed);
-            }
+            FG_PER.store(if on { FG_AWAITING_SAMPLE } else { FG_DISABLED }, Relaxed);
         }
     }
     if calls.framegen_on {
@@ -1932,8 +1930,11 @@ static FG_TIMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 /// What is asked of frame generation now: 0 off, 2..6 frames shown for each one rendered;
 /// `u32::MAX`: not asked yet (then [`framegen_times`], the start's).
 static FG_WANTED: AtomicU32 = AtomicU32::new(u32::MAX);
-/// Frames frame generation showed for the last frame presented (1 while it is off).
-static FG_PER: AtomicU32 = AtomicU32::new(1);
+// The driver returns a u32. Two values outside that range distinguish an
+// accepted change of mode from a measurement of zero or one shown frame.
+const FG_DISABLED: u64 = u64::MAX;
+const FG_AWAITING_SAMPLE: u64 = u64::MAX - 1;
+static FG_PER: AtomicU64 = AtomicU64::new(FG_DISABLED);
 
 fn framegen_wanted() -> u32 {
     match FG_WANTED.load(Relaxed) {
@@ -1968,7 +1969,30 @@ pub(crate) fn set_framegen(times: u32) {
 
 /// For the frame-rate texts: frames shown for each one rendered (1 without frame generation).
 pub(crate) fn shown_per_frame() -> u32 {
-    fsr::shown_per_frame().unwrap_or_else(|| FG_PER.load(Relaxed).max(1))
+    match framegen_reading() {
+        FramegenReading::Dlss(Some(per)) => per.max(1),
+        FramegenReading::Fsr => 2,
+        _ => 1,
+    }
+}
+
+pub(crate) enum FramegenReading {
+    Off,
+    /// The latest count reported by Streamline after presenting.
+    Dlss(Option<u32>),
+    /// The FSR backend enables 2x but exposes no presented-frame counter.
+    Fsr,
+}
+
+pub(crate) fn framegen_reading() -> FramegenReading {
+    if fsr::shown_per_frame().is_some() {
+        return FramegenReading::Fsr;
+    }
+    match FG_PER.load(Relaxed) {
+        FG_DISABLED => FramegenReading::Off,
+        FG_AWAITING_SAMPLE => FramegenReading::Dlss(None),
+        count => FramegenReading::Dlss(Some(count as u32)),
+    }
 }
 
 /// After our swap chain's Present: the frame's last marker, the next
@@ -1995,7 +2019,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
         spent(T_STATE, asked);
         if code == 0 {
-            FG_PER.store(state.num_frames_actually_presented.max(1), Relaxed);
+            FG_PER.store(u64::from(state.num_frames_actually_presented), Relaxed);
             FG_SHOWN.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             FG_SHOWN_ALL.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             let before = FG_STATUS.swap(state.status, Relaxed);
@@ -2025,7 +2049,7 @@ pub(crate) fn resizing() {
         unsafe { set_options(&viewport, &options) };
         calls.framegen_on = false;
         calls.framegen_times = 0;
-        FG_PER.store(1, Relaxed);
+        FG_PER.store(FG_DISABLED, Relaxed);
     }
 }
 
