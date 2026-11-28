@@ -81,9 +81,13 @@ $settings = @{
     VICTORY_WC_NO_BACK = '1'; VICTORY_WC_NO_BACK_MIN_KB = '1024'
     # The title's page-mapping copies kept without Windows views (no cutscene freezes at scene cuts)
     VICTORY_SOFT_VIEWS = 'copies'
-    # Textures: pool with no blocks made ahead, 16 ms a pass, no catch-up, levels not on demand (sharp)
-    VICTORY_TEXTURE_POOL = '1'; VICTORY_RIPE_BLOCKS = '0'; VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_TEXTURE_CATCHUP = '0'
-    VICTORY_TEXTURE_STAGE_MS = '16'; VICTORY_LEVELS_ON_DEMAND = '0'
+    # Textures: pool with no blocks made ahead, levels not on demand (sharp). Catch-up on a backlog, 64 ms a pass
+    # (32 ms for the pass made before a shader asks), no room held back for targets and, further down, 92 % of the
+    # card's budget where no frame generation holds room back. Outdoors on a 16 GB card: no capture with low mips
+    # (7 of 18 before), the queue at most 990 deep (4,272), 4x fewer frames over 150 ms.
+    VICTORY_TEXTURE_POOL = '1'; VICTORY_RIPE_BLOCKS = '0'; VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_TEXTURE_CATCHUP = '1'
+    VICTORY_TEXTURE_STAGE_MS = '64'; VICTORY_EARLY_TEXTURES_MS = '32'; VICTORY_LEVELS_ON_DEMAND = '0'
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '0'
     VICTORY_PRELUDE_UPLOADS = '1'; VICTORY_SHOW_NEW_LATER = '1'; VICTORY_POOL_SMALL = '0'; VICTORY_TABLED_REREAD = '1'
     VICTORY_QUEUE_HOST_TEXTURES = '0'
     # Descriptor heaps' records
@@ -138,6 +142,9 @@ if ($FgType -ne 'dlss' -and ($FrameGen -or ($FrameGenReady -and -not $NoFrameGen
     if (-not $settings.VICTORY_FRAMEGEN_X) { $settings.VICTORY_FRAMEGEN_X = if ($FrameGen) { [string]$timesWanted } else { '0' } }
     if (-not $settings.VICTORY_TEXTURE_ROOM_PERCENT) { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }
 }
+# Where no frame generation holds room back above (-NoFrameGenReady without -FrameGen, for one): textures up to
+# 92 % of the card's budget, as in the runs the texture settings were measured in.
+if (-not $settings.VICTORY_TEXTURE_ROOM_PERCENT) { $settings.VICTORY_TEXTURE_ROOM_PERCENT = '92' }
 if ($fpsWanted -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
 foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
