@@ -5663,6 +5663,29 @@ impl Host {
         let _ = self.submit(&[list], &[], false);
     }
 
+    /// Probe only (`upscaler-check --combined`, `VICTORY_CHECK_SR_ASYNC=1`):
+    /// a closed list of raw barriers and SDK calls goes to the direct queue
+    /// behind everything sent before it and is not waited for; `fence` is
+    /// signalled with `value` once it has run. No host state tracking or
+    /// settling applies: the caller keeps the list's resources alive and
+    /// waits for `value` before resetting the list or releasing them. Later
+    /// work on the same queue (the compositor's present) runs after it.
+    pub(crate) fn execute_unwaited(&self, list: &HostList, fence: &ID3D12Fence, value: u64) -> windows::core::Result<()> {
+        // One sender at a time, as for every other submission to this queue.
+        let _order = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a closed list on our queue; the caller keeps it and what it names alive until `value`.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[Some(list.list.cast()?)]);
+            // Execution has already been submitted. Returning an error here
+            // would let the caller release resources without a completion
+            // marker. Use the host's fatal GPU path; do not unwind teardown.
+            if let Err(e) = self.queue.Signal(fence, value) {
+                fail(format_args!("combined SR: queue Signal({value}) failed after submission: {e}"));
+            }
+            Ok(())
+        }
+    }
+
     /// A queue's submission with [`late`]: the host lists `lists`, taken
     /// from the title's, go to the card in `order` and are not waited for.
     /// They join the line of flights and are settled, with the others in
@@ -10544,6 +10567,69 @@ impl Host {
     pub(crate) fn drop_presenter(&self) {
         settle_now(WHY_SYNC);
         *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// DXGI's own present counters for the live swap chain (`victory
+    /// upscaler-check --validate-framegen`): `GetLastPresentCount`, and
+    /// `GetFrameStatistics`' present and refresh counts when DXGI has them.
+    /// Through Streamline's proxy these are the native swap chain's, so they
+    /// include presents frame generation made, unlike the SDK's own count.
+    pub(crate) fn present_counts(&self) -> Option<(u32, Option<(u32, u32)>)> {
+        let presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let p = presenter.as_ref()?;
+        // SAFETY: plain queries on our live swap chain.
+        unsafe {
+            let last = p.swap_chain.GetLastPresentCount().ok()?;
+            let mut stats = DXGI_FRAME_STATISTICS::default();
+            let frame = p.swap_chain.GetFrameStatistics(&mut stats).ok().map(|()| (stats.PresentCount, stats.PresentRefreshCount));
+            Some((last, frame))
+        }
+    }
+
+    /// Whether the window we present to is the foreground window. DLSS
+    /// Frame Generation makes no frames while it is not ("DLSS-G disabled:
+    /// window not focused" in Streamline's log), with status 0.
+    pub(crate) fn present_window_focused(&self) -> Option<bool> {
+        let presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let hwnd = presenter.as_ref()?.hwnd;
+        // SAFETY: a plain query.
+        Some(unsafe { GetForegroundWindow() } == hwnd)
+    }
+
+    /// The foreground window's process id and class, and ours, for the FG
+    /// probe's report of where focus went.
+    pub(crate) fn foreground_owner(&self) -> String {
+        let ours = self.presenter.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.hwnd);
+        // SAFETY: plain queries; the buffer outlives the call.
+        unsafe {
+            let front = GetForegroundWindow();
+            let mut pid = 0;
+            GetWindowThreadProcessId(front, Some(&mut pid));
+            let mut class = [0u16; 128];
+            let n = GetClassNameW(front, &mut class).max(0) as usize;
+            format!(
+                "foreground={front:?} pid={pid} class={} ours={ours:?} our_pid={}",
+                String::from_utf16_lossy(&class[..n]),
+                std::process::id()
+            )
+        }
+    }
+
+    /// Brings the window we present to to the foreground (`victory
+    /// upscaler-check --validate-framegen` only). Windows grants this only
+    /// to a process allowed the foreground (started from the foreground
+    /// window, or after the user's input); otherwise the taskbar button
+    /// flashes and the user clicks the window. Says whether it is in front.
+    pub(crate) fn focus_present_window(&self) -> Option<bool> {
+        let hwnd = self.presenter.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.hwnd;
+        // SAFETY: plain calls on our own live window.
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(hwnd);
+            Some(GetForegroundWindow() == hwnd)
+        }
     }
 
     fn presenter(

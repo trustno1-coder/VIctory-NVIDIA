@@ -272,6 +272,10 @@ Before it, once: `victory upscaler-check --present` (below, line 1).
    0x887a0005. With `VICTORY_STREAMLINE_LOG=<folder>` Streamline's own log has
    the plugin's last words.
 
+For initialized synthetic inputs, output readback, nonzero failure exits and
+bounded warm-up/timing measurements, see [the deterministic SR check](upscaler-validation.md)
+(`victory upscaler-check --validate`). The existing `--device` check remains a smoke test.
+
 ## Limits
 
 - Motion vectors: blocks of wrong motion inside character silhouettes (likely
