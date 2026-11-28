@@ -806,6 +806,19 @@ fn mod_dlls(here: &Path) -> Vec<String> {
     NAMES.iter().filter(|n| here.join(n).is_file()).map(|n| (*n).to_owned()).collect()
 }
 
+/// `canonicalize` returns `\\?\UNC\srv\share` for network paths: stripping only
+/// `\\?\` would leave the invalid `UNC\srv\share`.
+fn plain_path(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else { return path };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path
+    }
+}
+
 /// How long the first start of a new victory.exe plays before it restarts,
 /// counted from the first frame of the game's world (100 draws or more).
 const WARMUP_SECONDS: u32 = 10;
@@ -841,9 +854,7 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         })?,
     };
     anyhow::ensure!(exe.is_file(), "no {}", exe.display());
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    // (Windows' own long form `\\?\C:\...` back to the plain one.)
-    let exe = PathBuf::from(exe.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
+    let exe = plain_path(std::fs::canonicalize(&exe).unwrap_or(exe));
 
     check_shader_model()?;
 
@@ -994,6 +1005,13 @@ mod tests {
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    #[test]
+    fn verbatim_paths_keep_the_network_share() {
+        assert_eq!(plain_path(PathBuf::from(r"\\?\UNC\srv\share\game.exe")), PathBuf::from(r"\\srv\share\game.exe"));
+        assert_eq!(plain_path(PathBuf::from(r"\\?\C:\Games\game.exe")), PathBuf::from(r"C:\Games\game.exe"));
+        assert_eq!(plain_path(PathBuf::from(r"\\srv\share\game.exe")), PathBuf::from(r"\\srv\share\game.exe"));
     }
 
     #[test]
