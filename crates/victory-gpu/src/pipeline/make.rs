@@ -708,8 +708,10 @@ mod tests {
         assert!(named(&of("compute", resolve), b"CS_RaytracingResolve"));
         let activate = b"..\0CS_ScreenProbes_ActivateRays_0_Wrapped\0..";
         assert!(named(&of("compute", activate), b"CS_ScreenProbes_ActivateRays"));
-        // Only compute programs.
-        assert!(!named(&of("pixel", skin), RAY_SKINNING));
+        // Only compute programs. Bytes of their own: `shader` keeps one
+        // container per content, with the stage it was first given.
+        let pixel = b"..\0CSComputeSkinningRigidVelocity_ps_0_Wrapped\0..";
+        assert!(!named(&of("pixel", pixel), RAY_SKINNING));
     }
 
     #[test]
