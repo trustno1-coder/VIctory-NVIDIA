@@ -605,6 +605,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            note_live(&wide, &pso);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -626,26 +627,72 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
+    note_live(&wide, &pso);
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
+    match library.saving.try_read() {
+        Ok(_stores) => store(library, &wide, &pso),
+        // A save is writing the library out: stored after it ([`store_later`]).
+        Err(std::sync::TryLockError::WouldBlock) if store_later() => {
+            LATER.lock().unwrap_or_else(|e| e.into_inner()).push((wide, Later(pso.clone())));
+        }
+        Err(_) => {
+            let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+            store(library, &wide, &pso);
+        }
     }
     Ok(pso)
+}
+
+/// Stores `pso` as `name`; the caller holds `library.saving` for reading.
+fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) {
+    let _call = call("store", &name.to_string());
+    // SAFETY: a live pipeline; a name already stored (a description that
+    // differs) is refused, which leaves the library as it was.
+    if unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
+        library.added.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether a pipeline made while a save writes the library out is stored
+/// after the save, and handed to the draws that wait for it at once (on by
+/// default; `VICTORY_LIBRARY_STORE_LATER=0`: its worker waits for the save,
+/// as before). A save of a library of 4.78 GB (an RTX run of 2026-11-28)
+/// takes seconds, and every pipeline made meanwhile, one a frame waits for
+/// among them, waited for it before it was used.
+fn store_later() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_STORE_LATER").is_none_or(|v| v != "0"))
+}
+
+/// A pipeline made during a save, for [`LATER`].
+struct Later(ID3D12PipelineState);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Later {}
+
+/// Pipelines made while a save wrote the library out, stored after it.
+static LATER: Mutex<Vec<(HSTRING, Later)>> = Mutex::new(Vec::new());
+
+/// Stores the pipelines made during a save ([`LATER`]).
+fn store_waiting(library: &Library) {
+    let waiting = std::mem::take(&mut *LATER.lock().unwrap_or_else(|e| e.into_inner()));
+    if waiting.is_empty() {
+        return;
+    }
+    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    for (name, Later(pso)) in &waiting {
+        store(library, name, pso);
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        let every = save_every(SAVED.load(Ordering::Relaxed).max(BLOB.load(Ordering::Relaxed)));
+        if !now && last.is_some_and(|t| t.elapsed() < every) {
             return;
         }
         *last = Some(std::time::Instant::now());
@@ -654,6 +701,8 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+    // Those made during the last save go into this one.
+    store_waiting(library);
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
@@ -663,7 +712,9 @@ pub(crate) fn save(now: bool) {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
-        let added = library.added.load(Ordering::Relaxed);
+        // (Once the library was rebuilt at the end of the run, what is
+        // stored later is not written over it: [`compact`].)
+        let added = if COMPACTED.load(Ordering::Relaxed) { 0 } else { library.added.load(Ordering::Relaxed) };
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
             return;
         }
@@ -686,6 +737,7 @@ pub(crate) fn save(now: bool) {
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
+    store_waiting(library);
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -716,6 +768,161 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+}
+
+/// The pipelines this run loaded from the library or stored in it, by
+/// name ([`compact`] keeps those).
+static LIVE: Mutex<Vec<(HSTRING, Later)>> = Mutex::new(Vec::new());
+/// The library was rebuilt at the end of the run ([`compact`]).
+static COMPACTED: AtomicBool = AtomicBool::new(false);
+
+fn note_live(name: &HSTRING, pso: &ID3D12PipelineState) {
+    if keep_bytes() != 0 {
+        LIVE.lock().unwrap_or_else(|e| e.into_inner()).push((name.clone(), Later(pso.clone())));
+    }
+}
+
+/// The library is rebuilt at the end of a title's run once it is larger
+/// than this (`VICTORY_LIBRARY_KEEP_MB`, 1024; 0: never, it grows as
+/// before). The host's library has no way to take a pipeline out, and
+/// every change of a translation stores its pipelines under new names
+/// beside the old ones: the library of an RTX run of 2026-11-28 held
+/// 80,703 pipelines in 4.78 GB, of which the run loaded 986.
+fn keep_bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_LIBRARY_KEEP_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
+    })
+}
+
+/// A run that used fewer pipelines than this (one that ended at the menu)
+/// leaves the library as it is: rebuilt from those, it would lose the
+/// world's. That RTX run used about 2,700.
+const COMPACT_LEAST: usize = 1000;
+
+/// Whether a library of `bytes`, at the end of a run that used `used`
+/// pipelines, is rebuilt from those alone.
+fn compacts(bytes: u64, used: usize, keep: u64) -> bool {
+    keep != 0 && bytes > keep && used >= COMPACT_LEAST
+}
+
+/// What [`rebuild`] put in the new library: pipelines kept, names that
+/// came again (a pipeline the title made twice is loaded twice), and
+/// pipelines the new library refused.
+#[derive(Debug, Default, PartialEq)]
+struct Rebuilt {
+    kept: usize,
+    again: usize,
+    refused: usize,
+}
+
+/// A new library holding `live` alone (each name once), and what it holds.
+fn rebuild(
+    device: &ID3D12Device1,
+    live: &[(HSTRING, Later)],
+) -> windows::core::Result<(ID3D12PipelineLibrary1, Rebuilt)> {
+    // SAFETY: an empty library reads no bytes.
+    let fresh: ID3D12PipelineLibrary1 = unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(&[])?.cast()? };
+    let mut seen = HashSet::new();
+    let mut rebuilt = Rebuilt::default();
+    for (name, Later(pso)) in live {
+        if !seen.insert(name.to_string()) {
+            rebuilt.again += 1;
+            continue;
+        }
+        // SAFETY: a live pipeline; a name stored twice is refused.
+        if unsafe { fresh.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
+            rebuilt.kept += 1;
+        } else {
+            rebuilt.refused += 1;
+        }
+    }
+    Ok((fresh, rebuilt))
+}
+
+/// At the end of a title's run: a library grown past [`keep_bytes`] is
+/// written anew with the pipelines this run used alone, in place of the
+/// whole. The early list still names the title's other pipelines, so the
+/// next run starts them at their creation, as before; those no longer in
+/// the library are compiled then, which the driver's own cache on disk
+/// makes quick where it holds them (`victory warm` fills it).
+fn compact() {
+    let (Some(dir), Some(library), Some(host)) = (DIR.get(), library(), crate::host::host()) else {
+        return;
+    };
+    let Ok(device) = host.device.cast::<ID3D12Device1>() else { return };
+    let live = std::mem::take(&mut *LIVE.lock().unwrap_or_else(|e| e.into_inner()));
+    let _all = one_call();
+    let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: a plain query.
+    let before = unsafe { library.library.GetSerializedSize() } as u64;
+    if !compacts(before, live.len(), keep_bytes()) {
+        if keep_bytes() != 0 && before > keep_bytes() {
+            tracing::info!(
+                bytes = before,
+                used = live.len(),
+                "host pipeline library not rebuilt: this run used too few pipelines"
+            );
+        }
+        return;
+    }
+    let _call = call("rebuild", "the whole library");
+    let written = rebuild(&device, &live).map_err(|e| std::io::Error::other(e.to_string())).and_then(|(fresh, rebuilt)| {
+        // SAFETY: a plain query.
+        let size = unsafe { fresh.GetSerializedSize() };
+        let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+        if let Err(e) = serialise(&fresh, &tmp, size) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        replace_library(dir, &tmp)?;
+        Ok((rebuilt, size))
+    });
+    match written {
+        Ok((Rebuilt { kept, again, refused }, size)) => {
+            COMPACTED.store(true, Ordering::Relaxed);
+            library.added.store(0, Ordering::Relaxed);
+            SAVED.store(size as u64, Ordering::Relaxed);
+            tracing::info!(
+                before,
+                after = size,
+                kept,
+                again,
+                refused,
+                "host pipeline library rebuilt with the pipelines this run used (VICTORY_LIBRARY_KEEP_MB=0: never)"
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "host pipeline library not rebuilt; saved whole"),
+    }
+}
+
+/// At the end of a title's run: [`compact`], then [`save`] what is left.
+/// (Not for the tools that fill the library, `victory preload`: their few
+/// pipelines would take the place of the whole.)
+pub(crate) fn finish() {
+    compact();
+    save(true);
+}
+
+/// How long a save waits after the last one while a run goes on, for a
+/// library of `bytes`: 20 s up to 256 MB, and as much longer as it is
+/// larger (6 min at 4.78 GB), so that saves write at most about 13 MB a
+/// second on average. A save writes the whole library again, however few
+/// pipelines were added: at 4.78 GB (an RTX run of 2026-11-28) that was
+/// 4.78 GB of the file cache dirtied every 20 s while new pipelines came
+/// in, beside the title's own streaming. The save at the end of a run is
+/// not held back. `VICTORY_LIBRARY_SAVE_S=<seconds>`: that long whatever the size
+/// (20: as before).
+fn save_every(bytes: u64) -> std::time::Duration {
+    static ASKED: OnceLock<Option<u64>> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| std::env::var("VICTORY_LIBRARY_SAVE_S").ok().and_then(|v| v.trim().parse().ok()));
+    save_every_for(bytes, asked)
+}
+
+fn save_every_for(bytes: u64, asked: Option<u64>) -> std::time::Duration {
+    const BASE_S: u64 = 20;
+    const BASE_BYTES: u64 = 256 << 20;
+    std::time::Duration::from_secs(asked.unwrap_or_else(|| (BASE_S * bytes / BASE_BYTES).max(BASE_S)))
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
@@ -851,6 +1058,65 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_large_libraries_of_runs_that_reached_the_world_are_rebuilt() {
+        let gb = 1u64 << 30;
+        assert!(compacts(5 * gb, 2700, gb));
+        assert!(!compacts(gb / 2, 2700, gb), "small enough");
+        assert!(!compacts(5 * gb, 200, gb), "a run that ended at the menu");
+        assert!(!compacts(5 * gb, 2700, 0), "switched off");
+    }
+
+    /// A rebuilt library holds what it was given, each name once, and
+    /// opens again from its bytes.
+    #[test]
+    fn a_rebuilt_library_holds_the_pipelines_it_was_given() {
+        const CS: &str = "#define R \"RootFlags(0)\"\n[RootSignature(R)] [numthreads(1, 1, 1)] void main() {}";
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        let code = crate::host::compile(CS, windows::core::s!("main"), windows::core::s!("cs_5_1")).unwrap();
+        // SAFETY: plain object creation; the code lives through the calls,
+        // the root signature is inside it.
+        let pso: ID3D12PipelineState = unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).unwrap();
+            device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let name = HSTRING::from("rebuilt");
+        let live = vec![(name.clone(), Later(pso.clone())), (name.clone(), Later(pso.clone()))];
+        let (fresh, rebuilt) = rebuild(&device, &live).expect("rebuilt");
+        assert_eq!(rebuilt, Rebuilt { kept: 1, again: 1, refused: 0 });
+        // SAFETY: a live pipeline; the name is there already, so refused.
+        assert!(unsafe { fresh.StorePipeline(PCWSTR(name.as_ptr()), &pso) }.is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("rebuilt.bin");
+        // SAFETY: a plain query.
+        let size = unsafe { fresh.GetSerializedSize() };
+        serialise(&fresh, &tmp, size).unwrap();
+        let reopened = open(&device, Blob::Held(std::fs::read(&tmp).unwrap())).expect("a library");
+        assert!(!matches!(reopened._blob, Blob::None), "the rebuilt library was refused");
+    }
+
+    #[test]
+    fn saves_of_large_libraries_wait_longer() {
+        let s = |bytes, asked| save_every_for(bytes, asked).as_secs();
+        assert_eq!(s(0, None), 20);
+        assert_eq!(s(256 << 20, None), 20);
+        assert_eq!(s(1 << 30, None), 80);
+        assert_eq!(s(4_781_301_298, None), 356);
+        assert_eq!(s(4_781_301_298, Some(20)), 20);
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
