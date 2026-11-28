@@ -1964,18 +1964,33 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// sets the most). 2^18 ran out in the title's bigger places (session
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
+/// Default [`DYNAMIC`] budget on a host heap capped at [`PORTABLE_VIEWS`]
+/// (1,000,000 descriptors, typical on NVIDIA), leaving 541,247 1:1 title slots
+/// when `VICTORY_DYNAMIC_SLOTS` is unset. With 2^18 (262,144), high-draw
+/// outdoor scenes exhausted dynamic tables (13-22% refused) and dropped draws;
+/// 458,752 (`7 << 16`) eliminates those refusals while keeping `VICTORY_DYNAMIC_SLOTS`
+/// overridable and clamped cleanly to `[DYNAMIC, null / 2]`.
+const DYNAMIC_CAPPED: u32 = 7 << 16;
+
+fn parse_dynamic_slots(count: u32, null: u32, asked: Option<u32>) -> u32 {
+    if null < PORTABLE_VIEWS {
+        return match asked {
+            Some(asked) => asked.clamp(DYNAMIC, (null / 2).max(DYNAMIC)),
+            None => DYNAMIC_CAPPED,
+        };
+    }
+    let most = asked.unwrap_or(DYNAMIC << 2);
+    null.saturating_sub(count).min(most).max(DYNAMIC)
+}
+
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
     });
-    if null < PORTABLE_VIEWS {
-        return DYNAMIC;
-    }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    parse_dynamic_slots(count, null, asked)
 }
 
 impl HostHeap {
@@ -7103,5 +7118,20 @@ mod bake_flip_tests {
         assert_eq!(cb1(), None);
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
+}
+
+#[cfg(test)]
+mod dynamic_slots_tests {
+    use super::{DYNAMIC, DYNAMIC_CAPPED, PORTABLE_VIEWS, parse_dynamic_slots};
+
+    #[test]
+    fn dynamic_slots_on_capped_1m_heap() {
+        let null = PORTABLE_VIEWS - 1;
+        assert_eq!(parse_dynamic_slots(1_245_184, null, None), DYNAMIC_CAPPED);
+        assert_eq!(parse_dynamic_slots(1_245_184, null, Some(300_000)), 300_000);
+        assert_eq!(parse_dynamic_slots(1_245_184, null, Some(900_000)), null / 2);
+        assert_eq!(parse_dynamic_slots(1_245_184, null, Some(1024)), DYNAMIC);
+        assert_eq!(parse_dynamic_slots(1_245_184, 1 << 21, None), (1u32 << 21) - 1_245_184);
     }
 }
