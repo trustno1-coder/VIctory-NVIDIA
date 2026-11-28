@@ -84,6 +84,11 @@ const DETACH_DEADLINE: Duration = Duration::from_secs(5);
 /// `DLL_PROCESS_DETACH`, DLLs in reverse initialisation order, then the
 /// exe's TLS callbacks; then the CRT ends the process.
 extern "C" fn detach_all() {
+    // The first call (the CRT's exit or the HLE's ExitProcess) does the
+    // work; a later one must not end threads or detach images twice.
+    if EXITING.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let attached: Vec<_> = images()
         .iter_mut()
         .filter(|m| m.attached)
@@ -98,7 +103,6 @@ extern "C" fn detach_all() {
         images = dlls.len() + exes.len(),
         "process exit: ending other threads, detaching title images"
     );
-    EXITING.store(true, Ordering::SeqCst);
     // As on Windows, a lock a thread held when it ended stays taken; detach
     // code that waits for one would hang the exit. The watchdog runs before
     // the other threads end: a thread that ends can hold the heap lock or
@@ -139,6 +143,16 @@ extern "C" fn detach_all() {
             )
         };
     }
+}
+
+/// Sends the process-detach notices detach_all sends, from an exit path that
+/// does not run the CRT's atexit functions (the HLE's ExitProcess): title
+/// images are mapped from prepared copies with no entry point and no TLS
+/// callbacks, so the OS loader tells them nothing, and this is the only path
+/// that can. The first call (from here or the CRT) does the work; later ones
+/// return.
+pub fn exit_notices() {
+    detach_all();
 }
 
 /// Ends this process when the title images do not detach in time. It does
