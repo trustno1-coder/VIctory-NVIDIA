@@ -458,6 +458,10 @@ impl Menu {
     }
 
     fn lines(&self) -> Vec<String> {
+        self.lines_with_streamline(std::env::var_os("VICTORY_STREAMLINE_DIR").is_some())
+    }
+
+    fn lines_with_streamline(&self, streamline_configured: bool) -> Vec<String> {
         if self.picking {
             return self.pick_lines();
         }
@@ -494,7 +498,7 @@ impl Menu {
             ABOUT_MFG
         } else if ITEMS.get(self.at).is_some_and(|i| i.var == DLSS)
             && !matches!(self.values[self.at].as_str(), "" | "off")
-            && std::env::var_os("VICTORY_STREAMLINE_DIR").is_none()
+            && !streamline_configured
         {
             ABOUT_NO_DLSS
         } else {
@@ -998,15 +1002,22 @@ mod tests {
         for line in ABOUT_NO_DLSS {
             assert!(line.len() <= COLUMNS as usize && line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
         }
-        // DLSS picked on where NVIDIA's files are missing (no VICTORY_STREAMLINE_DIR in tests): said so.
+        // DLSS download instructions must not depend on the test process environment.
         let dlss = ITEMS.iter().position(|i| i.var == DLSS).expect("in the menu");
         menu.at = dlss;
         menu.values[dlss] = "quality".to_owned();
-        let lines = menu.lines();
+
+        let lines = menu.lines_with_streamline(false);
         assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_NO_DLSS);
-        menu.values[dlss] = "off".to_owned();
-        let lines = menu.lines();
+
+        let lines = menu.lines_with_streamline(true);
         assert!(lines[lines.len() - 5..lines.len() - 2].iter().all(String::is_empty));
+
+        menu.values[dlss] = "off".to_owned();
+        for configured in [false, true] {
+            let lines = menu.lines_with_streamline(configured);
+            assert!(lines[lines.len() - 5..lines.len() - 2].iter().all(String::is_empty));
+        }
         assert_eq!(ITEMS.iter().filter(|i| i.var == MFG).count(), 1);
     }
 
