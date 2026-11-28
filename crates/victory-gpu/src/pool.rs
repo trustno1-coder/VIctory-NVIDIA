@@ -1278,6 +1278,43 @@ mod tests {
         );
     }
 
+    /// Bench (`--ignored --nocapture`): a thread stages pieces of 64 KiB
+    /// while another stages pieces of 8 MiB and keeps them, so that new
+    /// staging blocks are made, as `VICTORY_BLOCKS_UNLOCKED` says (run once
+    /// with `=0`, once without).
+    #[test]
+    #[ignore]
+    fn bench_staging_while_another_thread_makes_blocks() {
+        let Some(host) = crate::host::host() else { return };
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut ms = Vec::new();
+        let mut keep = Vec::new();
+        keep.extend(staging(host, 64 << 10));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut held = std::collections::VecDeque::new();
+                while !stop.load(Ordering::Relaxed) {
+                    held.extend(staging(host, 8 << 20));
+                    if held.len() > 64 {
+                        held.pop_front();
+                    }
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            for _ in 0..1000 {
+                let began = std::time::Instant::now();
+                keep.extend(staging(host, 64 << 10));
+                ms.push(began.elapsed().as_secs_f64() * 1e3);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        eprintln!(
+            "staging of 64 KiB while another thread makes staging blocks (made with the lock let go: {}): {}",
+            blocks_unlocked(),
+            spread(ms)
+        );
+    }
+
     /// Threads that place textures at once, some of them making new blocks
     /// (outside the pool's lock, [`blocks_unlocked`]), get every texture,
     /// each in a piece of its own.
