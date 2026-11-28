@@ -942,6 +942,393 @@ fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
     eprintln!("ran on the hardware device: both console waves' loops, as the console runs them");
 }
 
+/// Runs `shader` (one 64-thread group, one raw UAV of `out_dwords` dwords, root constant `s0`)
+/// on both the hardware SM 6.6 device (when waves are 32) and WARP, returning `(label, words)`.
+fn run_group64_on_hosts(shader: &HostShader, s0: u32, out_dwords: u32) -> Vec<(&'static str, Vec<u32>)> {
+    let mut ran = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("{label} device rejected compute pipeline (WaveSize(32)?): {e}; skipped");
+                continue;
+            }
+        };
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = s0;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(out_dwords)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        ran.push((label, out[0][..out_dwords as usize].to_vec()));
+    }
+    assert!(!ran.is_empty(), "neither hardware nor WARP SM 6.6 device available");
+    ran
+}
+
+/// One 64-thread console wave on a 32-lane host: half-wave 0 (lanes 0..31) runs 2 rounds of a
+/// per-lane loop while half-wave 1 (lanes 32..63) runs 4 rounds, writing each lane's LDS dword
+/// and reading partner `t ^ 63` in the other half without a barrier. Tested for both a 1-block
+/// loop (`head == latch`) and a 2-block loop (`head -> latch`, write in `head`, read in `latch`,
+/// where treating `latch` as all-lane previously inserted deadlocking group barriers inside the
+/// divergent loop). Un-widened lowering must keep `wave == 64` and name `latch`; widened lowering
+/// must emit `wave == 32`, validate, and match the console on hardware and WARP.
+#[test]
+fn one_console_wave_divergent_loop_lds_widens_for_one_and_two_block_loops() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    for two_blocks in [false, true] {
+        let mut words = vec![
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0x3A06_00BF, // v_xor_b32 v3, 63, v0
+            0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+            0x4A04_0000, // v_add_nc_u32 v2, s0, v0
+            0x2C0E_0085, // v_lshrrev_b32 v7, 5, v0: 0 (lanes 0..31), 1 (lanes 32..63)
+            0x340E_0E81, // v_lshlrev_b32 v7, 1, v7: 0 or 2
+            0x4A0E_0E82, // v_add_nc_u32 v7, 2, v7: 2 rounds vs 4 rounds
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        ];
+        let head_word = words.len();
+        words.extend_from_slice(&[
+            0xD834_0000,
+            0x0000_0201, // ds_write_b32 v1, v2
+        ]);
+        if two_blocks {
+            words.extend_from_slice(&[
+                0xBF82_0001, // s_branch +1 (splits head -> latch)
+                0xBF80_0000, // s_nop 0
+            ]);
+        }
+        words.extend_from_slice(&[
+            0xD8D8_0000,
+            0x0400_0003, // ds_read_b32 v4, v3
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A04_0902, // v_add_nc_u32 v2, v2, v4
+            0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+            0x7DA8_0B07, // v_cmpx_gt_u32 exec, v7, v5
+        ]);
+        let back_off = -((words.len() + 1 - head_word) as i16) as u16 as u32;
+        words.push(0xBF89_0000 | back_off); // s_cbranch_execnz head_word
+        words.extend_from_slice(&[
+            0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+            0xE070_1000,
+            0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+        ]);
+        let mut native = native_of(&words, true, 64);
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+        }
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let write_blk = (0..p.blocks.len())
+            .find(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "ds_write_b32"))
+            .expect("write block");
+        let latch = (0..p.blocks.len())
+            .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execnz"))
+            .expect("latch block");
+        assert_eq!(write_blk != latch, two_blocks);
+
+        lower::take_needs();
+        let (wave, _) = lowered_with_wave(&native, &p, &HashSet::new());
+        assert_eq!(wave, Some(64), "two_blocks={two_blocks}: un-widened loop must not split at wave32");
+        let needs = lower::take_needs();
+        let st = structure::structure(&p).expect("structure");
+        assert_eq!(lower::branches_around(&st, &needs), Some(vec![latch]));
+
+        let wide = HashSet::from([latch]);
+        let (wave, shader) = lowered_with_wave(&native, &p, &wide);
+        assert_eq!(wave, Some(32));
+        assert!(lower::take_needs().is_empty());
+        if let Some(v) = &mut validator {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+
+        let console = |s0: u32| {
+            let mut sum: Vec<u32> = (0..64u32).map(|t| s0.wrapping_add(t)).collect();
+            let mut lds = [0u32; 64];
+            for round in 0..4u32 {
+                let on: Vec<usize> = (0..64usize)
+                    .filter(|&t| round < if t < 32 { 2 } else { 4 })
+                    .collect();
+                for &t in &on {
+                    lds[t] = sum[t];
+                }
+                for &t in &on {
+                    sum[t] = sum[t].wrapping_add(lds[t ^ 63]);
+                }
+            }
+            sum
+        };
+        for s0 in [0u32, 37, 0xFFFF_FE00] {
+            let want = console(s0);
+            for (label, got) in run_group64_on_hosts(&shader, s0, 64) {
+                assert_eq!(got, want, "{label}, two_blocks={two_blocks}, s0={s0:#x}");
+                if s0 == 0 {
+                    eprintln!("ran divergent LDS loop (two_blocks={two_blocks}) on {label}");
+                }
+            }
+        }
+    }
+}
+
+/// One 64-thread console wave on a 32-lane host: half-wave 0 (lanes 0..31) runs 2 rounds while
+/// half-wave 1 (lanes 32..63) runs 4 rounds of a loop containing cross-half wave reduction
+/// (`WAVE_OR_V7_TO_S7`), cross-half `v_readfirstlane_b32`, or cross-half 64-bit wave ballot
+/// (`s_bcnt1_i32_b64 exec`), in both 1-block (`head == latch`) and 2-block (`head -> latch`)
+/// forms. Un-widened lowering must refuse and name `latch`; widened lowering must validate and
+/// produce exact 64-lane results on hardware (including rounds 2..3 where only half 1 is active).
+#[test]
+fn one_console_wave_divergent_loop_wave_ops_widen_for_one_and_two_block_loops() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    for two_blocks in [false, true] {
+        for kind in ["reduction", "firstlane", "ballot"] {
+            let mut words = vec![
+                0x3406_0082, // v_lshlrev_b32 v3, 2, v0: byte offset 4 * t
+                0x7E08_0280, // v_mov_b32 v4, 0: accumulator
+                0x7E0A_0280, // v_mov_b32 v5, 0: round counter
+                0x2C0C_0085, // v_lshrrev_b32 v6, 5, v0: 0 or 1
+                0x340C_0C81, // v_lshlrev_b32 v6, 1, v6: 0 or 2
+                0x4A0C_0C82, // v_add_nc_u32 v6, 2, v6: 2 rounds (half 0) vs 4 rounds (half 1)
+                0x7E10_0281, // v_mov_b32 v8, 1
+            ];
+            if kind == "firstlane" {
+                // Make the shader cross 32-lane halves so `v_readfirstlane_b32` exchanges halves.
+                words.extend_from_slice(&[
+                    0xD765_000A,
+                    0x0001_007E, // v_mbcnt_lo_u32_b32 v10, exec_lo, 0
+                ]);
+            }
+            words.push(0xBE8E_047E); // s_mov_b64 s[14:15], exec
+            let head_word = words.len();
+            words.extend_from_slice(&[
+                0x2C0E_0081, // v_lshrrev_b32 v7, 1, v0
+                0x340E_1107, // v_lshlrev_b32 v7, v7, v8: 1 << (t >> 1)
+            ]);
+            if two_blocks {
+                words.extend_from_slice(&[
+                    0xBF82_0001, // s_branch +1 (splits head -> latch)
+                    0xBF80_0000, // s_nop 0
+                ]);
+            }
+            words.push(0x3408_0881); // v_lshlrev_b32 v4, 1, v4
+            match kind {
+                "reduction" => {
+                    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+                    words.push(0x3A08_0807); // v_xor_b32 v4, s7, v4
+                }
+                "firstlane" => {
+                    words.extend_from_slice(&[
+                        0x4A12_00FF,
+                        100,         // v_add_nc_u32 v9, 100, v0
+                        0x7E0C_0509, // v_readfirstlane_b32 s6, v9
+                        0x4A08_0806, // v_add_nc_u32 v4, s6, v4
+                    ]);
+                }
+                "ballot" => {
+                    words.extend_from_slice(&[
+                        0xBE87_107E, // s_bcnt1_i32_b64 s7, exec
+                        0x4A08_0807, // v_add_nc_u32 v4, s7, v4
+                    ]);
+                }
+                _ => unreachable!(),
+            }
+            words.extend_from_slice(&[
+                0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+                0x7DA8_0B06, // v_cmpx_gt_u32 exec, v6, v5
+            ]);
+            let back_off = -((words.len() + 1 - head_word) as i16) as u16 as u32;
+            words.push(0xBF89_0000 | back_off); // s_cbranch_execnz head_word
+            words.extend_from_slice(&[
+                0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+                0xE070_1000,
+                0x8002_0403, // buffer_store_dword v4, v3, s[8:11], 0 offen
+            ]);
+            let native = native_of(&words, true, 64);
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+            let latch = (0..p.blocks.len())
+                .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execnz"))
+                .expect("latch block");
+
+            lower::take_needs();
+            let per_lane = lowered(&native, &p, &HashSet::new());
+            let want_err = match kind {
+                "reduction" => "a wave reduction where not every lane runs",
+                "firstlane" => "a first-lane read where not every lane runs",
+                "ballot" => lower::DIVERGENT_MASK_EXCHANGE,
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(&per_lane, Err(ShaderError::Unsupported { what, .. }) if *what == want_err),
+                "two_blocks={two_blocks}, kind={kind}: {:?}",
+                per_lane.err()
+            );
+            let needs = lower::take_needs();
+            let st = structure::structure(&p).expect("structure");
+            assert_eq!(lower::branches_around(&st, &needs), Some(vec![latch]));
+
+            let shader = lowered(&native, &p, &HashSet::from([latch])).expect("widened lower");
+            if let Some(v) = &mut validator {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+
+            let mut want = vec![0u32; 64];
+            for round in 0..4u32 {
+                let first_lane = if round < 2 { 100u32 } else { 132u32 };
+                let wave_or = if round < 2 { u32::MAX } else { 0xFFFF_0000 };
+                let active = if round < 2 { 64u32 } else { 32u32 };
+                for (t, acc) in want.iter_mut().enumerate() {
+                    if round < if t < 32 { 2 } else { 4 } {
+                        *acc = match kind {
+                            "reduction" => acc.wrapping_shl(1) ^ wave_or,
+                            "firstlane" => acc.wrapping_shl(1).wrapping_add(first_lane),
+                            "ballot" => acc.wrapping_shl(1).wrapping_add(active),
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+            }
+            for (label, got) in run_group64_on_hosts(&shader, 0, 64) {
+                assert_eq!(got, want, "{label}, two_blocks={two_blocks}, kind={kind}");
+                eprintln!(
+                    "ran divergent wave-op loop (two_blocks={two_blocks}, kind={kind}) on {label}"
+                );
+            }
+        }
+    }
+}
+
+/// `CS_SortRayTiles`-style looped LDS atomics (`ds_add_rtn_u32` and `ds_add_u32`) after an
+/// `s_barrier` in a 64-thread Wave64 shader with divergent iteration counts across halves and
+/// lanes that skip the loop completely (`t >= s0`), for both 1-block and 2-block loops: lowers
+/// directly to `wave == 32` without widening, emits fence-only `dx.op.barrier` (`mode == 8`)
+/// inside the loop, validates, and produces exact reservations and totals on hardware and WARP.
+#[test]
+fn cs_sort_ray_tiles_divergent_loop_atomics_stay_wave32_with_fence_only() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    for two_blocks in [false, true] {
+        let mut words = vec![
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0x7E04_0280, // v_mov_b32 v2, 0: bin 0 byte offset
+            0x7E14_0284, // v_mov_b32 v10, 4: bin 1 byte offset
+            0x7E12_02C1, // v_mov_b32 v9, -1: sentinel for lanes that skip the loop
+            0xD834_0000,
+            0x0000_0201, // ds_write_b32 v1, v2: zero LDS before the barrier
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF8A_0000, // s_barrier
+            0x2C0C_0085, // v_lshrrev_b32 v6, 5, v0: 0 (lanes 0..31) or 1 (lanes 32..63)
+            0x340E_0C81, // v_lshlrev_b32 v7, 1, v6
+            0x4A0C_0F06, // v_add_nc_u32 v6, v6, v7: 0 or 3
+            0x4A0C_0C82, // v_add_nc_u32 v6, 2, v6: 2 rounds (half 0) vs 5 rounds (half 1)
+            0xBE8E_047E, // s_mov_b64 s[14:15], exec
+            0x7DA8_0000, // v_cmpx_gt_u32 exec, s0, v0: lanes below s0 enter the loop
+        ];
+        let skip_branch = words.len();
+        words.push(0); // patched to s_cbranch_execz after_loop
+        words.extend_from_slice(&[
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E10_0281, // v_mov_b32 v8, 1
+        ]);
+        let head_word = words.len();
+        words.extend_from_slice(&[
+            0xD880_0000,
+            0x0900_0802, // ds_add_rtn_u32 v9, v2, v8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ]);
+        if two_blocks {
+            words.extend_from_slice(&[
+                0xBF82_0001, // s_branch +1 (splits head -> latch)
+                0xBF80_0000, // s_nop 0
+            ]);
+        }
+        words.extend_from_slice(&[
+            0xD800_0000,
+            0x0000_080A, // ds_add_u32 v10, v8
+            0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+            0x7DA8_0B06, // v_cmpx_gt_u32 exec, v6, v5
+        ]);
+        let back_off = -((words.len() + 1 - head_word) as i16) as u16 as u32;
+        words.push(0xBF89_0000 | back_off); // s_cbranch_execnz head_word
+        let after_loop = words.len();
+        words[skip_branch] = 0xBF88_0000 | ((after_loop - (skip_branch + 1)) as u16 as u32);
+        words.extend_from_slice(&[
+            0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+            0xBF8A_0000, // s_barrier
+            0xD8D8_0000,
+            0x0300_0002, // ds_read_b32 v3, v2
+            0xD8D8_0000,
+            0x0400_000A, // ds_read_b32 v4, v10
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x3408_0890, // v_lshlrev_b32 v4, 16, v4
+            0x3806_0903, // v_or_b32 v3, v3, v4
+            0xE070_1000,
+            0x8002_0901, // buffer_store_dword v9, v1, s[8:11], 0 offen
+            0xE070_1100,
+            0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen offset:256
+        ]);
+        let mut native = native_of(&words, true, 64);
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+        }
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        lower::take_needs();
+        let (wave, shader) = lowered_with_wave(&native, &p, &HashSet::new());
+        assert_eq!(wave, Some(32), "two_blocks={two_blocks}: looped atomics must stay wave32");
+        assert!(lower::take_needs().is_empty());
+        let modes = super::bitcode::census::barrier_modes(&shader.dxil).expect("barrier modes");
+        assert_eq!(
+            modes.iter().filter(|&&m| m == 8).count(),
+            2,
+            "two_blocks={two_blocks}: both looped atomics must emit fence-only barrier(8), got {modes:?}"
+        );
+        if let Some(v) = &mut validator {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+
+        for s0 in [64u32, 48, 32, 0] {
+            let total: u32 = (0..s0).map(|t| if t < 32 { 2 } else { 5 }).sum();
+            let packed = total | (total << 16);
+            for (label, got) in run_group64_on_hosts(&shader, s0, 128) {
+                for t in 0..64usize {
+                    assert_eq!(got[64 + t], packed, "{label}, two_blocks={two_blocks}, s0={s0}, lane={t}");
+                    if (t as u32) >= s0 {
+                        assert_eq!(got[t], u32::MAX, "{label}, skipped lane {t}");
+                    } else {
+                        assert!(got[t] < total, "{label}, lane {t} ticket {} >= {total}", got[t]);
+                    }
+                }
+                let mut tickets: Vec<u32> = got[..s0 as usize].to_vec();
+                tickets.sort_unstable();
+                tickets.dedup();
+                assert_eq!(tickets.len(), s0 as usize, "{label}, two_blocks={two_blocks}, s0={s0}: duplicate tickets");
+                if s0 == 64 {
+                    eprintln!("ran CS_SortRayTiles-style atomic loop (two_blocks={two_blocks}) on {label}");
+                }
+            }
+        }
+    }
+}
+
 /// Which LDS accesses need the host waves of their console wave to meet
 /// ([`lower::LdsOrder`]): before a barrier a lane writes its dword and reads it back (the
 /// order counts); after it the lanes read and add with atomics only (it does not: a read

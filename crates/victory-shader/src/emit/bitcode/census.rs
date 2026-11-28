@@ -49,6 +49,9 @@ thread_local! {
     /// a hash of each one's bitcode, with its counts (a program may be
     /// emitted in several forms before one is kept).
     static WRITTEN: RefCell<Vec<(usize, u64, Census)>> = const { RefCell::new(Vec::new()) };
+    /// Under tests, the live `dx.op.barrier` modes of each module written on this thread.
+    #[cfg(test)]
+    static BARRIERS: RefCell<Vec<(usize, u64, Vec<u32>)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn fnv(bytes: &[u8]) -> u64 {
@@ -78,11 +81,33 @@ pub fn take(dxil: &[u8]) -> Option<Census> {
 /// Counts `m`, whose written form is `bitcode`, and keeps the result for
 /// [`take`].
 pub(crate) fn note(m: &Module, bitcode: &[u8]) {
+    #[cfg(test)]
+    BARRIERS.with(|l| {
+        let mut b = l.borrow_mut();
+        if b.len() >= 32 {
+            b.drain(..16);
+        }
+        b.push((bitcode.len(), fnv(bitcode), m.barrier_modes()));
+    });
     if !enabled() {
         return;
     }
     let c = m.census();
     WRITTEN.with(|l| l.borrow_mut().push((bitcode.len(), fnv(bitcode), c)));
+}
+
+/// The integer `mode` arguments of every live `dx.op.barrier` call in the module whose
+/// bitcode `dxil` holds, in reachable block order.
+#[cfg(test)]
+pub(crate) fn barrier_modes(dxil: &[u8]) -> Option<Vec<u32>> {
+    let at = dxil.windows(4).position(|w| w == b"BC\xC0\xDE")?;
+    BARRIERS.with(|l| {
+        l.borrow()
+            .iter()
+            .rev()
+            .find(|(len, hash, _)| dxil.get(at..at + *len).is_some_and(|b| fnv(b) == *hash))
+            .map(|w| w.2.clone())
+    })
 }
 
 fn kind(name: &str) -> usize {
@@ -170,5 +195,38 @@ impl Module {
             }
         }
         c
+    }
+
+    #[cfg(test)]
+    fn barrier_modes(&self) -> Vec<u32> {
+        let mut seen = vec![false; self.blocks.len()];
+        let mut stack = vec![0usize];
+        if !self.blocks.is_empty() {
+            seen[0] = true;
+        }
+        while let Some(b) = stack.pop() {
+            for &s in super::successors(self.blocks[b].term).iter() {
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        let mut modes = Vec::new();
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if !seen[b] {
+                continue;
+            }
+            for &i in &blk.body {
+                if let Op::Call(f, args) = &self.insts[i as usize].op
+                    && self.funcs[*f as usize].name == "dx.op.barrier"
+                    && let Some(&V::Const(c)) = args.get(1)
+                    && let super::Const::Int(mode) = self.consts[c as usize].1
+                {
+                    modes.push(mode as u32);
+                }
+            }
+        }
+        modes
     }
 }

@@ -992,7 +992,9 @@ fn emit_program(
             if why {
                 eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
             }
-            lower::take_needs();
+            if w < 64 {
+                lower::take_needs();
+            }
             Ok((shader, Some(w)))
         }
         other => {
