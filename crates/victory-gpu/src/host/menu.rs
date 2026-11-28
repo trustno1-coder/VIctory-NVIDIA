@@ -963,7 +963,10 @@ impl Menu {
         let _ours = crate::replay::record::unrecorded();
         let scale = (height / 540).max(1);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            std::mem::forget(self.buffers.take());
+            // Retired, not dropped at once: the card may still read them.
+            if let Some(old) = self.buffers.take() {
+                crate::host::retire(old);
+            }
             self.buffers = Buffers::new(host, format, scale);
             self.failed = self.buffers.is_none();
             self.changed = true;

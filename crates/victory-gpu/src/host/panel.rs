@@ -389,8 +389,10 @@ impl Panel {
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            // (What the card may still read stays: a picture's size changes once or twice in a run.)
-            std::mem::forget(self.buffers.take());
+            // Retired, not dropped at once: the card may still read them.
+            if let Some(old) = self.buffers.take() {
+                crate::host::retire(old);
+            }
             self.buffers = Buffers::new(host, PANEL, format, scale);
             self.failed = self.buffers.is_none();
             self.changed = true;
@@ -440,8 +442,10 @@ impl Notice {
         }
         let since = *self.since.get_or_insert_with(Instant::now);
         if since.elapsed() > NOTICE_FOR {
-            // (Its buffers stay: the card may still read them.)
-            std::mem::forget(self.buffers.take());
+            // Retired, not dropped at once: the card may still read them.
+            if let Some(old) = self.buffers.take() {
+                crate::host::retire(old);
+            }
             self.done = true;
             return;
         }
@@ -449,7 +453,9 @@ impl Notice {
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            std::mem::forget(self.buffers.take());
+            if let Some(old) = self.buffers.take() {
+                crate::host::retire(old);
+            }
             self.buffers = Buffers::new(host, self.shape, format, scale);
             self.written = false;
             if self.buffers.is_none() {

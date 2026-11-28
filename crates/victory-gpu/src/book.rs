@@ -214,9 +214,10 @@ fn watch(object: &ID3D12Object, id: u64) {
     // object takes its own.
     unsafe {
         let notice = IUnknown::from_raw(notice.cast());
-        if object.SetPrivateDataInterface(&KEY, &notice).is_err() {
-            std::mem::forget(notice);
-        }
+        // If the object will not take it, dropping the notice here removes
+        // the book entry at once instead of leaving it (and the notice)
+        // behind for good.
+        let _ = object.SetPrivateDataInterface(&KEY, &notice);
     }
 }
 
@@ -506,12 +507,28 @@ pub(crate) fn check() {
 /// buffers, naming what is gone, naming what was never there.
 static FOUND: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// How long a slot said of stays remembered, and how many are kept at most:
+/// the check runs for the whole run, so what it remembers must not grow
+/// with every slot and address it has ever seen.
+const SAID_KEPT_MS: u64 = 120_000;
+const SAID_MOST: usize = 65_536;
+
+fn prune_said(said: &mut HashMap<(u32, u64), (u64, u64)>, now: u64) {
+    said.retain(|_, &mut (_, last)| now.saturating_sub(last) <= SAID_KEPT_MS);
+    if said.len() > SAID_MOST {
+        let mut entries: Vec<_> = said.drain().collect();
+        entries.sort_by_key(|(_, (_, last))| *last);
+        let keep_from = entries.len() - SAID_MOST;
+        said.extend(entries.into_iter().skip(keep_from));
+    }
+}
+
 fn walk() {
     use Ordering::Relaxed;
     const CHUNK: u32 = 4096;
     let mut at = 0u32;
-    // Slots said already, by slot and address.
-    let mut said: HashMap<(u32, u64), u64> = HashMap::new();
+    // Slots said already, by slot and address: how often, and when last.
+    let mut said: HashMap<(u32, u64), (u64, u64)> = HashMap::new();
     let mut suspects: Vec<(u32, [u8; 32], u64)> = Vec::new();
     let mut round = std::time::Instant::now();
     let mut never_said = 0;
@@ -555,10 +572,12 @@ fn walk() {
                     Fate::Never => (5, "nothing the book ever had".to_owned()),
                 };
                 FOUND[what].fetch_add(1, Relaxed);
-                let times = said.entry((slot, base)).or_insert(0);
-                *times += 1;
+                let entry = said.entry((slot, base)).or_insert((0, now));
+                entry.0 += 1;
+                entry.1 = now;
+                let times = entry.0;
                 let quota = if what == 4 { &mut gone_said } else { &mut never_said };
-                if *times > 1 || *quota >= if what == 4 { 400 } else { 60 } {
+                if times > 1 || *quota >= if what == 4 { 400 } else { 60 } {
                     continue;
                 }
                 *quota += 1;
@@ -580,6 +599,7 @@ fn walk() {
                 round.elapsed().as_secs_f64(),
                 f[0], f[1], f[2], f[3], f[4], f[5]
             );
+            prune_said(&mut said, crate::host::now_ms());
             round = std::time::Instant::now();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -733,6 +753,19 @@ mod tests {
             }
         }
         FORCED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn said_slots_are_forgotten_when_old_or_too_many() {
+        let mut said = HashMap::from([((1, 10), (1, 0)), ((2, 20), (1, 100_000))]);
+        prune_said(&mut said, 200_000);
+        assert_eq!(said.len(), 1);
+        assert!(said.contains_key(&(2, 20)));
+        let mut many: HashMap<(u32, u64), (u64, u64)> =
+            (0..=SAID_MOST as u32).map(|i| ((i, u64::from(i)), (1, u64::from(i)))).collect();
+        prune_said(&mut many, SAID_MOST as u64);
+        assert_eq!(many.len(), SAID_MOST);
+        assert!(!many.contains_key(&(0, 0)));
     }
 
     #[test]

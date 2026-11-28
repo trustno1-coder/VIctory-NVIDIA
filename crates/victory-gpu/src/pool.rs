@@ -767,18 +767,17 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece, small: u64) {
+/// Whether the texture took it: if not, the reclaim object is dropped at
+/// once, which gives the piece back (it rests before reuse, and the texture
+/// has not been submitted yet), and the caller must not use the texture.
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, small: u64) -> bool {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
     let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, small }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
-        if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
-            // Never given back: the piece stays taken, nothing is reused
-            // under a texture that may be alive.
-            std::mem::forget(object);
-        }
+        texture.SetPrivateDataInterface(&KEY, &object).is_ok()
     }
 }
 
@@ -852,7 +851,12 @@ pub(crate) unsafe fn texture(
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
             counted(piece, small, true);
-            give_back_with(&made, piece, small);
+            if !give_back_with(&made, piece, small) {
+                // The piece is back in the pool (resting) and the texture
+                // was never submitted, so dropping it here is safe; fall
+                // back to an allocation of its own.
+                return None;
+            }
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
