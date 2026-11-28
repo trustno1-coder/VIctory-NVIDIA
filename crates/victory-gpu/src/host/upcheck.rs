@@ -942,6 +942,76 @@ mod tests {
         assert_eq!(host.log_messages(), None);
     }
 
+    /// The lean compare (`VICTORY_CARD_COMPARE_EVERY`, `heat::Lean`), end to
+    /// end, with the fetch on the copy queue: flights declare the whole copy
+    /// and each writes a byte of its own in a piece written once (cold: most
+    /// of their compares do not read it); right after, the title writes a
+    /// byte of its own in the same piece, which the next submission's
+    /// refresh sends up, hashing the piece again. Without the compares ahead
+    /// of those sends (`VICTORY_CARD_COMPARE_EVERY_AHEAD=0`) the hash takes
+    /// the flight's byte in and no later compare finds it: at the end every
+    /// flight's byte must be in title memory, every title byte its own, and
+    /// nothing differ between the card and the CPU's side.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_COMPARE_EVERY=4 VICTORY_UPCOPY_CHECK=1 and a process of its own"]
+    fn cold_writes_beside_the_titles_bytes_land_with_lean_compares() {
+        let Some(host) = host() else {
+            return;
+        };
+        assert!(super::super::lean_on(), "set VICTORY_CARD_COMPARE_EVERY=4 (with the relay)");
+        // As in the game: the thread that lands flights starts with the
+        // first submission, before any copy in the card's memory is made.
+        let first = host.new_list().unwrap();
+        first.close();
+        host.execute_own(&first);
+        settle_now(WHY_SYNC);
+        let (title, start, shadow) = title(0x6666, false);
+        let mut lists = vec![first];
+        let mut flights: Vec<(usize, u8)> = Vec::new();
+        let mut own: Vec<(usize, u8)> = Vec::new();
+        const ROUNDS: usize = 40;
+        for round in 0..ROUNDS {
+            let piece = 8 + round;
+            let at = (piece << 16) + 64 + round * 8;
+            let value = round as u8 + 1;
+            let list = host.new_list().unwrap();
+            shadow.refresh(&list, start as u64, LEN as u64);
+            shadow.gpu_writes(&list, start as u64, LEN as u64);
+            write(host, &list, &shadow, at, &[value]);
+            list.close();
+            host.execute_own(&list);
+            flights.push((at, value));
+            lists.push(list);
+            // The title's own, in the same piece: up with the next refresh.
+            let mine = (piece << 16) + 40_000 + round;
+            title[mine] = 0xA0 + round as u8;
+            own.push((mine, 0xA0 + round as u8));
+            if round % 7 == 6 {
+                settle_now(WHY_SYNC);
+            }
+        }
+        // Submissions that write nothing, until every range was read whole again.
+        for _ in 0..6 {
+            let list = host.new_list().unwrap();
+            shadow.refresh(&list, start as u64, LEN as u64);
+            shadow.gpu_writes(&list, start as u64, LEN as u64);
+            list.close();
+            host.execute_own(&list);
+            lists.push(list);
+        }
+        settle_now(WHY_SYNC);
+        let lost: Vec<usize> = flights.iter().filter(|&&(at, value)| title[at] != value).map(|&(at, _)| at >> 16).collect();
+        for &(at, value) in &own {
+            assert_eq!(title[at], value, "the title's byte at {at:#x} is its own");
+        }
+        let stats: Vec<u64> = heat::LEAN_STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        eprintln!("pieces whose flight's byte is not in title memory: {lost:?}; lean statistics {stats:?}");
+        assert!(lost.is_empty(), "shaders' writes lost to the sends' hashes");
+        assert!(stats[heat::lean_stat::AHEAD] > 0 && stats[heat::lean_stat::AHEAD_FOUND] > 0, "pieces compared ahead of sends");
+        assert_eq!(look(host), Some(0), "nothing differs at rest");
+        assert_eq!(host.log_messages(), None);
+    }
+
     #[test]
     #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
     fn each_submission_reads_its_own_copy_on_the_card() {
