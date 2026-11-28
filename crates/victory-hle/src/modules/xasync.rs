@@ -496,6 +496,9 @@ struct Call {
     context: usize,
     identity: usize,
     done: Mutex<bool>,
+    /// Whether waits on the call are over: once it is done and, if the
+    /// block has a completion routine, that routine has returned.
+    settled: Mutex<bool>,
     finished: Condvar,
 }
 
@@ -515,6 +518,12 @@ impl Call {
         };
         (self.provider)(op, &data)
     }
+
+    /// Ends waits on the call.
+    fn settle(&self) {
+        *lock(&self.settled) = true;
+        self.finished.notify_all();
+    }
 }
 
 /// Calls by block address.
@@ -523,6 +532,11 @@ static CALLS: LazyLock<Mutex<HashMap<usize, Arc<Call>>>> = LazyLock::new(Default
 fn call(block: *mut AsyncBlock) -> Option<Arc<Call>> {
     lock(&CALLS).get(&(block as usize)).cloned()
 }
+
+/// Calls that complete without a result, by block address, from just
+/// before they leave [`CALLS`] until their status is published: a wait
+/// that starts in between still finds its call.
+static COMPLETING: LazyLock<Mutex<HashMap<usize, Arc<Call>>>> = LazyLock::new(Default::default);
 
 /// Whether `call` is still the call in flight on `block`: once it is over,
 /// the title may begin another call on the same block.
@@ -594,6 +608,7 @@ pub fn XAsyncBegin(
         context: context as usize,
         identity: identity as usize,
         done: Mutex::new(false),
+        settled: Mutex::new(false),
         finished: Condvar::new(),
     });
     lock(&CALLS).insert(block as usize, call.clone());
@@ -647,8 +662,8 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     hr
 }
 
-/// Records the result (the first one wins), wakes waiters and queues the
-/// completion routine on the block's completion port.
+/// Records the result (the first one wins), queues the completion routine
+/// on the block's completion port and wakes waiters once it has returned.
 pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
     if let Some(call) = call(block) {
         complete_call(&call, block, result, required_size);
@@ -659,13 +674,24 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
 /// own completions name the call they belong to, not the block: if the
 /// provider already completed it, the title may have begun another call on
 /// the block, which a second complete by block would end.
-fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
-    extern "system" fn complete(block: *mut c_void, _canceled: bool) {
-        let block = block.cast::<AsyncBlock>();
-        // SAFETY: read before the status was published; see below.
+///
+/// A poll sees the status as soon as it is published, but with a completion
+/// routine a wait waits until the routine has returned (as XAsync.h says),
+/// so a title that waits on a block and then frees it does not free it
+/// under its routine.
+fn complete_call(call: &Arc<Call>, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
+    struct Completion {
+        call: Arc<Call>,
+        block: *mut AsyncBlock,
+    }
+    extern "system" fn complete(context: *mut c_void, _canceled: bool) {
+        // SAFETY: boxed in `complete_call`; a task runs once.
+        let Completion { call, block } = *unsafe { Box::from_raw(context.cast::<Completion>()) };
+        // SAFETY: the block outlives its completion routine.
         if let Some(routine) = unsafe { (*block).callback } {
             routine(block);
         }
+        call.settle();
     }
     if result == E_PENDING {
         return;
@@ -679,20 +705,37 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
+    let ends = result < 0 || required_size == 0;
+    if ends {
+        lock(&COMPLETING).insert(block as usize, call.clone());
         release(block);
     }
     size.store(required_size, Ordering::Release);
     status.store(result as u32 as usize, Ordering::Release);
     *done = true;
-    call.finished.notify_all();
-    drop(done);
-    if routine.is_some() {
-        let task = Task::new(block.cast(), complete);
-        match queue(handle) {
-            Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
-            _ => task.run(true),
+    if ends {
+        let mut completing = lock(&COMPLETING);
+        if completing
+            .get(&(block as usize))
+            .is_some_and(|c| Arc::ptr_eq(c, call))
+        {
+            completing.remove(&(block as usize));
         }
+    }
+    drop(done);
+    if routine.is_none() {
+        call.settle();
+        return;
+    }
+    let context = Box::into_raw(Box::new(Completion {
+        call: call.clone(),
+        block,
+    }));
+    let task = Task::new(context.cast(), complete);
+    match queue(handle) {
+        Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
+        // Refused, so the routine runs here, canceled; waits end after it.
+        _ => task.run(true),
     }
 }
 
@@ -700,9 +743,10 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && let Some(call) = call(block) {
-        let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+    let found = || call(block).or_else(|| lock(&COMPLETING).get(&(block as usize)).cloned());
+    if wait && let Some(call) = found() {
+        let settled = lock(&call.settled);
+        drop(call.finished.wait_while(settled, |s| !*s));
     }
     status(block)
 }
@@ -1261,7 +1305,9 @@ mod tests {
             ),
             S_OK
         );
-        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+        // A poll: a wait would wait for the routine, which only a dispatch
+        // on this thread runs.
+        assert_eq!(poll(&mut block), S_OK);
         let mut size = 0;
         assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_OK);
         assert_eq!(size, 8);
@@ -1284,6 +1330,155 @@ mod tests {
         );
         assert_eq!((value, used), (42, 8));
         assert!(call(&mut block).is_none(), "the call ends with its result");
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// The block's status once a poll sees it is no longer pending.
+    fn poll(block: *mut AsyncBlock) -> HRESULT {
+        let start = std::time::Instant::now();
+        loop {
+            let hr = XAsyncGetStatus(block, false);
+            if hr != E_PENDING || start.elapsed().as_secs() >= 5 {
+                return hr;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Never completes by itself.
+    extern "system" fn never_completes(_: u32, _: *const ProviderData) -> HRESULT {
+        S_OK
+    }
+
+    /// A completion routine that takes its time, then sets the flag its
+    /// block's context points at.
+    extern "system" fn slow_routine(block: *mut AsyncBlock) {
+        std::thread::sleep(Duration::from_millis(150));
+        // SAFETY: the tests' blocks point at a live flag.
+        let flag = unsafe { &*(*block).context.cast::<AtomicBool>() };
+        flag.store(true, Ordering::SeqCst);
+    }
+
+    /// A block on `queue` whose routine is [`slow_routine`], setting `flag`.
+    fn slow_block(queue: *const Queue, flag: &AtomicBool) -> AsyncBlock {
+        AsyncBlock {
+            queue,
+            context: std::ptr::from_ref(flag).cast_mut().cast(),
+            callback: Some(slow_routine),
+            internal: [0; 4],
+        }
+    }
+
+    /// Completes the call on `block` from another thread after a while,
+    /// with a byte of result: the call stays on the block until it is taken
+    /// (see [`take_result`]), so a wait that starts late still finds it.
+    fn complete_later(block: *mut AsyncBlock) -> std::thread::JoinHandle<()> {
+        let block = block as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            XAsyncComplete(block as *mut AsyncBlock, S_OK, 1);
+        })
+    }
+
+    /// Takes the byte of result [`complete_later`] leaves, ending the call.
+    fn take_result(block: *mut AsyncBlock) -> HRESULT {
+        let mut byte = 0u8;
+        let none = std::ptr::null();
+        XAsyncGetResult(block, none, 1, (&raw mut byte).cast(), std::ptr::null_mut())
+    }
+
+    /// A wait that starts while a call that ends without a result is being
+    /// cleaned up (it has left the calls in flight, its status is not yet
+    /// published) still waits for it.
+    #[test]
+    fn a_wait_that_starts_while_the_call_is_cleaned_up_finds_it() {
+        static CLEANING: AtomicBool = AtomicBool::new(false);
+        extern "system" fn slow_cleanup(op: u32, _: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                CLEANING.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            S_OK
+        }
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(begin(&mut block, std::ptr::null_mut(), slow_cleanup), S_OK);
+        let address = &raw mut block as usize;
+        let completer = std::thread::spawn(move || {
+            XAsyncComplete(address as *mut AsyncBlock, S_OK, 0);
+        });
+        let start = std::time::Instant::now();
+        while !CLEANING.load(Ordering::SeqCst) && start.elapsed().as_secs() < 5 {
+            std::thread::yield_now();
+        }
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+        assert!(completer.join().is_ok());
+    }
+
+    #[test]
+    fn a_wait_ends_after_a_pool_completion_routine_returns() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let ran = AtomicBool::new(false);
+        let mut block = slow_block(q, &ran);
+        assert_eq!(begin(&mut block, std::ptr::null_mut(), never_completes), S_OK);
+        let completer = complete_later(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+        assert!(ran.load(Ordering::SeqCst), "the routine returned first");
+        assert!(completer.join().is_ok());
+        assert_eq!(take_result(&mut block), S_OK);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn a_wait_ends_after_a_refused_completion_routine_runs_in_place() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        // A terminated queue refuses the routine, so it runs where the call
+        // completes.
+        assert_eq!(XTaskQueueTerminate(q, false, std::ptr::null_mut(), None), S_OK);
+        let ran = AtomicBool::new(false);
+        let mut block = slow_block(q, &ran);
+        assert_eq!(begin(&mut block, std::ptr::null_mut(), never_completes), S_OK);
+        let completer = complete_later(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+        assert!(ran.load(Ordering::SeqCst), "the routine returned first");
+        assert!(completer.join().is_ok());
+        assert_eq!(take_result(&mut block), S_OK);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn a_wait_on_a_manual_completion_port_ends_when_the_routine_is_dispatched() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 0, &mut q), S_OK);
+        let ran = AtomicBool::new(false);
+        let mut block = slow_block(q, &ran);
+        assert_eq!(begin(&mut block, std::ptr::null_mut(), never_completes), S_OK);
+        let waited = AtomicBool::new(false);
+        let address = &raw mut block as usize;
+        let (ran, waited) = (&ran, &waited);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(move || {
+                let hr = XAsyncGetStatus(address as *mut AsyncBlock, true);
+                waited.store(true, Ordering::SeqCst);
+                (hr, ran.load(Ordering::SeqCst))
+            });
+            assert!(complete_later(address as *mut AsyncBlock).join().is_ok());
+            // A poll sees the status before the routine runs.
+            assert_eq!(poll(address as *mut AsyncBlock), S_OK);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!ran.load(Ordering::SeqCst), "not dispatched yet");
+            assert!(!waited.load(Ordering::SeqCst), "the wait goes on");
+            assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+            assert!(ran.load(Ordering::SeqCst));
+            assert_eq!(waiter.join().ok(), Some((S_OK, true)));
+        });
+        assert_eq!(take_result(&mut block), S_OK);
         XTaskQueueCloseHandle(q);
     }
 
