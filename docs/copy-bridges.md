@@ -427,6 +427,10 @@ Every change below is either a pure refactor or measurement; no allocation polic
 threshold, budget, switch default or rendering behaviour changed, and with the direct switches
 off the same buffers are made in the same order as before.
 
+Sections 12-16 are the per-phase implementation records, in order. Where a later phase
+changes an earlier statement, the later section is authoritative; the cross-references in the
+text mark those changes.
+
 ### 12.1 The admission decision split from the allocation
 
 `shadow::card_admission` and `shadow::window_admission` now decide whether a copy is to have a
@@ -518,9 +522,266 @@ memory, at any address. It is behind its own switch, off by default.
    or a hole is refused before anything is created;
 2. `inplace::SectionView` maps **our own view** of that run of the section (the port's old
    mechanism, generalised and now owned by the Phase 2 registry);
+3. every page of the view must be committed; a reserved section maps only committed pages;
+4. `OpenExistingHeapFromAddress1` opens a heap on our view, and a placed cross-adapter UAV buffer
+   covers the run;
+5. `Shadow::placed` shapes it as a copy, so binding, descriptors and lifetime work unchanged,
+   while refresh, snapshot, write declaration and copy-back stay no-ops for it.
 
+`inplace::place_view_checked(start, len, window)` is the policy around it (written as
+`place_view` at Phase 3): `VICTORY_INPLACE_VIEW=1` enables windows, `=2` also title buffers; the
+in-place byte cap (`VICTORY_INPLACE_MB`, default 4 GiB, measured in whole view bytes because
+opening pins them) applies. At Phase 3 a placement was only tried while no submission could be in
+the air (`shadow::flights_air()`: the relay or the late wait). That gate was the Phase 5
+prerequisite: a placed copy declared no shader writes yet, so the layer's own CPU reads of title
+memory (constant fills, the title's buffer copies, texture staging) could not be ordered against a
+flight's writes through it. Without the gate the prototype was unsafe in the product path, where
+the launcher leaves the relay on; with it, the prototype ran with `VICTORY_RELAY=0` and no
+`VICTORY_LATE_WAIT`. Phase 5 replaced the gate with the placed-write declarations (section 15.1);
+the final code has no `shadow::flights_air` and no flight gate on either placement path.
 
+### 13.2 Where it is used
 
+The window path (`shadow::loose`) asks the direct placement after the device-local admission
+refused the window, so a window that would have got a VRAM side is never replaced (the
+memory-class rule of section 9). A placed window makes no staging buffer, no card side, no
+refresh/write-watch state, no compare and no copy-back; the GPU reads and writes the title's own
+pages over PCIe, which is the memory class the refused window would have stayed in anyway. Every
+refusal (not one run, not committed, cap, host refused, and at Phase 3 also in flight) is counted
+with its reason in the placement ledger and leaves the old copy path in place.
+
+### 13.3 Tests and checks
+
+- `warp_a_page_pool_window_is_placed_over_our_view_of_its_run`: a placeholder above 4 GiB, a
+  reserved section, two title views that follow in memory and in the section; a 5 KiB window that
+  crosses both is placed and the card reads the title's bytes at the right offset and writes them
+  back into the title's own views; with the heap standing a title view is made read-only and then
+  another unmapped, and the placed buffer still reads the section's pages; the last holder going
+  unmaps our view and the address is free again.
+- `place_view_part_refuses_scattered_and_private_memory`: adjacent views from two sections are
+  refused as scattered, and private memory is refused (it belongs to the other opening).
+- The existing port and in-place WARP tests still cover the older mechanisms.
+- `cargo check --workspace --all-targets --locked`: PASS; clippy shows only the pre-existing
+  baseline lint.
+
+### 13.4 What it did not do
+
+Scattered or holed ranges (multi-run composition is unresolved), memory shown in very many views,
+title buffers until `VICTORY_INPLACE_VIEW=2` is wired and the flight gate is lifted (Phase 4 and
+5), and any claim about the target driver's pinning, coherency or cost. Each placement opened its
+own heap and view (no region cache yet); that was acceptable for a prototype and is where a
+region registry matters for the buffer class (Phase 6 adds it, section 16.1).
+
+## 14. Phase 4 implemented: the migration of the refused copies
+
+The copy classes the audit ranked as removable now have a policy that replaces them where the
+memory can be opened - and only there. It is one decision, in one place.
+
+### 14.1 The policy
+
+`inplace::place_fallback(start, len, window)` is asked by the copy paths exactly where the
+device-local admission has already refused the copy, i.e. where it would have stayed a system
+memory mirror. It tries, in order:
+
+1. the page pool's view memory (`VICTORY_INPLACE_VIEW=1` for windows, `=2` for title buffers and
+   view-byte copies) through `place_view_checked` - our own view of the section run, a heap on it,
+   a placed buffer (Phase 3);
+2. private title memory (`VICTORY_INPLACE=3` and more) through the first mechanism's
+   `place_private` - a committed part of the allocation opened as a heap.
+
+Both were refused while any submission could be in the air (`shadow::flights_air`), however the
+switches were set: the placed-write declarations that make it safe under the relay are Phase 5,
+which removed the gate and the refusal reason with it (section 15.1). The paths are a pure
+function (`fallback_paths`) and unit-tested.
+
+`VICTORY_INPLACE=1`/`=2` keep their old meaning (place wherever the memory can be opened, before
+any admission decision) and are no longer taken for `=3` and more: from 3 on, only the refused
+copies are placed, so no copy a VRAM side would have served is replaced by system-memory access.
+
+### 14.2 Where it is wired
+
+- `shadow::lookup` (title buffers): the card admission is asked, and when it refused, the
+  fallback placement is tried before the CPU staging buffer exists. A placed buffer makes no
+  staging side, no card side, no hash twin and no send/fetch/compare state; the GPU reads and
+  writes the title's own pages, the memory class the refused copy would have been in.
+- `shadow::loose` (windows outside buffers): same, after `window_admission`.
+- `shadow::exact` (a view's own bytes, system memory by design): same policy for its copy; with
+  `VICTORY_INPLACE_VIEW=2` or `VICTORY_INPLACE=3` those copies can be the title's memory too.
+
+Every placement is counted in the in-place census and the placement ledger (Phase 2); every
+refusal is counted with its reason. At Phase 4 the reasons were `NotOpenable`, `Cap`,
+`HostRefused`, `HostUnavailable` and `InFlight` (the gate above); Phase 5 removed `InFlight`
+with the gate. The startup lines name `VICTORY_INPLACE` and `VICTORY_INPLACE_VIEW`, warn for the
+levels 1 and 2 combination with late submissions that the project keeps documented as
+unsupported, and - for the view path - say that shader writes through a placed copy are declared,
+so a log cannot show the switches set without saying what is and is not ordered.
+
+### 14.3 What is not migrated, and why
+
+- Copies the card admitted: replacing a device-local side with GPU access to system memory is a
+  memory-class downgrade (section 9's rule) and is not done without hardware measurement.
+- By-address shader memory: raw-address shaders need a GPU address a title CPU address cannot be
+  (the audit's anti-candidate).
+- Textures, render targets and depth: the console's tiled sizes and layouts, the depth+UAV
+  restriction and the missing PC formats block a direct representation (sections 4.2, 10).
+- Scattered or holed title memory: multi-run composition is unresolved; those copies keep the
+  mirror.
+- The layer's own CPU-authored buffers (per-draw scratch, descriptor-stride table, indirect
+  clamp): they are not copies of title bytes.
+
+### 14.4 Tests and checks
+
+- `the_fallback_paths_follow_the_switches` (then named
+  `the_fallback_paths_follow_the_switches_and_the_flight_gate`) covers the policy matrix (legacy
+  levels, 3, view 1/2, windows/buffers); the flight-gate cases went with the gate in Phase 5.
+- The Phase 3 WARP tests exercise both mechanisms' data paths; the Phase 2 tests exercise the
+  invalidation, the ledger and the view ownership. A run of the title is needed to measure how
+  much of the refused class is openable on a real save; no run is available here.
+- `cargo check --workspace --all-targets --locked`: PASS; clippy shows only the baseline lint.
+
+## 15. Phase 5 implemented: coherence and lifecycle safety
+
+The placed copies now take part in the copy machinery's ordering, and the lifecycle holes the audit
+found are wired. The prototype's flight gate is gone because the reason for it is fixed.
+
+### 15.1 Placed shader writes are declared
+
+`Shadow::gpu_writes` for a placed copy no longer returns in silence: it marks the copy written and
+records the range through `HostList::defer_gpu_write`, exactly the declaration path a copy's
+shaders use. The copy machinery builds each submission's written-range list from those declarations,
+so the late waits and settles now make a CPU reader of those title bytes wait for the flight that
+may write them - a refresh of an overlapping copy, a fill of upload memory, a title buffer copy or
+texture staging. That was guarantee G18 in the audit and the reason `VICTORY_INPLACE=2` was called
+unsupported with submissions in the air; the fallback placements (`VICTORY_INPLACE_VIEW`, and the
+`VICTORY_INPLACE=3` private path) are therefore no longer gated on the relay being off.
+The old, pre-existing shortcut is unchanged and documented: a host copy of the same bytes that a
+shader writes through a *different* copy is not told, because the card's writes are not seen by
+write watching. Placement does not widen it.
+
+A test in the host's placement tests places a copy over private title memory, declares a shader
+write to a host list, and asserts the range reached the list's deferred steps and the copy's
+written flag: the declaration path is the one the machinery already uses for copies.
+
+### 15.2 The title's free, decommit and protect let go of placed copies
+
+- `watch::title_memory_freed` (called by the title's `VirtualFree` hook for free, decommit and
+  release) now calls `inplace::title_memory_freeing` before the kernel call, so a placed copy is out
+  of the tables and retired rather than silently blocking the title's call.
+- `VirtualProtect` is now intercepted unconditionally (it used to be an export only with
+  `VICTORY_SOFT_VIEWS`) and lets go of what is in place in the range before forwarding.
+- `XMemFreeDefault`'s raw `VirtualFree` for the title's 32-bit allocations does the same.
+- The device's part-opening call (`ID3D12Device13`) is probed once; a run without it refuses every
+  placement as `HostUnavailable` (counted in the ledger) and makes copies as before, instead of
+  failing a host call per ask.
+
+### 15.3 Why the page-pool route is the safe one
+
+A heap opened on the title's **private** pages pins them: the title's own `VirtualFree` and
+`VirtualProtect` there fail with error 87 while it stands, and the heap is released through
+`host::retire` (deferred by the bury lag), so a title call that races the retirement is the
+documented private-placement exception. That is why the recommended migration is the page pool:
+a heap opened on **our own view** of a section leaves the title's views, placeholders and kernel
+calls alone.
+
+The section's pages cannot be recycled under that heap either: the section object stays alive while
+our view exists, so unmapping the title's view, freeing page numbers and closing the section handle
+do not touch the bytes our heap reads. A WARP test writes a pattern through a title view, maps our
+own `SectionView` of the same section, unmaps the title's view, closes the section handle, and
+asserts the pattern is still readable through our view. The remaining invalidation - the title maps
+other pages at an address, or the section ends - is already wired through
+`title_memory_changed`/`title_memory_freeing`/`port::section_gone`.
+
+### 15.4 Tests and checks
+
+- `a_placed_copy_declares_its_shader_writes` (host placement tests, WARP): a placed copy's shader
+  write reaches the copy machinery's declaration list.
+- `our_view_keeps_the_sections_pages_after_the_title_lets_go` (WARP): the section's pages survive
+  the title unmapping its view and closing the handle, through our view.
+- The Phase 2-4 tests (openability, invalidation, view ownership, direct accounting, page-pool
+  placement) are unchanged and still pass on CI.
+- `cargo check --workspace --all-targets --locked`: PASS; clippy shows only the baseline lint.
+- Not tested here: the ordering the declaration buys under a live relay needs a run with
+  submissions actually in the air (the unit only proves the declaration is recorded); the target
+  driver's behaviour remains unverified as stated in section 11.
+
+## 16. Phase 6: the removal, the copies that remain, and the end state
+
+### 16.1 Removed: the per-placement duplication of the page-pool view
+
+The Phase 3 prototype opened one view of the section run and one heap for every placed copy. Its
+replacement is a shared region: `inplace` keeps one `SectionView` and one heap per title run of a
+section (`REGIONS`), and the placements whose addresses fall in the run place their buffers into
+that heap at their offsets. A run is forgotten when the title shows other pages there
+(`forget_regions`, called from `title_memory_freeing`), and the view stays mapped while any placed
+buffer holds it - the same refcounted lifetime as before, now one per run instead of one per copy.
+The WARP test places two copies in one run and asserts they share the region, then that the title
+showing other pages forgets it. Opening a heap locks its pages, so a run larger than 512 MiB is
+still cut to the placement that asked for it (`REGION_MOST`); the in-place byte cap is the same.
+
+The port keeps its own older region policy (sub-4-GiB graphics heap, its own caps and statistics).
+It has used the shared `SectionView` since Phase 2; unifying its region bookkeeping with the
+general one is a follow-up, not a copy bridge.
+
+### 16.2 The copy bridges that remain, and why
+
+- **Carded copies of title buffers and windows** (CPU staging -> per-submission sends -> device-local
+  side, hash twins, on-card compare, fetch and merge): required by the VRAM memory class; replacing
+  them with GPU access to title system memory would be a memory-class downgrade. Unchanged, and
+  still what the product launcher asks for (`VICTORY_CARD_BUFFERS_MIN_KB=64`).
+- **System-memory mirrors of memory that cannot be opened**: scattered or holed view memory (no
+  multi-run composition yet), reserved/guarded/decommitted private memory, runs over the in-place
+  caps, runs without `ID3D12Device13`, and every copy the policy places while a placement is
+  refused. These are the fallback of the direct path and the whole path with the switches off.
+- **By-address shader memory** (arenas, directory, faults): raw-address shaders need a GPU address
+  that a title CPU address can never be; a device-local arena redesign is unresolved and out of
+  scope.
+- **Textures**: the console's tiled/mip-packed layouts, format stand-ins, and the row-major
+  single-level rule for a texture in an opened heap leave only a layout-equal linear subset as
+  plausible direct access; that needs a layout census and a WARP/NVIDIA probe first. The mirror,
+  detiling staging and texture read-backs stay for everything else.
+- **Render targets, depth and UAV textures**: the host copy is the contents' authority and PC target
+  and depth semantics plus the depth+UAV refusal require it; a layout- and format-compatible
+  subset is future work, not this project.
+- **Depth twins and the plane pass**: required by the PC's depth+UAV restriction and the missing
+  24-bit colour format.
+- **D3D12 infrastructure**: descriptor heaps (a mirror of the title's CPU descriptor bytes, with no
+  API to back them with application memory), the descriptor-stride table, command allocators and
+  lists, PSOs/root signatures/command signatures, the swap chain and present path, indirect
+  clamping, per-draw CPU-written scratch, the residency probe, the layer's UI, frame generation and
+  keep-awake. A direct-access migration cannot remove these; they are the documented required set.
+- **The title's own CPU copies and fills**: the title's commands executed on its memory; the layer's
+  job is their ordering, and placed writes are now declared and ordered like a copy's.
+- **Off-by-default experiments now superseded for openable memory**: the second system-memory sides
+  (`VICTORY_CARD_ALL`, `VICTORY_WINDOWS_OWN`), CPU-mapped VRAM (`VICTORY_SEND_BAR`,
+  `VICTORY_WINDOWS_BAR_MB`, `VICTORY_WC_BAR`) and the legacy in-place levels 1 and 2. They are kept
+  as switches because removing them is a policy decision that needs a hardware A/B; the fallback
+  substitution gives the same or better behaviour wherever the memory is openable.
+
+### 16.3 The end state
+
+The project delivers, relative to the agreed base:
+
+- a complete, sourced audit of the copy bridges and their classification (`docs/copy-bridges.md`);
+- backing-storage and admission invariants, so a direct placement is chosen on the same evidence as
+  the system-memory fallback it replaces, with the failure paths counted (`inplace::openability`,
+  `card_admission`/`window_admission`, the placement ledger, the exact placed-copy invalidation);
+- a working, switchable page-pool placement (`VICTORY_INPLACE_VIEW`) that opens our own view of a
+  section run at any address, shares it across placements, and keeps the title's own views, free,
+  decommit and protect calls untouched;
+- the migration policy for the refused system-memory copies of title buffers, windows and view
+  bytes (`VICTORY_INPLACE=3` for private memory, `VICTORY_INPLACE_VIEW=1/2` for page-pool
+  memory), with the mirror as the fallback and every refusal counted;
+- placed shader writes declared to the copy machinery, so the late waits order CPU readers behind
+  them; and the title's free/decommit/protect and section-close paths wired to let placed copies go
+  before the kernel call;
+- tests on the software adapter for the placement mechanics, the ordering declaration, the view
+  ownership and section lifetime, the invalidation and the policy matrix; and no default change:
+  the product path behaves as at the base until a hardware-validated run enables the switches.
+
+What is needed before any of it becomes a default is stated in section 11: target-driver behaviour,
+pinning cost and coherency, the openable share of the real title memory (the census), the cost of
+GPU access to title memory against the copies it replaces, and device-removal behaviour. The
+switches and the startup warnings are the way to measure that without changing the product path.
 
 ## 17. Verification
 
@@ -567,6 +828,10 @@ Local checks (Windows, Rust 1.98.1 x86_64-pc-windows-gnu, `CARGO_TARGET_DIR` out
   base; `cargo test` cannot link locally (GNU raw-dylib needs a working `dlltool`), so the tests
   run on CI as documented.
 
+The source tip the run tested is `d04af6e`; the commits after it on this branch change
+documentation and comments only (the phase records in sections 13-16 and the stale flight-gate
+notes), so the run describes this tree's source.
+
 New tests added by this project (all on the software adapter, all pass): the openability
 predicate, the refcounted section view's last-holder unmap and section lifetime, the page-pool
 placement (data both ways across two title views, a title view reprotected and unmapped under the
@@ -581,4 +846,5 @@ and pinning cost on that driver, coherency of GPU access to title system memory,
 the copies replaced, the openable share of the real title memory (the in-place census has never
 been recorded on a run), WDDM paging, and device-removal/TDR behaviour. WARP is not equivalent
 hardware, and `GetHeapProperties`/the WARP probe report the API's answer, not physical placement.
-The switches remain off by default; section 16.3 states what a hardware run must establish.
+The switches remain off by default; sections 11 and 16.3 record what a hardware run must
+establish.
