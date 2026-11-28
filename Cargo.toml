@@ -77,3 +77,15 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# A build for the PC it is built on: release plus whole-program optimisation
+# (`lto`, one code generation unit). Built with the CPU's own instructions
+# (`scripts\play-foxhound.ps1 -Build native` sets RUSTFLAGS=-C target-cpu=native:
+# AVX-512 on a Ryzen 9000), so the exe may not start on another processor.
+# Into target\native, beside the release build, not in its place. Slower to
+# build (several minutes more); helps the CPU side (the shader translator,
+# hashing, copies), not the card.
+[profile.native]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

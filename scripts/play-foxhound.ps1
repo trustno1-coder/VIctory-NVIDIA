@@ -6,6 +6,8 @@
 #   .\scripts\play-foxhound.ps1 -Exe ... -Dlss balanced -FrameGen
 #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)
 #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
+#   .\scripts\play-foxhound.ps1 -Exe ... -Build native        built for this PC's own CPU (AVX-512 on a Ryzen 9000),
+#                                                             whole-program optimised; runs only on such a CPU
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
 #
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
@@ -16,7 +18,7 @@
 # %LOCALAPPDATA%\victory\logs. Every VICTORY_... switch is described in a comment where the code reads it.
 param(
     [Parameter(Mandatory)][string]$Exe,
-    [ValidateSet('diag', 'release')][string]$Build = 'release',
+    [ValidateSet('diag', 'release', 'native')][string]$Build = 'release',
     [switch]$SeriesS,
     # 1440: output and scene 2560x1440 (Series X, the image is patched); 1080to1440: scene 1920x1080 upscaled by
     # the title; 4k: the stock Series X output (3840x2160).
@@ -165,6 +167,12 @@ if (-not (Test-Path $victory)) {
     Push-Location $repo
     try {
         if ($Build -eq 'diag') { cargo build --locked --profile diag -p victory --features diagnostics }
+        elseif ($Build -eq 'native') {
+            # This CPU's own instructions (Zen 5: AVX-512) and one optimisation over the whole program.
+            $rustflags = $env:RUSTFLAGS
+            $env:RUSTFLAGS = (@($rustflags, '-C target-cpu=native') | Where-Object { $_ }) -join ' '
+            try { cargo build --locked --profile native -p victory } finally { $env:RUSTFLAGS = $rustflags }
+        }
         else { cargo build --release --locked -p victory }
     } finally { Pop-Location }
     if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
