@@ -2260,12 +2260,106 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// Whether a title's barrier groups that order no write are left without
+/// the wait for every earlier shader write ([`groups_need_wait`];
+/// `VICTORY_SELECTIVE_BARRIERS=1`; off by default).
+///
+/// Every barrier group of the title became one such wait: about 750 a frame
+/// in the first gameplay area on an RTX 3070 Ti (2026-11-28, timing run:
+/// 9,000 commands of 4 microseconds each on average, the card at 100 % of
+/// its time and half of its power). A group whose barriers all go from
+/// reads to reads, or from no access, orders nothing a wait would.
+pub(crate) fn selective_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SELECTIVE_BARRIERS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("barrier groups that order no write are left without a wait (VICTORY_SELECTIVE_BARRIERS=1)");
+        }
+        on
+    })
+}
+
+/// The title's barrier groups seen with [`selective_barriers`] on, and of
+/// those left without a wait.
+static SELECTIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether the barrier groups `(count, groups)` of the title (the layout of
+/// `D3D12_BARRIER_GROUP`: type, barrier count, pointer to the barriers,
+/// each of which starts with its sync and access before and after) need a
+/// wait for earlier shader writes: yes unless every barrier in them has
+/// nothing to wait for (sync before none, or access before none) or goes
+/// from reads to reads (neither access common, which is any). Anything
+/// that does not look like that layout needs the wait.
+pub(crate) fn groups_need_wait(count: u32, groups: *const u8) -> bool {
+    let need = groups_need_wait_in(count, groups);
+    let seen = SELECTIVE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let left = SELECTIVE[1].fetch_add(u64::from(!need), std::sync::atomic::Ordering::Relaxed) + u64::from(!need);
+    if seen.is_power_of_two() || seen.is_multiple_of(100_000) {
+        tracing::info!(seen, left, "the title's barrier groups, and of those left without a wait (VICTORY_SELECTIVE_BARRIERS)");
+    }
+    need
+}
+
+fn groups_need_wait_in(count: u32, groups: *const u8) -> bool {
+    const GROUP: usize = 16;
+    if groups.is_null() || count == 0 || count > 64 || !(groups as usize).is_multiple_of(8) {
+        return true;
+    }
+    for g in 0..count as usize {
+        // SAFETY: the title's array of `count` groups, 16 bytes each.
+        let (kind, n, barriers) = unsafe {
+            let at = groups.add(g * GROUP);
+            (at.cast::<u32>().read(), at.add(4).cast::<u32>().read(), at.add(8).cast::<*const u8>().read())
+        };
+        let stride = match kind {
+            0 => 16, // global
+            1 => 64, // texture
+            2 => 40, // buffer
+            _ => return true,
+        };
+        if n == 0 {
+            continue;
+        }
+        if n > 4096 || barriers.is_null() || !(barriers as usize).is_multiple_of(8) {
+            return true;
+        }
+        for b in 0..n as usize {
+            // SAFETY: the group's array of `n` barriers of `stride` bytes,
+            // each starting with four 32-bit words.
+            let [sync_before, _, before, after] =
+                unsafe { barriers.add(b * stride).cast::<[u32; 4]>().read_unaligned() };
+            if barrier_needs_wait(sync_before, before, after) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// One barrier's sync before and access before and after: whether it needs
+/// the wait for earlier writes ([`groups_need_wait`]).
+fn barrier_needs_wait(sync_before: u32, before: u32, after: u32) -> bool {
+    const COMMON: u32 = 0;
+    const NO_ACCESS: u32 = 0x8000_0000;
+    // Render target, unordered access, depth write, stream output, copy and
+    // resolve destinations, acceleration structure, video writes.
+    const WRITES: u32 = 0x8 | 0x10 | 0x20 | 0x100 | 0x400 | 0x1000 | 0x8000 | 0x40000 | 0x100000 | 0x400000;
+    if sync_before == 0 || before == NO_ACCESS {
+        return false;
+    }
+    let reads = |access: u32| access != COMMON && (access == NO_ACCESS || access & WRITES == 0);
+    !(reads(before) && reads(after))
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+/// write (the title's buffer barriers order compute passes). With
+/// [`selective_barriers`], none for groups that order no write.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    let count = if !groups.is_null() && selective_barriers() && !groups_need_wait(count, groups) { 0 } else { count };
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2586,5 +2680,57 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod selective_barrier_tests {
+    use super::{barrier_needs_wait, groups_need_wait_in};
+
+    const SRV: u32 = 0x80;
+    const UAV: u32 = 0x10;
+    const RT: u32 = 0x8;
+    const NO_ACCESS: u32 = 0x8000_0000;
+    const ALL: u32 = 1;
+
+    #[test]
+    fn only_barriers_that_order_no_write_go_without_a_wait() {
+        // Reads to reads, or nothing before: no wait.
+        assert!(!barrier_needs_wait(ALL, SRV, SRV | 0x2));
+        assert!(!barrier_needs_wait(ALL, NO_ACCESS, UAV));
+        assert!(!barrier_needs_wait(0, NO_ACCESS, RT));
+        // A write before or after, or common (any access): the wait.
+        assert!(barrier_needs_wait(ALL, UAV, SRV));
+        assert!(barrier_needs_wait(ALL, SRV, UAV));
+        assert!(barrier_needs_wait(ALL, RT, SRV));
+        assert!(barrier_needs_wait(ALL, 0, SRV));
+        assert!(barrier_needs_wait(ALL, SRV, 0));
+    }
+
+    #[test]
+    fn groups_are_read_as_the_d3d12_layout_and_anything_else_waits() {
+        // One buffer group of two barriers (40 bytes each), one texture group (64).
+        let mut buffers = [0u64; 10];
+        let words = |b: &mut [u64], at: usize, w: [u32; 4]| {
+            b[at] = u64::from(w[0]) | u64::from(w[1]) << 32;
+            b[at + 1] = u64::from(w[2]) | u64::from(w[3]) << 32;
+        };
+        words(&mut buffers, 0, [ALL, ALL, SRV, SRV]);
+        words(&mut buffers, 5, [ALL, ALL, NO_ACCESS, UAV]);
+        let mut textures = [0u64; 8];
+        words(&mut textures, 0, [ALL, ALL, SRV, 0x40]);
+        let group = |kind: u32, n: u32, at: *const u64| [u64::from(kind) | u64::from(n) << 32, at as u64];
+        let [a, b] = group(2, 2, buffers.as_ptr());
+        let [c, d] = group(1, 1, textures.as_ptr());
+        let groups = [a, b, c, d];
+        assert!(!groups_need_wait_in(2, groups.as_ptr().cast()));
+        // A write in one barrier: the wait.
+        words(&mut textures, 0, [ALL, ALL, UAV, SRV]);
+        assert!(groups_need_wait_in(2, groups.as_ptr().cast()));
+        // An unknown group type, a null pointer, no groups: the wait.
+        let odd = [u64::from(7u32) | 1 << 32, buffers.as_ptr() as u64];
+        assert!(groups_need_wait_in(1, odd.as_ptr().cast()));
+        assert!(groups_need_wait_in(1, std::ptr::null()));
+        assert!(groups_need_wait_in(0, groups.as_ptr().cast()));
     }
 }
