@@ -225,8 +225,8 @@ pub(super) enum FillTo {
     /// A descriptor slot that shows the fill's memory, and nothing else does
     /// (title heap, slot): it is made to show our buffer instead.
     Slot(usize, u32),
-    /// A buffer the card can write, filled from its beginning.
-    Buffer(ID3D12Resource),
+    /// A buffer the card can write, with the byte offset of the fill.
+    Buffer(ID3D12Resource, u64),
 }
 
 /// Title memory something in the air writes: the host copy it goes through
@@ -253,16 +253,14 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                         copy: false,
                     }));
                 }
-                for &i in &flight.order {
-                    for &(_, at, [row, rows, pitch]) in &flight.lists[i].host().deferred().backs {
-                        out.push(Writer {
-                            shadow: None,
-                            from: at,
-                            to: at + rows.saturating_sub(1) * pitch + row,
-                            copy: false,
-                        });
-                    }
-                }
+                out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
+                    // The bytes are published by CPU landing, not by a
+                    // buffer shadow. Do not read a stale shadow for them.
+                    shadow: None,
+                    from,
+                    to,
+                    copy: false,
+                }));
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
             Late::Write(at, _, bytes) => out.push(Writer {
@@ -453,11 +451,21 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             _ => {}
         }
     }
+    let copies = order.iter().filter(|&&i| matches!(does[i], Does::Copy { .. })).count();
+    // Fill-only batches are already linear. Use the interval index only
+    // when avoiding a substantial number of pairwise comparisons.
+    if order.len().saturating_mul(copies) > 32_768 {
+        return Ok(levels_indexed(does, &order));
+    }
+    Ok(levels_reference(does, &order))
+}
+
+fn levels_reference(does: &[Does], order: &[usize]) -> Vec<(usize, u32)> {
     let mut out: Vec<(usize, u32)> = Vec::with_capacity(order.len());
     // The copies among them, which alone put others behind them or have to
     // stand behind others.
     let mut copies: Vec<usize> = Vec::new();
-    for &i in &order {
+    for &i in order {
         let Some((r, w)) = reads_writes(&does[i]) else {
             continue;
         };
@@ -481,7 +489,112 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         }
         out.push((i, level));
     }
-    Ok(out)
+    out
+}
+
+/// A compressed-coordinate range-maximum index. Values are dependency
+/// levels plus one; zero means no earlier operation. A max update never
+/// decreases a value. A node's `cover` applies to all its descendants,
+/// while `high` is the maximum of its complete subtree. No lazy push is
+/// needed because both queries and updates use max.
+struct RangeLevels {
+    size: usize,
+    high: Vec<u32>,
+    cover: Vec<u32>,
+}
+
+impl RangeLevels {
+    fn new(points: usize) -> Self {
+        let size = points.max(1).next_power_of_two();
+        Self { size, high: vec![0; 2 * size], cover: vec![0; 2 * size] }
+    }
+
+    fn raise(&mut self, from: usize, to: usize, value: u32) {
+        if from < to {
+            self.raise_node(1, 0, self.size, (from, to), value);
+        }
+    }
+
+    fn raise_node(&mut self, node: usize, lo: usize, hi: usize, range: (usize, usize), value: u32) {
+        let (from, to) = range;
+        if to <= lo || hi <= from {
+            return;
+        }
+        self.high[node] = self.high[node].max(value);
+        if from <= lo && hi <= to {
+            self.cover[node] = self.cover[node].max(value);
+            return;
+        }
+        let mid = lo + (hi - lo) / 2;
+        self.raise_node(node * 2, lo, mid, range, value);
+        self.raise_node(node * 2 + 1, mid, hi, range, value);
+    }
+
+    fn maximum(&self, from: usize, to: usize) -> u32 {
+        if from >= to { 0 } else { self.max_node(1, 0, self.size, (from, to)) }
+    }
+
+    fn max_node(&self, node: usize, lo: usize, hi: usize, range: (usize, usize)) -> u32 {
+        let (from, to) = range;
+        if to <= lo || hi <= from {
+            return 0;
+        }
+        if from <= lo && hi <= to {
+            return self.high[node];
+        }
+        let mid = lo + (hi - lo) / 2;
+        self.cover[node]
+            .max(self.max_node(node * 2, lo, mid, range))
+            .max(self.max_node(node * 2 + 1, mid, hi, range))
+    }
+}
+
+/// Assign the earliest legal level to every selected operation in the
+/// original order. A read depends on earlier overlapping writes; a write
+/// depends on both earlier overlapping reads and writes. These are exactly
+/// the three tests used by `levels_reference`, with no change in ordering.
+/// Complexity O(n log n), rather than O(n^2), for large copy-heavy batches.
+fn levels_indexed(does: &[Does], order: &[usize]) -> Vec<(usize, u32)> {
+    let mut points = Vec::with_capacity(order.len() * 4);
+    for &i in order {
+        if let Some((r, w)) = reads_writes(&does[i]) {
+            // Zero-length operations are rejected by the later preparation
+            // phase. Preserve the reference algorithm even for malformed
+            // input rather than changing its handling of empty ranges.
+            if r.0 >= r.1 || (w.0 >= w.1 && w != (0, 0)) {
+                return levels_reference(does, order);
+            }
+            for (from, to) in [r, w] {
+                if from < to {
+                    points.extend([from, to]);
+                }
+            }
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+    let span = |(from, to): (usize, usize)| {
+        if from < to {
+            (points.binary_search(&from).expect("indexed endpoint"), points.binary_search(&to).expect("indexed endpoint"))
+        } else {
+            (0, 0)
+        }
+    };
+    let mut reads = RangeLevels::new(points.len());
+    let mut writes = RangeLevels::new(points.len());
+    let mut out = Vec::with_capacity(order.len());
+    for &i in order {
+        let Some((r, w)) = reads_writes(&does[i]) else { continue; };
+        let (r0, r1) = span(r);
+        let (w0, w1) = span(w);
+        let level = writes.maximum(r0, r1)
+            .max(writes.maximum(w0, w1))
+            .max(reads.maximum(w0, w1));
+        reads.raise(r0, r1, level + 1);
+        writes.raise(w0, w1, level + 1);
+        out.push((i, level));
+    }
+    out
 }
 
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
@@ -551,7 +664,9 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     to: at.saturating_add(len),
                     asked: touches(written, at, at.saturating_add(len)),
                 },
-                &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
+                &Step::Host(_, (from, to)) if from < to => Does::Read {
+                    from, to, asked: touches(written, from, to),
+                },
                 Step::Refresh(shadow, at, len) => Does::Refresh {
                     shadow: Arc::as_ptr(shadow) as usize,
                     from: *at,
@@ -638,8 +753,8 @@ enum To {
     Copy(Arc<Shadow>, usize),
     /// A descriptor slot (title heap, slot).
     Slot(usize, u32),
-    /// A buffer's beginning.
-    Buffer(ID3D12Resource),
+    /// A byte range of a GPU-writable buffer.
+    Buffer(ID3D12Resource, u64),
 }
 
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
@@ -879,7 +994,7 @@ impl Host {
                 }
                 _ => match fill_to(runs, steps[i]) {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
-                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
+                    Some(FillTo::Buffer(buffer, offset)) => To::Buffer(buffer, offset),
                     None => continue,
                 },
             };
@@ -935,7 +1050,7 @@ impl Host {
                 }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
-                    To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                    To::Buffer(buffer, offset) => writes.push((buffer, *offset, op.at, len)),
                     To::Slot(..) => {}
                 }
             }
@@ -1002,7 +1117,7 @@ fn noted(ops: &[Op]) {
     for op in ops {
         let (to, dst) = match &op.to {
             To::Copy(to, dst) => (to.span(), *dst),
-            To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
+            To::Slot(..) | To::Buffer(..) => ((0, 0), 0),
         };
         let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
         *e = (e.0 + 1, op.from.1, dst);
@@ -1169,6 +1284,28 @@ mod tests {
         assert_eq!(behind(&[placed, copy(2060, 5000, 8, true)]), Some((0, 1)));
     }
 
+    #[test]
+    fn indexed_levels_match_the_pairwise_reference() {
+        let mut seed = 0x357a_6e41u64;
+        let mut rand = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as usize) % n
+        };
+        for round in 0..256 {
+            let count = if round == 255 { 4096 } else { 1 + rand(400) };
+            let does: Vec<Does> = (0..count).map(|_| {
+                let (src, dst, len) = (rand(4096), rand(4096), 1 + rand(128));
+                if rand(3) == 0 { fill(src, len, true) } else { copy(dst, src, len, true) }
+            }).collect();
+            let order: Vec<usize> = (0..count).filter(|_| rand(5) != 0).collect();
+            assert_eq!(levels_indexed(&does, &order), levels_reference(&does, &order), "round {round}");
+        }
+        let does = [copy(16, 0, 16, true), fill(32, 16, true), fill(16, 16, true)];
+        assert_eq!(levels_indexed(&does, &[0, 1, 2]), [(0, 0), (1, 0), (2, 1)]);
+    }
+
     /// Whatever the steps, done level by level (in a level every read
     /// before every write) they read and leave what they read and leave one
     /// after the other, the CPU's steps ahead of all of them.
@@ -1319,6 +1456,22 @@ mod tests {
         assert!(holder(&writers, 104, 120).is_err());
     }
 
+    #[test]
+    fn cpu_host_reads_overlap_gpu_writes() {
+        let Some(host) = host() else { return; };
+        let list = host.new_list().unwrap();
+        list.defer_host_read(0x1100, 0x20, || {});
+        let written = [(0x1000, 0x2000)];
+        assert_eq!(blocked_by(&written, &[&list], false), Some(WHY_READ));
+        let (does, _) = does_of(&written, &[&list]);
+        assert!(matches!(does.as_slice(), [Does::Read { asked: true, .. }]));
+        assert!(plan(&does, 2, true, &mut None).is_err());
+        let disjoint = [(0x1200, 0x2000)];
+        assert_eq!(blocked_by(&disjoint, &[&list], false), None);
+        let (does, _) = does_of(&disjoint, &[&list]);
+        assert!(matches!(does.as_slice(), [Does::Read { asked: false, .. }]));
+    }
+
     /// Reads are all before writes, between two buffers and within one, and
     /// the buffers are usable in the lists that follow in the same call.
     #[test]
@@ -1455,6 +1608,23 @@ mod tests {
             b.defer_copy((start + 1_500_000) as *mut u8, (start + HALF + 600) as *const u8, 700);
             let (staging, staged) = b.upload(host, 4096).unwrap();
             b.defer_fill_buffer(&staging, staged, (start + 1_500_100) as *const u8, 500);
+            // When the opt-in root path is enabled, both fills must target
+            // the same chunk at different aligned offsets. A later copy
+            // must not overwrite either destination.
+            let root = if card_root_cbv() {
+                let before = b.deferred().copies.len();
+                let first = b.fill_scratch((start + 1_500_100) as *const u8, 500).unwrap();
+                let second = b.fill_scratch((start + 1_500_300) as *const u8, 64).unwrap();
+                let deferred = b.deferred();
+                let [Step::Fill(p, _, _, Some(FillTo::Buffer(a, ao))),
+                    Step::Fill(q, _, _, Some(FillTo::Buffer(z, zo)))] = &deferred.copies[before..] else {
+                    panic!("expected two GPU-writable scratch fills");
+                };
+                assert_eq!(a.as_raw(), z.as_raw());
+                assert_eq!(*zo - *ao, 512);
+                assert_eq!(second - first, 512);
+                Some((*p, *q))
+            } else { None };
             b.defer_copy((start + HALF + 300) as *mut u8, (start + 8000) as *const u8, 64);
             b.close();
             host.execute_own(&b);
@@ -1481,6 +1651,15 @@ mod tests {
             // SAFETY: the mapping, which the flight wrote and has landed.
             let staged = unsafe { std::slice::from_raw_parts(staged, 500) };
             assert!(staged == &wanted[601..1101], "the fill behind it, round {round}");
+            if let Some((p, q)) = root {
+                // SAFETY: both scratch ranges belong to b; its flight is settled.
+                let (first, second) = unsafe {
+                    (std::slice::from_raw_parts(p as *const u8, 500),
+                     std::slice::from_raw_parts(q as *const u8, 64))
+                };
+                assert_eq!(first, &wanted[601..1101]);
+                assert_eq!(second, &wanted[801..865]);
+            }
             assert!(title[900_001..900_778] == wanted[400..1177], "the copy within the buffer, round {round}");
             assert!(title[1_200_000..1_201_500] == over[..], "the copy of the copy, round {round}");
             assert!(title[HALF..HALF + 100].iter().all(|&x| x == 0));

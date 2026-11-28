@@ -1299,6 +1299,8 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// GPU-copy-capable scratch for root CBVs, separate from upload-only memory.
+    card_scratch: Mutex<Scratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -2209,6 +2211,7 @@ impl Drop for Counted {
 struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
+    card_writable: bool,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -2256,6 +2259,15 @@ fn scratch_pool() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Experimental: allow the existing GPU-side fill planner to target
+/// unaligned root constant buffers instead of forcing CPU-only uploads.
+/// Default off until NVIDIA debug-layer and replay comparisons pass.
+fn card_root_cbv() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| card_steps::stage() > 1 && relay_exact()
+        && std::env::var_os("VICTORY_CARD_ROOT_CBV").is_some_and(|v| v == "1"))
+}
+
 /// Things of some sizes that nothing holds now, kept for whoever next asks
 /// for one of the same size.
 struct Spare<T> {
@@ -2273,8 +2285,8 @@ impl<T> Spare<T> {
     }
 
     /// A kept thing of `size` bytes, the one given last.
-    fn take(&mut self, size: u64) -> Option<T> {
-        let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
+    fn take(&mut self, size: u64, matches: impl Fn(&T) -> bool) -> Option<T> {
+        let at = self.kept.iter().rposition(|(thing, s)| *s == size && matches(thing))?;
         self.bytes -= size;
         self.low = self.low.min(self.bytes);
         Some(self.kept.remove(at).0)
@@ -2313,22 +2325,24 @@ impl<T> Spare<T> {
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
+fn take_chunk(host: &Host, size: u64, card_writable: bool) -> Option<Chunk> {
     if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
+        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner())
+            .take(size, |chunk| chunk.card_writable == card_writable)
     {
         ALIVE[3].fetch_sub(1, Ordering::Relaxed);
         ALIVE[4].fetch_sub(size, Ordering::Relaxed);
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = if card_writable { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
         buffer,
         data: data as usize,
+        card_writable,
     })
 }
 
@@ -3072,7 +3086,8 @@ struct Sent {
     back: Vec<Declared>,
     /// What was taken off it to be done on the card.
     own: Option<card_steps::Taken>,
-    /// Title-memory ranges written when its shader textures are copied back.
+    /// Title-memory ranges written when its textures are copied back,
+    /// including ordinary texture-to-buffer readbacks.
     texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -3108,8 +3123,9 @@ enum Late {
 
 struct Line {
     line: Vec<Late>,
-    /// The title memory the flights' shaders and texture readbacks may write
-    /// (address, end), in order and joined.
+    /// Title memory the pending and landing flights may write: shaders,
+    /// all texture readbacks, and bottom-of-pipe writes. Half-open, joined.
+    /// Kept until the landing has actually finished publishing its bytes.
     written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
@@ -3190,14 +3206,39 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // Merge in the existing allocation. The hot path used to allocate and
+    // discard a second Vec on every dependency-union update.
+    let mut kept = 0;
+    for i in 0..ranges.len() {
+        let (from, to) = ranges[i];
+        if kept != 0 && from <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(to);
+        } else {
+            ranges[kept] = (from, to);
+            kept += 1;
         }
     }
-    *ranges = out;
+    ranges.truncate(kept);
+}
+
+#[cfg(test)]
+mod pending_range_tests {
+    use super::{join_ranges, touches};
+
+    #[test]
+    fn union_preserves_every_pending_byte() {
+        let mut ranges = vec![(10, 15), (30, 40)];
+        let capacity = ranges.capacity();
+        join_ranges(&mut ranges, [(12, 30), (40, 40), (50, 70), (62, 80)]);
+        assert_eq!(ranges, [(10, 40), (50, 80)]);
+        assert!(ranges.capacity() >= capacity);
+        for from in 0..=90 {
+            for to in from..=90 {
+                let expected = (from..to).any(|n| (10..40).contains(&n) || (50..80).contains(&n));
+                assert_eq!(touches(&ranges, from, to), expected);
+            }
+        }
+    }
 }
 
 /// Whether anything is in the air.
@@ -3461,6 +3502,15 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 },
+                &Step::Host(_, (from, to)) if touches(written, from, to) => {
+                    // CPU-side expansion and other declared title-memory
+                    // reads must see the shader's completed writes too.
+                    #[cfg(feature = "diagnostics")]
+                    if count {
+                        blame("a host read", written, from, to - from);
+                    }
+                    return Some(WHY_READ);
+                }
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
@@ -3563,7 +3613,11 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     for list in &ahead {
         let deferred = list.deferred();
         written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
-        written.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
+        written.extend(deferred.backs.iter().filter_map(|&(_, at, [row, rows, pitch])| {
+            if row == 0 || rows == 0 { return None; }
+            Some((at, at.saturating_add(rows.saturating_sub(1).saturating_mul(pitch)).saturating_add(row)))
+        }));
+        written.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
@@ -4616,6 +4670,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                card_scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -5495,10 +5550,14 @@ impl Host {
             *lists = 0;
             let mut ranges = Vec::new();
             for item in items.iter() {
-                if let Late::Run(flight) = item {
-                    *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
-                    ranges.extend(flight.texture_back_ranges.iter().copied());
+                match item {
+                    Late::Run(flight) => {
+                        *lists += flight.order.len().max(1);
+                        ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                        ranges.extend(flight.texture_back_ranges.iter().copied());
+                    }
+                    Late::Write(at, _, bytes) => ranges.push((*at, at.saturating_add(*bytes))),
+                    Late::Signal(..) => {}
                 }
             }
             join_ranges(written, ranges);
@@ -5720,7 +5779,8 @@ impl Host {
                 sent.back
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
+                    .chain(sent.texture_back_ranges.iter().copied())
+                    .chain(sent.writes.iter().map(|&(at, _, bytes)| (at, at.saturating_add(bytes)))),
             );
             *flying += order.len();
             *target = *submitted;
@@ -5776,7 +5836,8 @@ impl Host {
                 sent.back
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
+                    .chain(sent.texture_back_ranges.iter().copied())
+                    .chain(sent.writes.iter().map(|&(at, _, bytes)| (at, at.saturating_add(bytes)))),
             );
             *flying += 1;
             *target = *submitted;
@@ -6293,7 +6354,17 @@ impl Host {
             let back = crate::picked::with(declared, &picked.written);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
-                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+                let deferred = list.deferred();
+                texture_back_ranges.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
+                // Ordinary CopyTextureRegion readbacks also write title
+                // memory during landing, not the host shadow on the GPU.
+                texture_back_ranges.extend(deferred.backs.iter().filter_map(|&(_, at, [row, rows, pitch])| {
+                    if row == 0 || rows == 0 {
+                        return None;
+                    }
+                    let end = at.saturating_add(rows.saturating_sub(1).saturating_mul(pitch)).saturating_add(row);
+                    Some((at, end))
+                }));
             }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
@@ -6973,8 +7044,8 @@ impl HostList {
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        for pool in [&self.scratch, &self.card_scratch] {
+            let mut scratch = pool.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
             // Every submission of the list has run: nothing reads its
             // scratch memory any more, and the next list to ask takes it.
@@ -7622,8 +7693,21 @@ impl HostList {
         if known.is_some() {
             return known;
         }
-        let (gpu, to) = self.scratch(len)?;
-        self.defer_fill(to, src, len as usize);
+        let card = if len != 0 && card_root_cbv() { self.scratch_at(len, true) } else { None };
+        let gpu = if let Some((buffer, at, to)) = card {
+            // SAFETY: the allocated scratch resource is retained by this list.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
+            self.deferred().copies.push(Step::Fill(
+                to as usize, src as usize, len as usize,
+                Some(card_steps::FillTo::Buffer(buffer, at)),
+            ));
+            gpu
+        } else {
+            // On allocation failure, preserve the original CPU path and its waits.
+            let (gpu, to) = self.scratch(len)?;
+            self.defer_fill(to, src, len as usize);
+            gpu
+        };
         self.deferred().filled.insert(key, gpu);
         Some(gpu)
     }
@@ -7639,7 +7723,7 @@ impl HostList {
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
-        let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
+        let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone(), 0));
         self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
     }
 
@@ -7707,7 +7791,7 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
+        let (buffer, at, data) = self.scratch_at(len, false)?;
         // SAFETY: a live buffer.
         Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
     }
@@ -7715,7 +7799,7 @@ impl HostList {
     /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
     /// slot to hold: the slot outlives the list's use of it.
     pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
+        let (buffer, at, data) = self.scratch_at(len, false)?;
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
         Some((buffer, gpu, data))
@@ -7723,12 +7807,13 @@ impl HostList {
 
     /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
     /// pointer.
-    fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    fn scratch_at(&self, len: u64, card_writable: bool) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
+        let pool = if card_writable { &self.card_scratch } else { &self.scratch };
+        let mut s = pool.lock().unwrap_or_else(|e| e.into_inner());
+        let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data) = if card_writable { host.shared_buffer(len)? } else { host.upload_buffer(len)? };
             name(&buffer, || format!("list scratch {len:#x}"));
             self.deferred().hold_upload(buffer.clone(), len);
             return Some((buffer, 0, data));
@@ -7744,7 +7829,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let chunk = take_chunk(host, size, card_writable)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -7757,8 +7842,10 @@ impl HostList {
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
     pub(crate) fn scratch_kept(&self) -> u64 {
-        let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        scratch.chunks.iter().map(|c| c.1).sum()
+        [&self.scratch, &self.card_scratch].into_iter().map(|pool| {
+            let scratch = pool.lock().unwrap_or_else(|e| e.into_inner());
+            scratch.chunks.iter().map(|c| c.1).sum::<u64>()
+        }).sum()
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -8090,7 +8177,7 @@ impl HostList {
         read: (usize, usize),
         fill: impl Fn(usize) + Send + 'static,
     ) -> Option<ID3D12Resource> {
-        let chunk = take_chunk(host()?, size)?;
+        let chunk = take_chunk(host()?, size, false)?;
         let source = chunk.buffer.clone();
         let destination = chunk.data;
         let mut deferred = self.deferred();
@@ -11318,7 +11405,7 @@ mod spare {
     #[test]
     fn kept_things_come_back_by_size_within_the_limit() {
         let mut spare: Spare<u32> = Spare::new();
-        assert_eq!(spare.take(4), None);
+        assert_eq!(spare.take(4, |_| true), None);
         assert_eq!(spare.give(1, 4, 10), None);
         assert_eq!(spare.give(2, 1, 10), None);
         assert_eq!(spare.give(3, 4, 10), None);
@@ -11326,13 +11413,26 @@ mod spare {
         // Past the limit: handed back, nothing changes.
         assert_eq!(spare.give(4, 4, 10), Some(4));
         assert_eq!(spare.bytes, 9);
-        assert_eq!(spare.take(2), None, "no thing of that size");
-        assert_eq!(spare.take(4), Some(3));
-        assert_eq!(spare.take(4), Some(1));
-        assert_eq!(spare.take(4), None);
-        assert_eq!(spare.take(1), Some(2));
+        assert_eq!(spare.take(2, |_| true), None, "no thing of that size");
+        assert_eq!(spare.take(4, |_| true), Some(3));
+        assert_eq!(spare.take(4, |_| true), Some(1));
+        assert_eq!(spare.take(4, |_| true), None);
+        assert_eq!(spare.take(1, |_| true), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    #[test]
+    fn spare_pool_does_not_confuse_upload_and_gpu_writable_chunks() {
+        let mut spare = Spare::new();
+        assert_eq!(spare.give((1, false), 256, 1024), None);
+        assert_eq!(spare.give((2, true), 256, 1024), None);
+        assert_eq!(spare.give((3, false), 256, 1024), None);
+        assert_eq!(spare.take(256, |x| x.1), Some((2, true)));
+        assert_eq!(spare.take(256, |x| x.1), None);
+        assert_eq!(spare.take(256, |x| !x.1), Some((3, false)));
+        assert_eq!(spare.take(256, |x| !x.1), Some((1, false)));
+        assert_eq!(spare.bytes, 0);
     }
 
     /// A trim frees only what stayed kept through the whole window since the
@@ -11348,13 +11448,13 @@ mod spare {
         assert!(spare.trim().is_empty());
         assert_eq!(spare.bytes, 12);
         // One taken and given back: 8 bytes stayed kept all the while.
-        assert_eq!(spare.take(4), Some(3));
+        assert_eq!(spare.take(4, |_| true), Some(3));
         assert_eq!(spare.give(3, 4, 100), None);
         let gone = spare.trim();
         assert_eq!(gone.iter().map(|g| g.1).sum::<u64>(), 8);
         assert_eq!(gone.iter().map(|g| g.0).collect::<Vec<_>>(), vec![1, 2], "the oldest go");
         assert_eq!(spare.bytes, 4);
-        assert_eq!(spare.take(4), Some(3));
+        assert_eq!(spare.take(4, |_| true), Some(3));
     }
 }
 
