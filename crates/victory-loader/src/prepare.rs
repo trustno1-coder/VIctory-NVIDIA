@@ -186,6 +186,9 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 mod tests {
     use super::*;
 
+    // These tests use the running test executable as a PE fixture; it is
+    // a PE image only on Windows. Synthetic fixtures remain portable.
+    #[cfg(windows)]
     #[test]
     fn patches_own_test_binary() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -213,6 +216,7 @@ mod tests {
         assert_eq!(prepared.bytes.len(), original.len());
     }
 
+    #[cfg(windows)]
     #[test]
     fn keeps_iat_slots_when_import_size_excludes_the_terminator() {
         let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -285,6 +289,7 @@ mod tests {
     /// A relocation block whose page RVA is not page-aligned and lies near the
     /// top of the 32-bit RVA space: the target of its first entry is past
     /// 4 GiB and must be skipped, not overflow.
+    #[cfg(windows)]
     #[test]
     fn relocation_targets_past_the_top_of_the_rva_space_are_skipped() {
         use victory_pe::SectionInfo;
@@ -368,6 +373,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn file_name_is_stable_per_build() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
