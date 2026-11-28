@@ -937,15 +937,22 @@ mod tests {
         let last = super::super::record::ticks();
         let me = record::thread();
         let other = worker.join().unwrap();
-        // A contended lock.
+        // A contended lock: the 20 ms it is held start once the second thread
+        // runs and is about to wait for it. (Counted from the spawn, a thread
+        // that began late on a busy processor found the lock nearly free and
+        // waited under 10 ms, or not at all: `None` below, in about one run
+        // in ten with eight test processes at once.)
         let held = lock.lock().unwrap();
+        let (started, running) = std::sync::mpsc::channel();
         let second = {
             let lock = lock.clone();
             std::thread::spawn(move || {
+                started.send(()).unwrap();
                 drop(lock.lock().unwrap());
                 record::thread()
             })
         };
+        running.recv().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         drop(held);
         let second = second.join().unwrap();
@@ -955,11 +962,18 @@ mod tests {
         let chain = trace.chain(me, last, first);
         let work: u64 = chain.iter().filter(|p| p.thread == other && p.cause == "the work of a test").map(|p| p.to - p.from).sum();
         assert!(ms(work) >= 20.0, "{chain:?}");
-        let contended = trace.waits[&second]
-            .iter()
-            .filter(|w| ms(w.t1 - w.t0) >= 10.0)
-            .find_map(|w| trace.waker(second, w));
-        assert_eq!(contended.map(|c| c.0), Some(me));
+        // The second thread's waits for the lock (on the object of its longest
+        // wait): 10 ms or more in all, the last ended by this thread's unlock.
+        // They can be several: WaitOnAddress returns now and then with no wake,
+        // and the lock waits again (16 waits of 1 to 4 ms for its 20 ms, beside
+        // the write watch's tests in one process), none of which was 10 ms.
+        let waits = &trace.waits[&second];
+        let lock_object = waits.iter().max_by_key(|w| w.t1 - w.t0).expect("the second thread waited").object;
+        let on_lock: Vec<&Wait> = waits.iter().filter(|w| w.object == lock_object).collect();
+        let waited: u64 = on_lock.iter().map(|w| w.t1 - w.t0).sum();
+        assert!(ms(waited) >= 10.0, "{on_lock:?}");
+        let ended = on_lock.iter().max_by_key(|w| w.t1).and_then(|w| trace.waker(second, w));
+        assert_eq!(ended.map(|c| c.0), Some(me), "{on_lock:?}");
         let mut names = Names::new();
         let sites: Vec<String> = data.stacks.iter().map(|s| names.site(s)).collect();
         assert!(sites.iter().any(|s| s.contains("real_waits_are_recorded")), "{sites:?}");
