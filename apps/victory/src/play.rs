@@ -266,7 +266,8 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     let saved = |k: &str| menu.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     let series_s = saved("VICTORY_MENU_CONSOLE").map_or(o.series_s, |c| c == "series-s");
     let res = saved("VICTORY_MENU_RES").filter(|r| RESOLUTIONS.contains(r)).unwrap_or(&o.res);
-    let dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
+    let saved_dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d));
+    let dlss = saved_dlss.unwrap_or(&o.dlss);
     // 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).
     let (mut framegen, mut times) = (o.framegen.is_some(), o.framegen.unwrap_or(2));
     if let Some(saved) = saved("VICTORY_MENU_FRAMEGEN") {
@@ -347,7 +348,8 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     set("VICTORY_MENU_CONSOLE", if series_s { "series-s" } else { "series-x" });
     set("VICTORY_MENU_RES", res);
-    set("VICTORY_MENU_DLSS", if dlss_on { dlss } else { "off" });
+    // A failed SDK download disables the runtime for this start. F1 still edits the saved mode.
+    set("VICTORY_MENU_DLSS", if dlss_on { dlss } else { saved_dlss.unwrap_or("off") });
     set("VICTORY_MENU_FRAMEGEN", &framegen_x.unwrap_or(0).to_string());
     set("VICTORY_MENU_FG_TYPE", fg_type);
     set("VICTORY_MENU_FPS", &fps.to_string());
@@ -1029,6 +1031,20 @@ mod tests {
         // check stopped the game (#331, #459)
         assert!(!s.contains_key("VICTORY_FSR_FRAMEGEN") && !s.contains_key("VICTORY_FRAMEGEN_X"));
         assert_eq!(get("VICTORY_MENU_FG_TYPE"), Some("auto"));
+    }
+
+    #[test]
+    fn saved_dlss_is_shown_even_when_the_download_failed() {
+        let mut o = options();
+        o.dlss = "off".into();
+        let menu = parse_menu("VICTORY_MENU_DLSS=quality\r\nVICTORY_MENU_DLSS=balanced\r\n");
+        let (missing, _) = settings(&o, &menu, None);
+        assert_eq!(missing["VICTORY_MENU_DLSS"], "balanced");
+        assert!(!missing.contains_key("VICTORY_DLSS"));
+        assert!(!missing.contains_key("VICTORY_DLSS_MODE"));
+        let (installed, _) = settings(&o, &menu, Some(Path::new("sdk")));
+        assert_eq!(installed["VICTORY_DLSS_MODE"], "balanced");
+        assert_eq!(installed["VICTORY_DLSS"], "1");
     }
 
     #[test]

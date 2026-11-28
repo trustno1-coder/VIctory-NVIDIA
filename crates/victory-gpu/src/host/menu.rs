@@ -98,9 +98,9 @@ const ABOUT_MFG: [&str; 3] = [
 /// The DLSS setting, and what is said while it is picked on in a start without NVIDIA's files.
 const DLSS: &str = "VICTORY_MENU_DLSS";
 const ABOUT_NO_DLSS: [&str; 3] = [
-    "THE NVIDIA DLSS FILES ARE NOT ON THIS PC YET: THEY ARE",
-    "DOWNLOADED FROM NVIDIA ON GITHUB AT THE NEXT START",
-    "(ABOUT 70 MB, ONCE). SAVE AND RESTART NOW DOES IT.",
+    "NVIDIA DLSS FILES MISSING (ABOUT 70 MB FROM NVIDIA).",
+    "IN VICTORY PLAY, SAVE AND RESTART NOW TO DOWNLOAD.",
+    "FOR THE SCRIPT LAUNCHER, RUN GET-NVIDIA-DLSS.CMD.",
 ];
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
@@ -934,6 +934,17 @@ mod tests {
         let text = std::fs::read_to_string(home.join("victory-settings.txt")).expect("saved without a save line");
         assert!(text.contains("VICTORY_MENU_DLSS=quality"), "{text}");
         assert_eq!(menu.note, "SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME");
+        // A later start may have no NVIDIA files. An unrelated F1 edit must merge with
+        // the settings on disk, even if that launcher showed DLSS as off.
+        menu.values[dlss] = "off".to_owned();
+        let fps = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_FPS").expect("in the menu");
+        menu.values[fps] = "120".to_owned();
+        menu.started = menu.values.clone();
+        menu.change_and_save(fps, 1);
+        let text = std::fs::read_to_string(home.join("victory-settings.txt")).unwrap();
+        assert!(text.lines().any(|line| line == "VICTORY_MENU_DLSS=quality"));
+        assert!(text.lines().any(|line| line == "VICTORY_MENU_FPS=60"));
+
         // Every note fits the box and has its letters.
         for note in [menu.note.as_str(), "SAVED. ON NOW", "SAVED. APPLIES AT THE NEXT START", "NO FOLDER FOR THE SETTINGS FILE"] {
             assert!(note.len() <= COLUMNS as usize, "{note}");
