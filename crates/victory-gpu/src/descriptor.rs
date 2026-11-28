@@ -1722,11 +1722,17 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null constant buffer view (`Constant(0, 0)`, which
+/// the host makes as a null view), as D3D12's `CreateConstantBufferView`
+/// does. It left the slot as it was, so the view written there before
+/// stayed live (makmatvey's fix, Marvisak/VIctory#2449).
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => View::Constant(u64::from(lo) | u64::from(hi) << 32, size),
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -2259,6 +2265,23 @@ mod tests {
             create(null, &other, &view_desc, handle);
             assert_ne!(slot, first);
         }
+    }
+
+    /// A null constant buffer view description writes a null view over the
+    /// slot, as D3D12 does: the view there before is not read again.
+    #[test]
+    fn a_null_cbv_clears_the_view_there_before() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let at = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], at);
+        assert_eq!(view(at), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), at);
+        assert_eq!(view(at), Some(View::Constant(0, 0)));
+        create_srv(null, null, std::ptr::null(), at);
+        assert_eq!(view(at), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), at);
+        assert_eq!(view(at), Some(View::Constant(0, 0)));
     }
 
     #[test]
