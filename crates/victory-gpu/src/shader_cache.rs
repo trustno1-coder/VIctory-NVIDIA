@@ -39,6 +39,34 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// The switches that pick the form of a translation, by name and value in its
+/// key: without them there a run with `VICTORY_WAVE_WIDE=0` was served the
+/// translations an earlier run of the same executable had cached with the
+/// switch unset, and one with `VICTORY_LOOPS_WAVE=0` or
+/// `VICTORY_LDS_FIRST_INIT=0` still was (the water light's tests, #739). The
+/// other switches the translator reads are in the key another way or change
+/// no translation: the tests check each of them.
+const KEYED: [&str; 18] = [
+    "VICTORY_WAVE_WIDE",
+    "VICTORY_WAVE_DEEP_SKIPS",
+    "VICTORY_WAVE_OWN_BITS",
+    "VICTORY_WAVE_LOCAL",
+    "VICTORY_F16_NEAREST",
+    "VICTORY_FILTER_3D",
+    "VICTORY_HELPER_OWN",
+    "VICTORY_FIRSTLANE_OWN",
+    "VICTORY_FIRST_HALF",
+    "VICTORY_STRICT_JOINS",
+    "VICTORY_MESH_OUTPUT_STRICT",
+    "VICTORY_BVH_FENCES",
+    "VICTORY_BVH_BOUNDS",
+    "VICTORY_THREAD_TICKET",
+    "VICTORY_LDS_LOOP_ATOMICS",
+    "VICTORY_LDS_BOUNDS",
+    "VICTORY_LOOPS_WAVE",
+    "VICTORY_LDS_FIRST_INIT",
+];
+
 /// What identifies a translation beside its container: the translator
 /// (the BLAKE3 of its sources, `build.rs`), the settings it runs with, and
 /// what it was told of the host. Not our executable: a rebuild of anything
@@ -60,28 +88,8 @@ fn build() -> [u8; 32] {
         bytes.extend_from_slice(&limit.to_le_bytes());
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
-        // So are the switches that pick the form of a wave64 program:
-        // without them here a run with `VICTORY_WAVE_WIDE=0` was
-        // served the translations an earlier run of the same
-        // executable had cached with the switch unset.
-        for name in [
-            "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_DEEP_SKIPS",
-            "VICTORY_WAVE_OWN_BITS",
-            "VICTORY_WAVE_LOCAL",
-            "VICTORY_F16_NEAREST",
-            "VICTORY_FILTER_3D",
-            "VICTORY_HELPER_OWN",
-            "VICTORY_FIRSTLANE_OWN",
-            "VICTORY_FIRST_HALF",
-            "VICTORY_STRICT_JOINS",
-            "VICTORY_MESH_OUTPUT_STRICT",
-            "VICTORY_BVH_FENCES",
-            "VICTORY_BVH_BOUNDS",
-            "VICTORY_THREAD_TICKET",
-            "VICTORY_LDS_LOOP_ATOMICS",
-            "VICTORY_LDS_BOUNDS",
-        ] {
+        // So are the switches that pick the form of a translation ([`KEYED`]).
+        for name in KEYED {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
             if let Some(value) = std::env::var_os(name) {
@@ -454,5 +462,56 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    /// Every switch the translator reads (`victory_shader::emit::SWITCHES`,
+    /// gathered from its sources at build time) is in the key by name
+    /// ([`KEYED`]), in it another way, or changes no translation. A new one
+    /// that is none of these fails here instead of being served translations
+    /// made without it.
+    #[test]
+    fn every_switch_of_the_translator_is_in_the_key() {
+        // `loop_limit`, `group_sync`, `early_depth`, `shader_opt`, and
+        // `host_settings` (`host_rdna`).
+        const ELSEWHERE: [&str; 5] = [
+            "VICTORY_SHADER_LOOP_LIMIT",
+            "VICTORY_GROUP_SYNC",
+            "VICTORY_EARLY_DEPTH",
+            "VICTORY_SHADER_OPT",
+            "VICTORY_RDNA_FLOAT",
+        ];
+        // What it says or writes out beside a translation, the host it is told
+        // of (`host_settings` holds what it learns of it), where its tools are,
+        // and its tests'.
+        const NOT_TRANSLATION: [&str; 16] = [
+            "VICTORY_WAVE_WHY",
+            "VICTORY_DESC_WHY",
+            "VICTORY_EMIT_DUMP",
+            "VICTORY_SHADER_CENSUS",
+            "VICTORY_ADAPTER",
+            "VICTORY_WARP",
+            "VICTORY_D3D12_DEBUG",
+            "VICTORY_DXIL",
+            "VICTORY_PC_DXC",
+            "VICTORY_CONSOLE_DXC",
+            "VICTORY_DIFF_ONLY",
+            "VICTORY_PROBE",
+            "VICTORY_REF_VS",
+            "VICTORY_REF_PS",
+            "VICTORY_SHADER_SOURCE_HASH",
+            "VICTORY_SHADER_SWITCHES",
+        ];
+        let read: Vec<&str> = victory_shader::emit::SWITCHES.split(',').filter(|s| !s.is_empty()).collect();
+        assert!(read.contains(&"VICTORY_WAVE_WIDE"), "the translator's switches are listed: {read:?}");
+        let unkeyed: Vec<&str> = read
+            .iter()
+            .copied()
+            .filter(|s| !KEYED.contains(s) && !ELSEWHERE.contains(s) && !NOT_TRANSLATION.contains(s))
+            .collect();
+        assert!(unkeyed.is_empty(), "switches the translator reads that the shader cache's key leaves out: {unkeyed:?}");
+        // And no name above is one the translator no longer reads.
+        for name in KEYED.iter().chain(&ELSEWHERE).chain(&NOT_TRANSLATION) {
+            assert!(read.contains(name), "{name} is not read by the translator any more");
+        }
     }
 }

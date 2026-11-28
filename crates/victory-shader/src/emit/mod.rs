@@ -356,6 +356,11 @@ fn parse_set(value: Option<&str>, unset: u32, all: u32) -> u32 {
     parsed.map_or(unset, |n| n & all)
 }
 
+/// Every `VICTORY_*` switch the translator's sources name (`build.rs`,
+/// comma-separated): for a cache's check that each one that changes a
+/// translation is in its key (`victory-gpu`'s shader cache).
+pub const SWITCHES: &str = env!("VICTORY_SHADER_SWITCHES");
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
