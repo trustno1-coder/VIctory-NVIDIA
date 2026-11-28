@@ -3773,6 +3773,7 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
+            && ![x, y, z].contains(&0)
             && self.ambient(list, p, role)
         {
             self.host_pipeline = 0;
@@ -3913,6 +3914,22 @@ impl State {
             }),
             _ => entry(ResourceType::Uav, at),
         };
+        // The optional neutral probe pass has no depth dependency. It has
+        // its own root signature and must also work when real depth exists.
+        let neutral_view = || {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(at.0)) else { return false };
+            let Some(view) = crate::descriptor::view(table + u64::from(at.1) * 4) else { return false };
+            match crate::descriptor::host::placed_texture(&view).unwrap_or(view) {
+                View::Unordered(_, _, words) => crate::ambient::neutral_uav(words.as_ref()),
+                _ => false,
+            }
+        };
+        if role == Role::Resolve && crate::ambient::neutral_level().is_some() && neutral_view()
+            && let Some((desc, handle)) = image.as_ref()
+            && crate::ambient::neutral_after(list, role, desc, *handle)
+        {
+            return true;
+        }
         let usual_depth = |at: (u8, u32)| {
             if stencil_at(at) {
                 static STENCIL: AtomicU64 = AtomicU64::new(0);

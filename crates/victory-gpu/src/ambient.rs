@@ -28,6 +28,12 @@
 //! - a number: that share of the estimate (1: all of it).
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
+//! `VICTORY_PROBE_NEUTRAL=<level>` replaces diffuse screen-probe light with
+//! neutral irradiance (positive finite, capped at 2; unset/0: unchanged).
+//! This opt-in workaround removes stale flashing colour and valid indirect
+//! colour alike. It follows only direct, nonempty diffuse resolves, requires
+//! the existing stand-in to be enabled, and does not read depth or UI pixels.
+//!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //! `VICTORY_AMBIENT_ONCE=1`: one bounce of the title's own light, without the
 //! stand-in's light coming back to it ([`once`]).
@@ -571,6 +577,99 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
+fn parse_neutral(value: &str) -> Option<f32> {
+    value.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).map(|v| v.min(2.0))
+}
+
+pub(crate) fn neutral_level() -> Option<f32> {
+    static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
+    *LEVEL.get_or_init(|| parse_neutral(&std::env::var("VICTORY_PROBE_NEUTRAL").unwrap_or_default()))
+}
+
+fn neutral_image(role: Role, desc: &D3D12_RESOURCE_DESC) -> bool {
+    role == Role::Resolve
+        && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT
+        && desc.SampleDesc.Count == 1
+        && desc.DepthOrArraySize == 1
+        && desc.Width > 0 && desc.Width <= u64::from(u32::MAX) && desc.Height > 0
+}
+
+/// A default UAV uses mip zero; explicit views must name a 2D R32_UINT
+/// mip-zero colour plane so full-resource dispatch bounds are valid.
+pub(crate) fn neutral_uav(words: Option<&[u32; 10]>) -> bool {
+    words.is_none_or(|d| crate::resource::pc_format(d[0]) == 42 && d[1] == 4 && d[4] == 0 && d[5] == 0)
+}
+
+const NEUTRAL_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), DescriptorTable(UAV(u0))"
+cbuffer Params : register(b0) { float level; uint width; uint height; };
+RWTexture2D<uint> light : register(u0);
+uint pack(float3 c) {
+    float peak = max(c.r, max(c.g, c.b));
+    int exponent = max(-16, int(floor(log2(max(peak, 1e-9))))) + 1;
+    float scale = exp2(float(exponent - 9));
+    uint3 m = uint3(floor(c / scale + 0.5));
+    if (max(m.r, max(m.g, m.b)) > 511) {
+        exponent++; scale *= 2; m = uint3(floor(c / scale + 0.5));
+    }
+    return (uint(exponent + 15) << 27) | m.r | (m.g << 9) | (m.b << 18);
+}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void neutral(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    light[at.xy] = pack(float3(1.0, 0.98, 0.94) * level);
+}
+"#;
+
+struct NeutralPass {
+    root: ID3D12RootSignature,
+    pipeline: ID3D12PipelineState,
+}
+
+fn make_neutral(device: &ID3D12Device) -> windows::core::Result<NeutralPass> {
+    let code = crate::host::compile(NEUTRAL_SOURCE, s!("neutral"), s!("cs_5_1"))?;
+    // SAFETY: the shader contains its root signature; the code lives through creation.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            ..Default::default()
+        };
+        Ok(NeutralPass { root, pipeline: device.CreateComputePipelineState(&desc)? })
+    }
+}
+
+/// Replaces only the diffuse probe UAV, before materials and the UI are composed.
+/// Called after a direct nonempty dispatch, even when no matching depth exists.
+pub(crate) fn neutral_after(list: &HostList, role: Role, desc: &D3D12_RESOURCE_DESC, image: D3D12_GPU_DESCRIPTOR_HANDLE) -> bool {
+    let Some(level) = neutral_level().filter(|_| neutral_image(role, desc)) else { return false };
+    static PASS: OnceLock<Option<NeutralPass>> = OnceLock::new();
+    let Some(pass) = PASS.get_or_init(|| {
+        make_neutral(&host()?.device)
+            .inspect_err(|error| tracing::warn!(%error, "neutral probe replacement unavailable"))
+            .ok()
+    }) else { return false };
+    let words = [level.to_bits(), desc.Width as u32, desc.Height];
+    let l = &list.list;
+    // SAFETY: the title just wrote this UAV; its heap remains set and its
+    // lifetime is held by the title's dispatch. No depth descriptor is bound.
+    unsafe {
+        uav_barrier(l);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetComputeRoot32BitConstants(0, 3, words.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(1, image);
+        l.SetPipelineState(&pass.pipeline);
+        l.Dispatch((desc.Width as u32).div_ceil(8), desc.Height.div_ceil(8), 1);
+        uav_barrier(l);
+    }
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| tracing::info!(level, "neutral probe replacement recorded (VICTORY_PROBE_NEUTRAL)"));
+    true
+}
+
 /// Whether the light of a frame has been kept: the estimate has something
 /// to begin with.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -771,6 +870,139 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neutral_probe_settings_and_image_scope() {
+        for value in ["", "0", "off", "-1", "nan", "inf", "constant:0.3"] {
+            assert_eq!(parse_neutral(value), None, "{value}");
+        }
+        assert_eq!(parse_neutral(" 0.3 "), Some(0.3));
+        assert_eq!(parse_neutral("100"), Some(2.0));
+        assert!(neutral_uav(None));
+        let mut view = [0u32; 10];
+        view[0] = 42;
+        view[1] = 4;
+        assert!(neutral_uav(Some(&view)));
+        for (word, value) in [(0, 26), (1, 5), (4, 1), (5, 1)] {
+            let mut invalid = view;
+            invalid[word] = value;
+            assert!(!neutral_uav(Some(&invalid)));
+        }
+        let image = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+            Width: 1280, Height: 720, DepthOrArraySize: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        assert!(neutral_image(Role::Resolve, &image));
+        for role in [Role::Radiance, Role::Air, Role::Miss] {
+            assert!(!neutral_image(role, &image));
+        }
+        for bad in [
+            D3D12_RESOURCE_DESC { Width: 0, ..image },
+            D3D12_RESOURCE_DESC { DepthOrArraySize: 2, ..image },
+            D3D12_RESOURCE_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R11G11B10_FLOAT, ..image },
+            D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D, ..image },
+        ] {
+            assert!(!neutral_image(Role::Resolve, &bad));
+        }
+    }
+
+    #[test]
+    fn neutral_probe_replaces_colour_without_depth_and_preserves_bounds() {
+        use crate::indirect::tests::WarpHarness;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
+
+        let mut gpu = WarpHarness::new().expect("a D3D12 WARP adapter");
+        let pass = make_neutral(&gpu.device).unwrap();
+        let (initial, initial_bytes, _) = gpu.shared_buffer(256);
+        let (readback, readback_bytes, _) = gpu.shared_buffer(256);
+        // Synthetic RGB9E5: ~0.6 gray, bright gray, saturated RGB and magenta.
+        // These catch both accidental luminance caps and colour rejection.
+        let gray = (15u32 << 27) | 307 | (307 << 9) | (307 << 18);
+        let bright = (19u32 << 27) | 256 | (256 << 9) | (256 << 18);
+        let red = (19u32 << 27) | 256;
+        let green = (19u32 << 27) | (256 << 9);
+        let blue = (19u32 << 27) | (256 << 18);
+        let magenta = red | blue;
+        let sentinel = 0xdeadbeef;
+        // SAFETY: live mapped buffers and D3D12 objects, all kept until the
+        // submitted command list completes. No depth descriptor exists here.
+        unsafe {
+            std::ptr::copy_nonoverlapping([0, gray, bright, red, green, blue, magenta, sentinel].as_ptr(), initial_bytes.cast(), 8);
+            let mut texture = None;
+            gpu.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 8, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+                    Format: DXGI_FORMAT_R32_UINT,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let heap: ID3D12DescriptorHeap = gpu.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, ..Default::default()
+                },
+            ).unwrap();
+            gpu.device.CreateUnorderedAccessView(
+                &texture, None::<&ID3D12Resource>, None, heap.GetCPUDescriptorHandleForHeapStart(),
+            );
+            let placed = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(r),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R32_UINT, Width: 8, Height: 1, Depth: 1, RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let image = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let l = &gpu.list;
+            l.CopyTextureRegion(&image, 0, 0, 0, &placed(&initial), None);
+            l.ResourceBarrier(&[crate::host::transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            l.SetDescriptorHeaps(&[Some(heap.clone())]);
+            l.SetComputeRootSignature(&pass.root);
+            let mut words = [0u32; 3];
+            words[0] = 0.3f32.to_bits();
+            words[1] = 7;
+            words[2] = 1;
+            l.SetComputeRoot32BitConstants(0, 3, words.as_ptr().cast(), 0);
+            l.SetComputeRootDescriptorTable(1, heap.GetGPUDescriptorHandleForHeapStart());
+            l.SetPipelineState(&pass.pipeline);
+            l.Dispatch(1, 1, 1);
+            l.ResourceBarrier(&[crate::host::transition(&texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            l.CopyTextureRegion(&placed(&readback), 0, 0, 0, &image, None);
+            gpu.submit_and_wait();
+            let pixels = std::slice::from_raw_parts(readback_bytes.cast::<u32>(), 8);
+            let rgb = |v: u32| {
+                let scale = 2.0f32.powi((v >> 27) as i32 - 24);
+                [v & 511, (v >> 9) & 511, (v >> 18) & 511].map(|n| n as f32 * scale)
+            };
+            let neutral = |pixel| {
+                for (value, wanted) in rgb(pixel).iter().zip([0.3, 0.294, 0.282]) {
+                    assert!((value - wanted).abs() < 0.002, "neutral ambient {:?}", rgb(pixel));
+                }
+            };
+            for pixel in &pixels[..7] { neutral(*pixel); }
+            assert_eq!(pixels[7], sentinel, "pixels outside the declared size stay intact");
+            eprintln!("depth-free ambient readback: {:?}", rgb(pixels[0]));
+        }
+    }
 
     #[test]
     fn settings() {
