@@ -454,8 +454,8 @@ enum Job {
     /// the parts of it are known when they are.
     Lists(usize, Recordings),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
-    /// begin in the order, and the signals given behind them.
-    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
+    /// begin in the order. Fence signals are submission boundaries.
+    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>),
     /// A signal of the queue's.
     Signal(usize, u64),
     /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
@@ -559,10 +559,11 @@ impl Work for Job {
         if most < 2 {
             return Err(next);
         }
-        // Nothing but waits and signals that a submission may follow.
-        let (queue, count, lists, signals) = match self {
-            Job::Run(queue, lists, order) => (*queue, 1, (&*lists, &*order), &[][..]),
-            Job::Joined(queue, lists, order, parts, signals) => (*queue, 1 + parts.len(), (&*lists, &*order), &signals[..]),
+        // A signal must be published behind its original prefix, not
+        // moved behind unrelated work joined after it.
+        let (queue, count, lists) = match self {
+            Job::Run(queue, lists, order) => (*queue, 1, (&*lists, &*order)),
+            Job::Joined(queue, lists, order, parts) => (*queue, 1 + parts.len(), (&*lists, &*order)),
             _ => return Err(next),
         };
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
@@ -580,11 +581,11 @@ impl Work for Job {
                 }
             }
             &Job::Wait(fence, value) => {
-                if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                if crate::fence::completed(fence as This) < value {
                     return Err(next);
                 }
             }
-            Job::Signal(..) => {}
+            Job::Signal(..) => return Err(next),
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
                 if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
@@ -594,26 +595,22 @@ impl Work for Job {
             Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
-        let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
-            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new()),
-            Job::Joined(queue, lists, order, parts, signals) => (queue, lists, order, parts, signals),
+        let (queue, mut lists, mut order, mut parts) = match taken {
+            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new()),
+            Job::Joined(queue, lists, order, parts) => (queue, lists, order, parts),
             other => {
                 *self = other;
                 return Err(next);
             }
         };
         let run = matches!(next, Job::Run(..));
-        match next {
-            Job::Run(_, more, then) => {
-                parts.push(order.len());
-                order.extend(then.into_iter().map(|i| i + lists.len()));
-                lists.extend(more);
-                STATS[JOINED].fetch_add(1, Relaxed);
-            }
-            Job::Signal(fence, value) => signals.push((fence, value)),
-            _ => {}
+        if let Job::Run(_, more, then) = next {
+            parts.push(order.len());
+            order.extend(then.into_iter().map(|i| i + lists.len()));
+            lists.extend(more);
+            STATS[JOINED].fetch_add(1, Relaxed);
         }
-        *self = Job::Joined(queue, lists, order, parts, signals);
+        *self = Job::Joined(queue, lists, order, parts);
         Ok(run)
     }
 
@@ -651,7 +648,7 @@ impl Work for Job {
                 });
                 QUEUED.fetch_sub(1, Relaxed);
             }
-            Job::Joined(queue, lists, order, parts, signals) => {
+            Job::Joined(queue, lists, order, parts) => {
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
                     format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
@@ -663,11 +660,6 @@ impl Work for Job {
                 });
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
-                for (fence, value) in signals {
-                    if !crate::host::late_signal(fence, value) {
-                        crate::fence::set(fence as This, value);
-                    }
-                }
             }
             Job::Signal(fence, value) => {
                 if !crate::host::late_signal(fence, value) {
@@ -982,8 +974,8 @@ mod tests {
         Slow(&'static str, Log, Arc<(Mutex<bool>, Condvar)>),
         Signal(usize, u64, Log),
         Present(&'static str, Log),
-        /// Takes others of its kind, waits that are met, and signals along.
-        Group(Vec<&'static str>, Log, Vec<(usize, u64)>),
+        /// Takes others of its kind and waits that are already met.
+        Group(Vec<&'static str>, Log),
     }
 
     impl Work for T {
@@ -1004,7 +996,7 @@ mod tests {
             matches!(self, T::Run(..) | T::Slow(..) | T::Group(..))
         }
         fn take_along(&mut self, next: T) -> Result<bool, T> {
-            let T::Group(names, _, signals) = self else {
+            let T::Group(names, _) = self else {
                 return Err(next);
             };
             match next {
@@ -1012,11 +1004,7 @@ mod tests {
                     names.extend(more);
                     Ok(true)
                 }
-                T::Wait(f, v) if crate::fence::completed(f as This) >= v || signals.contains(&(f, v)) => Ok(false),
-                T::Signal(f, v, _) => {
-                    signals.push((f, v));
-                    Ok(false)
-                }
+                T::Wait(f, v) if crate::fence::completed(f as This) >= v => Ok(false),
                 other => Err(other),
             }
         }
@@ -1039,12 +1027,7 @@ mod tests {
                     log.lock().unwrap().push(format!("signal {value}"));
                     crate::fence::set(fence as This, value);
                 }
-                T::Group(names, log, signals) => {
-                    log.lock().unwrap().push(names.join("+"));
-                    for (fence, value) in signals {
-                        crate::fence::set(fence as This, value);
-                    }
-                }
+                T::Group(names, log) => log.lock().unwrap().push(names.join("+")),
             }
         }
         fn mark_now() -> u64 {
@@ -1103,7 +1086,7 @@ mod tests {
         look(&lane);
         assert_eq!(MARKS.take(), [("c".to_string(), 7), ("d".to_string(), 9)]);
         // Taken along: a met wait between two parts raises them both.
-        let part = |name| T::Group(vec![name], log.clone(), Vec::new());
+        let part = |name| T::Group(vec![name], log.clone());
         NOW.set(10);
         LATER.set(12);
         lane.push(3, [part("x"), T::Wait(f, 1), part("y")]);
@@ -1160,7 +1143,7 @@ mod tests {
         let lane = Lane::new();
         let log: Log = Default::default();
         let f = fence();
-        let part = |name| T::Group(vec![name], log.clone(), Vec::new());
+        let part = |name| T::Group(vec![name], log.clone());
         lane.push(1, [part("a"), T::Wait(f, 0), part("b")]);
         lane.push(2, [part("other queue"), T::Wait(f, 1), part("behind a's signal")]);
         lane.push(1, [T::Signal(f, 1, log.clone()), T::Wait(f, 1), part("c"), part("d")]);
@@ -1171,12 +1154,28 @@ mod tests {
         lane.look(limit);
         assert_eq!(
             *log.lock().unwrap(),
-            ["a+b+c", "other queue+behind a's signal", "d", "held", "present", "next frame"],
+            ["a+b", "other queue", "signal 1", "behind a's signal", "c+d", "held", "present", "next frame"],
             "{:?}",
             lane.lock().items.len()
         );
         look(&lane);
         assert_eq!(log.lock().unwrap().last().unwrap(), "later");
+        let state = lane.lock();
+        assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_signal_is_not_delayed_behind_later_joinable_work() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        let part = |name| T::Group(vec![name], log.clone());
+        lane.push(1, [part("producer")]);
+        lane.push(2, [T::Wait(f, 1), part("consumer")]);
+        lane.push(1, [T::Signal(f, 1, log.clone()), part("unrelated later work")]);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["producer", "signal 1", "consumer", "unrelated later work"]);
+        assert_eq!(value(f), 1);
         let state = lane.lock();
         assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
     }

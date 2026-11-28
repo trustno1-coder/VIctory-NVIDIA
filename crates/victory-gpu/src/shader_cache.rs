@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
@@ -44,70 +44,29 @@ pub(crate) fn counts() -> (u64, u64) {
 /// what it was told of the host. Not our executable: a rebuild of anything
 /// else used to translate every shader again.
 fn build() -> [u8; 32] {
-    // The view heap's null slot differs by host GPU: a translation cached
-    // without the clamp must not be served (`host_settings` below).
+    // Probe before reading the translator's host settings. These settings
+    // must not be frozen by a cache lookup before the device is known.
     crate::descriptor::host::probe_view_limit();
-    static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
-    let fixed = FIXED.get_or_init(|| {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    REPORTED.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-            tracing::warn!(
-                limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
-            );
+            tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner");
         }
-        let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
-        bytes.extend_from_slice(&limit.to_le_bytes());
-        // Which group barriers wait is part of the translation too.
-        bytes.push(victory_shader::emit::group_sync());
-        // So are the switches that pick the form of a wave64 program:
-        // without them here a run with `VICTORY_WAVE_WIDE=0` was
-        // served the translations an earlier run of the same
-        // executable had cached with the switch unset.
-        for name in [
-            "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_DEEP_SKIPS",
-            "VICTORY_WAVE_OWN_BITS",
-            "VICTORY_WAVE_LOCAL",
-            "VICTORY_F16_NEAREST",
-            "VICTORY_FILTER_3D",
-            "VICTORY_HELPER_OWN",
-            "VICTORY_FIRSTLANE_OWN",
-            "VICTORY_FIRST_HALF",
-            "VICTORY_STRICT_JOINS",
-            "VICTORY_MESH_OUTPUT_STRICT",
-            "VICTORY_BVH_FENCES",
-            "VICTORY_BVH_BOUNDS",
-            "VICTORY_THREAD_TICKET",
-            "VICTORY_LDS_LOOP_ATOMICS",
-            "VICTORY_LDS_BOUNDS",
-        ] {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            if let Some(value) = std::env::var_os(name) {
-                bytes.extend_from_slice(value.as_encoded_bytes());
-            }
-            bytes.push(0);
-        }
-        // So is whether pixel programs keep the console's early depth test
-        // (`VICTORY_EARLY_DEPTH=1`): only while it is on, so that the
-        // translations cached without it are still served without it.
         if victory_shader::emit::early_depth() {
-            tracing::info!(
-                "VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test"
-            );
-            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
-            bytes.push(0);
+            tracing::info!("VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test");
         }
-        // And which clean-up passes ran over the translated code.
-        bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-        bytes
     });
+    fingerprint()
+}
+
+/// Use the translator's own build-generated inventory of switches, not
+/// a second manually maintained list. Retain the dependency/toolchain hash
+/// from victory-gpu's build script as well.
+fn fingerprint() -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
-    hash.update(fixed);
-    for value in victory_shader::emit::host_settings() {
-        hash.update(&value.to_le_bytes());
-    }
+    hash.update(env!("VICTORY_TRANSLATOR").as_bytes());
+    hash.update(&victory_shader::emit::translation_fingerprint());
     *hash.finalize().as_bytes()
 }
 
@@ -142,11 +101,12 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     Ok(shader)
 }
 
-/// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// Keep the translated shader independently of disk publication. In
+/// particular, a full disk or a racing cache writer must not turn a
+/// successful translation into a permanently missing pipeline.
 struct Translate<F> {
     translate: F,
-    ran: AtomicBool,
+    result: OnceLock<Result<HostShader, String>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -158,9 +118,11 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        self.result
+            .get_or_init(|| (self.translate)(&input[32..]))
+            .as_ref()
+            .map(encode)
+            .map_err(|e| anyhow::Error::msg(e.clone()))
     }
 }
 
@@ -173,14 +135,22 @@ fn cached(
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
-        ran: AtomicBool::new(false),
+        result: OnceLock::new(),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => {
+                // A genuine translator error is returned below, unchanged.
+                // If the translator succeeded, return its in-memory result.
+                if !matches!(converter.result.get(), Some(Err(_))) {
+                    tracing::warn!(error = %e, "shader cache unavailable; using in-memory translation");
+                }
+                break;
+            }
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
+            let (counter, what) = if converter.result.get().is_some() {
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
@@ -189,14 +159,22 @@ fn cached(
             tracing::debug!(path = %path.display(), "shader {what}");
             return Ok(shader);
         }
-        tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
+        tracing::debug!(path = %path.display(), "unreadable shader cache entry");
         let _ = std::fs::remove_file(&path);
+        if converter.result.get().is_some() {
+            // We already have a translation. Do not compile it again.
+            break;
+        }
     }
-    MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    let Translate { translate, result } = converter;
+    let result = result.into_inner().unwrap_or_else(|| translate(container));
+    if result.is_ok() {
+        MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -287,10 +265,17 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    // Detect corruption even if a modified payload still parses correctly.
+    let digest = blake3::hash(&out);
+    out.extend_from_slice(digest.as_bytes());
     out
 }
 
 fn decode(bytes: &[u8]) -> Option<HostShader> {
+    let (bytes, expected) = bytes.split_at_checked(bytes.len().checked_sub(32)?)?;
+    if blake3::hash(bytes).as_bytes().as_slice() != expected {
+        return None;
+    }
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
         fn take(&mut self, n: usize) -> Option<&'a [u8]> {
@@ -435,6 +420,67 @@ mod tests {
         assert!(cached(&cache, &build, b"other", fail).is_err());
     }
 
+    #[test]
+    fn cache_publication_failure_does_not_drop_a_valid_shader() {
+        use victory_pipeline::CacheKey;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [3u8; 32];
+        let container = b"valid console shader".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let converter = Translate { translate, result: OnceLock::new() };
+        let input = [&build[..], container].concat();
+        let path = cache.path_for(&CacheKey::new(&converter, &input));
+        // A directory at the entry path forces publication to fail on both
+        // Windows and Unix, without requiring special permissions.
+        std::fs::create_dir_all(&path).unwrap();
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        assert_eq!(cached(&cache, &build, container, fail), Err("unsupported".to_owned()));
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+    }
+
+    // Use child processes so the test does not mutate the environment of
+    // other tests or depend on settings already initialized by OnceLock.
+    #[test]
+    fn fingerprint_probe() {
+        if std::env::var_os("VICTORY_TEST_FINGERPRINT_PROBE").is_some() {
+            println!("fingerprint-probe:{:?}", fingerprint());
+        }
+    }
+
+    #[test]
+    fn translation_switches_invalidate_the_runtime_cache() {
+        let run = |name: &str, value: Option<&str>| -> String {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "shader_cache::tests::fingerprint_probe", "--nocapture"])
+                .env("VICTORY_TEST_FINGERPRINT_PROBE", "1")
+                .env_remove("VICTORY_LOOPS_WAVE")
+                .env_remove("VICTORY_LDS_FIRST_INIT");
+            if let Some(value) = value {
+                cmd.env(name, value);
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            stdout.lines().find_map(|l| l.split_once("fingerprint-probe:"))
+                .expect("child fingerprint output").1.to_owned()
+        };
+        let baseline = run("VICTORY_LOOPS_WAVE", None);
+        assert_eq!(baseline, run("VICTORY_LOOPS_WAVE", None));
+        assert_ne!(baseline, run("VICTORY_LOOPS_WAVE", Some("0")));
+        assert_ne!(baseline, run("VICTORY_LOOPS_WAVE", Some("2")));
+        assert_ne!(baseline, run("VICTORY_LDS_FIRST_INIT", Some("0")));
+    }
+
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for e in std::fs::read_dir(dir).unwrap().flatten() {
@@ -454,5 +500,15 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        // Every single-bit corruption in the encoded shader is rejected,
+        // including changes to the DXIL payload that keep its length valid.
+        let mut damaged = bytes.clone();
+        for i in 0..bytes.len() {
+            for bit in 0..8 {
+                damaged[i] ^= 1 << bit;
+                assert_eq!(decode(&damaged), None, "byte {i}, bit {bit}");
+                damaged[i] ^= 1 << bit;
+            }
+        }
     }
 }

@@ -293,10 +293,21 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Validation only: do not report successful gameplay when the runtime
+/// is intentionally or accidentally dropping a required pipeline.
+fn strict_pipelines() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRICT_PIPELINES").is_some_and(|v| v == "1"))
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    if p.left_out.is_some() {
+    let strict = strict_pipelines();
+    if let Some(why) = p.left_out {
+        if strict {
+            crate::host::fail(format_args!("strict rendering: excluded pipeline {}: {why}", p.key));
+        }
         LEFT_OUT.fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -309,7 +320,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    let result = p.made.get().and_then(|made| made.as_ref());
+    if strict && result.is_none() {
+        let why = if p.made.get().is_none() { "not ready before the budget expired" } else { "translation or creation failed" };
+        crate::host::fail(format_args!("strict rendering: pipeline {}: {why}; shaders {:?}", p.key, p.shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>()));
+    }
+    result
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
