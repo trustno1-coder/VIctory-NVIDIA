@@ -563,7 +563,24 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    if count > 0 && crate::host::place::narrow_barriers() {
+        match super::pack_barrier_groups(count, groups) {
+            super::PackedGroups::Skip => {
+                crate::host::place::NARROW_STATS[1].fetch_add(1, Relaxed);
+                return;
+            }
+            super::PackedGroups::Narrow(items) => {
+                front(this).put_with(
+                    BARRIER_GROUPS,
+                    &[u64::from(items.len() as u32) | (1u64 << 63)],
+                    &[bytes_of(items.as_ptr(), items.len())],
+                );
+                return;
+            }
+            super::PackedGroups::Global => {}
+        }
+    }
     front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
@@ -744,7 +761,13 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             BARRIER => {
                 super::barrier(list, n as u32, at_or(w, 1));
             }
-            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+            BARRIER_GROUPS => {
+                if w[0] & (1u64 << 63) != 0 {
+                    super::replay_narrow_barrier_groups(list, (w[0] & 0xFFFF_FFFF) as usize, at_or(w, 1));
+                } else {
+                    super::barrier_groups(list, n as u32, std::ptr::null());
+                }
+            }
             VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
             SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
             BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
