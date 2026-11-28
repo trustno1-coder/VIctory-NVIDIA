@@ -631,7 +631,8 @@ fn offer_mfg(card: &str, menu_file: &Path) -> bool {
         text.push_str("\r\n");
     }
     text.push_str("VICTORY_MFG_UNLOCKER=1\r\n");
-    if let Err(e) = std::fs::write(menu_file, text) {
+    // Replaced whole, as the F1 menu saves it: the file holds every setting saved there.
+    if let Err(e) = victory_core::fs::replace(menu_file, text.as_bytes()) {
         println!("Could not save the choice ({e}); on for this start only.");
     }
     true
