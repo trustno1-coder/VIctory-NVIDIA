@@ -1,6 +1,7 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
 //! (host slots 0-3) and, in the slots XInput leaves empty, from HID
-//! ([`playstation`]: DualShock 4, DualSense, DualSense Edge); while none is
+//! ([`playstation`]: DualShock 4, DualSense, DualSense Edge; `stadia`:
+//! Google's Stadia controller); while none is
 //! connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
@@ -27,6 +28,9 @@ use crate::{HleExport, HleModule};
 // PS4 pads (DualShock 4) and rumble from FrancescoGelosoEterea/VIscosity (d8db7a0).
 #[cfg(any(windows, test))]
 mod playstation;
+// Stadia controllers read straight from HID (Bluetooth or USB).
+#[cfg(windows)]
+mod stadia;
 
 /// Stops the motors of the PlayStation pads read over HID, before the
 /// process ends (XInput pads stop by themselves when it does).
@@ -1330,6 +1334,13 @@ mod host {
                     &mut self.hid_slots,
                     super::playstation::pads,
                 );
+                // A Stadia controller takes the first slot XInput and the
+                // PlayStation pads leave empty (`VICTORY_HID_PADS=0`: not).
+                if let Some(stadia) = super::stadia::latest()
+                    && let Some(free) = self.pads.iter_mut().find(|p| p.is_none())
+                {
+                    *free = Some(stadia);
+                }
             }
             #[allow(unused_mut)]
             let mut pad = self.pads[slot]?;
