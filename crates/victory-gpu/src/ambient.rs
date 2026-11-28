@@ -68,10 +68,29 @@ pub(crate) enum Role {
     /// Gives the reflection rays that found nothing the sky's light
     /// (`CS_RayMiss`, not `CS_RayMiss_Volumetrics` nor the screen probes').
     Miss,
+    /// Resolves the traced reflections (`VICTORY_AMBIENT_REFLECT_IN` names
+    /// the programs): after it each texel is held to a multiple of the light
+    /// around ([`reflect`]).
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
 pub(crate) fn role(container: &[u8]) -> Option<Role> {
+    role_in(container, reflect_in())
+}
+
+/// [`role`], with the texts that name the reflections' resolves (looked for
+/// last, so that no text takes a program of the other roles).
+fn role_in(container: &[u8], reflect_in: &[String]) -> Option<Role> {
+    let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
+    if let Some(found) = role_fixed(container) {
+        return Some(found);
+    }
+    reflect_in.iter().any(|name| has(name.as_bytes())).then_some(Role::Reflect)
+}
+
+/// The roles named in the code.
+fn role_fixed(container: &[u8]) -> Option<Role> {
     let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
     if has(b"CS_ScreenProbes_TemporalResolve") {
         Some(Role::Resolve)
@@ -154,6 +173,64 @@ fn parse_specular(set: &str) -> Option<Specular> {
     let share = parts.next().flatten().filter(|v| *v > 0.0)?;
     let sky = parts.next().flatten().map_or(0.0, |v| v.clamp(0.0, 1.0));
     Some(Specular { share, sky })
+}
+
+/// Where the reflections' resolves write them: the first of these places
+/// that holds a 2D image of their format (R32_UINT holding R9G9B9E5; the
+/// opaque surfaces' resolve has it at the first, the transparent ones' at the
+/// second).
+pub(crate) const REFLECTIONS: [(u8, u32); 2] = [(1, 128), (1, 136)];
+
+/// The most a resolved reflection may hold, as a multiple of the light
+/// around (`VICTORY_AMBIENT_REFLECT=<multiple>`; unset, `0` or `off`: the
+/// title's own). Acts only while `VICTORY_AMBIENT` is set and the builder
+/// does not run. Ported from TaynanGT/Vice-Tay#99 (fc9ef8a, fa90adf), itself
+/// from Serph91P's avatarmanz/VIctory-7900XTX#314 (6c7e3a87, GPL-3.0); the
+/// idea and the switch's name are beloooo's (VIctory-Belobug-AMD 44dcd437).
+fn reflect() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| parse_reflect(&std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default()))
+}
+
+fn parse_reflect(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+}
+
+/// The texts in the names of the programs that resolve the reflections
+/// (`VICTORY_AMBIENT_REFLECT_IN=<text>[,<text>]`, e.g.
+/// `CS_TemporalResolve2_Opaque,CS_TemporalResolve1_Alpha`); none while the
+/// hold is off.
+fn reflect_in() -> &'static [String] {
+    static SET: OnceLock<Vec<String>> = OnceLock::new();
+    SET.get_or_init(|| {
+        let held = reflect();
+        if held == 0.0 {
+            return Vec::new();
+        }
+        let names = parse_reflect_in(&std::env::var("VICTORY_AMBIENT_REFLECT_IN").unwrap_or_default());
+        if names.is_empty() {
+            tracing::warn!("VICTORY_AMBIENT_REFLECT without VICTORY_AMBIENT_REFLECT_IN: no reflections are held");
+        } else {
+            tracing::info!(held, ?names, "reflections held to a multiple of the light around (VICTORY_AMBIENT_REFLECT)");
+        }
+        names
+    })
+}
+
+fn parse_reflect_in(set: &str) -> Vec<String> {
+    set.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned).collect()
+}
+
+/// Reflections' resolves held since the start.
+static HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A resolve of the reflections was held after.
+fn note_held() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = HELD.fetch_add(1, Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(5000) {
+        tracing::info!(n, "reflections held after their resolve, since the start (VICTORY_AMBIENT_REFLECT)");
+    }
 }
 
 fn specular() -> Option<Specular> {
@@ -388,7 +465,7 @@ void reflect_light(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#ifdef RAISE
+#if defined(RAISE) || defined(HOLD)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -402,6 +479,40 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+#endif
+
+#ifdef HOLD
+// The resolved reflections: no brighter than `most` times the light around,
+// as the estimate has it at the four points about the texel (with a fifth of
+// the room's slow mean), or the constant; hue kept.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    light.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float3 around = float3(1.0, 0.98, 0.94) * constant;
+    if (constant <= 0.0) {
+        float2 g = (float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY) - 0.5;
+        int2 g0 = int2(floor(g));
+        float2 f = g - float2(g0);
+        around = 0;
+        for (int k = 0; k < 4; k++) {
+            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+            float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+            uint at0 = (q.y * PX + q.x) * 3;
+            around += b.x * b.y * float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        }
+        around = lerp(around, cells[CELLS].rgb, 0.2);
+    }
+    float top = most * dot(around, LUMA);
+    float3 c = unpack(light[at.xy]);
+    float has = dot(c, LUMA);
+    if (has > top) light[at.xy] = pack(c * (top / max(has, 1e-9)));
+}
+#endif
+
+#ifdef RAISE
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -507,6 +618,8 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     reflect: ID3D12PipelineState,
+    /// Made only while the hold of the reflections is on.
+    hold: Option<ID3D12PipelineState>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -539,6 +652,13 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let reflect = pipeline("REFLECT", s!("reflect_light"))?;
+    // Not made unless the hold is on, and on its own: without it the rest of
+    // the stand-in still runs.
+    let hold = if reflect_in().is_empty() {
+        None
+    } else {
+        pipeline("HOLD", s!("hold")).inspect_err(|e| tracing::warn!(%e, "no hold of the reflections")).ok()
+    };
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -549,6 +669,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         reflect,
+        hold,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -703,6 +824,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    // The traced reflections are the title's own while its rays run.
+    if role == Role::Reflect && (pass.hold.is_none() || crate::pipeline::builder_runs()) {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -722,7 +847,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.depth_size[0];
     words[7] = views.depth_size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = if role == Role::Reflect { reflect() } else { 4.0f32 }.to_bits();
     words[10] = air().to_bits();
     words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
     let l = &list.list;
@@ -755,6 +880,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                     run(&pass.gather, 20, 45, 1);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+            }
+            Role::Reflect => {
+                if let Some(hold) = &pass.hold {
+                    run(hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                    note_held();
+                }
             }
             Role::Miss => {
                 // The points afresh, from this frame's depth: the diffuse
