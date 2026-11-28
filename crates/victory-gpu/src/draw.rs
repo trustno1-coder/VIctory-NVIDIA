@@ -836,6 +836,11 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+/// Looks of the pass over textures picked by index at a slot whose host
+/// copy found no place in a block while the card had no room for a new one
+/// (`crate::pool::gate`): the slot stayed due. Since the start, and since
+/// the last line of the log.
+pub(crate) static HEAP_TEXTURES_NO_PLACE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
@@ -3403,6 +3408,27 @@ impl State {
             if !rest(6, || crate::residency::admit_texture_pass(required)) {
                 served = false;
                 break;
+            }
+            // The card has no room for a new block of textures
+            // (`crate::pool::gate`): the host copy this slot wants is made
+            // first, before anything of the slot changes. If no block there
+            // is has a place for it, it is not made and the slot waits as
+            // one without room does: it shows what it showed, and is looked
+            // at again after 1, 2, 4, ... frames, at most about four
+            // seconds. (A bake cannot wait: its textures get their block.)
+            if room && crate::pool::full() && !baking && sync.is_none() && !required {
+                let wanted = held.as_ref().and_then(crate::descriptor::host::placed_texture).or_else(|| held.clone());
+                if let Some(View::Shader(wanted, _)) = wanted
+                    && crate::resource::title_fills(wanted as This)
+                    && let (None, true) = crate::pool::waiting(|| crate::resource::host_resource(wanted as This))
+                {
+                    for count in &HEAP_TEXTURES_NO_PLACE {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    outcome(slot_outcome::HELD);
+                    tells.tell(index, write, Told::Later(frame, most));
+                    continue;
+                }
             }
             // A slot that shows the texture by an earlier view of it (one
             // from another level) goes on doing so until the upload of what
