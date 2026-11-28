@@ -377,6 +377,9 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
             s.insert(k.clone(), v.clone());
         }
     }
+    if let Some(language) = saved("VICTORY_MENU_LANGUAGE") {
+        s.insert("VICTORY_MENU_LANGUAGE".to_owned(), language.to_owned());
+    }
     for (k, v) in o.more.iter().filter_map(|m| m.split_once('=')) {
         s.insert(k.trim().to_owned(), v.trim().to_owned());
     }
@@ -1106,7 +1109,7 @@ mod tests {
     fn what_the_menu_saved_goes_over_the_options() {
         let menu = parse_menu(
             "# Saved by the F1 menu\r\nVICTORY_MENU_FRAMEGEN=6\r\nVICTORY_MENU_CONSOLE=series-s\r\n\
-             VICTORY_MENU_DLSS=performance\r\nVICTORY_MENU_FPS=60\r\nVICTORY_BVH_BUILDER=\r\n\
+             VICTORY_MENU_DLSS=performance\r\nVICTORY_MENU_FPS=60\r\nVICTORY_MENU_LANGUAGE=zh-CN\r\nVICTORY_BVH_BUILDER=\r\n\
              VICTORY_AMBIENT=0.5\r\nVICTORY_EARLY_DEPTH=\r\nnot a setting=1\r\n",
         );
         let (s, series_s) = settings(&options(), &menu, Some(Path::new("x")));
@@ -1121,6 +1124,12 @@ mod tests {
         assert_eq!((get("VICTORY_AMBIENT"), get("VICTORY_EARLY_DEPTH")), (Some("0.5"), None));
         assert_eq!(get("VICTORY_BVH_BUILDER"), None);
         assert_eq!(get("VICTORY_MENU_FRAMEGEN"), Some("6"));
+        assert_eq!(get("VICTORY_MENU_LANGUAGE"), Some("zh-CN"));
+        for language in ["en", "zh-TW", "es", "auto"] {
+            let menu = parse_menu(&format!("VICTORY_MENU_LANGUAGE={language}\r\n"));
+            let (s, _) = settings(&options(), &menu, Some(Path::new("x")));
+            assert_eq!(s.get("VICTORY_MENU_LANGUAGE").map(String::as_str), Some(language));
+        }
     }
 
     #[test]

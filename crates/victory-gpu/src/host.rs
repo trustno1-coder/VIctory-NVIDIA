@@ -4198,7 +4198,8 @@ pub(crate) mod awake;
 mod card_steps;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod indirects;
-mod font;
+pub(crate) mod font;
+pub(crate) mod language;
 mod menu;
 mod panel;
 mod place;
@@ -10174,9 +10175,25 @@ impl Meter {
         }
         let Some(caption) = &self.caption else { return };
         // With frame generation showing more frames than are rendered, both rates.
-        let text = match crate::streamline::shown_per_frame() {
-            1 => format!(" | VIctory-NVIDIA {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
-            per => format!(" | VIctory-NVIDIA {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
+        use language::Language;
+        let language = menu::language();
+        let per = crate::streamline::shown_per_frame();
+        let generated = if per == 1 {
+            String::new()
+        } else {
+            let shown = fps * f64::from(per);
+            match language {
+                Language::English => format!(" (frame gen {shown:.0} fps)"),
+                Language::SimplifiedChinese => format!("（显示 {shown:.0} 帧/秒）"),
+                Language::TraditionalChinese => format!("（顯示 {shown:.0} 畫格/秒）"),
+                Language::Spanish => format!(" ({shown:.0} fps de salida)"),
+            }
+        };
+        let text = match language {
+            Language::English => format!(" | VIctory-NVIDIA {fps:.0} fps{generated} {ms:.1} ms/frame {draws:.0} draws/frame"),
+            Language::SimplifiedChinese => format!(" | VIctory-NVIDIA {fps:.0} 帧/秒{generated}，{ms:.1} 毫秒/帧，{draws:.0} 次绘制/帧"),
+            Language::TraditionalChinese => format!(" | VIctory-NVIDIA {fps:.0} 畫格/秒{generated}，{ms:.1} 毫秒/畫格，{draws:.0} 次繪製/畫格"),
+            Language::Spanish => format!(" | VIctory-NVIDIA {fps:.0} fps{generated}, {ms:.1} ms/fotograma, {draws:.0} llamadas de dibujo/fotograma"),
         };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
