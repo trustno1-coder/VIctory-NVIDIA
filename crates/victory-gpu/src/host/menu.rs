@@ -136,7 +136,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
     Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
     Item { var: "VICTORY_FULLSCREEN", label: "FULLSCREEN (NO BORDER)", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_MOUSE_CAPTURE", label: "CONFINE MOUSE TO WINDOW", values: UNSET_ON, live: false },
     Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
     Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
@@ -447,7 +447,7 @@ impl Menu {
         let _ = keys();
         // `VICTORY_MENU_OPEN=1`: shown from the start (to look at it in a run nobody presses keys in).
         if std::env::var_os("VICTORY_MENU_OPEN").is_some_and(|v| v == "1") {
-            crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
+            crate::set_settings_menu_open(true);
         }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
         Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false }
@@ -779,7 +779,7 @@ impl Menu {
                 continue;
             }
             if vk == VK_F1 || (open && vk == VK_ESCAPE) {
-                crate::SETTINGS_MENU_OPEN.store(!open && vk == VK_F1, Ordering::Relaxed);
+                crate::set_settings_menu_open(!open && vk == VK_F1);
                 self.note.clear();
                 self.picking = false;
                 if !open {
@@ -837,7 +837,7 @@ impl Menu {
                         self.import_at = 0;
                         self.picking = true;
                     }
-                    _ => crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed),
+                    _ => crate::set_settings_menu_open(false),
                 },
                 _ => {}
             }

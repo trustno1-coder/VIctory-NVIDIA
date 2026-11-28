@@ -16,6 +16,7 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
 use windows_sys::core::{PCSTR, PCWSTR, w};
 
@@ -96,6 +97,8 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
+/// Set on the window while user32 owns its move/resize loop.
+const IN_SIZE_MOVE: PCWSTR = w!("victory.sizemove");
 
 /// Fullscreen, the English keyboard and the mouse capture are asked for
 /// (`=1`, or the F1 menu): left unset, the window and input stay as before.
@@ -156,7 +159,9 @@ fn capture_mouse(hwnd: HWND, active: bool) {
     // SAFETY: runs on the window thread; local geometry, balanced cursor count.
     unsafe {
         if active && !wm::GetParent(hwnd).is_null() { return; }
-        let active = active && wm::GetForegroundWindow() == hwnd && wm::IsIconic(hwnd) == 0;
+        let active = active && wm::GetForegroundWindow() == hwnd
+            && GetFocus() == hwnd
+            && wm::IsIconic(hwnd) == 0 && wm::GetPropW(hwnd, IN_SIZE_MOVE).is_null();
         if !active {
             if state.window == hwnd as usize {
                 wm::ClipCursor(std::ptr::null());
@@ -365,7 +370,17 @@ extern "system" fn window_proc(
         english_input();
     }
     match message {
-        wm::WM_KILLFOCUS | wm::WM_NCDESTROY => capture_mouse(hwnd, false),
+        wm::WM_ENTERSIZEMOVE => {
+            // SAFETY: this thread owns hwnd. The property is a non-null marker.
+            unsafe { wm::SetPropW(hwnd, IN_SIZE_MOVE, hwnd) };
+            capture_mouse(hwnd, false);
+        }
+        wm::WM_EXITSIZEMOVE | wm::WM_NCDESTROY => {
+            // SAFETY: remove our marker before resuming or destroying the window.
+            unsafe { wm::RemovePropW(hwnd, IN_SIZE_MOVE) };
+            capture_mouse(hwnd, message == wm::WM_EXITSIZEMOVE);
+        }
+        wm::WM_KILLFOCUS => capture_mouse(hwnd, false),
         wm::WM_ACTIVATE => capture_mouse(hwnd, wparam & 0xffff != wm::WA_INACTIVE as usize),
         wm::WM_SETFOCUS | wm::WM_MOVE | wm::WM_SIZE => capture_mouse(hwnd, true),
         _ => {}

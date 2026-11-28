@@ -97,7 +97,10 @@
 **In the game**
 
 - **F1** brings up the settings menu (arrow keys pick and change, Enter does
-  it): DLSS, frame generation, frame rate cap and more.
+  it): DLSS, frame generation, frame rate cap and more. **Confine mouse to
+  window** takes effect after restart. It clips and hides the pointer while
+  the game window has focus. The game uses a controller for camera movement.
+  The keyboard stand-in maps I/J/K/L to the right stick.
 - **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
   memory numbers).
 

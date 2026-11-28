@@ -47,6 +47,26 @@ mod host;
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
 pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Identifies mouse sampling intervals that crossed a menu close, including
+/// an entire open/close between two GameInput polls.
+static SETTINGS_MENU_CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current gameplay interval, or None while F1 owns the mouse input.
+pub fn mouse_input_interval() -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    (!SETTINGS_MENU_OPEN.load(Ordering::Acquire)).then(|| SETTINGS_MENU_CLOSES.load(Ordering::Relaxed))
+}
+
+/// Publish visibility and invalidate any mouse delta that spans a menu close.
+pub fn set_settings_menu_open(open: bool) {
+    use std::sync::atomic::Ordering;
+    if !open {
+        SETTINGS_MENU_CLOSES.fetch_add(1, Ordering::Relaxed);
+    }
+    SETTINGS_MENU_OPEN.store(open, Ordering::Release);
+}
+
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
