@@ -550,9 +550,17 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: std::collections::HashMap<
+        (usize, u64),
+        RootSlot,
+        std::hash::BuildHasherDefault<crate::host::AddressHash>,
+    >,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: std::collections::HashMap<
+        (usize, u64),
+        RootSlot,
+        std::hash::BuildHasherDefault<crate::host::AddressHash>,
+    >,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -2194,12 +2202,14 @@ impl State {
             }
             Some(s)
         };
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
+                crate::host::wide_write(a, len, pipeline);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -2232,40 +2242,39 @@ impl State {
             return false;
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
-        let (index, shadow) = match self.root_uav_slots.get(&key) {
-            Some((index, shadow)) => (*index, address.zip(shadow.clone())),
-            None => {
-                let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
-                    return false;
-                };
-                self.dynamic.push((key.0, host.id(), index, 1));
-                if let Some((a, s)) = &shadow {
-                    // SAFETY: a live buffer.
-                    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                    let offset = s.gpu(*a) - base;
-                    // Raw views start on 16 bytes: from the 16 bytes
-                    // below, and the shader adds the rest to its offsets
-                    // (`victory_shader::emit::USER_VIEW_BIAS`). (An address
-                    // not on 16 bytes got a null view at first: the
-                    // builder's counters are at such addresses.)
-                    let bias = offset & 15;
-                    host.raw_uav_at(index, &s.buffer, offset - bias, s.left(*a).min(limit) + bias);
-                }
-                if shadow.is_none() {
-                    host.null_raw_uav_at(index);
-                }
-                self.root_uav_slots
-                    .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
-                (index, shadow)
+        let index = if let Some(&(index, ref shadow)) = self.root_uav_slots.get(&key) {
+            if let Some((a, s)) = address.zip(shadow.as_ref()) {
+                ready(a, s);
             }
+            index
+        } else {
+            let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
+            let Some(index) = host.dynamic(1).or_else(|| {
+                crate::host::settle_for_fence();
+                host.dynamic(1)
+            }) else {
+                return false;
+            };
+            self.dynamic.push((key.0, host.id(), index, 1));
+            if let Some((a, s)) = &shadow {
+                // SAFETY: a live buffer.
+                let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+                let offset = s.gpu(*a) - base;
+                // Raw views start on 16 bytes: from the 16 bytes
+                // below, and the shader adds the rest to its offsets
+                // (`victory_shader::emit::USER_VIEW_BIAS`). (An address
+                // not on 16 bytes got a null view at first: the
+                // builder's counters are at such addresses.)
+                let bias = offset & 15;
+                host.raw_uav_at(index, &s.buffer, offset - bias, s.left(*a).min(limit) + bias);
+                ready(*a, s);
+            } else {
+                host.null_raw_uav_at(index);
+            }
+            self.root_uav_slots
+                .insert(key, (index, shadow.map(|(_, s)| s)));
+            index
         };
-        if let Some((a, s)) = &shadow {
-            ready(*a, s);
-        }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
         unsafe {
@@ -2306,52 +2315,52 @@ impl State {
             std::ptr::from_ref(heap) as usize,
             address.unwrap_or(0) | u64::from(biased) << 63,
         );
-        let (index, shadow) = match self.root_srv_slots.get(&key) {
-            Some((index, shadow)) => (*index, address.zip(shadow.clone())),
-            None => {
-                let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
-                    return false;
-                };
-                self.dynamic.push((key.0, host.id(), index, 1));
-                self.root_srv_slots
-                    .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
-                match &shadow {
-                    Some((a, s)) => {
-                        // SAFETY: a live buffer.
-                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                        let offset = s.gpu(*a) - base;
-                        if biased {
-                            // From the 16 bytes below; the shader adds the
-                            // rest (`victory_shader::emit::USER_VIEW_BIAS`).
-                            let bias = offset & 15;
-                            host.raw_at(index, &s.buffer, offset - bias, s.left(*a) + bias);
-                        } else if offset.is_multiple_of(16) {
-                            host.raw_at(index, &s.buffer, offset, s.left(*a));
-                        } else {
-                            // Raw views start on 16 bytes; one from the
-                            // aligned start would shift every read.
-                            once!(
-                                address = format_args!("{a:#x}"),
-                                "a root SRV not on 16 bytes reads zeros"
-                            );
-                            host.null_raw_at(index);
-                        }
-                    }
-                    None => host.null_raw_at(index),
-                }
-                (index, shadow)
+        let index = if let Some(&(index, ref shadow)) = self.root_srv_slots.get(&key) {
+            // As for root descriptors (`root_view`): all that is left of the
+            // buffer is brought up to date. The first 1 MiB only left what lay
+            // past it stale (most mesh vertex streams reach further).
+            if let Some((a, s)) = address.zip(shadow.as_ref()) {
+                s.refresh(list, a, s.left(a));
             }
+            index
+        } else {
+            let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+            let Some(index) = host.dynamic(1).or_else(|| {
+                crate::host::settle_for_fence();
+                host.dynamic(1)
+            }) else {
+                return false;
+            };
+            self.dynamic.push((key.0, host.id(), index, 1));
+            match &shadow {
+                Some((a, s)) => {
+                    // SAFETY: a live buffer.
+                    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+                    let offset = s.gpu(*a) - base;
+                    if biased {
+                        // From the 16 bytes below; the shader adds the
+                        // rest (`victory_shader::emit::USER_VIEW_BIAS`).
+                        let bias = offset & 15;
+                        host.raw_at(index, &s.buffer, offset - bias, s.left(*a) + bias);
+                    } else if offset.is_multiple_of(16) {
+                        host.raw_at(index, &s.buffer, offset, s.left(*a));
+                    } else {
+                        // Raw views start on 16 bytes; one from the
+                        // aligned start would shift every read.
+                        once!(
+                            address = format_args!("{a:#x}"),
+                            "a root SRV not on 16 bytes reads zeros"
+                        );
+                        host.null_raw_at(index);
+                    }
+                    s.refresh(list, *a, s.left(*a));
+                }
+                None => host.null_raw_at(index),
+            }
+            self.root_srv_slots
+                .insert(key, (index, shadow.map(|(_, s)| s)));
+            index
         };
-        // As for root descriptors (`root_view`): all that is left of the
-        // buffer is brought up to date. The first 1 MiB only left what lay
-        // past it stale (most mesh vertex streams reach further).
-        if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a));
-        }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
         unsafe {
@@ -4536,22 +4545,21 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = group
-                .indexed
-                .iter()
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
-            selected.sort_unstable();
-            selected.dedup();
+            let mut selected: Few<u32, 16> = Few::default();
+            for index in &group.indexed {
+                let constant = self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                );
+                // The shader adds i32 byte offsets and shifts by 5.
+                selected.push(index.byte_offset.wrapping_add(constant << index.shift) / 32);
+            }
+            if selected.len() > 1 {
+                selected.sort_unstable();
+                selected.dedup();
+            }
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
@@ -4571,18 +4579,21 @@ impl State {
                 (table, n, h.0)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
-            let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            let reader = ReadyReader {
+                plan: std::ptr::from_ref(plan) as usize,
+                tested_depth: TESTED_DEPTH.get().0,
+                direct_len: plan.direct.len() as u32,
+                stores: STORES.get(),
+                depth: false,
+            };
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
                 let once = ready_once() && selected.is_empty() && !group.has_uav;
-                if once
-                    && known.epoch == list.epoch()
-                    && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
-                {
-                    if *depth {
-                        TESTED_DEPTH.set((reader.3, true));
+                if once && let Some(depth) = known.find_ready(list.epoch(), &reader) {
+                    if depth {
+                        TESTED_DEPTH.set((reader.tested_depth, true));
                     }
                     made.push((slot, first * 32));
                     continue;
@@ -4595,7 +4606,7 @@ impl State {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
+                for &k in selected.iter() {
                     if group.entry(k).is_some() {
                         continue;
                     }
@@ -4611,14 +4622,7 @@ impl State {
                 if once && let Some(known) = self.fresh_tables.get_mut(&key) {
                     // (The epoch as it is now: what this changed itself it
                     // need not do again.)
-                    let epoch = list.epoch();
-                    if known.epoch != epoch {
-                        known.epoch = epoch;
-                        known.ready.clear();
-                    }
-                    if known.ready.len() < 16 {
-                        known.ready.push((reader, depth));
-                    }
+                    known.note_ready(list.epoch(), reader, depth);
                 }
                 made.push((slot, first * 32));
                 continue;
@@ -5336,7 +5340,9 @@ impl State {
                 && match run.as_mut() {
                     Some((r, Some(held))) => match host_signature(kind, r.step) {
                         Some(signature) => {
-                            held.signature = signature;
+                            if held.signature.as_raw() != signature.as_raw() {
+                                held.signature = ID3D12CommandSignature::clone(signature);
+                            }
                             r.join(&call, call.epoch);
                             true
                         }
@@ -5375,7 +5381,10 @@ impl State {
                 // Held back for the next ones to join.
                 *list.indirect_run() = Some((
                     merge::Run::of(&call, epoch),
-                    Some(merge::Held { signature: signature.clone(), buffer: bounded.clone() }),
+                    Some(merge::Held {
+                        signature: ID3D12CommandSignature::clone(signature),
+                        buffer: bounded.clone(),
+                    }),
                 ));
                 list.hold_indirect();
             } else {
@@ -5386,7 +5395,7 @@ impl State {
                 // host copies are kept alive by the list, and the signature is cached.
                 unsafe {
                     list.list.ExecuteIndirect(
-                        &signature,
+                        signature,
                         max,
                         &bounded,
                         at,
@@ -5490,40 +5499,63 @@ mod thread_tests {
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
+/// once and cached per thread as a `'static` reference (zero COM refcount
+/// traffic per indirect execution and zero COM calls during thread teardown).
+fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignature> {
+    type Entry = ((u32, u32), &'static ID3D12CommandSignature);
+    static MADE: std::sync::Mutex<Vec<Entry>> = std::sync::Mutex::new(Vec::new());
+    thread_local! {
+        static CACHE: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
-    };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
+    let key = (kind, stride);
+    if let Ok(Some(sig)) = CACHE.try_with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find_map(|&(k, s)| (k == key).then_some(s))
+    }) {
+        return Some(sig);
     }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    let sig = {
+        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, s)) = made.iter().find(|&&(k, _)| k == key) {
+            s
+        } else {
+            let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: stride,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &argument,
+                NodeMask: 0,
+            };
+            let mut signature: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a description of one argument; no root arguments.
+            let result = unsafe {
+                crate::host::host()?.device.CreateCommandSignature(
+                    &desc,
+                    None::<&ID3D12RootSignature>,
+                    &mut signature,
+                )
+            };
+            if let Err(e) = result {
+                once!(error = %e, kind, stride, "host command signature refused");
+                return None;
+            }
+            let sig: &'static ID3D12CommandSignature = Box::leak(Box::new(signature?));
+            made.push((key, sig));
+            sig
+        }
+    };
+    let _ = CACHE.try_with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.iter().any(|&(k, _)| k == key) {
+            cache.push((key, sig));
+        }
+    });
+    Some(sig)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
@@ -5591,6 +5623,47 @@ impl<T: Copy, const N: usize> Few<T, N> {
             self.many.push(what);
         }
     }
+
+    fn dedup(&mut self)
+    where
+        T: PartialEq,
+    {
+        if self.many.is_empty() {
+            if self.len <= 1 {
+                return;
+            }
+            let mut write = 1;
+            for read in 1..self.len {
+                if self.few[read] != self.few[write - 1] {
+                    self.few[write] = self.few[read];
+                    write += 1;
+                }
+            }
+            self.len = write;
+        } else {
+            self.many.dedup();
+            if self.many.len() <= N {
+                let n = self.many.len();
+                self.few[..n].copy_from_slice(&self.many);
+                self.len = n;
+                self.many.clear();
+            }
+        }
+    }
+}
+
+impl<T: PartialEq, const N: usize> PartialEq for Few<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: Eq, const N: usize> Eq for Few<T, N> {}
+
+impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for Few<T, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
 }
 
 impl<T, const N: usize> std::ops::Deref for Few<T, N> {
@@ -5606,6 +5679,27 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
     }
 }
 
+/// A reader whose entries of a [`FreshTable`] were brought up to date at the
+/// table's epoch, plus whether those entries read the tested depth target.
+#[derive(Clone, Copy, Default)]
+struct ReadyReader {
+    plan: usize,
+    tested_depth: usize,
+    direct_len: u32,
+    stores: bool,
+    depth: bool,
+}
+
+impl ReadyReader {
+    #[inline]
+    fn same_reader(&self, other: &Self) -> bool {
+        self.plan == other.plan
+            && self.direct_len == other.direct_len
+            && self.stores == other.stores
+            && self.tested_depth == other.tested_depth
+    }
+}
+
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
 struct FreshTable {
     first: u32,
@@ -5614,7 +5708,26 @@ struct FreshTable {
     /// tested depth target) read were brought up to date, and whether that read the
     /// tested depth target.
     epoch: u64,
-    ready: Vec<((usize, usize, bool, usize), bool)>,
+    ready: Vec<ReadyReader>,
+}
+
+impl FreshTable {
+    fn find_ready(&self, epoch: u64, reader: &ReadyReader) -> Option<bool> {
+        (self.epoch == epoch)
+            .then(|| self.ready.iter().find(|r| r.same_reader(reader)).map(|r| r.depth))
+            .flatten()
+    }
+
+    fn note_ready(&mut self, epoch: u64, mut reader: ReadyReader, depth: bool) {
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.ready.clear();
+        }
+        if self.ready.len() < 16 {
+            reader.depth = depth;
+            self.ready.push(reader);
+        }
+    }
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
@@ -6078,5 +6191,307 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod zero_alloc_tests {
+    use super::{Few, FreshTable, ReadyReader, host_signature};
+
+    #[test]
+    fn fresh_table_fits_single_cache_line_bucket() {
+        const { assert!(std::mem::size_of::<ReadyReader>() <= 24); }
+        const { assert!(std::mem::size_of::<FreshTable>() <= 48); }
+        const { assert!(std::mem::size_of::<((u64, u32, u64), FreshTable)>() <= 64); }
+    }
+
+    #[test]
+    fn ready_reader_layout_and_fresh_table_matching_and_clearing() {
+        const { assert!(std::mem::size_of::<ReadyReader>() <= 24); }
+
+        let mut table = FreshTable { first: 10, epoch: 0, ready: Vec::new() };
+        assert_eq!(table.ready.capacity(), 0);
+        let r = |plan: usize, direct_len: u32, stores: bool, tested_depth: usize| ReadyReader {
+            plan,
+            tested_depth,
+            direct_len,
+            stores,
+            depth: false,
+        };
+
+        let r0 = r(0x1000, 4, false, 0);
+        let r1 = r(0x1000, 4, true, 0);
+        let r2 = r(0x1000, 5, false, 0);
+        let r3 = r(0x1000, 4, false, 0xdead);
+
+        assert_eq!(table.find_ready(1, &r0), None);
+        table.note_ready(1, r0, false);
+        assert_eq!(table.find_ready(1, &r0), Some(false));
+        assert_eq!(table.find_ready(1, &ReadyReader { depth: true, ..r0 }), Some(false));
+        assert_eq!(table.find_ready(1, &r1), None);
+        assert_eq!(table.find_ready(1, &r2), None);
+        assert_eq!(table.find_ready(1, &r3), None);
+
+        table.note_ready(1, r1, false);
+        table.note_ready(1, r2, true);
+        table.note_ready(1, r3, true);
+        assert_eq!(table.ready.len(), 4);
+        assert_eq!(table.find_ready(1, &r2), Some(true));
+        assert_eq!(table.find_ready(1, &r3), Some(true));
+
+        // 5th through 16th are retained; 17th+ are capped at 16.
+        for i in 4..20usize {
+            table.note_ready(1, r(0x2000 + i, 1, false, 0), i % 2 == 0);
+        }
+        assert_eq!(table.ready.len(), 16);
+        assert_eq!(table.find_ready(1, &r(0x2000 + 15, 1, false, 0)), Some(false));
+        assert_eq!(table.find_ready(1, &r(0x2000 + 16, 1, false, 0)), None);
+
+        // Advancing epoch clears previous readers while preserving Vec capacity.
+        let cap = table.ready.capacity();
+        assert_eq!(table.find_ready(2, &r0), None);
+        table.note_ready(2, r3, true);
+        assert_eq!(table.epoch, 2);
+        assert_eq!(table.ready.len(), 1);
+        assert_eq!(table.ready.capacity(), cap);
+        assert_eq!(table.find_ready(2, &r3), Some(true));
+        assert_eq!(table.find_ready(2, &r0), None);
+        assert_eq!(table.find_ready(1, &r3), None);
+    }
+
+    #[test]
+    fn few_dedup_and_eq_preserve_inline_invariant() {
+        // Empty and single-element inline dedup.
+        let mut a: Few<u32, 4> = Few::default();
+        a.dedup();
+        assert!(a.is_empty() && a.many.is_empty());
+        a.push(9);
+        a.dedup();
+        assert_eq!(&*a, &[9]);
+        assert!(a.many.is_empty());
+
+        // Inline duplicates and exact-boundary inline dedup.
+        let mut b: Few<u32, 4> = Few::default();
+        for x in [1, 1, 2, 2] {
+            b.push(x);
+        }
+        assert!(b.many.is_empty());
+        b.dedup();
+        assert_eq!(&*b, &[1, 2]);
+        assert!(b.many.is_empty());
+        assert_eq!(format!("{b:?}"), "[1, 2]");
+
+        let mut exact: Few<u32, 4> = Few::default();
+        for x in [1, 2, 3, 4] {
+            exact.push(x);
+        }
+        assert!(exact.many.is_empty());
+        exact.dedup();
+        assert_eq!(&*exact, &[1, 2, 3, 4]);
+        assert!(exact.many.is_empty());
+
+        // Spilled staying spilled.
+        let mut spilled: Few<u32, 4> = Few::default();
+        for x in [1, 1, 2, 3, 4, 4, 5] {
+            spilled.push(x);
+        }
+        assert!(!spilled.many.is_empty());
+        spilled.dedup();
+        assert_eq!(&*spilled, &[1, 2, 3, 4, 5]);
+        assert!(!spilled.many.is_empty());
+
+        // Spilled shrinking to exact inline boundary (`len == N`) moves back inline.
+        let mut shrink_exact: Few<u32, 4> = Few::default();
+        for x in [1, 1, 2, 3, 4] {
+            shrink_exact.push(x);
+        }
+        assert!(!shrink_exact.many.is_empty());
+        shrink_exact.dedup();
+        assert_eq!(&*shrink_exact, &[1, 2, 3, 4]);
+        assert!(shrink_exact.many.is_empty());
+        assert_eq!(shrink_exact, exact);
+        assert_ne!(shrink_exact, b);
+        shrink_exact.push(5);
+        assert_eq!(&*shrink_exact, &[1, 2, 3, 4, 5]);
+        assert!(!shrink_exact.many.is_empty());
+        assert_eq!(shrink_exact, spilled);
+
+        // Spilled all-equal shrinks back inline and stays inline on next push.
+        let mut all_eq: Few<u32, 4> = Few::default();
+        for _ in 0..7 {
+            all_eq.push(7);
+        }
+        assert!(!all_eq.many.is_empty());
+        all_eq.dedup();
+        assert_eq!(&*all_eq, &[7]);
+        assert!(all_eq.many.is_empty());
+        all_eq.push(8);
+        assert_eq!(&*all_eq, &[7, 8]);
+        assert!(all_eq.many.is_empty());
+        assert_ne!(all_eq, b);
+    }
+
+    #[test]
+    fn host_signature_shares_static_com_pointer_across_threads() {
+        use windows::core::Interface;
+
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        const THREADS: usize = 4;
+        const DRAW: u32 = 0;
+        const DISPATCH: u32 = 2;
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let draw_first = host_signature(DRAW, 16).expect("draw signature");
+                    let disp_first = host_signature(DISPATCH, 12).expect("dispatch signature");
+                    let draw_raw = draw_first.as_raw() as usize;
+                    let disp_raw = disp_first.as_raw() as usize;
+                    for _ in 0..32 {
+                        let d = host_signature(DRAW, 16).expect("cached draw signature");
+                        let c = host_signature(DISPATCH, 12).expect("cached dispatch signature");
+                        assert_eq!(d.as_raw() as usize, draw_raw);
+                        assert_eq!(c.as_raw() as usize, disp_raw);
+                    }
+                    (draw_raw, disp_raw)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("worker thread should exit cleanly"))
+            .collect();
+        let expected = results[0];
+        assert_ne!(expected.0, 0);
+        assert_ne!(expected.1, 0);
+        assert_ne!(expected.0, expected.1);
+        for &r in &results[1..] {
+            assert_eq!(r, expected);
+        }
+
+        // Verify zero COM refcount churn on repeated TLS cache hits.
+        let sig = host_signature(DRAW, 16).expect("main thread draw signature");
+        assert_eq!(sig.as_raw() as usize, expected.0);
+        let refs_before = crate::host::references(sig);
+        for _ in 0..64 {
+            let hit = host_signature(DRAW, 16).expect("hot draw signature");
+            assert_eq!(hit.as_raw() as usize, expected.0);
+        }
+        assert_eq!(crate::host::references(sig), refs_before);
+    }
+
+    /// Opt-in release microbenchmark comparing per-draw state paths:
+    /// baseline (`Vec<u32>` + SipHash + `Arc::clone` + 40-byte tuple) vs
+    /// optimized (`Few<u32, 16>` + `AddressHash` + borrowed `&Arc` + 24-byte `ReadyReader`).
+    #[test]
+    #[ignore]
+    fn draw_zero_alloc_bench() {
+        use std::collections::HashMap;
+        use std::hash::BuildHasherDefault;
+        use std::hint::black_box;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        const DRAWS: usize = 250_000;
+        let keys: [(usize, u64); 16] =
+            std::array::from_fn(|i| (0x7fff_0000usize, 0x1_0000_0000u64 + (i as u64) * 0x1000));
+        let shadows: [Arc<u64>; 16] = std::array::from_fn(|i| Arc::new(i as u64 + 1));
+
+        let mut base_map: HashMap<(usize, u64), (u32, Option<Arc<u64>>)> = HashMap::new();
+        let mut fast_map: HashMap<
+            (usize, u64),
+            (u32, Option<Arc<u64>>),
+            BuildHasherDefault<crate::host::AddressHash>,
+        > = HashMap::default();
+        for (i, (&key, shadow)) in keys.iter().zip(&shadows).enumerate() {
+            base_map.insert(key, (i as u32, Some(shadow.clone())));
+            fast_map.insert(key, (i as u32, Some(shadow.clone())));
+        }
+
+        // Baseline loop
+        let mut base_ready: Vec<((usize, usize, bool, usize), bool)> = Vec::new();
+        let mut base_acc = 0u64;
+        let t_base = Instant::now();
+        for i in 0..DRAWS {
+            // selected indices in tables
+            let mut sel: Vec<u32> = vec![3, 1, 3];
+            sel.sort_unstable();
+            sel.dedup();
+            base_acc = base_acc.wrapping_add(u64::from(*sel.last().unwrap_or(&0)));
+            // FreshTable::ready epoch refresh (40-byte tuple)
+            let reader = (0x8000usize + (i & 3), 6usize, false, 0x5000usize);
+            if i & 7 == 0 {
+                base_ready.clear();
+            }
+            if let Some((_, depth)) = base_ready.iter().find(|(r, _)| *r == reader) {
+                base_acc = base_acc.wrapping_add(u64::from(*depth));
+            } else if base_ready.len() < 16 {
+                base_ready.push((reader, false));
+            }
+            // root_srv_slots SipHash + Arc::clone hit
+            let lookup = black_box(keys[i & 15]);
+            if let Some((slot, shadow)) = base_map.get(&lookup) {
+                let cloned = shadow.clone();
+                base_acc = base_acc
+                    .wrapping_add(u64::from(*slot))
+                    .wrapping_add(cloned.as_deref().copied().unwrap_or(0));
+            }
+        }
+        black_box(base_acc);
+        let base_ns = t_base.elapsed().as_nanos() as f64;
+
+        // Optimized loop
+        let mut fast_table = FreshTable { first: 0, epoch: 0, ready: Vec::new() };
+        let mut fast_acc = 0u64;
+        let t_fast = Instant::now();
+        for i in 0..DRAWS {
+            // selected indices in tables (zero heap alloc)
+            let mut sel: Few<u32, 16> = Few::default();
+            sel.push(3);
+            sel.push(1);
+            sel.push(3);
+            if sel.len() > 1 {
+                sel.sort_unstable();
+                sel.dedup();
+            }
+            fast_acc = fast_acc.wrapping_add(u64::from(*sel.last().unwrap_or(&0)));
+            // FreshTable::ready packed 24-byte ReadyReader in Vec<ReadyReader>
+            let epoch = (i >> 3) as u64 + 1;
+            let reader = ReadyReader {
+                plan: 0x8000usize + (i & 3),
+                tested_depth: 0x5000usize,
+                direct_len: 6,
+                stores: false,
+                depth: false,
+            };
+            if let Some(depth) = fast_table.find_ready(epoch, &reader) {
+                fast_acc = fast_acc.wrapping_add(u64::from(depth));
+            } else {
+                fast_table.note_ready(epoch, reader, false);
+            }
+            // root_srv_slots AddressHash + borrowed Arc hit (zero atomic)
+            let lookup = black_box(keys[i & 15]);
+            if let Some(&(slot, ref shadow)) = fast_map.get(&lookup) {
+                fast_acc = fast_acc
+                    .wrapping_add(u64::from(slot))
+                    .wrapping_add(shadow.as_deref().copied().unwrap_or(0));
+            }
+        }
+        black_box(fast_acc);
+        assert_eq!(base_acc, fast_acc);
+        let fast_ns = t_fast.elapsed().as_nanos() as f64;
+
+        println!(
+            "Per-draw state ({DRAWS} draws): baseline(Vec+SipHash+Arc::clone+40B)={:.1} ns/draw | zero_alloc(Few+AddressHash+borrow+24B)={:.1} ns/draw | speedup={:.2}x",
+            base_ns / DRAWS as f64,
+            fast_ns / DRAWS as f64,
+            base_ns / fast_ns
+        );
     }
 }

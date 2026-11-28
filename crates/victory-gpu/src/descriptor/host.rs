@@ -3549,35 +3549,40 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
+            let emit = |made: &ListView, views: &ListViews| -> Listed {
+                self.copy_from(index, views.slot(made.at));
+                if made.twin && twins {
+                    self.copy_from(self.raw + index, views.slot(made.at + 1));
+                    self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    self.clear_twin(index);
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
-                let stride_word = view_stride_word(&view);
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
+                self.write_stride(index, made.stride_word);
+                self.keep_ref(index, made.kept.as_ref());
+                made.listed
+            };
+            if let Some(made) = views.made.get(&words) {
+                return Some(emit(made, views));
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.clear_twin(index);
+            let view = super::view_at(words[1], words[2])?;
+            let at = 2 * views.made.len() as u32;
+            // (A constant buffer's bytes are copied for each draw.)
+            if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                return None;
             }
-            self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
-            Some(made.listed)
+            let twin = twinned(&view);
+            let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+            let stride_word = view_stride_word(&view);
+            let listed = Listed {
+                kind: crate::draw::view_kind(&view),
+                texture: is_texture_view(&view),
+                ready: (0, 0, false),
+                tabled: None,
+            };
+            let entry = ListView { view, at, twin, stride_word, kept, listed };
+            let result = emit(&entry, views);
+            views.made.insert(words, entry);
+            Some(result)
         })
     }
 
@@ -3654,6 +3659,28 @@ impl HostHeap {
         }
     }
 
+    /// As [`HostHeap::keep`], borrowing `resource` so a slot that already
+    /// holds the same COM object returns without cloning (`AddRef`/`Release`).
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            use windows::core::Interface;
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            // The same again: nothing to clone or retire.
+            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
+                return;
+            }
+            std::mem::replace(&mut *slot, resource.cloned())
+        };
+        // A running submission may still read the old resource through
+        // this slot.
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
+        }
+    }
+
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -3691,7 +3718,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3739,7 +3766,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3829,7 +3856,7 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -7033,6 +7060,75 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+#[cfg(test)]
+mod zero_alloc_tests {
+    use super::*;
+
+    #[test]
+    fn keep_ref_skips_clone_on_identity_and_retires_on_replacement() {
+        use windows::core::Interface;
+
+        let Some(h) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let s0 = heap.dynamic(1).unwrap();
+        let (buf_a, _) = h.upload_buffer(256).expect("upload buffer A");
+        let (buf_b, _) = h.upload_buffer(256).expect("upload buffer B");
+
+        assert_eq!(crate::host::references(&buf_a), 1);
+        assert_eq!(crate::host::references(&buf_b), 1);
+
+        // First bind takes one COM reference into `kept[s0]`.
+        heap.keep_ref(s0, Some(&buf_a));
+        assert_eq!(crate::host::references(&buf_a), 2);
+        assert_eq!(
+            heap.kept_in(s0).as_ref().map(Interface::as_raw),
+            Some(buf_a.as_raw())
+        );
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(heap.shows(s0, &buf_a), Some(true));
+
+        // Repeated binds of the same COM resource short-circuit without cloning
+        // or pushing duplicates into the retirement queue.
+        for _ in 0..16 {
+            heap.keep_ref(s0, Some(&buf_a));
+        }
+        assert_eq!(crate::host::references(&buf_a), 2);
+        assert_eq!(
+            heap.kept_in(s0).as_ref().map(Interface::as_raw),
+            Some(buf_a.as_raw())
+        );
+
+        // Replacing with `buf_b` swaps the slot and retires `buf_a`.
+        heap.keep_ref(s0, Some(&buf_b));
+        assert_eq!(
+            heap.kept_in(s0).as_ref().map(Interface::as_raw),
+            Some(buf_b.as_raw())
+        );
+        assert_eq!(crate::host::references(&buf_b), 2);
+        // `buf_a` is no longer held by the slot: refcount is 1 (dropped
+        // immediately if bury_lag == 0) or 2 (local + retirement queue).
+        assert!(matches!(crate::host::references(&buf_a), 1 | 2));
+        #[cfg(feature = "diagnostics")]
+        {
+            assert_eq!(heap.shows(s0, &buf_b), Some(true));
+            assert_eq!(heap.shows(s0, &buf_a), Some(false));
+        }
+
+        // Clearing to `None` retires `buf_b`; clearing again is a no-op.
+        heap.keep_ref(s0, None);
+        assert!(heap.kept_in(s0).is_none());
+        heap.keep_ref(s0, None);
+        assert!(heap.kept_in(s0).is_none());
+        assert!(matches!(crate::host::references(&buf_b), 1 | 2));
+
+        heap.release(heap.id(), s0, 1);
+    }
 }
 
 #[cfg(test)]
