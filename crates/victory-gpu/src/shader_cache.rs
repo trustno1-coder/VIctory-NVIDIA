@@ -82,6 +82,8 @@ fn build() -> [u8; 32] {
             "VICTORY_LDS_LOOP_ATOMICS",
             "VICTORY_LDS_BOUNDS",
             "VICTORY_MEMORY_NEAR",
+            // The water light's tile-slot rewrite changes the bytes of one program.
+            "VICTORY_WATER_TILE_SLOTS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
