@@ -779,10 +779,19 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     }
 }
 
+/// One-sided host copies whose CPU mapping a title buffer copy just wrote:
+/// taken by [`pc_copied`] for a submission-owned restore before the lists run.
+static PC_COPIED: Mutex<Vec<(std::sync::Weak<Shadow>, usize, usize)>> = Mutex::new(Vec::new());
+
 /// A title buffer copy was done on the CPU into `[dst, dst + len)`: all of it
 /// goes up to the copies in the card's memory that hold it, whether their
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
+///
+/// One-sided copies (PC memory the GPU reads directly) take the same bytes
+/// into their mapping and are noted for a submission-owned snapshot: a later
+/// submission's refresh must not change what this submission's GPU commands
+/// still read (`Host::pc_before`).
 pub(crate) fn send_copied(dst: usize, len: usize) {
     for shadow in carded_copies() {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
@@ -796,6 +805,39 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
             shadow.copy(a, b);
         }
     }
+    let Some(shadow) = peek(dst as u64, len as u64) else {
+        return;
+    };
+    if shadow.carded() || shadow.in_place() {
+        return;
+    }
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+    let (from, to) = (dst.max(start), (dst + len).min(end));
+    if from >= to {
+        return;
+    }
+    let busy: Vec<(usize, usize)> =
+        shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+    for (a, b) in outside(from, to, busy) {
+        shadow.copy(a, b);
+        let me = std::sync::Arc::downgrade(&shadow);
+        PC_COPIED.lock().unwrap_or_else(|e| e.into_inner()).push((me, a - start, b - start));
+    }
+}
+
+/// One-sided ranges [`send_copied`] wrote this submission, joined per copy.
+/// Cleared by the taking.
+pub(crate) fn pc_copied() -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    let noted = std::mem::take(&mut *PC_COPIED.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut by: BTreeMap<usize, (Arc<Shadow>, Vec<(usize, usize)>)> = BTreeMap::new();
+    for (weak, from, to) in noted {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        let key = Arc::as_ptr(&shadow) as usize;
+        by.entry(key).or_insert_with(|| (shadow, Vec::new())).1.push((from, to));
+    }
+    by.into_values().map(|(shadow, ranges)| (shadow, joined(ranges))).collect()
 }
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
