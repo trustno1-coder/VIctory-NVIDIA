@@ -1,2 +1,10 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# The title runs only on a processor with AVX2 (it is built for the console's
+# Zen 2), so our own code may use what every such processor has: AVX2, BMI1/2,
+# FMA, F16C, LZCNT, MOVBE (x86-64-v3). Without it the compiler kept to SSE2.
+# A processor without AVX2 now stops with an illegal instruction before the
+# launcher's own check can say so. `RUSTFLAGS`, when set, takes this place.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

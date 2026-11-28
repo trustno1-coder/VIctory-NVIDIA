@@ -1094,6 +1094,10 @@ fn frame_ends() {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
             behind::leave();
         }
+        // Where our threads run follows the switch as it changes.
+        if switch == "VICTORY_CCD_CORES" && was != will {
+            crate::cores::settle();
+        }
     });
 }
 
