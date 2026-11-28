@@ -9,11 +9,14 @@
 //! One group of 64 threads counts on a compute queue, over and
 //! over: it takes one or two of the card's few thousand wave slots, and the
 //! card is never idle. Nothing is sent once no submission has gone out for
-//! a quarter of a second (a title that stands still; not a menu, which goes on
-//! drawing: the system's counter shows the compute queue at 100 % there too).
+//! a quarter of a second (a title that stands still), nor while the frames
+//! are made of few submissions ([`MANY`]): a menu of three submissions a
+//! frame, drawn at 600 fps without it, went to 15-45 fps with it on an
+//! RTX 3060 while the window was in front (#771), and a frame of three
+//! submissions has no gaps between them to keep the clocks up through.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use windows::Win32::Foundation::CloseHandle;
@@ -45,9 +48,52 @@ fn now_ms() -> u64 {
 /// When a submission was last sent ([`now_ms`] plus one; 0: never).
 static LAST: AtomicU64 = AtomicU64::new(0);
 
+/// The card is kept awake only after a frame of at least this many of the
+/// title's submissions: what it is for is the gaps between some thirty of
+/// them a frame, and a menu sends three.
+const MANY: u32 = 8;
+
+/// The title's submissions frame by frame (frames presented so far, from
+/// `crate::queue::presented`): how many the last whole frame had.
+struct PerFrame {
+    frame: AtomicU64,
+    so_far: AtomicU32,
+    last: AtomicU32,
+}
+
+impl PerFrame {
+    const fn new() -> PerFrame {
+        PerFrame { frame: AtomicU64::new(0), so_far: AtomicU32::new(0), last: AtomicU32::new(0) }
+    }
+
+    /// One submission while `frame` frames have been presented.
+    fn sent(&self, frame: u64) {
+        if self.frame.swap(frame, Ordering::Relaxed) == frame {
+            self.so_far.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.last.store(self.so_far.swap(1, Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    /// The submissions of the last whole frame.
+    fn last(&self) -> u32 {
+        self.last.load(Ordering::Relaxed)
+    }
+}
+
+static PER_FRAME: PerFrame = PerFrame::new();
+
 fn wanted() -> bool {
-    let (last, now) = (LAST.load(Ordering::Relaxed), now_ms());
-    last != 0 && now + 1 < last + QUIET_MS && (mode() != Mode::ByTurns || now / TURN_MS % 2 == 1)
+    wanted_at(LAST.load(Ordering::Relaxed), now_ms(), PER_FRAME.last(), mode())
+}
+
+/// [`wanted`] at `now`, the last submission at `last` (plus one; 0: none yet),
+/// after a frame of `per_frame` submissions.
+fn wanted_at(last: u64, now: u64, per_frame: u32, mode: Mode) -> bool {
+    last != 0
+        && now + 1 < last + QUIET_MS
+        && per_frame >= MANY
+        && (mode != Mode::ByTurns || now / TURN_MS % 2 == 1)
 }
 
 /// With `VICTORY_CARD_AWAKE=turns`: this long on, this long off.
@@ -76,6 +122,7 @@ pub(super) fn sent(device: &ID3D12Device) {
         return;
     }
     let now = now_ms();
+    PER_FRAME.sent(crate::queue::presented());
     let before = LAST.swap(now + 1, Ordering::Relaxed);
     if mode() == Mode::ByTurns && before.saturating_sub(1) / TURN_MS != now / TURN_MS {
         tracing::info!(on = now / TURN_MS % 2 == 1, "the card is kept awake, by turns");
@@ -207,6 +254,48 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's submissions are counted frame by frame: a menu's three a
+    /// frame leave the card alone, a frame of the game's thirty keeps it awake.
+    #[test]
+    fn submissions_are_counted_frame_by_frame() {
+        let counts = PerFrame::new();
+        assert_eq!(counts.last(), 0, "no whole frame yet");
+        for _ in 0..3 {
+            counts.sent(1);
+        }
+        assert_eq!(counts.last(), 0, "the first frame is not over");
+        counts.sent(2);
+        assert_eq!(counts.last(), 3);
+        assert!(counts.last() < MANY, "a menu's frame");
+        for _ in 0..29 {
+            counts.sent(2);
+        }
+        counts.sent(3);
+        assert_eq!(counts.last(), 30);
+        assert!(counts.last() >= MANY, "a frame of the game");
+        // Frames presented without a submission are passed over: the last
+        // one with any (frame 3, one) is what counts.
+        counts.sent(5);
+        assert_eq!(counts.last(), 1);
+    }
+
+    /// Kept awake while the title submits, in frames of many submissions:
+    /// not in a menu's frames of three, not once it is quiet, and in the
+    /// comparing mode only on its turns.
+    #[test]
+    fn the_card_is_kept_awake_only_through_busy_frames() {
+        let (last, now) = (1_000, 1_100);
+        assert!(wanted_at(last, now, 30, Mode::On), "a frame of the game");
+        assert!(!wanted_at(last, now, 3, Mode::On), "a menu's frame");
+        assert!(!wanted_at(last, now, MANY - 1, Mode::On));
+        assert!(wanted_at(last, now, MANY, Mode::On));
+        assert!(!wanted_at(last, last + QUIET_MS, 30, Mode::On), "quiet");
+        assert!(!wanted_at(0, now, 30, Mode::On), "nothing submitted yet");
+        // `turns`: on in odd turns only.
+        assert!(!wanted_at(last, now, 30, Mode::ByTurns));
+        assert!(wanted_at(TURN_MS + 10, TURN_MS + 20, 30, Mode::ByTurns));
+    }
 
     /// Card memory the CPU maps holds what the CPU wrote, with the card kept
     /// awake meanwhile; the thread ends when it is let go.
