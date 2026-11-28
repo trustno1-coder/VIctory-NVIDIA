@@ -847,27 +847,10 @@ void main() {
     }
 
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
+        let code = crate::host::compile(source, s!("main"), s!("cs_5_1"))?;
+        // SAFETY: the bytecode and its embedded root signature live through both calls.
         unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
+            let bytes = code.as_slice();
             let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
             let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -891,10 +874,19 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
-        let Some(mut warp) = WarpHarness::new() else {
-            return;
-        };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let Some(gpu) = WarpHarness::new() else { return };
+        check_card_compare(gpu);
+    }
+
+    #[test]
+    #[ignore = "requires a hardware D3D12 adapter"]
+    fn hardware_card_compare_stores_the_hash_it_made_when_told() {
+        let gpu = WarpHarness::on(false).expect("a hardware D3D12 adapter");
+        check_card_compare(gpu);
+    }
+
+    fn check_card_compare(mut warp: WarpHarness) {
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
