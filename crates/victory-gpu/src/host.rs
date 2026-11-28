@@ -1335,6 +1335,8 @@ pub(crate) struct HostList {
     indirect_run: Mutex<Option<(crate::indirect::merge::Run, Option<crate::indirect::merge::Held>)>>,
     /// Whether an execution is held back.
     holding: std::sync::atomic::AtomicBool,
+    /// Whether this recording has any `Step::Placed` copy (`place::HostList::place_constant`).
+    has_placed: std::sync::atomic::AtomicBool,
     /// The upscaling (`crate::streamline`) recorded in the list, noted for
     /// the present after its submission; 0 for none.
     upscale: std::sync::atomic::AtomicU64,
@@ -2720,6 +2722,12 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Ranges `[dst, dst + len)` written on the GPU by `Step::Placed` in
+    /// this recording, in order, with the destination host copy.
+    placed_written: Vec<(usize, usize, std::sync::Arc<crate::shadow::Shadow>)>,
+    /// Current per-recording GPU buffer `(buffer, capacity, used)` for
+    /// inline placed constant snapshots ([`place`]).
+    placed_cbv: Option<(ID3D12Resource, u64, u64)>,
 }
 
 impl Deferred {
@@ -4122,12 +4130,15 @@ fn late_line(frames: f64) {
     crate::land::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let constants = place::CONSTANTS.swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out \
+             of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.1} constants read in place",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            constants,
         );
     }
     card_steps::log(frames);
@@ -4582,6 +4593,7 @@ impl Host {
                 title_calls: std::sync::atomic::AtomicU64::new(0),
                 indirect_run: Mutex::default(),
                 holding: std::sync::atomic::AtomicBool::new(false),
+                has_placed: std::sync::atomic::AtomicBool::new(false),
                 upscale: std::sync::atomic::AtomicU64::new(0),
                 hudless: std::sync::atomic::AtomicU64::new(0),
                 left_open: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
@@ -6908,6 +6920,7 @@ impl HostList {
         let left_open = self.still_left_open();
         self.changed_something();
         self.holding.store(false, Ordering::Relaxed);
+        self.has_placed.store(false, Ordering::Relaxed);
         *self.indirect_run.lock().unwrap_or_else(|e| e.into_inner()) = None;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -7536,6 +7549,8 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        let copy_dst = dst as usize;
+        deferred.placed_written.retain(|(a, b, _)| *b <= copy_dst || *a >= copy_dst.saturating_add(len));
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
