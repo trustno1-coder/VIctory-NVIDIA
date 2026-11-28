@@ -22,6 +22,11 @@ clap.workspace = true
 walkdir.workspace = true
 
 [features]
+# TEMPORARY (2026-11-28): the diagnostics build by default, so that a launcher
+# that only builds the plain release (VILauncher) can measure the card's time
+# by command (VICTORY_GPU_TIMING=1 with VICTORY_D3D12_DRED=1). To be taken out
+# again after that one measurement.
+default = ["diagnostics"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [
