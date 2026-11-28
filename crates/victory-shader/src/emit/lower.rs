@@ -24,6 +24,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+/// DexNom PR 62's size handle (AMD compiler crash on RDNA 4).
+#[path = "lower/amd.rs"]
+pub(super) mod amd;
 
 type Why = &'static str;
 
@@ -7346,7 +7349,7 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        let h = self.size_view_handle(site, first, &src, props, image.is_none())?; // amd.rs (DexNom PR 62)
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
