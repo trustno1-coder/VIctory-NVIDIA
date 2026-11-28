@@ -852,8 +852,9 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     // frame (dark tiles that flicker).
     // Followed here: what is known with EXEC empty where the region starts (masks saved from
     // it and narrowed from it are empty, SCC of such a narrowing is clear), along the branches
-    // that decides; a chain of decided branches that comes back to where it was, knowing the
-    // same, never ends.
+    // that decides. If a reachable path can cycle without a proven exit, keep the original
+    // guard. A scalar loop may read the old contents of an inactive vector lane and run as
+    // far as the watchdog even if some other value would have ended it promptly.
     let stalls = |b: usize, target: usize, first: usize, inside: &[bool]| -> bool {
         use std::collections::{BTreeMap, BTreeSet};
         // (dwords known to hold no lane, SCC values known)
@@ -861,8 +862,8 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         // (block, the block come from, what is known on the way in)
         type State = (usize, usize, Facts);
         let exec = |r: &(Reg, Value)| matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1);
-        let none_left = |inst: &Inst, facts: &Facts| {
-            let mut dwords = inst.reads.iter().filter(|r| exec(r)).peekable();
+        let empty_mask = |inst: &Inst, facts: &Facts, low: u8| {
+            let mut dwords = inst.reads.iter().filter(|r| matches!(r.0, Reg::S(c) if c == low || c == low + 1)).peekable();
             dwords.peek().is_some() && dwords.all(|r| facts.0.contains(&r.1))
         };
         let Some(branch) = p.blocks[b].insts.last() else {
@@ -875,7 +876,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         // The states after (block, from, facts): one if the block's exit is decided (none if
         // it leaves the region), else each way on.
-        let step = |(x, from, mut facts): State| -> (bool, Vec<State>) {
+        let step = |(x, from, mut facts): State| -> Vec<State> {
             let block = &p.blocks[x];
             let at = block.preds.iter().position(|&q| q == from);
             let merged: Vec<(Value, bool, Option<bool>)> = block
@@ -906,7 +907,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             }
             for inst in &block.insts {
                 let name = inst.name();
-                let none = none_left(inst, &facts);
+                let none = empty_mask(inst, &facts, EXEC);
                 let mut empty = vec![false; inst.writes.len()];
                 let mut scc = None;
                 if matches!(name, "s_mov_b32" | "s_mov_b64")
@@ -927,7 +928,8 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                         };
                     }
                     scc = narrows.then_some(false);
-                } else if none && name.starts_with("v_cmpx") {
+                } else if none && name.starts_with("v_cmp") {
+                    // A vector comparison with empty EXEC produces an empty result mask.
                     empty.fill(true);
                 }
                 for (e, w) in empty.into_iter().zip(&inst.writes) {
@@ -936,11 +938,13 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             }
             let on = |t: usize, facts: Facts| (t != target && inside[t]).then_some((t, x, facts));
             match block.exit {
-                Exit::Jump(t) => (true, on(t, facts).into_iter().collect()),
+                Exit::Jump(t) => on(t, facts).into_iter().collect(),
                 Exit::Branch { taken, not_taken } => {
                     let decided = block.insts.last().and_then(|last| match last.name() {
-                        "s_cbranch_execz" => none_left(last, &facts).then_some(taken),
-                        "s_cbranch_execnz" => none_left(last, &facts).then_some(not_taken),
+                        "s_cbranch_execz" => empty_mask(last, &facts, EXEC).then_some(taken),
+                        "s_cbranch_execnz" => empty_mask(last, &facts, EXEC).then_some(not_taken),
+                        "s_cbranch_vccz" => empty_mask(last, &facts, VCC).then_some(taken),
+                        "s_cbranch_vccnz" => empty_mask(last, &facts, VCC).then_some(not_taken),
                         name @ ("s_cbranch_scc0" | "s_cbranch_scc1") => last
                             .read(Reg::Scc)
                             .and_then(|v| facts.1.get(&v))
@@ -948,48 +952,33 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                         _ => None,
                     });
                     match decided {
-                        Some(t) => (true, on(t, facts).into_iter().collect()),
-                        None => (
-                            false,
-                            on(taken, facts.clone()).into_iter().chain(on(not_taken, facts)).collect(),
-                        ),
+                        Some(t) => on(t, facts).into_iter().collect(),
+                        None => on(taken, facts.clone()).into_iter().chain(on(not_taken, facts)).collect(),
                     }
                 }
-                Exit::End | Exit::Indirect => (false, Vec::new()),
+                Exit::End | Exit::Indirect => Vec::new(),
             }
         };
-        let mut seen: HashSet<State> = HashSet::new();
-        let mut work = vec![(first, b, facts)];
-        // (states followed in all; past that the region is taken not to stall, as before)
+        let mut visiting = HashSet::new();
+        let mut finished = HashSet::new();
+        let mut work = vec![(false, (first, b, facts))];
         let mut budget = 20_000u32;
-        while let Some(start) = work.pop() {
-            if !seen.insert(start.clone()) {
+        while let Some((leaving, state)) = work.pop() {
+            if leaving {
+                visiting.remove(&state);
+                finished.insert(state);
                 continue;
             }
-            let mut chain = vec![start.clone()];
-            let mut at = start;
-            loop {
-                budget -= 1;
-                if budget == 0 {
-                    return false;
-                }
-                let (decided, next) = step(at);
-                if !decided {
-                    work.extend(next);
-                    break;
-                }
-                let Some(next) = next.into_iter().next() else {
-                    break;
-                };
-                if chain.contains(&next) {
-                    return true;
-                }
-                if !seen.insert(next.clone()) {
-                    break;
-                }
-                chain.push(next.clone());
-                at = next;
+            if finished.contains(&state) {
+                continue;
             }
+            if budget == 0 || !visiting.insert(state.clone()) {
+                return true;
+            }
+            budget -= 1;
+            let next = step(state.clone());
+            work.push((true, state));
+            work.extend(next.into_iter().map(|s| (false, s)));
         }
         false
     };
@@ -1946,6 +1935,25 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    #[test]
+    fn an_empty_wave_keeps_its_skip_around_a_loop_that_can_reach_the_watchdog() {
+        let vcc = 0x7D88_0000; // v_cmp_gt_u32 vcc, s0, v0
+        let until_any_lane = skip(&[vcc, 0xBF86_FFFE], &[]); // s_cbranch_vccz to the compare
+        let while_any_lane = skip(&[vcc, 0xBF87_FFFE], &[]); // s_cbranch_vccnz to the compare
+        let from_inactive_lane = skip(&[
+            0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+            0x8106_8106, // s_add_i32 s6, s6, 1
+            0xBF03_0006, // s_cmp_ge_i32 s6, s0
+            0xBF84_FFFD, // s_cbranch_scc0 to the increment
+        ], &[]);
+        for deep in [false, true] {
+            assert!(without_skips(&until_any_lane, deep).is_none());
+            assert!(without_skips(&from_inactive_lane, deep).is_none());
+            // With no active lane the comparison clears VCC, so this body executes once.
+            assert_eq!(skips(&without_skips(&while_any_lane, deep).expect("safe to enter")), 0);
+        }
     }
 
     #[test]
