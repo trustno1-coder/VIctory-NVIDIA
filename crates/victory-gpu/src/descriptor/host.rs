@@ -1894,6 +1894,41 @@ fn raw_twins() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEWS").is_none_or(|v| v != "0"))
 }
 
+/// Maximum shader-visible CBV/SRV/UAV descriptor heap size reported by `device`
+/// (`OPTIONS19.MaxViewDescriptorHeapSize`, or `PORTABLE_VIEWS` below binding
+/// tier 3); `None` when the runtime predates `OPTIONS19` on a tier 3 device.
+pub(crate) fn max_shader_visible_views(device: &ID3D12Device) -> Option<u32> {
+    let mut o19 = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    // SAFETY: writes `o19` of the given size; older runtimes return Err.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS19,
+            (&raw mut o19).cast(),
+            size_of_val(&o19) as u32,
+        )
+    }
+    .is_ok()
+        && o19.MaxViewDescriptorHeapSize > 0
+    {
+        return Some(o19.MaxViewDescriptorHeapSize);
+    }
+    let mut o0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: writes `o0` of the given size.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            (&raw mut o0).cast(),
+            size_of_val(&o0) as u32,
+        )
+    }
+    .is_ok()
+        && o0.ResourceBindingTier.0 < D3D12_RESOURCE_BINDING_TIER_3.0
+    {
+        return Some(PORTABLE_VIEWS);
+    }
+    None
+}
+
 /// Picks, once, the null slot at the end of every host view heap and tells
 /// the translator now (`set_view_heap_limit`) instead of when the title's
 /// heap is made: a shader keeps the limit it was translated with, and the
@@ -1911,8 +1946,12 @@ pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
+        let max_views = max_shader_visible_views(&host.device);
         let fits = |count: u32| {
-            // SAFETY: plain heap creation; the heap is released at once.
+            if max_views.is_some_and(|max| count > max) {
+                return false;
+            }
+            // SAFETY: plain heap creation within the reported limit; released at once.
             let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
                 host.device
                     .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -7103,5 +7142,97 @@ mod bake_flip_tests {
         assert_eq!(cb1(), None);
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
+}
+
+#[cfg(test)]
+mod view_limit_tests {
+    use super::*;
+
+    /// Verifies `max_shader_visible_views`, `probe_view_limit`, and
+    /// `HostHeap::new` on the hardware adapter without triggering
+    /// `D3D12_MESSAGE_ID_CREATE_DESCRIPTOR_HEAP_INVALID_DESC` (`id=645`).
+    #[test]
+    fn shader_visible_view_heap_stays_within_device_limit() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::core::Interface;
+
+        // SAFETY: optional debug-layer enablement before creating a standalone test device.
+        unsafe {
+            let mut dbg: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut dbg).is_ok()
+                && let Some(d) = &dbg
+            {
+                d.EnableDebugLayer();
+            }
+        }
+        let Some((adapter, _, _)) = victory_shader::emit::host::hardware_adapter() else {
+            return;
+        };
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain hardware device creation.
+        if unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            return;
+        }
+        let Some(device) = device else { return };
+        let info = device.cast::<ID3D12InfoQueue>().ok();
+        if let Some(q) = &info {
+            // SAFETY: clears startup messages before probing.
+            unsafe { q.ClearStoredMessages() };
+        }
+
+        let max = max_shader_visible_views(&device);
+        if let Some(limit) = max {
+            assert!(limit >= PORTABLE_VIEWS, "unexpected view heap limit {limit}");
+            // Creating a heap at the reported limit (or PORTABLE_VIEWS) must succeed cleanly.
+            let probe_size = limit.min(2 * RAW_TWINS);
+            // SAFETY: plain shader-visible heap creation within `limit`.
+            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: probe_size,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+            };
+            assert!(made.is_ok(), "heap of {probe_size} views within limit {limit} must succeed");
+        }
+
+        probe_view_limit();
+        let chosen_null = victory_shader::emit::view_heap_limit();
+        let chosen_raw = victory_shader::emit::raw_views();
+        let chosen_total = if chosen_raw == 0 { chosen_null + 1 } else { 2 * chosen_raw };
+        if let Some(limit) = max {
+            assert!(
+                chosen_total <= limit,
+                "chosen host view heap size {chosen_total} exceeds device limit {limit}"
+            );
+        }
+        let heap = HostHeap::new(false, 1024).expect("host view heap");
+        assert!(heap.count() > 0);
+
+        if let Some(q) = &info {
+            let mut bad = Vec::new();
+            // SAFETY: reads stored messages into buffers sized by `GetMessage`.
+            unsafe {
+                for i in 0..q.GetNumStoredMessages() {
+                    let mut size = 0;
+                    if q.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u64; size.div_ceil(8)];
+                    let m = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if q.GetMessage(i, Some(m), &mut size).is_ok()
+                        && ((*m).Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+                            || (*m).ID == D3D12_MESSAGE_ID_CREATE_DESCRIPTOR_HEAP_INVALID_DESC)
+                    {
+                        let text = std::slice::from_raw_parts((*m).pDescription, (*m).DescriptionByteLength);
+                        bad.push(format!("id={} sev={}: {}", (*m).ID.0, (*m).Severity.0, String::from_utf8_lossy(text).trim_end_matches('\0')));
+                    }
+                }
+                q.ClearStoredMessages();
+            }
+            assert!(bad.is_empty(), "unexpected D3D12 heap validation errors: {bad:?}");
+        }
     }
 }
