@@ -146,7 +146,9 @@ impl Book {
     /// The live entry that starts last at or below `at`, and the next above.
     fn neighbours(&self, at: u64) -> [Option<&Entry>; 2] {
         let below = self.by_start.range(..=(at, u64::MAX)).next_back();
-        let above = self.by_start.range((at + 1, 0)..).next();
+        // Saturating, as the lower bounds above: `at` is an address the
+        // card reported, any u64.
+        let above = self.by_start.range((at.saturating_add(1), 0)..).next();
         [below, above].map(|e| e.and_then(|((_, id), ())| self.live.get(id)))
     }
 
@@ -255,7 +257,11 @@ pub(crate) fn address(texture: &ID3D12Resource) -> Option<u64> {
 
 /// The address of a texture: the base its descriptor has.
 fn texture_address(texture: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
-    struct Slot(ID3D12DescriptorHeap, usize);
+    struct Slot {
+        /// Kept alive: `at` is in it.
+        _heap: ID3D12DescriptorHeap,
+        at: usize,
+    }
     // SAFETY: a descriptor heap, used under the lock.
     unsafe impl Send for Slot {}
     static SLOT: Mutex<Option<Slot>> = Mutex::new(None);
@@ -276,9 +282,9 @@ fn texture_address(texture: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Opti
         .ok()?;
         // SAFETY: a live heap.
         let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart().ptr };
-        *slot = Some(Slot(heap, at));
+        *slot = Some(Slot { _heap: heap, at });
     }
-    let at = slot.as_ref()?.1;
+    let at = slot.as_ref()?.at;
     let format = viewable(desc.Format.0)?;
     let mut view = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT(format),
@@ -748,5 +754,7 @@ mod tests {
         assert_eq!(b.neighbours(0x1000_0100)[1].map(|e| e.what.as_str()), Some("two"));
         b.remove(two, 3, 13);
         assert!(b.neighbours(u64::MAX - 1)[0].is_none() && b.by_object.is_empty());
+        // An address the card reports can be anything, the top one included.
+        assert!(b.neighbours(u64::MAX)[0].is_none() && b.neighbours(u64::MAX)[1].is_none());
     }
 }
