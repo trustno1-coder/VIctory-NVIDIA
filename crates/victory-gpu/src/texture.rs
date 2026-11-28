@@ -1323,6 +1323,29 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     });
 }
 
+/// Bink writes its luma plane as `R8_UNORM` (already recognised exactly) and
+/// its alpha plane as `A8_UNORM`. The alpha plane is still a one-byte CPU
+/// decoder plane whose still letterbox edges frame generation would move, so
+/// it extends the movie gate even though its upload path stays as it was.
+/// This is the format of the 22:12:09 near-miss in the 2026-11-27 log
+/// (`format=65`, 2048x2048), where only the Bink signal held the gate.
+fn movie_alpha_plane_format(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> bool {
+    format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_A8_UNORM
+}
+
+#[cfg(test)]
+mod movie_plane_tests {
+    use super::movie_alpha_plane_format;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UINT};
+
+    #[test]
+    fn only_binks_alpha_plane_extends_the_gate() {
+        assert!(movie_alpha_plane_format(DXGI_FORMAT_A8_UNORM));
+        assert!(!movie_alpha_plane_format(DXGI_FORMAT_R8_UNORM));
+        assert!(!movie_alpha_plane_format(DXGI_FORMAT_R8_UINT));
+    }
+}
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
@@ -1420,15 +1443,55 @@ impl Staging {
     fn movie_plane(&self) -> bool {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
         let desc = &self.layout.desc;
-        !self.on_demand
+        let first = self.footprints.first();
+        let plane = !self.on_demand
             && desc.dimension == victory_formats::texture::Dimension::Tex2d
             && desc.swizzle.0 == 0
             && desc.depth == 1
             && desc.mips == 1
             && desc.samples == 1
-            && self.footprints.len() == 1
-            && self.footprints[0].Offset == 0
-            && self.footprints[0].Footprint.Format == DXGI_FORMAT_R8_UNORM
+            && first.is_some_and(|f| f.Offset == 0 && f.Footprint.Format == DXGI_FORMAT_R8_UNORM);
+        if plane {
+            return true;
+        }
+        // Do not widen the upload path on a guess. A close match keeps its
+        // old upload; only Bink's alpha plane is known to be a real decoder
+        // plane, so it extends the movie gate on its own (the 2026-11-27
+        // 22:12:09 near-miss was A8_UNORM and had only the Bink signal).
+        let near = desc.dimension == victory_formats::texture::Dimension::Tex2d
+            && desc.swizzle.0 == 0
+            && desc.element_bytes == 1
+            && desc.block == 1
+            && first.is_some();
+        if near {
+            let f = first.expect("a first footprint");
+            if movie_alpha_plane_format(f.Footprint.Format) {
+                // Only an open Bink movie's alpha plane is a movie plane.
+                // Ordinary CPU-written A8 UI textures refresh every frame and
+                // would otherwise keep the four-present lease renewed forever
+                // (and, through `note_movie_plane`, the 1,200-present Bink idle
+                // lease too), leaving frame generation retired after a movie.
+                crate::streamline::note_alpha_plane();
+                once!(
+                    format = f.Footprint.Format.0,
+                    size = ?[desc.width, desc.height],
+                    "a CPU-written alpha movie plane was recognised by the movie gate"
+                );
+            } else {
+                once!(
+                    on_demand = self.on_demand,
+                    depth = desc.depth,
+                    mips = desc.mips,
+                    samples = desc.samples,
+                    footprints = self.footprints.len(),
+                    offset = f.Offset,
+                    format = f.Footprint.Format.0,
+                    size = ?[desc.width, desc.height],
+                    "a CPU-written plane nearly matched the movie plane upload; frame generation is held off only by the Bink signal"
+                );
+            }
+        }
+        false
     }
 
     /// Returns the bytes of title memory read.

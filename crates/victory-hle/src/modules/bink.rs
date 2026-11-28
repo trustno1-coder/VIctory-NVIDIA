@@ -16,7 +16,11 @@
 //! Imports bound by the loader are wrapped ([`SkipMovies`]): those of the
 //! executable and its DLLs at startup (beneath the FidelityFX interposer,
 //! which only looks at its own DLL), and those of DLLs the title loads
-//! later; a Bink export looked up with `GetProcAddress` is not.
+//! later. Bink exports looked up with `GetProcAddress` are wrapped too,
+//! whether the DLL was loaded by the host or mapped as a title image. They
+//! are wrapped even when no movie is skipped, to tell frame generation that
+//! a movie is being shown. Only the first Bink DLL's export address can be
+//! wrapped; a second one is reported and left alone.
 //!
 //! Written by C-GDev (fork PR 613, 75fe122c; the idea from XCL PR #1053,
 //! code written anew for VIctory's loader), as carried in
@@ -113,8 +117,8 @@ static MODE: AtomicU8 = AtomicU8::new(Mode::Off as u8);
 /// Open movies seen so far, and whether each is skipped.
 static MOVIES: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
 
-/// The address an import of `dll!name` found at `address` is bound to:
-/// a wrapper when movies are skipped and it is a wrapped Bink export.
+/// The address an import of `dll!name` found at `address` is bound to: a
+/// wrapper for a wrapped Bink export (whether or not movies are skipped).
 pub fn wrap(dll: &str, name: &str, address: usize) -> usize {
     static FROM_ENV: OnceLock<Mode> = OnceLock::new();
     let mode = *FROM_ENV.get_or_init(|| {
@@ -131,7 +135,7 @@ fn wrap_with(mode: Mode, dll: &str, name: &str, address: usize) -> usize {
     let is_bink = dll
         .get(..4)
         .is_some_and(|start| start.eq_ignore_ascii_case("bink"));
-    if mode == Mode::Off || !is_bink || address == 0 {
+    if !is_bink || address == 0 {
         return address;
     }
     let Some(i) = NAMES.iter().position(|&n| n == name) else {
@@ -167,6 +171,7 @@ fn skipped(movie: *mut Movie) -> bool {
     if movie.is_null() {
         return false;
     }
+    let mode = MODE.load(Ordering::Relaxed);
     let mut movies = movies();
     let movies = movies.get_or_insert_with(HashMap::new);
     let skip = *movies.entry(movie as usize).or_insert_with(|| {
@@ -174,7 +179,13 @@ fn skipped(movie: *mut Movie) -> bool {
         // the movie structure, which starts with `Movie`.
         let m = unsafe { &*movie };
         let looping = m.open_flags & WILL_LOOP != 0;
-        let skip = m.frames > 0 && (!looping || MODE.load(Ordering::Relaxed) == Mode::All as u8);
+        let skip = mode != Mode::Off as u8
+            && m.frames > 0
+            && (!looping || mode == Mode::All as u8);
+        // The movie is on screen from the first player call until BinkClose,
+        // including skipped movies held on their last frame and long gaps
+        // between wrapped calls. Keep frame generation off for all of it.
+        victory_gpu::streamline::bink_movie_opened();
         tracing::info!(
             width = m.width,
             height = m.height,
@@ -193,13 +204,21 @@ fn skipped(movie: *mut Movie) -> bool {
             (*movie).frame_num = frames;
             (*movie).last_frame_num = frames;
         }
+        // A skipped movie is held on its last frame. The wrapper returns
+        // before the normal Bink sign below, so without this the frame
+        // generation gate's bounded idle lease would expire while the last
+        // frame (and its letterbox borders) is still on screen.
+        victory_gpu::streamline::note_bink_movie();
     }
     skip
 }
 
 extern "system" fn close(movie: *mut Movie, a: usize, b: usize, c: usize) -> usize {
-    if let Some(movies) = movies().as_mut() {
-        movies.remove(&(movie as usize));
+    if movies()
+        .as_mut()
+        .is_some_and(|movies| movies.remove(&(movie as usize)).is_some())
+    {
+        victory_gpu::streamline::bink_movie_closed();
     }
     forward(CLOSE, movie, a, b, c)
 }
@@ -212,6 +231,9 @@ macro_rules! wrapper {
             if skipped(movie) {
                 return $skipped;
             }
+            // A movie frame is being shown or worked on: hold frame
+            // generation off, even with VICTORY_SKIP_BINK=0.
+            victory_gpu::streamline::note_bink_movie();
             forward($i, movie, a, b, c)
         }
     };
@@ -310,15 +332,18 @@ mod tests {
             unsafe { std::mem::transmute::<usize, Export>(address) }
         };
         let dll = "Bink2Scarlett.dll";
-        // Off, other DLLs and exports that are not wrapped stay as they are.
-        assert_eq!(wrap_with(Mode::Off, dll, "BinkWait", 0x1000), 0x1000);
-        assert_eq!(wrap_with(Mode::All, "game.dll", "BinkWait", 0x1000), 0x1000);
-        assert_eq!(wrap_with(Mode::All, dll, "BinkGetRects", 0x1000), 0x1000);
+        // Other DLLs and exports that are not wrapped stay as they are.
+        assert_eq!(wrap_with(Mode::Off, "game.dll", "BinkWait", 0x1000), 0x1000);
+        assert_eq!(wrap_with(Mode::Off, dll, "BinkGetRects", 0x1000), 0x1000);
+        assert_eq!(wrap_with(Mode::Off, dll, "BinkWait", 0), 0);
 
-        let wait = bind(Mode::NotLooping, dll, "BinkWait", dll_wait);
+        // Bink exports are wrapped even when movies are not skipped.
+        let wait = bind(Mode::Off, dll, "BinkWait", dll_wait);
         let next = bind(Mode::NotLooping, dll, "BinkNextFrame", dll_next);
         let close = bind(Mode::NotLooping, dll, "BinkClose", dll_close);
         let do_async = bind(Mode::NotLooping, dll, "BinkDoFrameAsyncMulti", dll_wait);
+        // The same wrapper now serves the not-skipping mode.
+        bind(Mode::NotLooping, dll, "BinkWait", dll_wait);
         assert_ne!(wait as usize, dll_wait as *const () as usize);
         // A second Bink DLL keeps its own exports.
         assert_eq!(

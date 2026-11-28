@@ -37,7 +37,7 @@ pub use plan::Mode;
 
 use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -1210,6 +1210,150 @@ pub(crate) fn fresh_inputs() -> Option<Inputs> {
     Some(Inputs { depth: n.depth.current(), motion: n.motion.current(), camera: n.camera, frame_ms: n.frame_ms })
 }
 
+/// How many title presents after the last sign of a movie frame generation
+/// stays off. A movie decoder can hold a plane for several presents, and the
+/// upload can be recorded a list or two before the present that shows it.
+/// The lease is in presents, not milliseconds: the title can present at 250
+/// frames a second in the menu and at 12 in the world, and an async present
+/// worker must not re-decide it after a wall-clock deadline has passed.
+const MOVIE_PLANE_HOLD_FRAMES: u64 = 4;
+static MOVIE_PLANE_UNTIL_FRAME: AtomicU64 = AtomicU64::new(0);
+/// A Bink handle can stay open long after its last frame (a looping background
+/// movie decoded early, or a close that never reaches the wrapper). Classing
+/// every present as a movie for the whole life of the handle retired FSR 3 at
+/// the first movie in the fresh retest and never let it re-arm: log 13403 and
+/// every line after, "0 presents with it on, 416 off", while two handles were
+/// still open. Every Bink sign extends this lease instead; quiet handles stop
+/// holding frame generation off.
+///
+/// The frame part keeps queued presents classed the same as when they were
+/// taken (the worker must not re-decide a present after a wall-clock deadline).
+/// It alone was 1,200 presents, which is ~5 s in the 250-present/s menu but
+/// ~100 s in the measured 12-present/s gameplay: after the movie closed at
+/// 00:46:33 there were 0 Bink signs and 0 plane notes, yet every line still
+/// held 13-15 presents off. The wall-clock part caps that tail at 5 s from the
+/// last Bink sign, matching the old menu behaviour, while every real movie
+/// frame keeps renewing it. Both are checked at the title's Present, so the
+/// answer still travels unchanged to the async worker and FSR.
+const BINK_IDLE_HOLD_FRAMES: u64 = 1200;
+const BINK_IDLE_HOLD_MS: u64 = 5000;
+static BINK_IDLE_UNTIL_FRAME: AtomicU64 = AtomicU64::new(0);
+static BINK_IDLE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// Bink movies open in the title. Counted for diagnostics only: the gate uses
+/// the bounded lease above, not this handle count.
+static BINK_MOVIES_OPEN: AtomicUsize = AtomicUsize::new(0);
+static BINK_MOVIES_OPENED: AtomicU64 = AtomicU64::new(0);
+static BINK_MOVIES_CLOSED: AtomicU64 = AtomicU64::new(0);
+static MOVIE_PLANE_NOTES: AtomicU64 = AtomicU64::new(0);
+static MOVIE_BINK_NOTES: AtomicU64 = AtomicU64::new(0);
+static MOVIE_PLANE_TAKES: AtomicU64 = AtomicU64::new(0);
+static MOVIE_PLANE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Called when a list records a CPU-written movie plane upload. The upload
+/// can be recorded a list or two before the present that shows it, so it
+/// extends the lease over those presents.
+pub fn note_movie_plane() {
+    note_movie_plane_at(crate::queue::frame_count());
+}
+
+/// Extend the lease without shortening it. Several threads can note a plane
+/// or a Bink call for the same or an older present; a plain store would let
+/// the older one cancel the longer lease and turn frame generation on before
+/// the last movie frame had been shown.
+fn note_movie_plane_at(frame: u64) {
+    MOVIE_PLANE_NOTES.fetch_add(1, Relaxed);
+    let until = frame.saturating_add(MOVIE_PLANE_HOLD_FRAMES);
+    MOVIE_PLANE_UNTIL_FRAME.fetch_max(until, AcqRel);
+    BINK_IDLE_UNTIL_FRAME.fetch_max(frame.saturating_add(BINK_IDLE_HOLD_FRAMES), AcqRel);
+    BINK_IDLE_UNTIL_MS.fetch_max(crate::host::now_ms().saturating_add(BINK_IDLE_HOLD_MS), AcqRel);
+}
+
+/// A CPU-written plane upload is only a movie plane while a Bink movie is
+/// actually open. The latest retest's ordinary UI alpha textures were noted on
+/// nearly every frame ("a CPU-written alpha movie plane was recognised" at
+/// line 332, then 10-76 notes every five seconds all the way to the end), so
+/// the four-present lease never expired and every later present was classed as
+/// a movie: FSR 3 retired its context at line 12576 and made none again; 0
+/// presents with it on from line 13032 on. The Bink wrappers are the
+/// authoritative sign; a plane upload extends only the short lease, and only
+/// for an open movie, so it can bridge the last uploads without latching frame
+/// generation off. The dedicated upload path itself is unchanged.
+pub fn note_plane_upload_at(frame: u64) {
+    if BINK_MOVIES_OPEN.load(Acquire) != 0 {
+        MOVIE_PLANE_NOTES.fetch_add(1, Relaxed);
+        MOVIE_PLANE_UNTIL_FRAME.fetch_max(frame.saturating_add(MOVIE_PLANE_HOLD_FRAMES), AcqRel);
+    }
+}
+
+/// [`note_plane_upload_at`] for the current present frame.
+pub fn note_plane_upload() {
+    note_plane_upload_at(crate::queue::frame_count());
+}
+
+/// The `A8_UNORM` near-match uses the same bounded gate as the exact
+/// `R8_UNORM` Bink luma upload.
+pub fn note_alpha_plane_at(frame: u64) {
+    note_plane_upload_at(frame);
+}
+
+/// [`note_alpha_plane_at`] for the current present frame.
+pub fn note_alpha_plane() {
+    note_plane_upload();
+}
+
+/// Called by the title's Bink player whenever it works on a movie frame,
+/// even when no movie is being skipped. It tells us a movie is present when
+/// the decoder writes a plane we do not recognise as one.
+pub fn note_bink_movie() {
+    MOVIE_BINK_NOTES.fetch_add(1, Relaxed);
+    note_movie_plane();
+}
+
+/// The title opened a Bink movie. The movie gate holds through gaps with no
+/// wrapped calls or plane uploads for [`BINK_IDLE_HOLD_FRAMES`] after the last
+/// sign, but an idle handle no longer latches it forever.
+pub fn bink_movie_opened() {
+    BINK_MOVIES_OPEN.fetch_add(1, Relaxed);
+    BINK_MOVIES_OPENED.fetch_add(1, Relaxed);
+    note_movie_plane();
+}
+
+/// The title closed a Bink movie. Keep a short lease so the last frame still
+/// shown while the close is processed is classed as a movie.
+pub fn bink_movie_closed() {
+    if BINK_MOVIES_OPEN.fetch_update(AcqRel, Acquire, |n| n.checked_sub(1)).is_ok() {
+        BINK_MOVIES_CLOSED.fetch_add(1, Relaxed);
+    }
+    note_movie_plane();
+}
+
+/// Whether title present `frame` shows a movie plane. Frame generation
+/// interpolates the still letterbox edges of a video and makes the black
+/// borders flicker, so it is held off for these presents only; DLSS, FSR and
+/// the user's frame-generation choice are untouched.
+///
+/// This is called once at the title's Present, before the present is put in
+/// the async line. The answer travels with the present: the worker, the
+/// composer fallbacks, FSR and DLSS all use the same class for that frame.
+pub(crate) fn take_movie_plane(frame: u64) -> bool {
+    take_movie_plane_at(frame, crate::host::now_ms())
+}
+
+/// The same decision with the clock passed in, so a test can expire the wall
+/// part without waiting. The caller at the title's Present passes its own
+/// `now_ms`; the async worker uses the result already taken.
+fn take_movie_plane_at(frame: u64, now_ms: u64) -> bool {
+    let active = frame <= MOVIE_PLANE_UNTIL_FRAME.load(Acquire)
+        || (frame <= BINK_IDLE_UNTIL_FRAME.load(Acquire)
+            && now_ms <= BINK_IDLE_UNTIL_MS.load(Acquire));
+    if active {
+        MOVIE_PLANE_TAKES.fetch_add(1, Relaxed);
+    } else {
+        MOVIE_PLANE_MISSES.fetch_add(1, Relaxed);
+    }
+    active
+}
+
 /// A texture frame generation reads at the present, and the state it is in
 /// then: a title texture's host copy (in the state the lists submitted so
 /// far left it in), or one of the check's ([`check`]) in a fixed state.
@@ -1680,8 +1824,8 @@ pub(crate) struct Presenting {
 /// Before our swap chain's Present of title frame `frame`: with frame
 /// generation, the frame's latency markers, constants and tags, and whether
 /// frame generation runs on it (it does when an upscaling was submitted
-/// since the last present).
-pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presenting> {
+/// since the last present, and the present is not a movie plane).
+pub(crate) fn present_begins(frame: u64, planes: Planes<'_>, video: bool) -> Option<Presenting> {
     if !FG_READY.load(Acquire) || !SWAP_CHAIN_PROXIED.load(Acquire) {
         return None;
     }
@@ -1781,7 +1925,9 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             mvec_scale = ?constants.mvec_scale,
             "DLSS Frame Generation: first frame with depth and motion vectors tagged"
         );
-        code == 0
+        // A movie plane was recorded for this present: the tags are kept in
+        // step, but generation must not interpolate the black bars.
+        if video { false } else { code == 0 }
     } else {
         if calls.framegen_on {
             // No upscaling this frame (a menu, a load): what was tagged may
@@ -2160,7 +2306,7 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
         let hooked = present && asked.present_hook && !framegen;
         for round in 0..if hooked { 120 } else { 3 } {
             if hooked && round > 0 {
-                host.present_planes(&base, 0, None, round);
+                host.present_planes(&base, 0, None, round, false);
             }
             let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
             let list = match host.new_list() {
@@ -2225,7 +2371,7 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
             if let Some(copy) = &copy {
                 lock(&HUD_SUBMITTED).push(Copied { id: frame, target: base.as_raw() as usize, texture: copy.clone() });
             }
-            host.present_planes(&base, 0, None, frame);
+            host.present_planes(&base, 0, None, frame, false);
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
         crate::host::settle_for_fence();
@@ -2282,6 +2428,20 @@ fn texture(
 
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
+    let [notes, bink, takes, misses] = [
+        &MOVIE_PLANE_NOTES,
+        &MOVIE_BINK_NOTES,
+        &MOVIE_PLANE_TAKES,
+        &MOVIE_PLANE_MISSES,
+    ]
+    .map(|c| c.swap(0, Relaxed));
+    let opened = BINK_MOVIES_OPENED.swap(0, Relaxed);
+    let closed = BINK_MOVIES_CLOSED.swap(0, Relaxed);
+    tracing::info!(
+        "movie plane gate: {notes} plane uploads noted ({bink} Bink signs), {opened} Bink movies opened, {closed} closed, \
+         {} still open; {takes} presents held off, {misses} presents not held off",
+        BINK_MOVIES_OPEN.load(Relaxed)
+    );
     if let Some((on, off, failed, hudless)) = fsr::line_counts() {
         tracing::info!(
             "FSR 3 frame generation: {on} presents with it on ({hudless} with the colour without the interface), {off} off, {failed} prepare dispatches failed"
@@ -2331,6 +2491,126 @@ pub(crate) fn line(frames: f64) {
                 "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn reset_gate() {
+        MOVIE_PLANE_UNTIL_FRAME.store(0, Relaxed);
+        BINK_IDLE_UNTIL_FRAME.store(0, Relaxed);
+        BINK_IDLE_UNTIL_MS.store(0, Relaxed);
+        BINK_MOVIES_OPEN.store(0, Relaxed);
+    }
+
+    #[test]
+    fn a_late_movie_note_does_not_shorten_an_earlier_lease() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_gate();
+        note_movie_plane_at(10);
+        note_movie_plane_at(1);
+        assert_eq!(MOVIE_PLANE_UNTIL_FRAME.load(Acquire), 10 + MOVIE_PLANE_HOLD_FRAMES);
+        assert_eq!(BINK_IDLE_UNTIL_FRAME.load(Acquire), 10 + BINK_IDLE_HOLD_FRAMES);
+        reset_gate();
+    }
+
+    /// The latest retest refreshed the movie gate from ordinary A8 UI alpha
+    /// textures on nearly every frame, with no movie open. Such a note must
+    /// hold neither the short lease nor the long Bink-idle lease.
+    #[test]
+    fn an_alpha_plane_without_a_bink_movie_does_not_hold_the_gate() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_gate();
+        note_alpha_plane_at(10);
+        assert_eq!(MOVIE_PLANE_UNTIL_FRAME.load(Acquire), 0);
+        assert_eq!(BINK_IDLE_UNTIL_FRAME.load(Acquire), 0);
+        assert!(!take_movie_plane(10));
+        reset_gate();
+    }
+
+    /// The exact `R8_UNORM` plane upload uses the dedicated decoder buffer,
+    /// which ordinary one-byte UI textures can also match. It is no more a
+    /// movie sign than the A8 near-match unless a Bink movie is open.
+    #[test]
+    fn a_plane_upload_without_a_bink_movie_does_not_hold_the_gate() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_gate();
+        note_plane_upload_at(10);
+        assert_eq!(MOVIE_PLANE_UNTIL_FRAME.load(Acquire), 0);
+        assert_eq!(BINK_IDLE_UNTIL_FRAME.load(Acquire), 0);
+        assert!(!take_movie_plane(10));
+        reset_gate();
+    }
+
+    /// With a movie open, an alpha plane still bridges the last few uploads,
+    /// but must not extend the 1,200-present Bink idle lease: a Bink handle
+    /// that stays open after the last frame would otherwise keep FG off for
+    /// the whole run as UI textures refreshed.
+    #[test]
+    fn an_alpha_plane_of_an_open_bink_movie_extends_only_the_short_lease() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_gate();
+        BINK_MOVIES_OPEN.store(1, Relaxed);
+        note_alpha_plane_at(10);
+        assert_eq!(MOVIE_PLANE_UNTIL_FRAME.load(Acquire), 10 + MOVIE_PLANE_HOLD_FRAMES);
+        assert_eq!(BINK_IDLE_UNTIL_FRAME.load(Acquire), 0);
+        assert!(take_movie_plane(10 + MOVIE_PLANE_HOLD_FRAMES));
+        assert!(!take_movie_plane(11 + MOVIE_PLANE_HOLD_FRAMES));
+        reset_gate();
+    }
+
+    /// The fresh retest's movie gate: one long Bink handle stayed open, and
+    /// every present after the retire was classed as a movie forever. The
+    /// open count is still kept for diagnostics; only the idle lease expires.
+    #[test]
+    fn an_idle_bink_handle_stops_holding_the_gate() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_gate();
+        note_bink_movie();
+        BINK_MOVIES_OPEN.store(1, Relaxed);
+        let until = BINK_IDLE_UNTIL_FRAME.load(Acquire);
+        assert!(take_movie_plane(until), "the last movie frame must still be held off");
+        assert!(!take_movie_plane(until + 1), "an idle handle must not latch the gate forever");
+        // Diagnostics still see the handle.
+        assert_eq!(BINK_MOVIES_OPEN.load(Acquire), 1);
+        reset_gate();
+    }
+
+    /// The new retest held 13-15 presents off every second after the movie
+    /// closed with 0 Bink signs: 1,200 presents is ~100 s at gameplay's 12
+    /// presents/s. The wall-clock half must end that tail at 5 s, before the
+    /// frame half would, while still holding the queued presents taken before
+    /// the last sign.
+    #[test]
+    fn an_idle_bink_lease_expires_by_clock_before_its_frame_count() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_gate();
+        note_bink_movie();
+        let until_frame = BINK_IDLE_UNTIL_FRAME.load(Acquire);
+        let until_ms = BINK_IDLE_UNTIL_MS.load(Acquire);
+        assert!(until_frame > MOVIE_PLANE_HOLD_FRAMES);
+        assert!(take_movie_plane_at(until_frame - 1, until_ms - 1));
+        assert!(!take_movie_plane_at(until_frame - 1, until_ms + 1));
+        reset_gate();
+    }
+
+    /// A skipped movie is held on its last frame and returns before the
+    /// wrapper's normal sign; each wrapped call must keep renewing the lease.
+    #[test]
+    fn late_signs_extend_the_idle_lease_without_shortening_it() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_gate();
+        note_movie_plane_at(10);
+        note_movie_plane_at(10 + BINK_IDLE_HOLD_FRAMES - MOVIE_PLANE_HOLD_FRAMES);
+        let until = BINK_IDLE_UNTIL_FRAME.load(Acquire);
+        assert_eq!(until, 10 + 2 * BINK_IDLE_HOLD_FRAMES - MOVIE_PLANE_HOLD_FRAMES);
+        assert!(take_movie_plane(until));
+        assert!(!take_movie_plane(until + 1));
+        reset_gate();
     }
 }
 

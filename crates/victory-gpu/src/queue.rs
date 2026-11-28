@@ -919,6 +919,12 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// The frame a list recorded now will be presented with. Used to lease movie
+/// frame generation off in presents, not wall-clock milliseconds.
+pub(crate) fn frame_count() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 /// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
@@ -1035,11 +1041,15 @@ extern "system" fn present(
             .filter(|&over_res| base_res != Some(over_res))
             .and_then(take_copy);
         let resource = texture.as_ref().map_or(0, |t| t.0);
+        // The movie class belongs to this title frame. Decide it here, before
+        // the async line can separate the present from the plane upload that
+        // caused it, and carry the answer with the present.
+        let video = crate::streamline::take_movie_plane(frame);
         behind::present(
             this,
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
-            Shown { frame, resource },
+            Shown { frame, resource, video },
         );
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1071,11 +1081,12 @@ extern "system" fn present(
                     (over_res, over_tex, over_state)
                 })
             });
+        let video = crate::streamline::take_movie_plane(frame);
         show_planes(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
+            Shown { frame, resource: resource as usize, video },
         );
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
@@ -1103,12 +1114,14 @@ fn frame_ends() {
     });
 }
 
-/// The frame a present shows, and the title's resource it shows.
+/// The frame a present shows, the title's resource it shows, and whether
+/// that frame was classed as a movie at the title's Present.
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 struct Shown {
     frame: u64,
     resource: usize,
+    video: bool,
 }
 
 /// Shows `texture` (with optional `overlay` plane blended over it) in our window.
@@ -1122,7 +1135,7 @@ fn show_planes(
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    let shown = host.present_planes(texture, state, overlay, what.frame, what.video);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]

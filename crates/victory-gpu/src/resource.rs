@@ -1854,6 +1854,17 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+/// The byte limit on host copies of title textures, if
+/// `VICTORY_TEXTURE_BUDGET_MB` is set.
+#[cfg(windows)]
+fn texture_budget_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    })
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
@@ -1865,11 +1876,7 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
+    let limit = texture_budget_limit();
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
@@ -1886,11 +1893,196 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
+            // Keep a bounded part of the line for slots that have never had a
+            // host texture: those draw black while the normal queue fills the
+            // line. The 72% setting is unchanged; this only reserves headroom
+            // inside it.
+            let line = room_line(budget).saturating_sub(face_headroom_bytes());
             used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < room_line(budget)
+                < line
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// `VICTORY_TEXTURE_FIRST_UPLOAD_MB` (default 128, 0..=512), the bounded
+/// allowance over the normal 72% line for slots that draw black until they
+/// have a host texture. 0 keeps the old strict line.
+#[cfg(windows)]
+fn first_upload_allowance_mb() -> u64 {
+    static ALLOWANCE_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ALLOWANCE_MB.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_FIRST_UPLOAD_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(128)
+            .clamp(0, 512)
+    })
+}
+
+/// A small, hard-capped allowance over the normal texture room line, spent
+/// only on a slot that has never had a host texture: that slot draws black
+/// while it waits ([`draw.rs`](crate::draw)'s face-texture note). It never
+/// crosses 80% of the card's budget. Render-target and buffer-copy reserves
+/// still have to fit in the remaining budget, so a burst that would exhaust
+/// the card as a whole shuts it off.
+/// `VICTORY_TEXTURE_FIRST_UPLOAD_MB` (default 128, 0..=512) sets it; 0 keeps
+/// the old strict line.
+#[cfg(windows)]
+pub(crate) fn room_for_first_upload(memory: Option<[u64; 4]>, reserve: u64) -> bool {
+    let mb = first_upload_allowance_mb();
+    let filled = KINDS[1].load(std::sync::atomic::Ordering::Relaxed) + crate::tiles::given_total();
+    // One look at the free part of the texture heaps: the same bytes are
+    // subtracted from `used` below, and are what a placed texture takes before
+    // a new block is asked for (pool.rs `texture_room`).
+    let free_blocks = crate::pool::texture_room();
+    let counted = memory.map_or(0, |[_, used, ..]| {
+        used.saturating_sub(free_blocks) + crate::shadow::card_room_kept() + targets_room_kept()
+    });
+    let why = first_upload_decision(
+        memory,
+        reserve,
+        room(memory),
+        texture_budget_limit().is_some(),
+        mb,
+        filled,
+        counted,
+        free_blocks,
+    );
+    FIRST_UPLOAD_REASONS[why as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    why == FirstUpload::Allow
+}
+
+/// Why a slot that has never had a host texture was refused or admitted just
+/// over the room line. The order is the order of the checks in
+/// [`room_for_first_upload`], so a log can say which bound held it back.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum FirstUpload {
+    Allow,
+    ExplicitBudget,
+    NoMemory,
+    AllowanceOff,
+    /// The bytes in host copies of title textures, plus this upload, reached
+    /// the 72% line with the first-upload allowance (never past 80%).
+    FilledCeiling,
+    /// The title's whole card use, including render targets and buffer
+    /// copies, plus this upload, reached the card's budget.
+    WholeCard,
+}
+
+/// Counters for the first-upload decisions since the last frame-rate line.
+#[cfg(windows)]
+pub(crate) static FIRST_UPLOAD_REASONS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// The decision [`room_for_first_upload`] makes, with every input passed in
+/// so it can be replayed against a log line in a test.
+#[cfg(any(windows, test))]
+fn first_upload_decision(
+    memory: Option<[u64; 4]>,
+    reserve: u64,
+    room_ok: bool,
+    explicit_limit: bool,
+    allowance_mb: u64,
+    filled: u64,
+    _counted: u64,
+    free_blocks: u64,
+) -> FirstUpload {
+    if room_ok {
+        return FirstUpload::Allow;
+    }
+    // An explicit byte limit on texture copies stays absolute.
+    if explicit_limit {
+        return FirstUpload::ExplicitBudget;
+    }
+    let Some([budget, used, ..]) = memory else { return FirstUpload::NoMemory; };
+    if allowance_mb == 0 {
+        return FirstUpload::AllowanceOff;
+    }
+    let ceiling = room_line(budget).saturating_add(allowance_mb << 20).min(budget / 100 * 80);
+    // The 80% ceiling is on bytes held by host copies of textures, not on
+    // every byte the title has on the card. Using `used - free texture
+    // blocks` here counted the title's render targets twice: at 22:41:23
+    // they held 2,663 MB of the 6,016 MB weighed, and at 22:44:24 the target
+    // reserve was gone but 6,156 MB was still weighed against a 5,204 MB
+    // face ceiling. In both cases only 5,023 MB was in texture copies, so
+    // no black slot could ever be admitted. Count the texture copies; keep
+    // the whole-card guard below so a burst that would exhaust the budget
+    // still shuts off.
+    if filled.saturating_add(reserve) >= ceiling {
+        return FirstUpload::FilledCeiling;
+    }
+    // A placed texture takes the free part of the texture heaps first (pool.rs
+    // `texture`), so an upload that fits there commits no more card memory at
+    // all. The fresh 2026-11-28 00:47:46 line had 893 MB free in those blocks
+    // while `used - free + reserves` was 7,316 MB against a 7,070 MB budget:
+    // charging the upload to that sum refused 60,000 faces in five seconds,
+    // though nothing they needed would have grown the card's use. Only bytes
+    // past the free blocks can ask for a new heap; those still have to fit
+    // under the budget. `counted` is kept for diagnostics and the line, not
+    // charged twice.
+    let new_card_bytes = reserve.saturating_sub(free_blocks);
+    if new_card_bytes > 0 && used.saturating_add(new_card_bytes) >= budget {
+        return FirstUpload::WholeCard;
+    }
+    FirstUpload::Allow
+}
+
+/// How many more bytes of first uploads the hard guards can take now: the
+/// smaller of the room under the 80% texture-copy ceiling and the room under
+/// the whole-card budget, after the upload being considered. `draw.rs` uses
+/// this in place of a flat rate cap for its per-window admission, so a slot
+/// that [`room_for_first_upload`] allows is not held back by an arbitrary
+/// number. The guards themselves, the 72% line, and the explicit
+/// `VICTORY_TEXTURE_FIRST_UPLOAD_WINDOW_MB` override are unchanged.
+#[cfg(windows)]
+pub(crate) fn first_upload_headroom(memory: Option<[u64; 4]>, reserve: u64) -> u64 {
+    let filled = KINDS[1].load(std::sync::atomic::Ordering::Relaxed) + crate::tiles::given_total();
+    let free_blocks = crate::pool::texture_room();
+    let counted = memory.map_or(0, |[_, used, ..]| {
+        used.saturating_sub(free_blocks) + crate::shadow::card_room_kept() + targets_room_kept()
+    });
+    first_upload_headroom_from(memory, reserve, first_upload_allowance_mb(), filled, counted, free_blocks)
+}
+
+/// The headroom calculation with every input passed in, so a test can replay
+/// a room line from a log.
+#[cfg(any(windows, test))]
+fn first_upload_headroom_from(
+    memory: Option<[u64; 4]>,
+    reserve: u64,
+    allowance_mb: u64,
+    filled: u64,
+    _counted: u64,
+    free_blocks: u64,
+) -> u64 {
+    let Some([budget, used, ..]) = memory else { return 0 };
+    let ceiling = room_line(budget)
+        .saturating_add(allowance_mb << 20)
+        .min(budget / 100 * 80);
+    // The whole-card room for first uploads is what fits in the free texture
+    // blocks (no new card memory) plus any headroom under the budget for bytes
+    // that need a new block. `counted` already had the free blocks taken out,
+    // so charging `reserve` against it a second time shut the window whenever
+    // a new scene made the target reserve come back.
+    let whole_card = budget.saturating_sub(used).saturating_add(free_blocks);
+    ceiling
+        .saturating_sub(filled.saturating_add(reserve))
+        .min(whole_card.saturating_sub(reserve))
+}
+
+/// Takes the first-upload decision counters for the frame-rate line.
+#[cfg(windows)]
+pub(crate) fn first_upload_reasons() -> [u64; 6] {
+    use std::sync::atomic::Ordering::Relaxed;
+    FIRST_UPLOAD_REASONS
+        .iter()
+        .map(|c| c.swap(0, Relaxed))
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -1911,14 +2103,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
 ///
-/// Once the world's targets are made (half of the reserve or more) and
-/// have not grown by 64 MiB for `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS`
-/// (20,000; 0: kept for the run, as before), nothing is kept: at 1440p the
-/// targets level off at 2.1-2.9 GB, and the rest of the 3,072 MB (990 MB
-/// at the first world frame, 160-640 MB in play) stayed reserved for
-/// targets that never came while thousands of textures waited for room
-/// (2026-11-26 diag run 16:28, 10:59:54: 8,722 MB in use + 836 MB kept
-/// for targets against a line of 9,527 MB). The reserve comes back when
+/// Once the world has made a real set of targets (a quarter of the reserve
+/// or more) and they have not grown by 64 MiB for
+/// `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS` (20,000; 0: kept for the run,
+/// as before), nothing is kept: at 1440p the targets level off at 2.1-2.9
+/// GB, and at the 1706x960 Quality render scale they level off at about
+/// 1,402 MB. The rest of the 3,072 MB stayed reserved for targets that
+/// never came while thousands of textures waited for room (fresh retest
+/// 2026-11-28 00:06:25: 1,532 MB kept, 53,235 first uploads refused at
+/// the whole-card budget in five seconds). The reserve comes back when
 /// the targets grow by 64 MiB again (a new scene's), for as long again.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
@@ -1967,11 +2160,21 @@ fn targets_seen(last: u64, since: u64, targets: u64, now: u64) -> (u64, u64) {
 }
 
 /// What [`targets_room_kept`] keeps of `most`: what the targets do not
-/// hold yet, or nothing once they hold half of it or more and have not
-/// grown for `settle` ms (`still_ms`; `settle` 0: always kept).
+/// hold yet, or nothing once a real set of targets has stopped growing for
+/// `settle` ms (`still_ms`; `settle` 0: always kept).
+///
+/// The earlier half-of-the-reserve floor was wrong at the 1706x960 render
+/// scale of DLSS Quality. The world's targets levelled off at 1,402 MiB,
+/// just under half of the 3,072 MiB reserve, so 1,670 MiB stayed kept for
+/// targets that never came. `room_for_first_upload` then refused every
+/// never-before-seen texture at the whole-card budget (53,235 in five
+/// seconds at 00:06:25), leaving their slots black. A quarter of the
+/// reserve still proves the world made its targets; once they have stopped
+/// growing, the unused reserve is returned. If a new scene grows them by
+/// 64 MiB, [`targets_seen`] starts the clock and the reserve comes back.
 #[cfg(any(windows, test))]
 fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
-    if settle > 0 && targets >= most / 2 && still_ms >= settle {
+    if settle > 0 && targets >= most / 4 && still_ms >= settle {
         0
     } else {
         most.saturating_sub(targets)
@@ -1984,7 +2187,7 @@ fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
 /// the system's numbers, or under `VICTORY_TEXTURE_BUDGET_MB` (which
 /// weighs the textures' own bytes instead).
 #[cfg(windows)]
-pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
+pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 8]> {
     if std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
         return None;
     }
@@ -1997,6 +2200,12 @@ pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
             crate::shadow::card_room_kept(),
             targets_room_kept(),
             room_line(budget),
+            // What `room()` actually compares against, after the headroom
+            // kept inside the 72% line, and the texture bytes that count
+            // toward first uploads. Logging only the raw line made the
+            // starvation look like it began 20 seconds later than it did.
+            room_line(budget).saturating_sub(face_headroom_bytes()),
+            KINDS[1].load(std::sync::atomic::Ordering::Relaxed) + crate::tiles::given_total(),
         ]
         .map(|bytes| bytes >> 20),
     )
@@ -2037,6 +2246,24 @@ pub(crate) fn room_percent() -> u64 {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(90, |percent| percent.clamp(50, 97))
+    })
+}
+
+/// Headroom left inside the normal texture line for first uploads of slots
+/// that draw black until they have a host texture (`VICTORY_FACE_HEADROOM_MB`,
+/// default 256, 0..=512). This does not change
+/// `VICTORY_TEXTURE_ROOM_PERCENT`; it stops the ordinary queue from spending
+/// the whole allowance before a face gets one.
+#[cfg(windows)]
+fn face_headroom_bytes() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_FACE_HEADROOM_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+            .clamp(0, 512)
+            << 20
     })
 }
 
@@ -5224,6 +5451,12 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(targets_kept(most, 2083 * MIB, 5_000, 20_000), 989 * MIB);
         // Settled: nothing kept.
         assert_eq!(targets_kept(most, 2432 * MIB, 20_000, 20_000), 0);
+        // The 1706x960 Quality render scale settles below half the reserve.
+        // It still made its targets, so the unused part goes back; otherwise
+        // every texture that has never been uploaded is refused at the
+        // whole-card budget and its slot draws black.
+        assert_eq!(targets_kept(most, 1402 * MIB, 60_000, 20_000), 0);
+        assert_eq!(targets_kept(most, 1402 * MIB, 5_000, 20_000), 1670 * MIB);
         // `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS=0`: kept as before.
         assert_eq!(targets_kept(most, 2432 * MIB, 600_000, 0), 640 * MIB);
 
@@ -5268,6 +5501,205 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Once render targets settle, their reserve must stop vetoing the first
+    /// upload of a slot that still draws black. The whole-card guard stays.
+    #[test]
+    fn first_upload_decision_lets_settled_targets_stop_vetoing_faces() {
+        const MIB: u64 = 1 << 20;
+        let budget = 6794 * MIB;
+        let used = 5842 * MIB;
+        let blocks = 539 * MIB;
+        let buffers = 149 * MIB;
+        let targets = 0;
+        let counted = used.saturating_sub(blocks) + buffers + targets;
+        let filled = 5023 * MIB;
+        let reserve = 12 * MIB;
+        let ceiling = super::room_line(budget).saturating_add(128 * MIB).min(budget / 100 * 80);
+        assert!(filled + reserve < ceiling, "{filled} + {reserve} >= {ceiling}");
+        assert!(counted + reserve < budget, "{counted} + {reserve} >= {budget}");
+        assert_eq!(
+            super::first_upload_decision(
+                Some([budget, used, blocks, buffers]),
+                reserve,
+                false,
+                false,
+                128,
+                filled,
+                counted,
+                blocks
+            ),
+            super::FirstUpload::Allow
+        );
+    }
+
+    /// Replays the fresh retest's 00:06:25 room line exactly. The world's
+    /// targets had settled at 1,402 MiB, below the old half-of-3,072 floor,
+    /// so 1,532 MiB was still counted as kept for them. That alone pushed the
+    /// old whole-card sum over the budget and refused 53,235 first uploads in
+    /// five seconds. A placed texture of one MiB fits in the 468 MiB of free
+    /// texture blocks, so it commits no new card memory and must not be refused
+    /// for a reserve that is not spent.
+    #[test]
+    fn settled_targets_were_the_whole_card_veto_in_the_fresh_retest() {
+        const MIB: u64 = 1 << 20;
+        let budget = 6729 * MIB;
+        let used = 5717 * MIB;
+        let blocks = 468 * MIB;
+        let buffers = 158 * MIB;
+        let filled = 1707 * MIB;
+        let reserve = 1 * MIB;
+        let old_targets = 1532 * MIB;
+        let counted_old = used - blocks + buffers + old_targets;
+        let counted_new = used - blocks + buffers + super::targets_kept(
+            3072 * MIB,
+            1402 * MIB,
+            60_000,
+            20_000,
+        );
+        assert!(counted_old >= budget, "{counted_old} < {budget}");
+        assert!(counted_new < budget, "{counted_new} >= {budget}");
+        assert_eq!(
+            super::first_upload_decision(
+                Some([budget, used, blocks, buffers]),
+                reserve,
+                false,
+                false,
+                128,
+                filled,
+                counted_old,
+                blocks
+            ),
+            super::FirstUpload::Allow
+        );
+        assert_eq!(
+            super::first_upload_decision(
+                Some([budget, used, blocks, buffers]),
+                reserve,
+                false,
+                false,
+                128,
+                filled,
+                counted_new,
+                blocks
+            ),
+            super::FirstUpload::Allow
+        );
+        // The guard is not gone: a texture that needs a new block and would
+        // take the card past its budget is still refused.
+        let big = blocks + (budget - used) + 1;
+        assert!(big > blocks && used + (big - blocks) >= budget);
+        assert_eq!(
+            super::first_upload_decision(
+                Some([budget, used, blocks, buffers]),
+                big,
+                false,
+                false,
+                128,
+                filled,
+                counted_new,
+                blocks
+            ),
+            super::FirstUpload::WholeCard
+        );
+    }
+
+    /// The 00:47:46 line of the latest retest: the card was already over its
+    /// budget, but 893 MiB of the texture heaps were free. Small first uploads
+    /// were refused at the whole-card budget in that window while their faces
+    /// drew black, though a placed texture would not have grown the card's use.
+    #[test]
+    fn a_full_card_with_free_texture_blocks_still_admits_faces() {
+        const MIB: u64 = 1 << 20;
+        let budget = 7070 * MIB;
+        let used = 7743 * MIB;
+        let free_blocks = 893 * MIB;
+        let buffers = 59 * MIB;
+        let targets = 407 * MIB;
+        let filled = 1922 * MIB;
+        let reserve = 1 * MIB;
+        let counted = used - free_blocks + buffers + targets;
+        assert!(used >= budget && free_blocks >= reserve);
+        assert_eq!(
+            super::first_upload_decision(
+                Some([budget, used, 0, 0]),
+                reserve,
+                false,
+                false,
+                128,
+                filled,
+                counted,
+                free_blocks
+            ),
+            super::FirstUpload::Allow
+        );
+        // The window's cap is the free blocks, not zero from `budget - counted`.
+        let cap = super::first_upload_headroom_from(
+            Some([budget, used, 0, 0]),
+            reserve,
+            128,
+            filled,
+            counted,
+            free_blocks,
+        );
+        assert_eq!(cap, free_blocks - reserve);
+    }
+
+    /// After the stale reserve is gone, the fresh retest still held 25,717
+    /// first uploads at 00:09:20 though every hard guard said `Allow`. The
+    /// flat 128 MiB window cap was the only remaining gate; the real headroom
+    /// under the 80% ceiling and the budget was 957 MiB. The window now uses
+    /// that headroom unless the user set an explicit cap.
+    #[test]
+    fn first_upload_window_uses_the_hard_ceiling_headroom_from_the_retest() {
+        const MIB: u64 = 1 << 20;
+        let budget = 7029 * MIB;
+        let used = 6072 * MIB;
+        let filled = 1831 * MIB;
+        let reserve = 1 * MIB;
+        assert_eq!(
+            super::first_upload_headroom_from(Some([budget, used, 0, 0]), reserve, 128, filled, used, 0),
+            957 * MIB - reserve
+        );
+        // The old flat cap would have let only 128 MiB through, 87% less.
+        assert!(128 * MIB * 7 < 957 * MIB);
+    }
+
+    /// Each guard that can refuse a never-uploaded slot is named, so a log
+    /// can say whether the ceiling, the whole card, or a switch held it back.
+    #[test]
+    fn first_upload_decision_names_the_bound_that_refused_it() {
+        const MIB: u64 = 1 << 20;
+        let budget = 7051 * MIB;
+        let memory = Some([budget, 6172 * MIB, 539 * MIB, 149 * MIB]);
+        let ceiling = super::room_line(budget).saturating_add(128 * MIB).min(budget / 100 * 80);
+        assert_eq!(
+            super::first_upload_decision(memory, 0, false, true, 128, 0, 0, 0),
+            super::FirstUpload::ExplicitBudget
+        );
+        assert_eq!(
+            super::first_upload_decision(None, 0, false, false, 128, 0, 0, 0),
+            super::FirstUpload::NoMemory
+        );
+        assert_eq!(
+            super::first_upload_decision(memory, 0, false, false, 0, 0, 0, 0),
+            super::FirstUpload::AllowanceOff
+        );
+        assert_eq!(
+            super::first_upload_decision(memory, 0, false, false, 128, ceiling, 0, 0),
+            super::FirstUpload::FilledCeiling
+        );
+        // 880 MiB past the 6,172 MiB in use needs a new block and reaches the
+        // 7,051 MiB budget; a byte that fits in free blocks would not.
+        assert_eq!(
+            super::first_upload_decision(memory, 880 * MIB, false, false, 128, 0, 0, 0),
+            super::FirstUpload::WholeCard
+        );
+        assert_eq!(
+            super::first_upload_decision(memory, 0, true, false, 128, ceiling, budget, 0),
+            super::FirstUpload::Allow
+        );
     }
 
     /// Fork PR #1336 (CwWwWwW, f8fab6fb): the source a placed view aliases

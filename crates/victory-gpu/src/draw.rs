@@ -841,6 +841,107 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Slots with no host texture at all admitted just over the 72% room line.
+pub(crate) static HEAP_TEXTURES_FIRST_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// First uploads are bounded in one window so a whole frame of faces cannot
+/// commit together. The room check charges the texture's actual bytes: a
+/// 12 KiB face must not reserve 64 MiB and shut out the other faces before
+/// either the window or the 80% ceiling is near.
+fn first_upload_window_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_FIRST_UPLOAD_WINDOW_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(5000)
+            .max(1)
+    })
+}
+
+fn first_upload_window_bytes() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_FIRST_UPLOAD_WINDOW_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(128)
+            .saturating_mul(1 << 20)
+    })
+}
+
+static FIRST_UPLOAD_WINDOW: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
+fn first_upload_reserve(bytes: u64, memory: Option<[u64; 4]>, reserve: u64) -> bool {
+    let now = crate::host::now_ms() / first_upload_window_ms();
+    let cap = first_upload_window_cap(memory, reserve);
+    let mut window = FIRST_UPLOAD_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    first_upload_spend(&mut window, now, bytes, cap)
+}
+
+/// Without an explicit `VICTORY_TEXTURE_FIRST_UPLOAD_WINDOW_MB`, the window
+/// spends the real headroom under the hard guards, not a flat 128 MiB. Each
+/// upload is still checked against `room_for_first_upload`, so the 72% line
+/// and 80% ceiling remain the binding limits as the window drains.
+fn first_upload_window_cap(memory: Option<[u64; 4]>, reserve: u64) -> u64 {
+    static EXPLICIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *EXPLICIT.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FIRST_UPLOAD_WINDOW_MB").is_some()) {
+        first_upload_window_bytes()
+    } else {
+        crate::resource::first_upload_headroom(memory, reserve)
+    }
+}
+
+/// The accounting in [`first_upload_reserve`], kept separate so a test can
+/// prove that small faces do not use a 64 MiB room-check floor as their cost.
+fn first_upload_spend(window: &mut (u64, u64), now: u64, bytes: u64, cap: u64) -> bool {
+    if window.0 != now || now.wrapping_sub(window.0) > 1 {
+        *window = (now, bytes.min(cap));
+        return bytes <= cap;
+    }
+    let spent = window.1.saturating_add(bytes);
+    if spent <= cap {
+        window.1 = spent;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod first_upload_window_tests {
+    use super::first_upload_spend;
+
+    #[test]
+    fn small_first_uploads_share_the_window_by_their_own_bytes() {
+        let cap = 128 << 20;
+        let mut window = (7, 0);
+        assert!(first_upload_spend(&mut window, 7, 12 << 10, cap));
+        assert!(first_upload_spend(&mut window, 7, 217 << 10, cap));
+        let spent = (12 + 217) << 10;
+        assert_eq!(window, (7, spent));
+        assert!(first_upload_spend(&mut window, 7, 64 << 20, cap));
+        let spent = spent + (64 << 20);
+        assert_eq!(window.1, spent);
+        assert!(!first_upload_spend(&mut window, 7, 64 << 20, cap));
+        assert_eq!(window.1, spent, "a refused upload must not spend again");
+        assert!(first_upload_spend(&mut window, 8, 64 << 20, cap));
+    }
+
+    #[test]
+    fn a_ceiling_sized_window_admits_a_backlog() {
+        let cap = 956 << 20;
+        let mut window = (7, 0);
+        let each = 217 << 10;
+        for _ in 0..4000 {
+            assert!(first_upload_spend(&mut window, 7, each, cap));
+        }
+        let spent = window.1;
+        assert_eq!(spent, 4000 * each);
+        assert!(!first_upload_spend(&mut window, 7, cap - spent + 1, cap));
+    }
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -3313,12 +3414,15 @@ impl State {
             }
             let mut partly = None;
             let mut there = None;
+            let mut placed_len = 1u64;
+            let mut first_upload = false;
             // The view the slot holds now, read once for the looks below.
             let held = rest(1, || heap.handle(index).and_then(crate::descriptor::view));
             if let Some(View::Placed(false, resource, desc)) = &held {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(desc);
                 let len = crate::resource::placed_bytes_from(resource, first).unwrap_or(1);
+                placed_len = len;
                 let mapped = timed(1, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
@@ -3370,31 +3474,55 @@ impl State {
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
             if !room {
-                let has_its_texture = reupload_when_full()
-                    && rest(1, || heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)));
+                let made = rest(1, || heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)));
+                let has_its_texture = reupload_when_full() && made;
                 if !has_its_texture {
-                    refused += 1;
-                    outcome(slot_outcome::HELD);
-                    if full_card_pass() {
-                        // Held back for the frames of about four seconds
-                        // (`most`), or until the card has room; the pass
-                        // goes on, within a count that bounds one pass.
-                        tells.tell(index, write, Told::Held(frame + most));
-                        if refused > 1024 {
+                    // A slot with no host texture at all is the black face:
+                    // `reupload_when_full` cannot help it. Admit a bounded
+                    // number of first uploads just over the line, up to the
+                    // hard 80% ceiling that keeps the target/buffer reserves.
+                    let reserve = placed_len;
+                    first_upload = rest(6, || crate::resource::room_for_first_upload(memory, reserve))
+                        // Both checks use the bytes this upload actually
+                        // takes. The old 64 MiB floor let only two small
+                        // faces through per window and could refuse a face
+                        // while hundreds of MiB were still under the hard
+                        // ceiling. The window bounds the total per 5 s.
+                        && first_upload_reserve(reserve, memory, reserve);
+                    if !first_upload {
+                        refused += 1;
+                        outcome(slot_outcome::HELD);
+                        if full_card_pass() {
+                            // Held back for the frames of about four seconds
+                            // (`most`), or until the card has room; the pass
+                            // goes on, within a count that bounds one pass.
+                            tells.tell(index, write, Told::Held(frame + most));
+                            if refused > 1024 {
+                                break;
+                            }
+                        } else if refused > 256 {
                             break;
                         }
-                    } else if refused > 256 {
-                        break;
+                        continue;
                     }
-                    continue;
-                }
-                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n.is_multiple_of(500) {
-                    tracing::info!(
-                        so_far = n,
-                        slot = index,
-                        "a texture already on the card is brought up to date although the card has no room for new ones"
-                    );
+                    let n = HEAP_TEXTURES_FIRST_FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(250) {
+                        tracing::info!(
+                            so_far = n,
+                            slot = index,
+                            bytes = reserve,
+                            "a first host texture was admitted just over the room line (black face fix)"
+                        );
+                    }
+                } else {
+                    let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(500) {
+                        tracing::info!(
+                            so_far = n,
+                            slot = index,
+                            "a texture already on the card is brought up to date although the card has no room for new ones"
+                        );
+                    }
                 }
             }
             // Gate new host texture creation / staging on commit reserve after
@@ -3635,7 +3763,7 @@ impl State {
             rest(6, || crate::texture::unstage(resource));
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
-            if room && since_asked >= 32 << 20 {
+            if first_upload || (room && since_asked >= 32 << 20) {
                 since_asked = 0;
                 room = rest(6, || crate::resource::room(crate::host::host().and_then(|h| h.video_memory())));
             }

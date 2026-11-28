@@ -264,6 +264,10 @@ static FFX: OnceLock<Ffx> = OnceLock::new();
 static SWAP_CHAIN: AtomicBool = AtomicBool::new(false);
 /// Frame generation ran on the last present.
 static ON: AtomicBool = AtomicBool::new(false);
+/// The class of the previous title present. On Game -> Movie the context is
+/// retired once, so a generated frame from the last game frame cannot be
+/// shown over the still letterbox edges of the first movie frame.
+static LAST_VIDEO: AtomicBool = AtomicBool::new(false);
 // Since the last frame-rate line: presents with frame generation on, off,
 // and prepare dispatches that failed.
 static PRESENTS_ON: AtomicU64 = AtomicU64::new(0);
@@ -514,7 +518,10 @@ unsafe extern "C" fn generate(params: *mut Header, user: *mut c_void) -> u32 {
 /// without the interface. Otherwise (Series X) that is the copy taken in front
 /// of the title's interface composite. FidelityFX tells the interface (and our
 /// panel and menu, drawn after) from the scene by it and does not move it with
-/// the scene.
+/// the scene. A movie class is still taken and logged at the title's Present,
+/// but FSR 3 is deliberately not gated on it: retiring the context at every
+/// cutscene and re-arming it later cost frames and often left generation off
+/// for the rest of the run. The letterbox borders are accepted for now.
 pub(crate) fn before_present(
     device: &ID3D12Device,
     swap_chain: &IDXGISwapChain3,
@@ -523,7 +530,10 @@ pub(crate) fn before_present(
     format: DXGI_FORMAT,
     base: (&ID3D12Resource, u32),
     two_planes: bool,
+    _video: bool,
 ) {
+    // Always generate: no movie retire, no held-off presents.
+    let video = false;
     if !SWAP_CHAIN.load(Acquire) {
         return;
     }
@@ -550,16 +560,31 @@ pub(crate) fn before_present(
         // SAFETY: a live texture.
         unsafe { t.GetDesc() }.Format
     });
+    let was_video = LAST_VIDEO.swap(video, Relaxed);
     let mut guard = live();
     let Some(live) = guard.as_mut() else { return };
+    if video && !was_video && live.framegen.is_some() {
+        // Everything sent so far has run before the swap chain is told to
+        // stop calling the old context; the first movie frame is then shown
+        // without a generated frame from the game frame before it.
+        crate::host::settle_now(crate::host::WHY_SYNC);
+        if retire(ffx, live) {
+            tracing::info!(frame_id = live.frame_id, "FSR 3 frame generation: its context was retired for a movie present");
+        }
+    }
     // The textures' states are those the submissions before this present
     // left: only the line of submissions orders the two.
     let line = crate::queue::line_on();
     if !line {
         once!(warn, "FSR 3 frame generation: the line of submissions did not start; frame generation stays off");
     }
-    let wanted = super::framegen_wanted() != 0 && line;
-    let fresh = if wanted { super::fresh_inputs() } else { None };
+    if video && line && super::framegen_wanted() != 0 {
+        once!(info, "FSR 3 frame generation: held off for a movie plane letterbox");
+    }
+    let wanted = super::framegen_wanted() != 0 && line && !video;
+    // Take the newest inputs even while held off: leaving them queued would
+    // let the first present after the movie generate from stale movie frames.
+    let fresh = super::fresh_inputs().filter(|_| wanted);
     // The context, made at the first upscaling (its sizes are the title's)
     // and again when they change.
     if let Some(inputs) = &fresh {
