@@ -371,6 +371,8 @@ pub(crate) struct Twin {
     /// the bits of a 24-bit depth plane, so the two are not copied: a pass
     /// draws the twin into the plane.
     pub(crate) plane: Option<std::sync::Arc<HostTexture>>,
+    /// Immutable SRVs of the depth-plane twin, created on its first draw.
+    pub(crate) plane_views: std::sync::Mutex<Option<windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>>,
 }
 
 #[cfg(windows)]
@@ -588,6 +590,7 @@ fn twin_texture(
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
+        plane_views: Default::default(),
     }))
 }
 
@@ -4816,19 +4819,30 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
+        let _ = draw_depth_classes(1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a D3D12 device and depth-plane twins"]
+    fn depth_array_draw_keeps_the_first_slices_view() {
+        draw_depth_classes(257).expect("requires a D3D12 device and depth-plane twins");
+    }
+
+    #[cfg(windows)]
+    fn draw_depth_classes(slices: u16) -> Option<()> {
         use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
         use windows::core::s;
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
+        let host = crate::host::host()?;
         let null = std::ptr::null();
         const DEPTH_WRITE: u32 = 0x10;
         let desc = ResourceDesc {
             flags: 6,
+            depth_or_array_size: slices,
             ..texture(4, 4, 118, 1)
         };
         let mut depth = null;
@@ -4845,10 +4859,9 @@ mod tests {
             ),
             S_OK
         );
+        let _owner = Held(depth);
         let host_depth = host_resource(depth).unwrap();
-        let Some(plane) = twin_plane_resource(depth) else {
-            return; // these twins are turned off
-        };
+        let plane = twin_plane_resource(depth)?;
         // SAFETY: live resources.
         let (d, t) = unsafe { (host_depth.GetDesc(), plane.GetDesc()) };
         // R24G8 typeless with depth, R16 typeless with unordered access.
@@ -4861,14 +4874,16 @@ mod tests {
         const CLASSES: [u16; 16] = [
             8, 65, 128, 129, 65, 8, 129, 128, 0, 255, 65, 64, 129, 130, 8, 65,
         ];
-        let mut pattern = vec![0u8; 1024];
+        let mut pattern = vec![0u8; 2048];
         for (i, class) in CLASSES.into_iter().enumerate() {
             let at = i / 4 * 256 + i % 4 * 2;
             pattern[at..at + 2].copy_from_slice(&class.to_le_bytes());
+            // All other slices match the class-65 draw at every texel.
+            pattern[1024 + at..1026 + at].copy_from_slice(&65u16.to_le_bytes());
         }
-        let (upload, data) = host.upload_buffer(1024).unwrap();
-        // SAFETY: the buffer's mapping, 1024 bytes.
-        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 1024) };
+        let (upload, data) = host.upload_buffer(pattern.len() as u64).unwrap();
+        // SAFETY: the buffer's mapping, as large as the pattern.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, pattern.len()) };
         let buffer = |kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: kind,
@@ -4984,7 +4999,13 @@ mod tests {
         unsafe {
             let l = &fill.list;
             l.ResourceBarrier(&[moved(plane, written, dest)]);
-            l.CopyTextureRegion(&whole(plane), 0, 0, 0, &rows(&upload, rows_of(53)), None);
+            for slice in 0..u32::from(slices) {
+                let mut layer = whole(plane);
+                layer.Anonymous.SubresourceIndex = slice;
+                let mut footprint = rows_of(53);
+                footprint.Offset = if slice == 0 { 0 } else { 1024 };
+                l.CopyTextureRegion(&layer, 0, 0, 0, &rows(&upload, footprint), None);
+            }
             l.ResourceBarrier(&[moved(plane, dest, written)]);
         }
         fill.close();
@@ -5064,7 +5085,10 @@ float4 lit() : SV_Target { return 1.0; }
             host_depth,
             Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
                 Format: DXGI_FORMAT(45),
-                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_DSV { ArraySize: 1, ..Default::default() },
+                },
                 ..Default::default()
             }),
         );
@@ -5120,11 +5144,12 @@ float4 lit() : SV_Target { return 1.0; }
                 .unwrap();
             std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
         };
-        for (i, class) in CLASSES.into_iter().enumerate() {
-            let covered = read[i / 4 * 256 + i % 4] != 0;
-            let drawn = matches!(class, 65 | 129);
-            assert_eq!(covered, drawn, "texel {i}, class {class}");
-        }
+        let coverage: [u8; 16] = std::array::from_fn(|i| read[i / 4 * 256 + i % 4]);
+        // SAFETY: the CPU has finished reading the mapped bytes.
+        unsafe { readback.Unmap(0, Some(&D3D12_RANGE::default())) };
+        let expected = CLASSES.map(|class| if matches!(class, 65 | 129) { 255 } else { 0 });
+        assert_eq!(coverage, expected, "slice zero of {slices}");
+        Some(())
     }
 
     #[test]
