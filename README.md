@@ -303,7 +303,8 @@ generation, with hardware-accelerated GPU scheduling on; more than 2x needs an
 RTX 50), [Rust](https://rustup.rs) (the toolchain is pinned), the Visual Studio
 Build Tools with "Desktop development with C++", and **your own dump** of the
 title's Xbox Series build v1.0.2.1 (the folder with
-`game_scarlett_master.exe`).
+`game_scarlett_master.exe`). On Linux, see [docs/linux.md](docs/linux.md): it
+is cross-built and runs under Wine.
 
 ```powershell
 git clone https://github.com/trustno1-coder/VIctory-NVIDIA

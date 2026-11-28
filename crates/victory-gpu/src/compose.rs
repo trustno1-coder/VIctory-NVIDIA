@@ -2,7 +2,6 @@
 //! (the interface) over the first (the scene), each scaled to the screen.
 //! The game presents so on Series S.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -47,7 +46,7 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
     unsafe {
-        D3DCompile(
+        crate::dxc::d3d_compile(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
             s!("compose"),
