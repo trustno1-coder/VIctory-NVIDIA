@@ -220,6 +220,18 @@ impl<B: Clone> Pool<B> {
         align: u64,
         now: u64,
         ripe: Ripe,
+        make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        self.take_ripe_with_policy(len, align, now, ripe, false, make)
+    }
+
+    fn take_ripe_with_policy(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        ripe: Ripe,
+        best_fit: bool,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
@@ -228,16 +240,21 @@ impl<B: Clone> Pool<B> {
             return None;
         }
         self.rested(now);
-        let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        let mut found = if best_fit {
+            self.best_fit_ripe(len, align, ripe)
+        } else {
+            let mut found = None;
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
-        }
+            found
+        };
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
             let mut unripe: Vec<(u64, usize)> =
@@ -273,6 +290,47 @@ impl<B: Clone> Pool<B> {
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
+    }
+
+    /// Choose the smallest fitting free interval in a ripe block, breaking
+    /// ties by alignment padding, block index and offset. An exact fit
+    /// cannot be improved. Leave the unripe fallback and quarantine alone.
+    fn best_fit_ripe(&mut self, len: u64, align: u64, ripe: Ripe) -> Option<(usize, u64)> {
+        let mut best: Option<(u64, u64, usize, u64)> = None;
+        'search: for (i, block) in self.blocks.iter().enumerate() {
+            let Some(block) = block else { continue };
+            if !ripe.is(block) {
+                continue;
+            }
+            for (&start, &size) in &block.free.0 {
+                // Skip ranges that cannot fit or cannot beat the best size.
+                if size < len || best.is_some_and(|old| size > old.0) {
+                    continue;
+                }
+                let at = start.next_multiple_of(align);
+                if at + len <= start + size {
+                    let key = (size, at - start, i, at);
+                    if best.is_none_or(|old| key < old) {
+                        best = Some(key);
+                    }
+                    if size == len && at == start {
+                        break 'search;
+                    }
+                }
+            }
+        }
+        let (_, _, i, at) = best?;
+        let ranges = &mut self.blocks[i].as_mut()?.free.0;
+        let (&start, &size) = ranges.range(..=at).next_back()?;
+        debug_assert!(at + len <= start + size);
+        ranges.remove(&start);
+        if at > start {
+            ranges.insert(start, at - start);
+        }
+        if at + len < start + size {
+            ranges.insert(at + len, start + size - at - len);
+        }
+        Some((i, at))
     }
 
     fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
@@ -637,6 +695,12 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     }
 }
 
+/// Experimental texture placement; staging and the default policy are unchanged.
+fn texture_best_fit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_BEST_FIT").is_some_and(|v| v == "1"))
+}
+
 /// A texture of `desc` (no target, depth or unordered access) in a block;
 /// `None`: not pooled, or the host refused.
 ///
@@ -666,27 +730,38 @@ pub(crate) unsafe fn texture(
         return None;
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        // SAFETY: plain creation.
-        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
-            tracing::warn!(error = %e, "no block of texture memory");
-        }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
-        }
-        heap
-    })?;
+    let (piece, heap, again) = lock(&TEXTURES).take_ripe_with_policy(
+        info.SizeInBytes,
+        info.Alignment.max(1),
+        now(),
+        Ripe::now(),
+        texture_best_fit(),
+        || {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: BLOCK,
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            // SAFETY: plain creation.
+            if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+                crate::residency::allocation_error(&e);
+                tracing::warn!(error = %e, "no block of texture memory");
+            }
+            if let Some(h) = &heap
+                && let Err(e) =
+                    crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+            {
+                tracing::warn!(error = %e, "a block of texture memory is not resident");
+                return None;
+            }
+            heap
+        },
+    )?;
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -740,6 +815,69 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn best_fit_prefers_an_exact_ripe_range() {
+        let mut pool = Pool::new(2);
+        pool.add(1u32, 0);
+        pool.add(2u32, 0);
+        pool.blocks[0].as_mut().unwrap().free = Ranges(BTreeMap::from([(0, 8192)]));
+        pool.blocks[1].as_mut().unwrap().free = Ranges(BTreeMap::from([(4096, 4096)]));
+        assert_eq!(pool.best_fit_ripe(4096, 4096, Ripe::ALL), Some((1, 4096)));
+        assert_eq!(pool.blocks[0].as_ref().unwrap().free.0.get(&0), Some(&8192));
+        assert!(pool.blocks[1].as_ref().unwrap().free.0.is_empty());
+    }
+
+    #[test]
+    fn best_fit_splits_aligned_ranges_without_losing_padding() {
+        let mut pool = Pool::new(2);
+        pool.add(1u32, 0);
+        let block = pool.blocks[0].as_mut().unwrap();
+        block.free = Ranges(BTreeMap::from([(4097, 8192), (32768, 16384)]));
+        assert_eq!(pool.best_fit_ripe(4096, 4096, Ripe::ALL), Some((0, 8192)));
+        let free = &pool.blocks[0].as_ref().unwrap().free.0;
+        assert_eq!(
+            *free,
+            BTreeMap::from([(4097, 4095), (12288, 1), (32768, 16384)])
+        );
+    }
+
+    #[test]
+    fn best_fit_does_not_prefer_an_unripe_exact_range() {
+        let mut pool = Pool::new(2);
+        pool.add(1u32, 0);
+        pool.add(2u32, 9);
+        pool.blocks[0].as_mut().unwrap().free = Ranges(BTreeMap::from([(0, 8192)]));
+        pool.blocks[1].as_mut().unwrap().free = Ranges(BTreeMap::from([(0, 4096)]));
+        let ripe = Ripe {
+            started: 10,
+            finished: 5,
+            ahead: 1,
+        };
+        assert_eq!(pool.best_fit_ripe(4096, 4096, ripe), Some((0, 0)));
+        assert_eq!(pool.blocks[1].as_ref().unwrap().free.0.get(&0), Some(&4096));
+    }
+
+    #[test]
+    fn best_fit_policy_preserves_quarantine() {
+        let mut pool = Pool::new(2);
+        let make = || Some(1u32);
+        let p = pool
+            .take_ripe_with_policy(4096, 4096, 0, Ripe::ALL, true, make)
+            .unwrap()
+            .0;
+        pool.give(p, 10);
+        let q = pool
+            .take_ripe_with_policy(4096, 4096, REST + 9, Ripe::ALL, true, make)
+            .unwrap()
+            .0;
+        assert_ne!((p.block, p.start), (q.block, q.start));
+        let r = pool
+            .take_ripe_with_policy(4096, 4096, REST + 10, Ripe::ALL, true, make)
+            .unwrap()
+            .0;
+        assert_eq!((p.block, p.start), (r.block, r.start));
     }
 
     #[test]
