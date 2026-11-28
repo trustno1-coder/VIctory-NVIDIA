@@ -2690,6 +2690,11 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Per-shadow coalesced span `(copies_index, from, to)` in the current
+    /// uninterrupted segment (cleared on title writes and per-shadow on GPU
+    /// writes): lets `VICTORY_THIN` workers merge overlapping/adjacent
+    /// refreshes before the submitting thread ever walks `copies`.
+    refreshed_span: std::collections::HashMap<usize, (usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     /// Ranges declared written by shaders since the list last wrote title
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
@@ -2736,6 +2741,7 @@ impl Deferred {
     /// date before them is not any more.
     fn title_written(&mut self) {
         self.refreshed.clear();
+        self.refreshed_span.clear();
         self.gpu_written.clear();
         self.filled.clear();
     }
@@ -6830,6 +6836,7 @@ impl HostList {
         deferred
             .copies
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
+        deferred.refreshed_span.clear();
     }
 
     /// A new host list for one of the title's lists (`crate::list::detach`),
@@ -7604,11 +7611,33 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let deferred = &mut *deferred;
+        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        let end = address.saturating_add(len);
+        if let Some(&mut (idx, ref mut from, ref mut to)) = deferred.refreshed_span.get_mut(&ptr)
+            && address <= *to
+            && end >= *from
+        {
+            if *from <= address && end <= *to {
+                return;
+            }
+            let new_from = (*from).min(address);
+            let new_to = (*to).max(end);
+            if let Some(Step::Refresh(_, a, l)) = deferred.copies.get_mut(idx) {
+                *a = new_from;
+                *l = new_to - new_from;
+                *from = new_from;
+                *to = new_to;
+                return;
+            }
+        }
+        let key = (ptr, address, len);
         if deferred.refreshed.insert(key) {
+            let idx = deferred.copies.len();
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+            deferred.refreshed_span.insert(ptr, (idx, address, end));
         }
     }
 
@@ -7624,7 +7653,9 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        deferred.refreshed_span.remove(&ptr);
+        let key = (ptr, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
         }
@@ -8914,27 +8945,56 @@ impl Batch {
         let many = spans.len() > FEW;
         if !many {
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let journal = crate::watch::read_journal();
+            spans.retain(|(shadow, from, to)| !shadow.nothing_new_with(&journal, *from, *to - *from));
+            drop(journal);
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && !crate::watch::is_kept();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+        let due_len = due.len();
+        let spans_len = spans.len();
+        // Textures first (longer pieces, 1 per worker claim), then buffer
+        // refreshes in 32-item chunks sharing one `JournalRead` and one
+        // `FLUSHES[2]` increment per chunk (never holding `JournalRead` across
+        // `Self::update`).
+        if due_len > 0 {
+            crate::shadow::wide_each(due_len, move |i| due[i].refresh());
+        }
+        crate::shadow::wide_chunks(spans_len, 32, move |range| {
+            if !many {
+                for i in range {
+                    let (shadow, from, to) = &spans[i];
+                    Self::update(shadow, *from, *to);
+                }
                 return;
             }
-            Self::update(shadow, *from, *to);
+            let mut need = [0usize; 32];
+            let mut n_need = 0usize;
+            let mut skipped = 0u64;
+            {
+                let journal = crate::watch::read_journal();
+                for i in range {
+                    let (shadow, from, to) = &spans[i];
+                    if shadow.nothing_new_with(&journal, *from, *to - *from) {
+                        skipped += 1;
+                    } else {
+                        need[n_need] = i;
+                        n_need += 1;
+                    }
+                }
+            }
+            if skipped > 0 {
+                FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
+            }
+            for &i in &need[..n_need] {
+                let (shadow, from, to) = &spans[i];
+                Self::update(shadow, *from, *to);
+            }
         });
         if ahead {
             crate::watch::ask_ahead_done();
@@ -8977,9 +9037,21 @@ impl Batch {
         }
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
-            let (shadow, from, to) = &due[i];
-            if !shadow.nothing_new(*from, *to - *from) {
+        crate::shadow::wide_chunks(due.len(), 32, move |range| {
+            let mut need = [0usize; 32];
+            let mut n_need = 0usize;
+            {
+                let journal = crate::watch::read_journal();
+                for i in range {
+                    let (shadow, from, to) = &due[i];
+                    if !shadow.nothing_new_with(&journal, *from, *to - *from) {
+                        need[n_need] = i;
+                        n_need += 1;
+                    }
+                }
+            }
+            for &i in &need[..n_need] {
+                let (shadow, from, to) = &due[i];
                 Self::update(shadow, *from, *to);
             }
         });
@@ -9057,13 +9129,15 @@ impl Batch {
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let journal = crate::watch::read_journal();
+            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new_with(&journal, *from, *to - *from));
+            drop(journal);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = self.refreshes.len() > 1 && !crate::watch::is_kept();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -9083,15 +9157,41 @@ impl Batch {
             let before = PREPARING[0].load(Ordering::Relaxed);
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
-                // A number to a free thread, not a job to each copy.
+                // Chunked claiming: one `JournalRead` and one `FLUSHES[2]`
+                // increment per 32-item chunk instead of per item.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                let len = refreshes.len();
+                let check = len > FEW;
+                crate::shadow::wide_chunks(len, 32, move |range| {
+                    if !check {
+                        for i in range {
+                            let (shadow, from, to) = &refreshes[i];
+                            Self::update(shadow, *from, *to);
+                        }
                         return;
                     }
-                    Self::update(shadow, *from, *to);
+                    let mut need = [0usize; 32];
+                    let mut n_need = 0usize;
+                    let mut skipped = 0u64;
+                    {
+                        let journal = crate::watch::read_journal();
+                        for i in range {
+                            let (shadow, from, to) = &refreshes[i];
+                            if shadow.nothing_new_with(&journal, *from, *to - *from) {
+                                skipped += 1;
+                            } else {
+                                need[n_need] = i;
+                                n_need += 1;
+                            }
+                        }
+                    }
+                    if skipped > 0 {
+                        FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
+                    }
+                    for &i in &need[..n_need] {
+                        let (shadow, from, to) = &refreshes[i];
+                        Self::update(shadow, *from, *to);
+                    }
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
