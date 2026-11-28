@@ -7049,6 +7049,7 @@ impl HostList {
 
     /// A mesh pipeline was just bound on the list.
     pub(crate) fn mesh_bound(&self) {
+        crate::mesh_rest::note_mesh_bind();
         if crate::mesh_rest::mode() != crate::mesh_rest::Mode::Off {
             self.mesh_bound.store(true, Ordering::Relaxed);
         }
@@ -9850,6 +9851,7 @@ impl Meter {
         crate::shadow::back_line(frames);
         submit_split_line(frames);
         fresh_open_line(frames);
+        crate::mesh_rest::line(frames);
         crate::heap_marks::line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);

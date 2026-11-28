@@ -16,9 +16,35 @@
 //! `VICTORY_MESH_REST`: `off` (never), `bind` (bind the rest pipeline),
 //! `draw` (bind it and draw one point it clips away, for a driver that only
 //! takes in a pipeline at a draw). Default: `bind` on an Intel card, `off` on
-//! others.
+//! others. The frame-rate line is followed by one with the mesh and rest
+//! binds per frame ([`line`]).
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Since the last frame line: mesh pipelines bound on host lists (with or
+/// without the rest pipeline; again after a rest included), rest pipelines
+/// bound, and rest draws ([`line`]).
+static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// A mesh pipeline was bound on a host list.
+pub(crate) fn note_mesh_bind() {
+    COUNTS[0].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The binds of [`COUNTS`] per frame, for the frame-rate line: what the
+/// rest pipeline costs in binds, read beside the frame's preparation time
+/// and its draws dropped without a host pipeline. With
+/// `VICTORY_MESH_REST=off` the mesh binds are those the title asks for.
+pub(crate) fn line(frames: f64) {
+    let [mesh, rests, draws] = [0, 1, 2].map(|i| COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if mesh + rests > 0.0 {
+        tracing::info!(
+            "mesh pipelines per frame (VICTORY_MESH_REST={:?}): {mesh:.1} bound, {rests:.1} rest pipelines bound in their place before other work ({draws:.1} with a draw)",
+            mode()
+        );
+    }
+}
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_POINTLIST, ID3DBlob};
@@ -160,6 +186,10 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList) -> bool {
             list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
             list.DrawInstanced(1, 1, 0, 0);
         }
+    }
+    COUNTS[1].fetch_add(1, Ordering::Relaxed);
+    if mode == Mode::Draw {
+        COUNTS[2].fetch_add(1, Ordering::Relaxed);
     }
     true
 }
