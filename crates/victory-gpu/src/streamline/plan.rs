@@ -73,6 +73,17 @@ impl Mode {
         }
     }
 
+    /// The mode the Series S profile can run: DLAA's scene at the output's
+    /// full size does not fit the title's Series S memory. Its allocator
+    /// fails on a render target of that size (0x882000 bytes) during
+    /// loading and stops the title at its fatal-error break
+    /// (0x80000003 at +0x2219650, #663, with or without frame generation),
+    /// so DLAA runs at Quality's scale there, the Series S title's own (2/3).
+    /// Series X is unchanged: DLAA runs there.
+    pub fn for_profile(self, series_s: bool) -> Self {
+        if series_s && self == Mode::Dlaa { Mode::Quality } else { self }
+    }
+
     /// The render size the title makes of `output` at this scale (it
     /// truncates, as the title's own sizing code does).
     pub fn render_size(self, output: [u32; 2]) -> [u32; 2] {
@@ -391,6 +402,10 @@ mod tests {
         assert_eq!(Mode::from_name("ultra-performance"), Some(Mode::UltraPerformance));
         assert_eq!(Mode::from_name("fast"), None);
         assert_eq!(Mode::Balanced.ffx_mode(), 2);
+        // #663: no DLAA on Series S; every other mode, and Series X, unchanged.
+        assert_eq!(Mode::Dlaa.for_profile(true), Mode::Quality);
+        assert_eq!(Mode::Dlaa.for_profile(false), Mode::Dlaa);
+        assert_eq!(Mode::Performance.for_profile(true), Mode::Performance);
         assert_eq!(preset("K"), Some(11));
         assert_eq!(preset("default"), Some(0));
         assert_eq!(preset("a"), None);

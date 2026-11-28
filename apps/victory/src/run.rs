@@ -126,6 +126,15 @@ pub fn run(
     // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
     let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
     asked.series_s = matches!(console, Console::SeriesS);
+    let mode = asked.mode.for_profile(asked.series_s);
+    if mode != asked.mode {
+        println!(
+            "upscaling      {} is not for the Series S profile (the title's memory there has no room for a full-size scene): {} instead",
+            asked.mode.name(),
+            mode.name()
+        );
+        asked.mode = mode;
+    }
     let available = victory_hle::streamline::init(&asked);
     // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
     // scale with its own FidelityFX upscaling (no Streamline): DLSS's
