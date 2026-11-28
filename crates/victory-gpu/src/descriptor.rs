@@ -1231,7 +1231,7 @@ fn shape_census(shape: &Shape, count: usize) {
             set.insert(w);
         }
     }
-    if count == 1000 || (count > 0 && count % 50_000 == 0) {
+    if count == 1000 || (count > 0 && count.is_multiple_of(50_000)) {
         let distinct: Vec<String> = seen.iter().map(|s| s.len().to_string()).collect();
         let last: Vec<String> = words.iter().map(|w| format!("{w:x}")).collect();
         tracing::info!(
