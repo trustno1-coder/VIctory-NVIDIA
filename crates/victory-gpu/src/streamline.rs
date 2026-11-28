@@ -2005,9 +2005,86 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
                     "DLSS Frame Generation status changed (0 ok, 1 output too small, 2 Reflex not seen, 4 HDR format, 8 constants invalid, 16 back buffer index not asked)"
                 );
             }
+            let before = Stuck { count: FG_STUCK.load(Relaxed), tries: FG_TRIES.load(Relaxed) };
+            let (after, rearm) = stuck_step(before, calls.framegen_times, state.num_frames_actually_presented, rearm_after());
+            FG_STUCK.store(after.count, Relaxed);
+            FG_TRIES.store(after.tries, Relaxed);
+            if after.tries == REARM_TRIES && before.tries < REARM_TRIES {
+                tracing::warn!(
+                    tries = REARM_TRIES,
+                    "DLSS Frame Generation still showed one frame a present after being switched again that many times in a row (the title's window without focus does so too): left as it is until it shows more again"
+                );
+            }
+            if rearm && let Some(set_options) = functions.dlssg_set_options {
+                // Off now; the next present with an upscaling asks it on again, as after a resize.
+                let options = abi::DlssgOptions::new(abi::DLSSG_OFF);
+                // SAFETY: filled options for viewport 0, on the presenting thread.
+                let code = unsafe { set_options(&viewport, &options) };
+                calls.framegen_on = false;
+                calls.framegen_times = 0;
+                FG_PER.store(1, Relaxed);
+                let rearms = FG_REARMS.fetch_add(1, Relaxed) + 1;
+                tracing::warn!(
+                    frame,
+                    presents = rearm_after(),
+                    rearms,
+                    code,
+                    "DLSS Frame Generation showed one frame a present that long with more asked (status 0): switched off to be asked on again"
+                );
+            }
         }
     }
     spent(T_AFTER, began);
+}
+
+/// Presents in a row in which DLSS Frame Generation, on and asked for 2 or more frames,
+/// showed only the rendered one; at [`rearm_after`] of them it is switched off and on again.
+/// Seen 2026-11-27 on an RTX 4070: after Streamline's "Couldn't lock the mutex on sync
+/// present - will skip the present" it stayed on with status 0 and showed one frame a
+/// present for minutes, until the next switch.
+static FG_STUCK: AtomicU32 = AtomicU32::new(0);
+/// Times frame generation was switched off and on again for that.
+static FG_REARMS: AtomicU32 = AtomicU32::new(0);
+/// Of them, in a row since frame generation last showed more than one frame a present.
+static FG_TRIES: AtomicU32 = AtomicU32::new(0);
+/// Switches in a row that do not bring the generated frames back before it is left as it is:
+/// with the title's window not in front it shows one frame a present until it is again, and a
+/// switch does not change that (45 switches in one run of 2026-11-28, all without focus).
+const REARM_TRIES: u32 = 3;
+
+/// The watch on frame generation showing one frame a present: presents in a row so far, and
+/// switches in a row that did not bring the generated frames back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stuck {
+    count: u32,
+    tries: u32,
+}
+
+/// `VICTORY_FRAMEGEN_REARM=<presents>`: how many presents in a row with one frame shown while
+/// more are asked switch frame generation off and on again (90 unless set, about five seconds
+/// at the frame rates it is used at; 0: never).
+fn rearm_after() -> u32 {
+    static AFTER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| std::env::var("VICTORY_FRAMEGEN_REARM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(90))
+}
+
+/// One present for the watch: what it was, the frames asked for each rendered one (0 off),
+/// the frames shown and the limit; what it is now, and whether to switch off and on. A present
+/// with more than one frame shown starts both counts again; after [`REARM_TRIES`] switches in
+/// a row that did not, it waits for one.
+fn stuck_step(was: Stuck, asked: u32, shown: u32, limit: u32) -> (Stuck, bool) {
+    if shown >= 2 {
+        return (Stuck { count: 0, tries: 0 }, false);
+    }
+    if limit == 0 || asked < 2 || was.tries >= REARM_TRIES {
+        return (Stuck { count: 0, ..was }, false);
+    }
+    let count = was.count + 1;
+    if count >= limit {
+        (Stuck { count: 0, tries: was.tries + 1 }, true)
+    } else {
+        (Stuck { count, ..was }, false)
+    }
 }
 
 /// Our swap chain's buffers are about to be made again: frame generation is
@@ -2347,5 +2424,57 @@ mod failing_tests {
         assert!(!dlss_failing(89, 89));
         assert!(!dlss_failing(120, 1000));
         assert!(!dlss_failing(500, 600));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{REARM_TRIES, Stuck, stuck_step};
+
+    const FRESH: Stuck = Stuck { count: 0, tries: 0 };
+
+    /// Frame generation asked for 2 that shows one frame a present for `limit` presents in a
+    /// row is switched off and on again once; a present with 2 shown starts the count again.
+    #[test]
+    fn frame_generation_showing_one_frame_too_long_is_switched_again() {
+        let mut was = FRESH;
+        for _ in 0..89 {
+            let (next, rearm) = stuck_step(was, 2, 1, 90);
+            assert!(!rearm);
+            was = next;
+        }
+        assert_eq!(stuck_step(was, 2, 1, 90), (Stuck { count: 0, tries: 1 }, true));
+        // A present that shows two frames starts the counts again.
+        assert_eq!(stuck_step(Stuck { count: 89, tries: 2 }, 2, 2, 90), (FRESH, false));
+        assert_eq!(stuck_step(Stuck { count: 89, tries: 0 }, 4, 3, 90), (FRESH, false));
+    }
+
+    /// Off, or the switch off by its setting: never counted.
+    #[test]
+    fn frame_generation_off_or_unwatched_is_not_counted() {
+        assert_eq!(stuck_step(Stuck { count: 89, tries: 0 }, 0, 1, 90), (FRESH, false));
+        assert_eq!(stuck_step(Stuck { count: 89, tries: 0 }, 2, 1, 0), (FRESH, false));
+        // The first presents after a switch on show one frame: counted, not switched yet.
+        assert_eq!(stuck_step(FRESH, 2, 1, 90), (Stuck { count: 1, tries: 0 }, false));
+    }
+
+    /// Switches that do not bring the generated frames back (the window without focus) stop
+    /// after REARM_TRIES in a row, until a present shows more than one frame again.
+    #[test]
+    fn switching_that_does_not_help_stops_until_frames_come_back() {
+        let mut was = FRESH;
+        let mut switches = 0;
+        for _ in 0..90 * 10 {
+            let (next, rearm) = stuck_step(was, 2, 1, 90);
+            switches += u32::from(rearm);
+            was = next;
+        }
+        assert_eq!(switches, REARM_TRIES);
+        assert_eq!(was.tries, REARM_TRIES);
+        // Generated frames again: the watch starts over and may switch again later.
+        let (was, _) = stuck_step(was, 2, 2, 90);
+        assert_eq!(was, FRESH);
+        let switched = (0..90).any(|_| stuck_step(Stuck { count: 89, ..was }, 2, 1, 90).1);
+        assert!(switched);
     }
 }
