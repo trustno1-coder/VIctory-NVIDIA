@@ -554,7 +554,7 @@ nothing is pushed to the NVIDIA target repository and no PR is opened):
 | Run | Branch / commit | Result |
 |---|---|---|
 | Baseline (recorded by the earlier work) | `63b902f`, run 46122898345 | build check PASS; tests **452 passed, 1 failed, 36 ignored** |
-| This branch, final | `ci/copy-bridges-final-fixed` = the final source tip | build check PASS; tests **[FILL: final run result]** |
+| This branch, final | `ci/copy-bridges-final-fixed` (run 46139316939; source tip d04af6e) | build check PASS; tests **470 passed, 1 failed, 36 ignored** (the one failure is the baseline `depth_bounds_pipeline_loads_and_filters_draws`) |
 | Intermediate runs | the same branch before the last two test fixes | the placement tests passed; two test-only defects were found and fixed: a startup-warning unit test still asserted the old `VICTORY_INPLACE` level semantics, and the new port test read unmapped title memory in an assertion (the access violation above) |
 
 Local checks (Windows, Rust 1.98.1 x86_64-pc-windows-gnu, `CARGO_TARGET_DIR` outside the tree):
