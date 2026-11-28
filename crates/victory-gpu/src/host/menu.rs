@@ -1127,7 +1127,7 @@ mod tests {
             std::env::remove_var("VICTORY_MENU_FILE");
             std::env::set_var("VICTORY_HOME", &home);
         }
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: vec![String::new(); ITEMS.len() + BINDS.len()], started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, capturing: None, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
         menu.change_and_save(dlss, 1);
@@ -1255,7 +1255,7 @@ mod tests {
 
     #[test]
     fn every_key_name_and_note_has_a_picture() {
-        let mut menu = Menu { values: vec![String::new(); ITEMS.len() + BINDS.len()], started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, capturing: None };
+        let mut menu = Menu { values: vec![String::new(); ITEMS.len() + BINDS.len()], started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, capturing: None, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         // each usable key on the longest label, and the note it leaves
         for vk in (0..=0xFF_u8).filter(|&vk| keybinds::usable(vk)) {
