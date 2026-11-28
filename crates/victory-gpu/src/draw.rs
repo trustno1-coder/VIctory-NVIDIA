@@ -3821,6 +3821,10 @@ impl State {
         else {
             return false;
         };
+        // The title resources of the shader views found, by their handle: the
+        // depth the pass reads is made readable before it runs (it may still
+        // be in the depth-read state the title's draws left it in).
+        let found_views: std::cell::RefCell<Vec<(u64, usize)>> = std::cell::RefCell::default();
         let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
             t.used.iter().find(|u| {
                 u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
@@ -3844,7 +3848,11 @@ impl State {
             let host = crate::resource::host_resource(resource as This)?;
             // SAFETY: a live resource.
             let desc = unsafe { host.GetDesc() };
-            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+            let handle = heap.gpu_handle((start + offset * 4) / 32);
+            if kind == ResourceType::Srv {
+                found_views.borrow_mut().push((handle.ptr, resource));
+            }
+            Some((desc, handle))
         };
         let at = match role {
             Role::Resolve => LIGHT,
@@ -3994,6 +4002,7 @@ impl State {
                         continue;
                     }
                     let found = (d, heap.gpu_handle((start + offset * 4) / 32));
+                    found_views.borrow_mut().push((found.1.ptr, resource));
                     match d.Format {
                         DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => {
                             static WIDE: AtomicU64 = AtomicU64::new(0);
@@ -4076,6 +4085,19 @@ impl State {
                 crate::ambient::note_miss(MissNote::NotReady);
             }
             return false;
+        }
+        // The depth the pass reads (Resolve and Miss; Radiance and Air read
+        // none): a shader resource, and still depth-read for the title's
+        // draws that test it (D3D12 debug layer message 538 otherwise). A
+        // texture that is no depth target takes the shader states only.
+        let depth_title = found_views.borrow().iter().find(|(h, _)| *h == depth.ptr).map(|&(_, r)| r);
+        if let Some(resource) = depth_title {
+            let state = if seen.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+                DEPTH_READ | SHADER_RESOURCE
+            } else {
+                SHADER_RESOURCE
+            };
+            crate::list::ensure_state(list, resource as This, state);
         }
         let ran = crate::ambient::after(list, role, &Views {
             image,

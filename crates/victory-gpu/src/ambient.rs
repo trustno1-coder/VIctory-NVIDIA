@@ -207,7 +207,10 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+// The depth range is volatile: the keep and mean programs (Radiance, Air)
+// read no depth, and the table they are given there is the image's, a UAV
+// (D3D12 debug layer message 646 with a static range).
+#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0, flags=DESCRIPTORS_VOLATILE)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
