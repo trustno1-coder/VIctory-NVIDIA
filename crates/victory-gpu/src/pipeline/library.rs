@@ -806,26 +806,38 @@ fn compacts(bytes: u64, used: usize, keep: u64) -> bool {
     keep != 0 && bytes > keep && used >= COMPACT_LEAST
 }
 
-/// A new library holding `live` alone (each name once), and how many it
-/// holds.
+/// What [`rebuild`] put in the new library: pipelines kept, names that
+/// came again (a pipeline the title made twice is loaded twice), and
+/// pipelines the new library refused.
+#[derive(Debug, Default, PartialEq)]
+struct Rebuilt {
+    kept: usize,
+    again: usize,
+    refused: usize,
+}
+
+/// A new library holding `live` alone (each name once), and what it holds.
 fn rebuild(
     device: &ID3D12Device1,
     live: &[(HSTRING, Later)],
-) -> windows::core::Result<(ID3D12PipelineLibrary1, usize)> {
+) -> windows::core::Result<(ID3D12PipelineLibrary1, Rebuilt)> {
     // SAFETY: an empty library reads no bytes.
     let fresh: ID3D12PipelineLibrary1 = unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(&[])?.cast()? };
     let mut seen = HashSet::new();
-    let mut kept = 0;
+    let mut rebuilt = Rebuilt::default();
     for (name, Later(pso)) in live {
         if !seen.insert(name.to_string()) {
+            rebuilt.again += 1;
             continue;
         }
         // SAFETY: a live pipeline; a name stored twice is refused.
         if unsafe { fresh.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
-            kept += 1;
+            rebuilt.kept += 1;
+        } else {
+            rebuilt.refused += 1;
         }
     }
-    Ok((fresh, kept))
+    Ok((fresh, rebuilt))
 }
 
 /// At the end of a title's run: a library grown past [`keep_bytes`] is
@@ -855,7 +867,7 @@ fn compact() {
         return;
     }
     let _call = call("rebuild", "the whole library");
-    let written = rebuild(&device, &live).map_err(|e| std::io::Error::other(e.to_string())).and_then(|(fresh, kept)| {
+    let written = rebuild(&device, &live).map_err(|e| std::io::Error::other(e.to_string())).and_then(|(fresh, rebuilt)| {
         // SAFETY: a plain query.
         let size = unsafe { fresh.GetSerializedSize() };
         let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
@@ -864,10 +876,10 @@ fn compact() {
             return Err(e);
         }
         replace_library(dir, &tmp)?;
-        Ok((kept, size))
+        Ok((rebuilt, size))
     });
     match written {
-        Ok((kept, size)) => {
+        Ok((Rebuilt { kept, again, refused }, size)) => {
             COMPACTED.store(true, Ordering::Relaxed);
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
@@ -875,6 +887,8 @@ fn compact() {
                 before,
                 after = size,
                 kept,
+                again,
+                refused,
                 "host pipeline library rebuilt with the pipelines this run used (VICTORY_LIBRARY_KEEP_MB=0: never)"
             );
         }
@@ -1081,8 +1095,8 @@ mod tests {
         };
         let name = HSTRING::from("rebuilt");
         let live = vec![(name.clone(), Later(pso.clone())), (name.clone(), Later(pso.clone()))];
-        let (fresh, kept) = rebuild(&device, &live).expect("rebuilt");
-        assert_eq!(kept, 1);
+        let (fresh, rebuilt) = rebuild(&device, &live).expect("rebuilt");
+        assert_eq!(rebuilt, Rebuilt { kept: 1, again: 1, refused: 0 });
         // SAFETY: a live pipeline; the name is there already, so refused.
         assert!(unsafe { fresh.StorePipeline(PCWSTR(name.as_ptr()), &pso) }.is_err());
         let dir = tempfile::tempdir().unwrap();
