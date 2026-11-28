@@ -150,7 +150,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, path: kept.clone() });
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -278,6 +278,20 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    /// The path the title opened it by, for what is said of a request of
+    /// it that fails ([`source_path`]).
+    path: String,
+}
+
+/// The path of the file `request` reads from; empty for a request whose
+/// source is memory. A request that fails says it (#812: every chunk of two
+/// entries failed, and only the order of the log said which archive).
+fn source_path(request: &Request) -> &str {
+    if request.options & MEMORY_SOURCE != 0 || request.source.is_null() {
+        return "";
+    }
+    // SAFETY: a file object we created; the title keeps it open.
+    &unsafe { &*request.source.cast::<Instance<File>>() }.state.path
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -1407,6 +1421,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             intermediate_size = request.intermediate_size,
             tag = request.tag,
             name = text(request.name),
+            path = source_path(request),
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -1960,6 +1975,21 @@ mod tests {
         assert_eq!(raw, plain[5000..6000]);
         assert_eq!(inflated, plain);
         void(queue, 0x40);
+    }
+
+    /// A request names the file it reads, for its failure's warning; one
+    /// whose bytes are no zlib stream fails as bad data; a memory source
+    /// names no file.
+    #[test]
+    fn a_request_names_the_file_it_reads() {
+        let (dir, file) = file_with(b"these bytes are no zlib stream");
+        let mut out = vec![0u8; 64];
+        let r = request(ZLIB, out.as_mut_ptr().cast(), out.len(), file, 0, 30);
+        assert_eq!(source_path(&r), dir.path().join("data.bin").to_string_lossy());
+        assert_eq!(execute(&r), Err(INVALID_DATA));
+        let source = [0u8; 4];
+        let memory = request(ZLIB | MEMORY_SOURCE, out.as_mut_ptr().cast(), out.len(), source.as_ptr().cast(), 0, 4);
+        assert_eq!(source_path(&memory), "");
     }
 
     #[test]
