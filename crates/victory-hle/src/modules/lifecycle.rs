@@ -372,10 +372,11 @@ extern "system" fn window_proc(
         wm::WM_SETFOCUS | wm::WM_MOVE | wm::WM_SIZE => capture_mouse(hwnd, true),
         _ => {}
     }
-    // A user close (close button, Alt+F4, window or taskbar menu); a
-    // console title never sees one, nor a WM_CLOSE from it.
-    if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
-        end_title("window closed", Box::new(|| {}));
+    // A close asked of the window ends the title as the console would (`close_request`).
+    // SAFETY: the window this procedure runs for.
+    let top_level = message == wm::WM_CLOSE && unsafe { wm::GetParent(hwnd) }.is_null();
+    if let Some(why) = close_request(message, wparam, top_level) {
+        end_title(why, Box::new(|| {}));
         return 0;
     }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
@@ -395,6 +396,20 @@ extern "system" fn window_proc(
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+    }
+}
+
+/// How a close asked of the window is said in the log, if `message` is one: the
+/// user's (close button, Alt+F4, the window or taskbar menu: `SC_CLOSE`), or a
+/// `WM_CLOSE` to the top-level window from another program (`Process.CloseMainWindow`,
+/// `taskkill` without `/F`). A console title never sees either. Passed on to the
+/// title, a `WM_CLOSE` destroyed the window while the title went on presenting to
+/// it, until the process was killed (#726).
+fn close_request(message: u32, wparam: WPARAM, top_level: bool) -> Option<&'static str> {
+    match message {
+        wm::WM_SYSCOMMAND if wparam & 0xFFF0 == wm::SC_CLOSE as usize => Some("window closed"),
+        wm::WM_CLOSE if top_level => Some("window closed (WM_CLOSE)"),
+        _ => None,
     }
 }
 
@@ -760,5 +775,22 @@ mod tests {
         }
         let seen = COMMANDS.with(|c| c.borrow().clone());
         assert_eq!(seen, [wm::SC_MINIMIZE as usize]);
+    }
+
+    /// The user's close and another program's WM_CLOSE to the top-level window
+    /// end the title; nothing else does.
+    #[test]
+    fn closes_asked_of_the_window_end_the_title() {
+        let command = |c: u32| close_request(wm::WM_SYSCOMMAND, c as usize, true);
+        assert_eq!(command(wm::SC_CLOSE), Some("window closed"));
+        assert_eq!(command(wm::SC_CLOSE | 2), Some("window closed")); // the low bits are the system's
+        assert_eq!(close_request(wm::WM_CLOSE, 0, true), Some("window closed (WM_CLOSE)"));
+        assert_eq!(close_request(wm::WM_CLOSE, 0, false), None); // a child window's
+        for c in [wm::SC_KEYMENU, wm::SC_MINIMIZE, wm::SC_MAXIMIZE] {
+            assert_eq!(command(c), None);
+        }
+        for message in [wm::WM_DESTROY, wm::WM_NCDESTROY, wm::WM_SIZE] {
+            assert_eq!(close_request(message, wm::SC_CLOSE as usize, true), None);
+        }
     }
 }
