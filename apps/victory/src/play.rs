@@ -38,6 +38,18 @@ use anyhow::{Context, Result};
 /// The title's executable, looked for beside this program.
 const GAME: &str = "game_scarlett_master.exe";
 
+/// Additional executable names to auto-detect (common Xbox/PC ports).
+const ALT_GAMES: &[&str] = &[
+    "game_scarlett_master.exe",
+    "game.exe",
+    "game_x64.exe",
+    "game_win64.exe",
+    "Game.exe",
+    "Game_x64.exe",
+    "GTA6.exe",
+    "GTA6_x64.exe",
+];
+
 /// `scripts\get-nvidia-sdks.ps1`, run by Windows PowerShell.
 const FETCH: &str = include_str!("../../../scripts/get-nvidia-sdks.ps1");
 
@@ -832,13 +844,45 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     let here = program.parent().map(Path::to_path_buf).unwrap_or_default();
     let exe = match &o.exe {
         Some(exe) => exe.clone(),
-        None => [here.join(GAME), PathBuf::from(GAME)].into_iter().find(|p| p.is_file()).with_context(|| {
-            format!(
-                "no {GAME} beside this program ({}): put the program into your own dump's folder, \
-                 or name the title's executable (`victory play <path to {GAME}>`)",
-                here.display()
-            )
-        })?,
+        None => {
+            // 1. Explicit GAME name beside exe or in cwd
+            let explicit = [here.join(GAME), PathBuf::from(GAME)].into_iter().find(|p| p.is_file());
+            if let Some(e) = explicit {
+                e
+            } else {
+                // 2. Any known alt name beside exe or in cwd
+                let mut found = None;
+                for name in ALT_GAMES {
+                    let candidates = [here.join(name), PathBuf::from(name)];
+                    if let Some(e) = candidates.into_iter().find(|p| p.is_file()) {
+                        found = Some(e);
+                        break;
+                    }
+                }
+                if let Some(e) = found {
+                    e
+                } else {
+                    // 3. Any single .exe in the folder = that one
+                    let exes: Vec<_> = std::fs::read_dir(&here)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")))
+                        .collect();
+                    if exes.len() == 1 {
+                        exes[0].clone()
+                    } else {
+                        anyhow::bail!(
+                            "no {} beside this program ({}): put victory.exe into your game folder, \
+                             or name the title's executable (`victory play <path>`)",
+                            GAME, here.display()
+                        );
+                    }
+                }
+            }
+        }
     };
     anyhow::ensure!(exe.is_file(), "no {}", exe.display());
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
