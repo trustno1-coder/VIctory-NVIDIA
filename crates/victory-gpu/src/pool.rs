@@ -1107,6 +1107,74 @@ mod tests {
         assert!(pool.take(BLOCK, 65536, 0, make).is_none());
     }
 
+    /// Milliseconds calls took, summed up: mean, median, 99th percentile,
+    /// longest.
+    fn spread(mut ms: Vec<f64>) -> String {
+        ms.sort_by(f64::total_cmp);
+        let at = |q: f64| ms[((ms.len() - 1) as f64 * q).round() as usize];
+        format!(
+            "{} calls: mean {:.3} ms, median {:.3}, 99th {:.3}, longest {:.3}",
+            ms.len(),
+            ms.iter().sum::<f64>() / ms.len() as f64,
+            at(0.5),
+            at(0.99),
+            ms[ms.len() - 1]
+        )
+    }
+
+    /// A texture of `side` x `side` RGBA8, one level: 4 x side^2 bytes.
+    fn square(side: u64) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: side,
+            Height: side as u32,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        }
+    }
+
+    /// Bench (`--ignored --nocapture`, with `VICTORY_RIPE_BLOCKS=0
+    /// VICTORY_BLOCK_AHEAD=0`): a thread places textures of 256 KiB, which
+    /// blocks with pieces have room for, while another places textures of
+    /// 24 MiB, which need a new block every second one, as
+    /// `VICTORY_BLOCKS_UNLOCKED` says (run once with `=0`, once without).
+    #[test]
+    #[ignore]
+    fn bench_textures_placed_while_another_thread_makes_blocks() {
+        let Some(host) = crate::host::host() else { return };
+        let (small, big) = (square(256), square(2560));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        // SAFETY: valid descriptions, here and below.
+        let mut keep: Vec<ID3D12Resource> = (0..4).filter_map(|_| unsafe { texture(&host.device, &small, D3D12_RESOURCE_STATE_COMMON) }).collect();
+        let mut ms = Vec::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut held = std::collections::VecDeque::new();
+                while !stop.load(Ordering::Relaxed) {
+                    held.extend(unsafe { texture(&host.device, &big, D3D12_RESOURCE_STATE_COMMON) });
+                    if held.len() > 16 {
+                        held.pop_front();
+                    }
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            for _ in 0..1000 {
+                let began = std::time::Instant::now();
+                keep.extend(unsafe { texture(&host.device, &small, D3D12_RESOURCE_STATE_COMMON) });
+                ms.push(began.elapsed().as_secs_f64() * 1e3);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        eprintln!(
+            "textures of 256 KiB placed while another thread makes blocks (blocks made with the lock let go: {}): {}",
+            blocks_unlocked(),
+            spread(ms)
+        );
+    }
+
     /// Threads that place textures at once, some of them making new blocks
     /// (outside the pool's lock, [`blocks_unlocked`]), get every texture,
     /// each in a piece of its own.
