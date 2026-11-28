@@ -131,6 +131,32 @@ pub fn frame_phase() -> u32 {
 pub fn frames_begun() -> u64 {
     frame::current()
 }
+
+/// When the first frame of 500 draws or more was presented: the world, past
+/// the menus and loading screens (the same test as `VICTORY_CAPTURE_WORLD`).
+/// Scripted keys count from it with `VICTORY_KEYS_FROM=world`.
+pub fn world_since() -> Option<std::time::Instant> {
+    WORLD_SINCE.get().copied()
+}
+
+static WORLD_SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// At a present: the draws run on the host so far.
+#[cfg(windows)]
+pub(crate) fn world_frame(drawn: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let before = LAST.swap(drawn, Relaxed);
+    if WORLD_SINCE.get().is_none() && world_reached(before, drawn) && WORLD_SINCE.set(std::time::Instant::now()).is_ok() {
+        tracing::info!(frames = frames_begun(), "the world: the first frame of 500 draws or more");
+    }
+}
+
+/// Whether a frame that ran the draws from `before` to `drawn` is one of the world's.
+fn world_reached(before: u64, drawn: u64) -> bool {
+    drawn.saturating_sub(before) >= 500
+}
+
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
@@ -141,3 +167,15 @@ pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
     title_memory_written, use_lazy_views, use_soft_views, writing as kernel_will_write,
 };
+
+#[cfg(test)]
+mod world_tests {
+    #[test]
+    fn a_frame_of_500_draws_is_the_world() {
+        assert!(!super::world_reached(0, 499));
+        assert!(super::world_reached(0, 500));
+        assert!(super::world_reached(10_000, 10_600));
+        // A counter that went back (never expected) is not a world frame.
+        assert!(!super::world_reached(10_000, 20));
+    }
+}
