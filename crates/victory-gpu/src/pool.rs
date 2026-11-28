@@ -928,6 +928,93 @@ mod tests {
         assert!(none.take(65536, 65536, 0, || None).is_none());
     }
 
+    /// What a thread that only cuts pieces from a block with room waits for
+    /// while another thread makes new blocks of the card's memory, each a
+    /// heap of 64 MiB made resident and waited for until it is mapped, as
+    /// [`texture`] makes them: with the blocks made inside the pool's lock
+    /// ([`Pool::take_ripe`], the way it was) and with the lock let go
+    /// ([`take_from`]). Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn waits_for_a_piece_while_blocks_are_made() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        const BLOCKS: usize = 12;
+        let Some(host) = crate::host::host() else { return };
+        if let Some((_, name, _)) = victory_shader::emit::host::hardware_adapter() {
+            println!("adapter: {name}");
+        }
+        let make_block = |device: &ID3D12Device| -> Option<ID3D12Heap> {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: BLOCK,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            // SAFETY: plain creation.
+            unsafe { device.CreateHeap(&desc, &mut heap) }.ok()?;
+            let heap = heap?;
+            crate::host::resident(device, &heap).and_then(|()| crate::host::mapped(device)).ok()?;
+            Some(heap)
+        };
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        for inside in [true, false] {
+            let pool: &'static Mutex<Pool<ID3D12Heap>> = Box::leak(Box::new(Mutex::new(Pool::new(SPARE_KEPT))));
+            // The block the other thread cuts from: room for all its pieces.
+            assert!(take_from(pool, 256, 256, || Ripe::ALL, || make_block(&host.device)).is_some());
+            let done = AtomicBool::new(false);
+            let (makes, waits) = std::thread::scope(|s| {
+                let maker = s.spawn(|| {
+                    // A whole block each time, made ahead too: a new block for
+                    // every piece.
+                    let ripe = || Ripe { started: 0, finished: 0, ahead: 1 };
+                    let make = || make_block(&host.device);
+                    let mut makes = Vec::new();
+                    for _ in 0..BLOCKS {
+                        let began = Instant::now();
+                        let taken = if inside {
+                            lock(pool).take_ripe(BLOCK, 65536, now(), ripe(), make)
+                        } else {
+                            take_from(pool, BLOCK, 65536, ripe, make)
+                        };
+                        assert!(taken.is_some(), "a block of the card's memory");
+                        makes.push(began.elapsed());
+                    }
+                    done.store(true, Ordering::Release);
+                    makes
+                });
+                let mut waits = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    let began = Instant::now();
+                    let taken = take_from(pool, 256, 256, || Ripe::ALL, || panic!("the first block has room"));
+                    waits.push(began.elapsed());
+                    assert!(taken.is_some());
+                    std::thread::yield_now();
+                }
+                (maker.join().unwrap(), waits)
+            });
+            let mut sorted = waits.clone();
+            sorted.sort_unstable();
+            let at = |q: f64| sorted[((sorted.len() - 1) as f64 * q) as usize];
+            println!(
+                "blocks made {}: {BLOCKS} pieces that each made blocks, {:.2} ms each on average; {} pieces cut from a block with \
+                 room meanwhile: median {:.4} ms, 99th percentile {:.3} ms, longest {:.3} ms, {:.1} ms in all",
+                if inside { "inside the lock (before)" } else { "with the lock let go (after)" },
+                ms(makes.iter().sum::<Duration>()) / BLOCKS as f64,
+                sorted.len(),
+                ms(at(0.5)),
+                ms(at(0.99)),
+                ms(*sorted.last().unwrap()),
+                ms(waits.iter().sum()),
+            );
+            // The card's memory back.
+            let mut p = lock(pool);
+            p.blocks.clear();
+            p.resting.clear();
+        }
+    }
+
     /// A block is made with the pool's lock let go (making one waits for
     /// residency, up to a second near the card's budget), it is marked with
     /// the submissions begun after its making, and a block made ahead is
