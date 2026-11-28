@@ -1,0 +1,12 @@
+# Saved by the F1 menu; applied over the play settings at every start (an empty value: unset).
+# The choices behind the screenshots (RTX 5070 Ti + Ryzen 5 5600X). Copy to victory-settings.txt at the
+# repository root, where scripts\play-foxhound.ps1 reads it, or set them in the F1 menu.
+VICTORY_MENU_CONSOLE=series-x
+VICTORY_MENU_DLSS=dlaa
+VICTORY_MENU_FRAMEGEN=3
+VICTORY_MENU_FG_TYPE=dlss
+VICTORY_MENU_FPS=1000
+VICTORY_AMBIENT=1
+VICTORY_AMBIENT_SPECULAR=
+VICTORY_PIPELINE_SAMPLER_REUSE=1
+VICTORY_NEURAL=1

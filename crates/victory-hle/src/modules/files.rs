@@ -258,6 +258,130 @@ fn widen(mode: *const c_char) -> Vec<u16> {
 type Handle = *mut c_void;
 type File = *mut c_void;
 
+/// What `VICTORY_FILES_BUFFERED` asks of the title's opens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Buffered {
+    /// `count`: the opens and the title's reads are counted, nothing else.
+    Count,
+    /// `1`: counted, and a synchronous read-only open of an existing file
+    /// on a virtual drive that bypasses the system's file cache reads
+    /// through it ([`buffered_flags`]).
+    Clear,
+}
+
+/// `VICTORY_FILES_BUFFERED` (off by default; `count` or `1`).
+///
+/// The title opens some of its package files past the system's file cache
+/// (the no-buffering flag) and reads them synchronously, one small read
+/// after another: through menu and loading the game's disk did 235-1,474
+/// reads a second of 4-8 KB, one at a time (two runs of 2026-11-26), and a
+/// second start ten minutes later put the same reads through the disk
+/// again, which a cached handle would have served from memory. With `1`
+/// such an open reads through the cache: the title's own reads then go
+/// disk, system cache, title buffer, one kernel copy more (at most about
+/// 7 MB/s before the world), read by the title's CPU. Nothing is claimed
+/// for frame time: in the world the disk did 4-13 reads a second. Nothing
+/// is gained on the first read after a restart of the PC; the gain is in
+/// later starts while the pages stay in standby. An open that reads
+/// overlapped is passed through untouched (and counted): the title's opens
+/// were not seen to, and on a cached handle such a read can finish inside
+/// the call. The DirectStorage files (`super::dstorage`, flags 0) are
+/// opened through [`CreateFileW`] too and are in the count. Compiled only,
+/// not run.
+fn buffered() -> Option<Buffered> {
+    static MODE: std::sync::OnceLock<Option<Buffered>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_FILES_BUFFERED").as_deref().map(str::trim) {
+        Ok("count") => Some(Buffered::Count),
+        Ok("1") => Some(Buffered::Clear),
+        _ => None,
+    })
+}
+
+const GENERIC_READ: u32 = 0x8000_0000;
+const OPEN_EXISTING: u32 = 3;
+const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+/// The flags an open is made with: `flags` without the no-buffering flag
+/// when `clear` and the open is of a path on a virtual drive (`rewritten`),
+/// for reading only, of a file that exists, and not overlapped; else
+/// `flags` as the title gave them. No other bit changes.
+fn buffered_flags(access: u32, disposition: u32, flags: u32, rewritten: bool, clear: bool) -> u32 {
+    if clear
+        && rewritten
+        && access == GENERIC_READ
+        && disposition == OPEN_EXISTING
+        && flags & FILE_FLAG_NO_BUFFERING != 0
+        && flags & FILE_FLAG_OVERLAPPED == 0
+    {
+        flags & !FILE_FLAG_NO_BUFFERING
+    } else {
+        flags
+    }
+}
+
+/// With [`buffered`]: opens; of them those that asked to bypass the cache,
+/// those of these that read overlapped (passed through), and those read
+/// through the cache now; the title's `ReadFile` calls, their bytes and
+/// their microseconds in the host's call.
+static FILES_BUFFERED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// The (access, flags, on a virtual drive, cleared) kinds of open seen.
+static OPEN_KINDS: Mutex<Option<std::collections::HashSet<(u32, u32, bool, bool)>>> = Mutex::new(None);
+
+/// The flags to open with, the open counted ([`buffered`]): a line the
+/// first time each kind of open is seen (no path in it).
+fn open_flags(access: u32, disposition: u32, flags: u32, rewritten: bool) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(mode) = buffered() else {
+        return flags;
+    };
+    let out = buffered_flags(access, disposition, flags, rewritten, mode == Buffered::Clear);
+    let cleared = out != flags;
+    let n = FILES_BUFFERED[0].fetch_add(1, Relaxed) + 1;
+    if flags & FILE_FLAG_NO_BUFFERING != 0 {
+        FILES_BUFFERED[1].fetch_add(1, Relaxed);
+        if flags & FILE_FLAG_OVERLAPPED != 0 {
+            FILES_BUFFERED[2].fetch_add(1, Relaxed);
+        }
+    }
+    if cleared {
+        FILES_BUFFERED[3].fetch_add(1, Relaxed);
+    }
+    let new = OPEN_KINDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert((access, flags, rewritten, cleared));
+    if new {
+        tracing::info!(
+            access = format_args!("{access:#x}"),
+            flags = format_args!("{flags:#x}"),
+            on_a_virtual_drive = rewritten,
+            cleared,
+            "files: a kind of open not seen before (VICTORY_FILES_BUFFERED)"
+        );
+    }
+    if n.is_power_of_two() {
+        files_line();
+    }
+    out
+}
+
+/// The totals of [`FILES_BUFFERED`], at powers of two of the opens and of
+/// the reads.
+fn files_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [opens, bypass, overlapped, cleared, reads, bytes, micros] = [0, 1, 2, 3, 4, 5, 6].map(|i| FILES_BUFFERED[i].load(Relaxed));
+    tracing::info!(
+        "files since the start (VICTORY_FILES_BUFFERED): {opens} opens, {bypass} of them past the system's file cache \
+         ({overlapped} of these overlapped, passed through), {cleared} read through the cache now; the title's ReadFile: \
+         {reads} calls, {} MB, {:.1} ms in the host's call",
+        bytes >> 20,
+        micros as f64 / 1e3
+    );
+}
+
 // kernel32 and its file API sets.
 
 pub extern "system" fn CreateFileW(
@@ -270,6 +394,7 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
+    let flags = open_flags(access, disposition, flags, p.1.is_some());
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
@@ -292,6 +417,7 @@ pub extern "system" fn CreateFileA(
 ) -> Handle {
     match narrow(path) {
         Some(p) => {
+            let flags = open_flags(access, disposition, flags, true);
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 p.as_ptr(),
                 access,
@@ -303,6 +429,8 @@ pub extern "system" fn CreateFileA(
             )
         }
         None => {
+            // (Counted only: not on a virtual drive.)
+            let flags = open_flags(access, disposition, flags, false);
             host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 path,
                 access,
@@ -536,12 +664,27 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
+    // (Timed only with `VICTORY_FILES_BUFFERED`.)
+    let started = buffered().map(|_| std::time::Instant::now());
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
     // The call's error is the title's to ask for.
     // SAFETY: plain calls.
     let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    if let Some(started) = started {
+        use std::sync::atomic::Ordering::Relaxed;
+        let micros = started.elapsed().as_micros() as u64;
+        // SAFETY: the title's count, written by the host's call when it
+        // succeeded (null tolerated).
+        let got = if done != 0 && !read.is_null() { u64::from(unsafe { read.read_unaligned() }) } else { 0 };
+        let n = FILES_BUFFERED[4].fetch_add(1, Relaxed) + 1;
+        FILES_BUFFERED[5].fetch_add(got, Relaxed);
+        FILES_BUFFERED[6].fetch_add(micros, Relaxed);
+        if n >= 1024 && n.is_power_of_two() {
+            files_line();
+        }
+    }
     // shortcut: a read that goes on after the call (overlapped) is written
     // into pages the kernel has locked by now: it lands all the same, but a
     // refresh that guards its blocks before it does will not see it.
@@ -770,6 +913,22 @@ mod tests {
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
+    }
+
+    /// Only a synchronous read-only open of an existing file on a virtual
+    /// drive loses the no-buffering flag, and only that bit; counting alone
+    /// changes nothing.
+    #[test]
+    fn only_a_plain_read_of_the_package_reads_through_the_cache() {
+        let past = FILE_FLAG_NO_BUFFERING | 0x80;
+        assert_eq!(buffered_flags(GENERIC_READ, OPEN_EXISTING, past, true, true), 0x80);
+        assert_eq!(buffered_flags(GENERIC_READ, OPEN_EXISTING, past, true, false), past);
+        assert_eq!(buffered_flags(GENERIC_READ, OPEN_EXISTING, past, false, true), past);
+        assert_eq!(buffered_flags(GENERIC_READ | 0x4000_0000, OPEN_EXISTING, past, true, true), past);
+        assert_eq!(buffered_flags(GENERIC_READ, 4, past, true, true), past);
+        let overlapped = past | FILE_FLAG_OVERLAPPED;
+        assert_eq!(buffered_flags(GENERIC_READ, OPEN_EXISTING, overlapped, true, true), overlapped);
+        assert_eq!(buffered_flags(GENERIC_READ, OPEN_EXISTING, 0x80, true, true), 0x80);
     }
 
     #[test]

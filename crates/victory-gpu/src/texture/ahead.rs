@@ -83,6 +83,13 @@ static ON_THEIR_WAY: Mutex<Vec<(u64, Arc<Job>)>> = Mutex::new(Vec::new());
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static LANDED: Condvar = Condvar::new();
 static BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Uploads on their way on the copy queue now (zero unless `VICTORY_UPLOAD_AHEAD`
+/// is on), for the lines under the frame rate (`crate::loading`).
+pub(crate) fn in_flight() -> usize {
+    // a display number only, so a relaxed load is enough
+    IN_FLIGHT.load(Relaxed)
+}
 /// Since the start: uploads, bytes, microseconds from the asking until the
 /// copy had run, the longest; askings turned down; waits of lists.
 static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
@@ -263,6 +270,9 @@ impl Worker {
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
         for job in jobs {
             job.staging.refresh();
+            // (A piece handed out without its zeros that the refresh did
+            // not detile whole: zeros before the copy reads it.)
+            job.staging.zero_if_unwritten();
         }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
@@ -355,6 +365,121 @@ pub(crate) fn there(resource: This) -> bool {
     crate::resource::made_copy(resource).is_some_and(|copy| copy.ahead.load(Relaxed) == DONE)
 }
 
+/// Whether a buffer staged for one upload of the texture pass is read by
+/// threads of ours as soon as the pass lets go of it, not at the list's
+/// submission (`VICTORY_TEXTURE_READ_AHEAD=1`, off by default; with it unset
+/// nothing is queued and every such buffer is read at its submission, on
+/// the wide threads, as before).
+///
+/// Where the bytes are: title memory -> the staging buffer (an upload
+/// heap, detiled) -> the texture on the card. No hop is added or repeated:
+/// the read into the staging buffer moves from the submission to here, and
+/// the submission's refresh of a filled buffer returns at once. Only for a
+/// buffer the pass took a fingerprint of for a later look (a write between
+/// this read and the submission shows there), not one of a bake (exact)
+/// nor one a table draw keeps watched. The saving is an upper bound of
+/// 12-20 ms a frame of the wide threads' time in ray-traced streaming,
+/// 1-5 ms without (bakes' uploads not counted), and it is the submit
+/// thread's time, while that thread mostly stands waiting for translation:
+/// not frame time. On the frame line "textures" rises by what moves here
+/// (refreshes in front no longer subtract it); "copies" and the refreshes'
+/// flushes fall; "a texture picked by index changed after its upload" and
+/// "waiting for a texture another thread is refreshing" must not rise.
+pub(crate) fn read_ahead() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_READ_AHEAD").is_some_and(|v| v == "1"))
+}
+
+/// Bytes of staging buffers queued for reading at most: past it a buffer
+/// is read at its submission, as before.
+const READ_MOST: u64 = 64 << 20;
+
+/// The buffers to read and their bytes; the two threads wait on it.
+static READS: (Mutex<(VecDeque<Arc<Staging>>, u64)>, Condvar) = (Mutex::new((VecDeque::new(), 0)), Condvar::new());
+/// Since the last line: buffers queued, read here, their MB in bytes, filled
+/// first by a submission, held back by the guards, turned away full.
+static READ_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Queues `staging` for a read ahead of its submission ([`read_ahead`]),
+/// on the pass's thread; never waits. Not queued when full, or when the
+/// threads could not be started.
+pub(crate) fn read_soon(staging: Arc<Staging>) {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    let started = *STARTED.get_or_init(|| {
+        (0..2).fold(false, |any, n| {
+            let spawned = std::thread::Builder::new().name(format!("textures read ahead {n}")).spawn(read_worker).is_ok();
+            any | spawned
+        })
+    });
+    if !started {
+        return;
+    }
+    let bytes = staging.read as u64;
+    {
+        let mut reads = READS.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !fits(reads.1, bytes) {
+            READ_STATS[5].fetch_add(1, Relaxed);
+            return;
+        }
+        reads.1 += bytes;
+        reads.0.push_back(staging);
+    }
+    READ_STATS[0].fetch_add(1, Relaxed);
+    READS.1.notify_one();
+}
+
+/// Whether `bytes` more fit beside `queued` ([`READ_MOST`]).
+fn fits(queued: u64, bytes: u64) -> bool {
+    queued.saturating_add(bytes) <= READ_MOST
+}
+
+/// A thread of [`read_soon`]'s: reads one buffer at a time, under the
+/// buffer's own lock, as the submission would.
+fn read_worker() {
+    loop {
+        let staging = {
+            let mut reads = READS.0.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(staging) = reads.0.pop_front() {
+                    reads.1 = reads.1.saturating_sub(staging.read as u64);
+                    break staging;
+                }
+                reads = READS.1.wait(reads).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        match staging.refresh_soon() {
+            Some(true) => {
+                READ_STATS[1].fetch_add(1, Relaxed);
+                READ_STATS[2].fetch_add(staging.read as u64, Relaxed);
+            }
+            Some(false) => {
+                READ_STATS[3].fetch_add(1, Relaxed);
+            }
+            None => {
+                READ_STATS[4].fetch_add(1, Relaxed);
+            }
+        }
+    }
+}
+
+/// The read-ahead numbers since the last line, per frame, with the switch.
+pub(crate) fn read_ahead_line(frames: f64) {
+    if !read_ahead() || frames <= 0.0 {
+        return;
+    }
+    let [queued, read, bytes, first, held, full] = [0, 1, 2, 3, 4, 5].map(|i| READ_STATS[i].swap(0, Relaxed) as f64 / frames);
+    // like the lines next to it, say nothing in menus and quiet frames
+    if queued + read + first + held + full == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "texture uploads of the lists read ahead of their submission (VICTORY_TEXTURE_READ_AHEAD=1), per frame: {queued:.1} queued, \
+         {read:.1} read ahead ({:.1} MB), {first:.1} the submission filled first, {held:.1} held back (read once no more, exact \
+         or uploaded), {full:.1} left to the submission with the queue full",
+        bytes / 1e6
+    );
+}
+
 /// The state of [`HostTexture::ahead`] of a new host copy.
 pub(crate) fn fresh() -> AtomicU8 {
     AtomicU8::new(NONE)
@@ -363,6 +488,16 @@ pub(crate) fn fresh() -> AtomicU8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The queue for reads ahead holds at most its bytes; a buffer past
+    /// them is left to its submission.
+    #[test]
+    fn reads_ahead_fit_their_bound() {
+        assert!(fits(0, READ_MOST));
+        assert!(fits(READ_MOST - 1, 1));
+        assert!(!fits(READ_MOST, 1));
+        assert!(!fits(1, u64::MAX));
+    }
 
     /// The texels of a placed texture arrive by the copy queue, all levels of
     /// them, and what waits for them is called then; a second asking finds the

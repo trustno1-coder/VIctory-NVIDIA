@@ -2,7 +2,7 @@
 //! (host slots 0-3) and, in the slots XInput leaves empty, from HID
 //! ([`playstation`]: DualShock 4, DualSense, DualSense Edge); while none is
 //! connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
+//! stand-in gamepad (`fallback`, its keys changeable in the F1 menu). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+use victory_gpu::keybinds::control as bind;
 
 // PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy);
 // PS4 pads (DualShock 4) and rumble from FrancescoGelosoEterea/VIscosity (d8db7a0).
@@ -80,7 +81,9 @@ const DEVICES: usize = PADS + 3;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (key, button); README lists it.
+/// The keyboard's stand-in gamepad as it starts (virtual key, button); README
+/// lists it. The pad itself goes by `victory_gpu::keybinds` (the F1 menu can
+/// change each key); scripted keys (`VICTORY_KEYS`) keep this table.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. The letters are
 /// where a US keyboard has them ([`pad_key`]): the same keys under the
 /// fingers on every layout (Z/Q/S/D on AZERTY).
@@ -208,8 +211,33 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// The stand-in pad's buttons by control of `victory_gpu::keybinds`, whose
+/// keys the player can change in the F1 menu (the defaults are
+/// [`FALLBACK_BUTTONS`]' keys, which scripted keys keep using).
+const BOUND_BUTTONS: [(usize, u32); 14] = [
+    (bind::MENU, MENU),
+    (bind::VIEW, VIEW),
+    (bind::A, A),
+    (bind::B, B),
+    (bind::X, X),
+    (bind::Y, Y),
+    (bind::UP, UP),
+    (bind::DOWN, DOWN),
+    (bind::LEFT, LEFT),
+    (bind::RIGHT, RIGHT),
+    (bind::LEFT_SHOULDER, LEFT_SHOULDER),
+    (bind::RIGHT_SHOULDER, RIGHT_SHOULDER),
+    (bind::LEFT_STICK, LEFT_STICK),
+    (bind::RIGHT_STICK, RIGHT_STICK),
+];
+
+/// The stand-in pad for the keys held: each control's key as the F1 menu
+/// has it now (read at every poll, so a change there shows at once).
 fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
+    // 1 while the control's key is held (a letter by its place on a US
+    // keyboard, [`pad_key`])
+    let on = |control: usize| {
+        let vk = victory_gpu::keybinds::key(control);
         if keys.iter().any(|k| pad_key(k) == vk) {
             1.0
         } else {
@@ -217,16 +245,16 @@ fn fallback(keys: &[KeyState]) -> PadState {
         }
     };
     PadState {
-        buttons: FALLBACK_BUTTONS
+        buttons: BOUND_BUTTONS
             .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
+            .filter(|(control, _)| on(*control) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        left_trigger: on(bind::LEFT_TRIGGER),
+        right_trigger: on(bind::RIGHT_TRIGGER),
+        left_x: on(bind::LEFT_STICK_RIGHT) - on(bind::LEFT_STICK_LEFT),
+        left_y: on(bind::LEFT_STICK_UP) - on(bind::LEFT_STICK_DOWN),
+        right_x: on(bind::RIGHT_STICK_RIGHT) - on(bind::RIGHT_STICK_LEFT),
+        right_y: on(bind::RIGHT_STICK_UP) - on(bind::RIGHT_STICK_DOWN),
     }
 }
 
@@ -726,6 +754,19 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    // `VICTORY_REFLEX`: the title is about to take a pad or keyboard
+    // reading. A reading that opens a simulation is where Reflex sleeps and
+    // that simulation starts with its input sample, so this comes before
+    // the reading is picked (afterwards a sleep could not make it fresher)
+    // and before our lock is taken (our poll thread must not wait for the
+    // sleep). Here, where the title asks, not where our poll thread reads
+    // the host; whether a reading is then found does not matter, the title
+    // sampled its input either way. A call with nowhere to put a reading
+    // is not one. Nothing without the switch.
+    #[cfg(windows)]
+    if !out.is_null() {
+        victory_gpu::streamline::input_sampling();
+    }
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
@@ -1577,6 +1618,18 @@ mod tests {
 
     use super::*;
     use crate::HleResolver;
+
+    #[test]
+    fn the_bound_defaults_are_the_readme_layout() {
+        // every button control's default key is the one the old table gave it
+        for (control, bit) in BOUND_BUTTONS {
+            let default = victory_gpu::keybinds::BINDS[control].default;
+            assert!(FALLBACK_BUTTONS.contains(&(default, bit)), "{}", victory_gpu::keybinds::BINDS[control].var);
+        }
+        // and the sticks and triggers keep W/A/S/D, I/J/K/L, Z and C
+        let defaults: Vec<u8> = victory_gpu::keybinds::BINDS[bind::LEFT_TRIGGER..].iter().map(|b| b.default).collect();
+        assert_eq!(defaults, b"ZCWSADIKJL");
+    }
     use crate::HostPolicy;
     use victory_loader::Provenance;
     use victory_pe::ImportSymbol;

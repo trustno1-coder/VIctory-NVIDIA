@@ -9,6 +9,14 @@
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
 //! often states the reason. Panics of ours go to the crash log too.
+//!
+//! The crash log sits deep in the data folder, and players send the run's
+//! log instead (`VICTORY_LOG_FILE`, which `victory play` names), so a report
+//! is appended there as well. The first report of a run also leaves two
+//! files in victory.exe's own folder, next to the launcher, where a player
+//! finds them without looking: `crash-<run>.log`, a copy of the run's log
+//! ending with the report, and `crash-<run>.dmp`, a small minidump (threads,
+//! stacks, module list) that a debugger opens with our symbols.
 
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{
@@ -45,13 +53,40 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// The run's own log (`VICTORY_LOG_FILE`), if it has one: reports go there
+/// too, as it is the file players are asked to send.
+static RUN_LOG: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// The folder of victory.exe: the game's folder, next to the launcher, where
+/// a crash leaves its files (see the module comment).
+static ROOT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Set by the first report that left its files: a second fault while
+/// reporting, or on another thread as the process goes down, must not
+/// replace them with a less useful pair.
+static LEFT_FILES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
+    // Both looked up now, on the starting thread: a crashing thread should
+    // not have to read the environment or ask where the exe is.
+    let _ = RUN_LOG.set(
+        std::env::var_os("VICTORY_LOG_FILE")
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from),
+    );
+    let _ = ROOT.set(
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf)),
+    );
     if LOG.set(file).is_ok() {
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
+            // Logged only: some of our panics are caught and the run goes
+            // on, so they leave no crash files.
             append_to_log(&format!(
                 "VIctory: panic on thread {:?}: {info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
@@ -67,25 +102,170 @@ pub fn log_crash(text: &str) {
     let text = format!("{text}
 {}", title_output());
     eprint!("{text}");
-    append_to_log(&text);
+    leave_crash_files(&text, std::ptr::null());
 }
 
+/// Appends `text` to the crash log and to the run's log.
 fn append_to_log(text: &str) {
     use std::io::Write;
-    let Some(file) = LOG.get() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
-    if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+    let run_log = RUN_LOG.get().and_then(Option::as_ref);
+    for file in LOG.get().into_iter().chain(run_log) {
+        // A handle of our own in append mode: the log's writer keeps its
+        // file open too, and appends from both land whole, one after the other.
+        let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
+        // One write for the whole report: several small writes let lines
+        // of the log's own writer land between them.
+        let whole = format!("unix time {now}, process {}\n{text}\n", std::process::id());
+        if let Ok(mut f) = opened {
+            let _ = f.write_all(whole.as_bytes());
+        }
     }
+}
+
+/// Appends `text` (a report) to the logs, then, the first time in a run,
+/// leaves `crash-<run>.log` and `crash-<run>.dmp` in the game's folder (see
+/// the module comment). `info` is the exception being reported, or null for
+/// a failure that is not one.
+fn leave_crash_files(text: &str, info: *const EXCEPTION_POINTERS) {
+    use std::sync::atomic::Ordering;
+    // Held for the whole call: a second failure on another thread (the
+    // host's own report after a device loss, say) waits here instead of
+    // ending the process while the first one is still writing the dump,
+    // which left a dump of 0 bytes.
+    // A fault inside this very call on the same thread comes back here: it
+    // only appends, since waiting for the lock it holds would hang.
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static WRITER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // SAFETY: no arguments; returns the calling thread's id.
+    let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    if WRITER.load(Ordering::Acquire) == me {
+        append_to_log(text);
+        return;
+    }
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    WRITER.store(me, Ordering::Release);
+    // Cleared when the call ends, whichever way it returns.
+    struct Clear<'a>(&'a std::sync::atomic::AtomicU32);
+    impl Drop for Clear<'_> {
+        fn drop(&mut self) {
+            self.0.store(0, Ordering::Release);
+        }
+    }
+    let _clear = Clear(&WRITER);
+    if LEFT_FILES.swap(true, Ordering::AcqRel) {
+        append_to_log(text);
+        return;
+    }
+    let run_log = RUN_LOG.get().and_then(Option::as_ref);
+    // The game's folder, or failing that the crash log's.
+    let dir = ROOT
+        .get()
+        .and_then(Option::as_deref)
+        .or_else(|| LOG.get().and_then(|l| l.parent()));
+    let Some(dir) = dir else {
+        append_to_log(text);
+        return;
+    };
+    // Named after the run's log (`victory-nvidia-play-<time>-<process>`, or
+    // `play-<time>-<process>` before, becomes `crash-<time>-<process>`), so
+    // the two are matched at a glance, and the launchers' `crash-*` finds it.
+    let stem = run_log
+        .and_then(|l| l.file_stem())
+        .map(|s| {
+            let s = s.to_string_lossy();
+            match s.find("play-") {
+                Some(at) => format!("crash-{}", &s[at + "play-".len()..]),
+                None => format!("crash-{s}"),
+            }
+        })
+        .unwrap_or_else(|| format!("crash-{}", std::process::id()));
+    let (log_copy, dump) = (dir.join(format!("{stem}.log")), dir.join(format!("{stem}.dmp")));
+    let note = format!(
+        "  crash files for whoever reads this: {} and {}\n",
+        log_copy.display(),
+        dump.display()
+    );
+    eprint!("{note}");
+    append_to_log(&format!("{text}{note}"));
+    // The copy is taken after the report went in, so it ends with it.
+    let copied = match run_log {
+        Some(log) => std::fs::copy(log, &log_copy).map(|_| ()),
+        // No run log (a start without `victory play`): the report alone.
+        None => std::fs::write(&log_copy, text),
+    };
+    if let Err(e) = copied {
+        eprintln!("  could not write {}: {e}", log_copy.display());
+    }
+    if let Err(e) = write_minidump(&dump, info) {
+        eprintln!("  could not write {}: {e}", dump.display());
+    }
+}
+
+/// Writes a small minidump of this process to `path`: every thread's
+/// registers and stack, the module list, and the faulting thread's
+/// exception when `info` is not null. No heap: the title's memory runs to
+/// tens of gigabytes and is not ours to send around.
+fn write_minidump(path: &std::path::Path, info: *const EXCEPTION_POINTERS) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        MINIDUMP_EXCEPTION_INFORMATION, MiniDumpNormal, MiniDumpWithThreadInfo,
+        MiniDumpWithUnloadedModules, MiniDumpWriteDump,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
+    };
+    let file = std::fs::File::create(path)?;
+    // SAFETY: the thread id is the calling thread's, the one that faulted
+    // when `info` is set; `info` is the system's, valid while it dispatches.
+    let exception = MINIDUMP_EXCEPTION_INFORMATION {
+        ThreadId: unsafe { GetCurrentThreadId() },
+        ExceptionPointers: info.cast_mut(),
+        ClientPointers: 0,
+    };
+    let exception_param = if info.is_null() { std::ptr::null() } else { &exception };
+    // SAFETY: our own process and an open, writable file; the pointers are
+    // to locals that outlive the call, or null where the call allows it.
+    let ok = unsafe {
+        MiniDumpWriteDump(
+            GetCurrentProcess(),
+            GetCurrentProcessId(),
+            file.as_raw_handle(),
+            MiniDumpNormal | MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules,
+            exception_param,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The original file names of title images, by base address: the Windows
+/// loader only knows the prepared copies (`victory-image-<hash>.dll`), which
+/// say nothing to whoever reads a report.
+static NAMES: std::sync::RwLock<Vec<(usize, String)>> = std::sync::RwLock::new(Vec::new());
+
+/// Names the title image mapped at `base` after its original file, for
+/// [`locate`] and so for crash reports.
+pub fn name_image(base: usize, original: &str) {
+    let mut names = NAMES.write().unwrap_or_else(|e| e.into_inner());
+    names.retain(|(b, _)| *b != base);
+    names.push((base, original.to_owned()));
 }
 
 /// The title's last lines of debug output, kept for crash reports.
 static SAID: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
-const SAID_LINES: usize = 8;
+/// Enough to see past a crash reporter's own chatter: the title's reporter
+/// writes about forty lines of its own before ours runs (seen in a
+/// player's log), which pushed the lines before the crash out of a
+/// shorter window.
+const SAID_LINES: usize = 64;
 
 /// Keeps a line of the title's debug output for the next crash report.
 pub fn note_title_output(line: &str) {
@@ -589,8 +769,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         text.push_str(&l);
         text.push('\n');
     };
+    // SAFETY: no preconditions; the thread id matches the minidump's.
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
     line(format!(
-        "VIctory: {what} {:#010x} at {}{detail}",
+        "VIctory: {what} {:#010x} at {}{detail} on thread {thread}",
         code as u32,
         locate(at)
     ));
@@ -623,7 +805,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         let said = title_output();
         eprint!("{said}");
         text.push_str(&said);
-        append_to_log(&text);
+        leave_crash_files(&text, info);
     }
     #[cfg(feature = "diagnostics")]
     for (address, len, file) in SAVE.get().into_iter().flatten() {
@@ -717,6 +899,13 @@ fn module_of(address: usize) -> Option<String> {
     };
     if found == 0 {
         return None;
+    }
+    // A title image by its original name; `try_read`, as the thread that
+    // faulted may be the one naming an image.
+    if let Ok(names) = NAMES.try_read()
+        && let Some((_, name)) = names.iter().find(|(base, _)| *base == module as usize)
+    {
+        return Some(format!("{name}+{:#x}", address - module as usize));
     }
     let mut path = [0u16; 260];
     // SAFETY: `module` is a loaded module; the buffer length is passed.

@@ -64,6 +64,12 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// The title's own hash of the program, only for a container made from pieces ([`pieces`]); None for every container the title passed itself, so with `VICTORY_PIPELINE_PIECES` unset it is None everywhere and `is` behaves as plain hash equality.
+    #[cfg(windows)]
+    program: Option<victory_shader::pieces::ProgramHash>,
+    /// The logged hashes of the title's own containers of the same program, from the containers of earlier runs (`known::stock_hashes`), resolved on first ask by `stands_for`.
+    #[cfg(windows)]
+    stock: OnceLock<Vec<String>>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -102,7 +108,26 @@ pub(crate) fn kept() -> [u64; 7] {
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
-    let full = blake3::hash(bytes);
+    shader_of(stage, std::borrow::Cow::Borrowed(bytes))
+}
+
+/// The shared container for `bytes`, which are kept as they are when they
+/// come owned and no pipeline had them yet (a container put together from
+/// loose pieces, [`pieces`]: read from title memory once, into this).
+fn shader_of(stage: &'static str, bytes: std::borrow::Cow<[u8]>) -> Arc<Shader> {
+    #[cfg(windows)]
+    let find_program = pieces::asked();
+    #[cfg(not(windows))]
+    let find_program = false;
+    shader_keyed(stage, bytes, find_program)
+}
+
+/// `shader_of`, with whether to read the program key of a container made from
+/// pieces: only a run that makes some needs it, so with the switch unset the
+/// title's containers are not parsed again under the lock.
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn shader_keyed(stage: &'static str, bytes: std::borrow::Cow<[u8]>, find_program: bool) -> Arc<Shader> {
+    let full = blake3::hash(&bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
@@ -113,14 +138,53 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
                 #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                ambient: (stage == "compute").then(|| crate::ambient::role(&bytes)).flatten(),
+                // the hash above stays the container's own: the pipeline library and the shader
+                // cache key on it, and a pipeline from pieces must not share a key with a stock one
+                #[cfg(windows)]
+                program: find_program.then(|| victory_shader::pieces::program_of_pieces(&bytes)).flatten(),
+                #[cfg(windows)]
+                stock: OnceLock::new(),
+                container: bytes.into_owned(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
         .clone()
+}
+
+impl Shader {
+    /// The program's own name where its container carries one: the first run of letters, digits and underscores that starts with CS_, PS_, VS_, MS_, GS_, HS_, DS_ or AS_ at a word boundary, up to 96 characters. Scans the whole container, so only the diagnostics that name passes (`streamline::targets`, once per pipeline) call it.
+    pub(crate) fn program_name(&self) -> Option<String> {
+        program_name_in(&self.container)
+    }
+}
+
+/// The first program name in `bytes`, see [`Shader::program_name`].
+fn program_name_in(bytes: &[u8]) -> Option<String> {
+    const PREFIXES: [&[u8]; 8] = [
+        b"CS_", b"PS_", b"VS_", b"MS_", b"GS_", b"HS_", b"DS_", b"AS_",
+    ];
+    // a name is cut here so a stray run of text cannot flood a log line
+    const LONGEST: usize = 96;
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for i in 0..bytes.len() {
+        let rest = &bytes[i..];
+        // a prefix only counts at a word boundary, so "xCS_" is not a name
+        if i > 0 && is_word(bytes[i - 1]) {
+            continue;
+        }
+        if !PREFIXES.iter().any(|p| rest.starts_with(p)) {
+            continue;
+        }
+        let len = rest.iter().take(LONGEST).take_while(|&&b| is_word(b)).count();
+        // a bare prefix is not a name, keep looking
+        if len > 3 {
+            return Some(String::from_utf8_lossy(&rest[..len]).into_owned());
+        }
+    }
+    None
 }
 
 /// A translated shader and the console resources its code reads.
@@ -179,9 +243,84 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
+                // a container from pieces that did not translate is kept
+                // for the next run, which refuses it (`pieces::refuse_untranslated`)
+                if done.is_err() {
+                    pieces::note_untranslated(&self.container);
+                }
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+/// With `VICTORY_PIPELINE_PIECES=1`, once per title pipeline (at most 256):
+/// what a draw or dispatch dropped without a host pipeline was aimed at, if
+/// one of the pipeline's stages is a container from pieces. `shape` says
+/// what was drawn and where, and is built only for a pipeline not yet
+/// named. The translation state is only peeked at: the title's thread must
+/// not wait for a worker's translation.
+#[cfg(windows)]
+pub(crate) fn note_unbuilt(this: This, shape: impl FnOnce() -> String) {
+    if this.is_null() || !pieces::enabled() {
+        return;
+    }
+    let p = pipeline(this);
+    // every pipeline is judged once, and one that is not from pieces is
+    // remembered too, so that its dropped draws do not parse containers again
+    static SEEN: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(HashMap::new);
+        if seen.contains_key(&(this as usize)) || seen.len() >= 4096 {
+            return;
+        }
+        let room = seen.values().filter(|&&named| named).count() < 256;
+        let named = room && p.shaders.iter().any(|s| pieces::is_pieces(&s.container));
+        seen.insert(this as usize, named);
+        if !named {
+            return;
+        }
+    }
+    let stages: Vec<String> = p
+        .shaders
+        .iter()
+        .map(|s| {
+            let state = match s.translated.get() {
+                Some(Some(_)) => "translated",
+                Some(None) => "not",
+                None => "pending",
+            };
+            format!("{} {} {state}", s.stage, s.hash)
+        })
+        .collect();
+    tracing::warn!(
+        pipeline = format_args!("{:#x}", this as usize),
+        stages = %stages.join(", "),
+        "a pipeline from pieces has no host pipeline, its draw is dropped: {}",
+        shape()
+    );
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// The logged hashes of the title's own containers that hold this program, for a shader made from pieces (empty for any other, and when the book of earlier runs has none). The first ask of a shader from pieces may wait for the index of the book that `known::prime` builds on a worker; every later ask is a read.
+    fn stands_for(&self) -> &[String] {
+        match self.program {
+            None => &[],
+            Some(p) => self.stock.get_or_init(|| known::stock_hashes(&p)),
+        }
+    }
+
+    /// Whether this shader is the program that the title's container with logged hash `stock` holds: the same hash, or (for a pipeline made from pieces, whose containers are ours and so have other hashes) a title container of the same program. Every list of stock hashes in the layer (VICTORY_LEAVE_OUT, the interface composite, the bake programs, ...) is matched through this, so a pipeline from pieces is taken for what its program is. Called per draw: for a shader that is not from pieces it is one string comparison.
+    pub(crate) fn is(&self, stock: &str) -> bool {
+        self.hash == stock || self.stands_for().iter().any(|h| h == stock)
+    }
+
+    /// Whether the program carries `name` (one of `known::NAMES`): in its own container, or for a shader from pieces, which holds no names as text, in a title container of the same program that the book of earlier runs has.
+    pub(crate) fn has_name(&self, name: &[u8]) -> bool {
+        self.container.windows(name.len()).any(|w| w == name)
+            || self.program.is_some_and(|p| known::program_named(&p, name))
     }
 }
 
@@ -189,20 +328,19 @@ impl Shader {
 impl Shader {
     /// The console programs of the container; `None` if they are not known.
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
-        use victory_shader::{Container, FourCC};
+        use victory_shader::Container;
         let c = Container::parse(&self.container).ok()?;
-        let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
-        victory_shader::native_programs(part.data).ok()
+        victory_shader::native_programs(c.native_part()?.data).ok()
     }
 }
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+    let programs = match c.native_part() {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
@@ -329,8 +467,8 @@ pub(crate) fn builder_rests(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    // (`VICTORY_BVH_BUILDER=1`, or `VICTORY_RT_NATIVE=1`, which asks for it.)
+    if !make::builder_asked() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -339,6 +477,12 @@ pub(crate) fn builder_runs() -> bool {
     }
     if b.whole {
         return true;
+    }
+    // Those not made yet (a title that builds right after creating them)
+    // all go to the workers first, so that they are made side by side and
+    // this thread waits for the slowest instead of making each in turn.
+    for p in &b.pipelines {
+        make::ahead(p);
     }
     let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
     if !missing.is_empty() {
@@ -510,7 +654,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| hashes.iter().any(|h| shader.is(h)))
         .map(|shader| shader.hash.as_str())
 }
 
@@ -587,6 +731,13 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        drop(b);
+        // With the builder asked for, its programs go to the workers now:
+        // the title creates them minutes before its first build, and that
+        // first build needs every one of them in the same frame.
+        if make::builder_asked() {
+            make::ahead(&host);
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
@@ -771,6 +922,7 @@ mod library;
 #[cfg(windows)]
 mod make;
 #[cfg(windows)]
+pub(crate) mod pieces;
 pub(crate) mod samplers;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
@@ -792,6 +944,11 @@ pub(crate) fn library_removal_note() -> String {
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
+    // pipelines from pieces are matched against the stock hash lists through the book of earlier
+    // runs, whose index is built on a worker from here, ahead of the title's first call
+    if pieces::asked() {
+        known::prime();
+    }
 }
 
 /// Saves the pipeline cache now if anything was added (at the end of a run).
@@ -814,6 +971,27 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn program_name_finds_the_first_name_at_a_word_boundary() {
+        assert_eq!(
+            program_name_in(b"\0\x01..PS_Example_Pass_01\0tail").as_deref(),
+            Some("PS_Example_Pass_01")
+        );
+        assert_eq!(program_name_in(b"xCS_notaname CS_Real").as_deref(), Some("CS_Real"));
+        assert_eq!(program_name_in(b"CS_ then VS_Ok").as_deref(), Some("VS_Ok"));
+        assert_eq!(program_name_in(b"no names here"), None);
+        assert_eq!(program_name_in(b""), None);
+    }
+
+    #[test]
+    fn program_name_is_cut_at_96() {
+        let mut bytes = b"\0CS_".to_vec();
+        bytes.extend(std::iter::repeat_n(b'a', 200));
+        let name = program_name_in(&bytes).unwrap();
+        assert_eq!(name.len(), 96);
+        assert!(name.starts_with("CS_aaa"));
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
@@ -917,5 +1095,70 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// a container made from pieces whose metadata ends in a 0x43 record holding `digest`
+    #[cfg(windows)]
+    fn container_from_pieces(digest: [u8; 16]) -> Vec<u8> {
+        let mut packet = [0u8; victory_shader::pieces::COMPUTE_PACKET];
+        packet[0x0c..0x12].copy_from_slice(&[8, 0, 8, 0, 1, 0]);
+        packet[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        let mut code = 0xBF81_0000u32.to_le_bytes().to_vec();
+        code.resize(16, 0);
+        // a 0x18 byte header (kind at 0, code dwords at 8), then one 32 byte record
+        let mut meta = vec![0u8; 0x18 + 32];
+        meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        meta[8..12].copy_from_slice(&((code.len() / 4) as u32).to_le_bytes());
+        meta[0x18] = 0x43;
+        meta[0x18 + 4..0x18 + 20].copy_from_slice(&digest);
+        let mut draft = victory_shader::pieces::compute(&packet, code.len(), meta.len()).unwrap();
+        let (c, m) = (draft.code.clone(), draft.metadata.clone());
+        draft.bytes[c].copy_from_slice(&code);
+        draft.bytes[m].copy_from_slice(&meta);
+        draft.bytes
+    }
+
+    /// a title style container: one HASH part (a dword of flags, then the digest)
+    #[cfg(windows)]
+    fn container_of_title(digest: [u8; 16]) -> Vec<u8> {
+        let mut out = b"DXBC".to_vec();
+        out.extend([0u8; 16]);
+        out.extend(1u32.to_le_bytes());
+        out.extend(64u32.to_le_bytes());
+        out.extend(1u32.to_le_bytes());
+        out.extend(36u32.to_le_bytes());
+        out.extend(b"HASH");
+        out.extend(20u32.to_le_bytes());
+        out.extend(0u32.to_le_bytes());
+        out.extend(digest);
+        out
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_shader_from_pieces_stands_for_the_stock_hash_of_its_program() {
+        let digest: [u8; 16] = std::array::from_fn(|i| i as u8 + 1);
+        let made = shader_keyed("compute", std::borrow::Cow::Owned(container_from_pieces(digest)), true);
+        assert_eq!(made.program, Some(digest));
+        // the title's own container of the same program is not from pieces
+        let stock = shader("compute", &container_of_title(digest));
+        assert_eq!(stock.program, None);
+        assert_ne!(stock.hash, made.hash);
+        // the book's answer is injected so the process wide cache folder stays untouched
+        made.stock.set(vec![stock.hash.clone()]).unwrap();
+        assert!(made.is(&stock.hash));
+        assert!(made.is(&made.hash));
+        assert!(!made.is("0000000000000000"));
+        // a title container never stands for one from pieces: plain equality
+        assert!(!stock.is(&made.hash));
+        assert!(stock.is(&stock.hash));
+        // a program the book has nothing on matches nothing but its own hash
+        let other: [u8; 16] = std::array::from_fn(|i| 0x20 + i as u8);
+        let lone = shader_keyed("compute", std::borrow::Cow::Owned(container_from_pieces(other)), true);
+        assert_eq!(lone.program, Some(other));
+        lone.stock.set(Vec::new()).unwrap();
+        assert!(lone.is(&lone.hash));
+        assert!(!lone.is(&stock.hash));
+        assert!(!lone.is(&made.hash));
     }
 }

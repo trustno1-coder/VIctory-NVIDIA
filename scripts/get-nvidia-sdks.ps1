@@ -3,10 +3,14 @@
 # NVIDIA's, under NVIDIA's licences (saved beside them: read them); this repository does not and may not carry
 # them, so each person gets them from NVIDIA directly. Get-NVIDIA-DLSS.cmd in the repository's folder runs this.
 # Nothing of NVIDIA's is needed to build the layer: the files are loaded when the game runs.
+#   get-nvidia-sdks.ps1 -RayReconstruction    also DLSS Ray Reconstruction's plugin and model (46 MB more)
 param(
     [string]$StreamlineTag = 'v2.14.16',
     # Another folder for them than nvidia-sdk here (`victory get-dlss` names one under %LOCALAPPDATA%\victory).
-    [string]$To = ''
+    [string]$To = '',
+    # Also the two files of DLSS Ray Reconstruction, from the same archive: only the title's ray tracing
+    # (VICTORY_RT_NATIVE) has a use for them.
+    [switch]$RayReconstruction
 )
 $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest's progress bar makes it many times slower
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -15,6 +19,7 @@ $sl = Join-Path $sdk 'Streamline'
 $bin = Join-Path $sl 'bin\x64'
 # What is loaded when the game runs: Streamline's interposer and plugins, DLSS and the frame generation model.
 $dlls = 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.dlss_g.dll', 'sl.reflex.dll', 'sl.pcl.dll', 'nvngx_dlss.dll', 'nvngx_dlssg.dll'
+if ($RayReconstruction) { $dlls += 'sl.dlss_d.dll', 'nvngx_dlssd.dll' }
 
 # One file from a URL, with curl's progress line where Windows has curl (it has since Windows 10 1803).
 function Get-File([string]$Url, [string]$To) {
@@ -105,7 +110,8 @@ if (-not $missing) {
     Write-Host "  all there already: $bin"
 } else {
     $url = "https://github.com/NVIDIA-RTX/Streamline/releases/download/$StreamlineTag/streamline-sdk-$StreamlineTag.zip"
-    $names = ($dlls | ForEach-Object { [regex]::Escape($_) }) -join '|'
+    # Only what is not there yet: a file a running game has loaded cannot be written over.
+    $names = ($missing | ForEach-Object { [regex]::Escape($_) }) -join '|'
     $want = "(^|/)bin/x64/($names|[^/]*license[^/]*\.txt)$|^([^/]+/)?license\.txt$"
     try { [void](Get-FromZip $url $want $sl) }
     catch { Write-Host "  Taking the files out of the archive in place did not work ($($_.Exception.Message))." }

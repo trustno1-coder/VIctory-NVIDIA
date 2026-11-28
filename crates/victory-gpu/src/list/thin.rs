@@ -545,10 +545,24 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
         return std::ptr::null_mut();
     }
     let front = front(this);
+    // A null ends the run in the title's structure builder ("Failed to
+    // allocate upload buffer"), so each reason is said once before it.
     if front.closed || front.recording.is_none() {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!(
+                size,
+                alignment,
+                closed = front.closed,
+                recording = front.recording.is_some(),
+                "allocate_upload on a list that is not recording (VICTORY_THIN=1): answering null"
+            );
+        }
         return std::ptr::null_mut();
     }
     let Some(mut block) = Upload::new(len) else {
+        // (`Upload::new` said why)
+        tracing::warn!(size, alignment, "allocate_upload: no room for the list's upload memory (VICTORY_THIN=1), answering null");
         return std::ptr::null_mut();
     };
     let start = block.start();

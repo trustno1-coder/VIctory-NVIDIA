@@ -210,7 +210,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .collect();
             (loaded, &inputs[..], &[][..])
         }
-        (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
+        (StageIo::Vs { inputs, outputs, .. }, HwStage::Vs) => {
             let mut loaded = vec![
                 (Reg::V(0), Input::VertexId),
                 (Reg::V(2), Input::PrimitiveId),
@@ -915,5 +915,45 @@ mod tests {
                 (3, Input::Position(1)),
             ]
         );
+    }
+
+    #[test]
+    fn vertex_clip_and_cull_exports_are_position_rows() {
+        // A vertex program's second and third position exports carry the
+        // clip and cull distances; raising names them by row only and the
+        // signature decides which distance each channel is.
+        let code: Vec<u8> = [
+            0xF800_00CFu32,
+            0x0302_0100, // exp pos0, v0, v1, v2, v3
+            0xF800_00DF,
+            0x0302_0100, // exp pos1, v0, v1, v2, v3
+            0xF800_08EF,
+            0x0302_0100, // exp pos2 (cull and clip rows), done
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let native = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: vec![],
+                outputs: vec![],
+                fetch: vec![],
+            },
+            code,
+        };
+        let io = raise(&p, &native).unwrap();
+        let targets: Vec<Target> = io.exports.iter().map(|e| e.target).collect();
+        assert_eq!(
+            targets,
+            [Target::Position(0), Target::Position(1), Target::Position(2)]
+        );
+        assert!(io.exports[2].done);
     }
 }

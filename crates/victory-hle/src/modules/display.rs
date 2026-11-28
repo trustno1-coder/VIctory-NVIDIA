@@ -57,13 +57,39 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-/// 2: disabled. We present in SDR, so the title must render SDR.
-// shortcut: HDR output is not done (see the presentation items in
-// `TODO.md`); report enabled, with the host display's luminance, once the
-// swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
-    tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
-    2
+/// The result for "HDR is on". GUESS: the first value of the public result
+/// enum; never confirmed against a run. Disabled stays the 2 answered before.
+const HDR_ENABLED: u32 = 0;
+
+/// The title's info struct as we fill it: three f32 in nits, the minimum
+/// tone-map luminance, the maximum tone-map luminance and the maximum
+/// full-frame luminance. GUESS: layout taken from the public GDK header, not
+/// seen in a run. Written only when the title passes a non-null pointer.
+// HDR is answered only when VICTORY_HDR=1 and the display reports it
+// (`victory_gpu::hdr::display`); otherwise the title is told SDR so it
+// renders SDR, which is what the swap chain presents.
+extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
+    match victory_gpu::hdr::display() {
+        Some(d) => {
+            if !info.is_null() {
+                let nits = [d.min_nits, d.max_nits, d.max_full_frame_nits];
+                // SAFETY: the title passes room for the info struct or null; null was checked, and the write is unaligned-safe.
+                unsafe { std::ptr::write_unaligned(info.cast::<[f32; 3]>(), nits) };
+            }
+            tracing::info!(
+                preference,
+                min_nits = d.min_nits,
+                max_nits = d.max_nits,
+                max_full_frame_nits = d.max_full_frame_nits,
+                "HDR mode: enabled"
+            );
+            HDR_ENABLED
+        }
+        None => {
+            tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
+            2
+        }
+    }
 }
 
 /// Nothing launches URIs for the title: no store, browser or console app

@@ -2391,3 +2391,105 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
         }
     }
 }
+
+/// `s_pack_ll_b32_b16` joins the low halves of its sources and leaves SCC
+/// alone (the compare before it sets SCC, the select after it reads it).
+#[test]
+fn scalar_pack_takes_low_halves_and_keeps_scc() {
+    let shader = build_valu_cs(&[
+        0xBF06_0302,           // s_cmp_eq_u32 s2, s3
+        sop2(0x32, 16, 0, 1),  // s_pack_ll_b32_b16 s16, s0, s1
+        sop2(0x0a, 16, 16, 128), // s_cselect_b32 s16, s16, 0
+        vop1(1, 0, sgpr(16)),  // v_mov_b32 v0, s16
+    ]);
+    let cases = [[0x1234_5678, 0x9ABC_DEF0, 7, 7], [0x1234_5678, 0x9ABC_DEF0, 7, 8]];
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        let want = if i == 0 { 0xDEF0_5678 } else { 0 };
+        assert_eq!(got, want, "{backend}, case {i}");
+    });
+}
+
+/// A typed store that names fewer than four channels writes the others as
+/// zero, as the console does, whatever the element held before.
+#[test]
+fn typed_stores_of_some_channels_write_zero_to_the_rest() {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UINT,
+        DXGI_FORMAT_R32G32B32A32_FLOAT,
+    };
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let used = || {
+        vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 0,
+        }]
+    };
+    let half_before = [0x4000_3C00u32, 0x4400_4200].repeat(4);
+    let float_before = [0x3F80_0000u32; 16];
+    // setup of the data registers, store opcode, format, element bytes, view bits, view before, wanted
+    #[allow(clippy::type_complexity)]
+    let cases: [(&str, Vec<u32>, u8, _, u32, u32, &[u32], Vec<u32>); 3] = [
+        (
+            "d16 x into RGBA16F",
+            vec![0x7E04_02FF, 0x4500], // v_mov_b32 v2, 0x4500
+            0x84,                      // buffer_store_format_d16_x
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            8,
+            8,
+            &half_before,
+            [0x0000_4500u32, 0].repeat(4),
+        ),
+        (
+            "d16 x into RGBA16_UINT",
+            vec![0x7E04_02FF, 0xABCD],
+            0x84,
+            DXGI_FORMAT_R16G16B16A16_UINT,
+            8,
+            8 | super::VIEW_INTEGER,
+            &half_before,
+            [0xABCDu32, 0].repeat(4),
+        ),
+        (
+            "xyz into RGBA32F",
+            vec![0x7E04_02F2, 0x7E06_02F4, 0x7E08_02F6], // v2, v3, v4 = 1.0, 2.0, 4.0
+            0x06,                                        // buffer_store_format_xyz
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
+            16,
+            16,
+            &float_before,
+            [0x3F80_0000u32, 0x4000_0000, 0x4080_0000, 0].repeat(4),
+        ),
+    ];
+    for (label, setup, op, format, elem_bytes, stride_word, before, want) in cases {
+        let mut body = s_load_dwordx4_off(8, 4, 0).to_vec();
+        body.extend(setup);
+        body.extend_from_slice(&mubuf_idxen(op, 2, 0, 8));
+        let shader = build_table_typed_cs(&body, used());
+        for (backend, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{backend}: compute_pipeline failed: {e}"));
+            let views = [View::TypedUav { data: before, format, elem_bytes }];
+            let mut roots = vec![(0, Root::Constants(vec![0u32; shader.user_data_dwords().max(1) as usize]))];
+            // only the d16 shaders ask for the view kinds
+            if shader.root_srvs.contains(&super::SLOT_TABLE_STRIDES) {
+                roots.push((1, Root::View { srv: true, data: vec![stride_word] }));
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch { roots, views: &views, samplers: &[], groups: [1, 1, 1] },
+                )
+                .unwrap_or_else(|e| panic!("{backend} {label}: dispatch failed: {e}"));
+            assert_eq!(out[0], want, "{backend} {label}");
+        }
+    }
+}

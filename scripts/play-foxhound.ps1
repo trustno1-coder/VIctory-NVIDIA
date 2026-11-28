@@ -6,6 +6,7 @@
 #   .\scripts\play-foxhound.ps1 -Exe ... -Dlss balanced -FrameGen
 #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)
 #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
+#   .\scripts\play-foxhound.ps1 -Exe ... -Res wide            5120x1440 (32:9): the scene and the title's camera made for it, the interface kept 16:9 in the middle
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
 #
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
@@ -19,8 +20,10 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'release',
     [switch]$SeriesS,
     # 1440: output and scene 2560x1440 (Series X, the image is patched); 1080to1440: scene 1920x1080 upscaled by
-    # the title; 4k: the stock Series X output (3840x2160).
-    [ValidateSet('1440', '1080to1440', '4k')][string]$Res = '1440',
+    # the title; 4k: the stock Series X output (3840x2160); wide: output and scene 5120x1440 (VICTORY_DISPLAY_WIDE;
+    # Series X only, the image is patched, never run on the title before this was added); another wide size:
+    # -Res 1440 -More @{VICTORY_DISPLAY_WIDE='3440x1440'}
+    [ValidateSet('1440', '1080to1440', '4k', 'wide')][string]$Res = '1440',
     # DLSS Super Resolution in place of the title's upscaling; needs NVIDIA Streamline (README).
     [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance')][string]$Dlss = 'quality',
     # DLSS Frame Generation (RTX 40 or later, hardware-accelerated GPU scheduling on); needs DLSS.
@@ -41,6 +44,9 @@ param(
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
     [ValidateRange(1, 1000)][int]$Fps = 1000,
+    # The streaming and submitting-thread switches (each described where the code reads it), all on at once.
+    # Newer than the settings above and not yet measured in the world one by one; -More turns any of them off.
+    [switch]$Fast,
     # Every shader and the loading pipelines made first (`victory preload`), then the game; the F1 menu's
     # PRELOAD SHADERS starts this again with it.
     [switch]$Preload,
@@ -61,7 +67,7 @@ if (Test-Path -LiteralPath $menuFile) {
 }
 $fpsWanted = $Fps
 if ($menu.Contains('VICTORY_MENU_CONSOLE')) { $SeriesS = $menu['VICTORY_MENU_CONSOLE'] -eq 'series-s' }
-if ($menu['VICTORY_MENU_RES'] -in '1440', '1080to1440', '4k') { $Res = $menu['VICTORY_MENU_RES'] }
+if ($menu['VICTORY_MENU_RES'] -in '1440', '1080to1440', '4k', 'wide') { $Res = $menu['VICTORY_MENU_RES'] }
 if ($menu['VICTORY_MENU_DLSS'] -in 'off', 'dlaa', 'quality', 'balanced', 'performance') { $Dlss = $menu['VICTORY_MENU_DLSS'] }
 $timesWanted = $FrameGenX
 if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
@@ -77,6 +83,9 @@ $settings = @{
     VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_CARD_AWAKE = '1'
     VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_INDIRECT_BATCH = '2'
     VICTORY_UPLOAD_AHEAD = '1'; VICTORY_SHOW_AFTER = '1'; VICTORY_MAP_THREADS = '1'
+    # Immediate samplers as a sampler table, so those pipelines are kept in the pipeline library
+    # instead of being made again by the driver every run (about half of all pipelines, ~1.4 s each)
+    VICTORY_PIPELINE_SAMPLER_TABLE = '1'
     # Shader writes into big write-combined copies stay on the card (-5 ms a frame)
     VICTORY_WC_NO_BACK = '1'; VICTORY_WC_NO_BACK_MIN_KB = '1024'
     # The title's page-mapping copies kept without Windows views (no cutscene freezes at scene cuts)
@@ -102,9 +111,36 @@ $settings = @{
     VICTORY_ALLOCATOR_TRIM = '1'
     VICTORY_BUDGET_PACK = '1'
 }
+if ($Fast) {
+    # Host pipelines: no wait that cannot end in the frame, none while a backlog is queued, extra threads for the
+    # slow ones while nothing is asked
+    $settings.VICTORY_PIPELINE_WAIT_ONCE = '1'; $settings.VICTORY_PIPELINE_WAIT_BACKLOG = '64'
+    $settings.VICTORY_PIPELINE_SLOW_WORKERS = '8'
+    # Textures and staging
+    $settings.VICTORY_TEXTURE_LOOK_ONCE = '1'; $settings.VICTORY_TEXTURE_READ_AHEAD = '1'; $settings.VICTORY_STAGING_NO_ZERO = '1'
+    $settings.VICTORY_SEND_COPIED_FIND = '1'; $settings.VICTORY_FILES_BUFFERED = '1'
+    # Title memory by address (the ray-tracing path)
+    $settings.VICTORY_MEMORY_FRESH = '1'; $settings.VICTORY_MEMORY_ARENAS_AHEAD = '1'; $settings.VICTORY_MEMORY_QUIET = '1'
+    $settings.VICTORY_MEMORY_LAND_SENT = '1'; $settings.VICTORY_MEMORY_ASK_RUNS = '1'; $settings.VICTORY_MEMORY_LEAN = '1'
+    $settings.VICTORY_MEMORY_DIRTY = '1'; $settings.VICTORY_MEMORY_BUFFER_FAULTS = '1'
+    # The submitting thread
+    $settings.VICTORY_REFRESH_PROBE_US = '300'; $settings.VICTORY_DECLARE_ACROSS_LISTS = '1'
+    $settings.VICTORY_REFRESH_PROBE_TEXTURES = '1'
+    # Where its time goes (stats lines only)
+    $settings.VICTORY_REFRESH_SPLIT = '1'; $settings.VICTORY_WAIT_SPLIT = '1'; $settings.VICTORY_DSTORAGE_STATS = '1'
+    # Graphics pipelines from the title's pieces; a stage that does not translate refuses its pipeline,
+    # so the title falls back. Compute from pieces stays off until its layout is right (grey world).
+    $settings.VICTORY_PIPELINE_PIECES = '1'; $settings.VICTORY_PIPELINE_PIECES_REFUSE_UNTRANSLATED = '1'
+    $settings.VICTORY_PIPELINE_PIECES_ONLY = 'graphics'
+    # The submitting thread: refresh sets, refreshes kept across title writes, page parts, sending on its own thread
+    $settings.VICTORY_REFRESH_SET = '1'; $settings.VICTORY_TITLE_WRITE_RANGE = '1'
+    $settings.VICTORY_UNDER_PARTS = '1'; $settings.VICTORY_SEND_THREAD = '1'
+}
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
+    # the runner then also asks for the interface to stay 16:9 in the middle (VICTORY_UI_LETTERBOX)
+    elseif ($Res -eq 'wide') { $settings.VICTORY_NATIVE_1440P = '1'; $settings.VICTORY_DISPLAY_WIDE = '5120x1440' }
 }
 if ($Dlss -ne 'off') {
     # NVIDIA's files: where VICTORY_STREAMLINE_DIR says, else where Get-NVIDIA-DLSS.cmd puts them.
@@ -155,7 +191,7 @@ $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })$(if ($Fast) { ' -Fast' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {

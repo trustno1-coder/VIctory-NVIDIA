@@ -109,8 +109,14 @@ fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
     Some(code)
 }
 
-/// Room for [`clzero_stub`]s near the title's code: where it is and the bytes used.
-static STUBS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
+/// Room for [`clzero_stub`]s near the title's code: where each area is and the bytes used.
+/// A `jmp rel32` reaches 2 GB, and the title's DLLs can lie further than that from its exe
+/// (and from each other), so a loop the areas so far cannot reach gets one of its own near it.
+/// With a single area made near the first loop, a loop out of its reach was quietly left to
+/// the emulation (the clzero test failed about one run in four for it: its pages land anywhere).
+static STUBS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+/// Areas made at most: 16 of 64 KiB, never freed.
+const STUB_AREAS: usize = 16;
 pub(crate) const STUBS_LEN: usize = 64 << 10;
 
 /// Memory for code within reach of a `jmp rel32` at `at`.
@@ -135,20 +141,37 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
         return false;
     };
+    // a jump that would cross 16 aligned bytes, or a loop of a form the stub does not take:
+    // no area helps, so none is made for it
+    if (at & 15) + 5 > 16 || clzero_stub(at, at, [x, y, z]).is_none() {
+        return false;
+    }
     let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
-    if stubs.is_none() {
-        *stubs = near(at).map(|place| (place, 0));
-    }
-    let Some((place, used)) = stubs.as_mut() else {
+    // the stub as it would be at the end of an area: its code and the jump to it, if the area
+    // is in reach and has the room
+    let fits = |&(place, used): &(usize, usize)| {
+        let stub = place + used;
+        let body = clzero_stub(at, stub, [x, y, z])?;
+        let jump = jump(at, stub)?;
+        (used + body.len() <= STUBS_LEN).then_some((body, jump))
+    };
+    let found = match stubs.iter().position(|area| fits(area).is_some()) {
+        Some(i) => Some(i),
+        // none in reach: a new one near this loop
+        None if stubs.len() < STUB_AREAS => near(at).map(|place| {
+            stubs.push((place, 0));
+            stubs.len() - 1
+        }),
+        None => None,
+    };
+    let Some(i) = found else {
         return false;
     };
+    let Some((body, jump)) = fits(&stubs[i]) else {
+        return false;
+    };
+    let (place, used) = &mut stubs[i];
     let stub = *place + *used;
-    let (Some(body), Some(jump)) = (clzero_stub(at, stub, [x, y, z]), jump(at, stub)) else {
-        return false;
-    };
-    if *used + body.len() > STUBS_LEN || (at & 15) + 5 > 16 {
-        return false;
-    }
     // SAFETY: inside the memory made for it, which nothing runs yet; then the title's code.
     unsafe {
         std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());

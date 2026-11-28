@@ -139,7 +139,7 @@ const KEPT: &[&str] = &[
 
 const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
 
-const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
+const RESOLUTIONS: [&str; 5] = ["1440", "1080to1440", "4k", "wide", "ultrawide"];
 const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
 /// The Series S scene heights the F1 menu offers and the DLSS mode of each: the picture
 /// is 1920x1080, the scene that mode's share of it (720: the game's own size, and what
@@ -156,7 +156,10 @@ pub(crate) struct Play {
     #[arg(long)]
     series_s: bool,
     /// 1440: output and scene 2560x1440; 1080to1440: scene 1920x1080
-    /// upscaled by the title; 4k: the stock 3840x2160 output.
+    /// upscaled by the title; 4k: the stock 3840x2160 output; wide: the Series X
+    /// output and scene made for 5120x1440 (32:9), the interface kept 16:9 in the
+    /// middle (VICTORY_DISPLAY_WIDE; another size: --set VICTORY_DISPLAY_WIDE=2560x1080
+    /// with --res 1440); ultrawide: the same at 3440x1440 (21:9).
     #[arg(long, default_value = "1440", value_parser = RESOLUTIONS)]
     res: String,
     /// DLSS in place of the title's upscaling (needs NVIDIA's files).
@@ -325,6 +328,15 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         match res {
             "1440" => set("VICTORY_NATIVE_1440P", "1"),
             "1080to1440" => set("VICTORY_RENDER_1080P", "1"),
+            "wide" => {
+                set("VICTORY_NATIVE_1440P", "1");
+                set("VICTORY_DISPLAY_WIDE", "5120x1440");
+            }
+            // 21:9, made the same way as 32:9
+            "ultrawide" => {
+                set("VICTORY_NATIVE_1440P", "1");
+                set("VICTORY_DISPLAY_WIDE", "3440x1440");
+            }
             _ => {}
         }
     }
@@ -663,6 +675,44 @@ pub(crate) fn load_mfg() {
     match victory_hle::streamline::load_mod("MFG Unlocker (F1, MFG UNLOCKER)", &dll) {
         Ok(()) => println!("MFG Unlocker loaded ({}). Backspace opens its menu.", dll.display()),
         Err(code) => println!("MFG Unlocker did not load (Windows error {code}): running without it."),
+    }
+}
+
+/// Copia +gerenc xbox: F1's NEURAL RENDERING (`VICTORY_NEURAL=1`): NVIDIA's DLSS 5 Neural
+/// Rendering through the OptiScaler DLSS5 mod (github.com/Skynizz/optiscaler-dlss5, GPL-3.0, not
+/// ours; undocumented by NVIDIA), loaded as MFG Unlocker is, before the layer makes its device
+/// or loads Streamline: it then sees the DLSS evaluations Streamline makes and runs the model
+/// after (or before) them, before the interface is drawn. Its folder (`VICTORY_NEURAL_DIR`, else
+/// an `optiscaler-dlss5` folder beside this program or up to five folders above it) holds it as
+/// `winmm.dll` with its `OptiScaler.ini`, the forwarder `nvngx.dll_dlssnr.dll` and NVIDIA's model
+/// `nvngx_dlssnr.dll`. Its own frame generation is off in that ini (`FGInput`/`FGOutput=nofg`):
+/// NVIDIA's, through our Streamline, stays as it is. Insert opens its menu (the DLSS 5 tab).
+pub(crate) fn load_neural() {
+    if std::env::var_os("VICTORY_NEURAL").is_none_or(|v| v != "1") {
+        return;
+    }
+    const DLL: &str = "winmm.dll";
+    let dir = std::env::var_os("VICTORY_NEURAL_DIR").filter(|v| !v.is_empty()).map(PathBuf::from).or_else(|| {
+        let program = std::env::current_exe().ok()?;
+        program.ancestors().skip(1).take(6).map(|d| d.join("optiscaler-dlss5")).find(|d| d.join(DLL).is_file())
+    });
+    let Some(dir) = dir else {
+        eprintln!("NEURAL RENDERING (VICTORY_NEURAL=1): no optiscaler-dlss5 folder beside victory.exe or above it, nor VICTORY_NEURAL_DIR: running without it");
+        return;
+    };
+    let missing: Vec<&str> = [DLL, "OptiScaler.ini", "nvngx.dll_dlssnr.dll", "nvngx_dlssnr.dll"]
+        .into_iter()
+        .filter(|f| !dir.join(f).is_file())
+        .collect();
+    if !missing.is_empty() {
+        eprintln!("NEURAL RENDERING: missing in {}: {}", dir.display(), missing.join(", "));
+        if missing.contains(&DLL) {
+            return;
+        }
+    }
+    match victory_hle::streamline::load_mod("DLSS 5 neural rendering (OptiScaler DLSS5, F1 NEURAL RENDERING)", &dir.join(DLL)) {
+        Ok(()) => eprintln!("DLSS 5 neural rendering loaded ({}). Insert opens its menu.", dir.display()),
+        Err(code) => eprintln!("DLSS 5 neural rendering did not load (Windows error {code}): running without it."),
     }
 }
 
@@ -1194,6 +1244,33 @@ mod tests {
         for k in ["VICTORY_HOME", "VICTORY_ADAPTER", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"] {
             assert!(KEPT.contains(&k), "{k}");
         }
+    }
+
+    #[test]
+    fn the_wide_picture_sets_the_display_size() {
+        let mut o = options();
+        o.res = "wide".to_owned();
+        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        let get = |k: &str| s.get(k).map(String::as_str);
+        assert_eq!((get("VICTORY_NATIVE_1440P"), get("VICTORY_DISPLAY_WIDE")), (Some("1"), Some("5120x1440")));
+        assert_eq!((get("VICTORY_MENU_RES"), get("VICTORY_RENDER_1080P")), (Some("wide"), None));
+        // the Series S profile has no picture size of its own, wide included
+        o.series_s = true;
+        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        assert_eq!((s.get("VICTORY_DISPLAY_WIDE"), s.get("VICTORY_NATIVE_1440P")), (None, None));
+        // the picture the F1 menu saved is accepted too
+        let menu = parse_menu("VICTORY_MENU_RES=wide\r\n");
+        let (s, _) = settings(&options(), &menu, Some(Path::new("x")));
+        assert_eq!(s.get("VICTORY_DISPLAY_WIDE").map(String::as_str), Some("5120x1440"));
+        // and 21:9, from the command line or the menu
+        let mut o = options();
+        o.res = "ultrawide".to_owned();
+        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        let get = |k: &str| s.get(k).map(String::as_str);
+        assert_eq!((get("VICTORY_NATIVE_1440P"), get("VICTORY_DISPLAY_WIDE")), (Some("1"), Some("3440x1440")));
+        let menu = parse_menu("VICTORY_MENU_RES=ultrawide\r\n");
+        let (s, _) = settings(&options(), &menu, Some(Path::new("x")));
+        assert_eq!(s.get("VICTORY_DISPLAY_WIDE").map(String::as_str), Some("3440x1440"));
     }
 
     #[test]

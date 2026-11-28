@@ -232,7 +232,11 @@ const _: () = assert!(size_of::<Mode>() == 32);
 /// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
 /// shortcut: not yet the host display's own size by default; make it so
 /// once a title is seen to render for the mode it is given.
-fn display_size() -> (u32, u32) {
+/// draw.rs asks for this size too, because the frontend composite is placed
+/// against the output. the runner sets VICTORY_DISPLAY_MODE before anything
+/// reads it, so the answer is the patched output: 2560x1440, or the wide
+/// size VICTORY_DISPLAY_WIDE asked for.
+pub(crate) fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
