@@ -263,6 +263,12 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                         });
                     }
                 }
+                out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
+                    shadow: None,
+                    from,
+                    to,
+                    copy: false,
+                }));
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
             Late::Write(at, _, bytes) => out.push(Writer {
@@ -1317,6 +1323,42 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    /// A flight's `texture_back_ranges` reach title memory only when `texback::land`
+    /// runs at landing: `writers` records `Writer { shadow: None }` for them so
+    /// `holder` refuses to serve stale `Shadow` bytes over `[from, to)`.
+    #[test]
+    fn flight_texture_back_ranges_refuse_stale_shadow_holder() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const LEN: usize = 64 << 10;
+        // SAFETY: private committed test pages kept alive for the registered Shadow.
+        let start = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(start, 0);
+        crate::shadow::register(start, start as u64, LEN as u64);
+        let shadow = crate::shadow::find(start as u64, 64).expect("registered shadow");
+        // Without an in-flight texture readback, the registered Shadow holds `[start + 256, start + 320)`.
+        assert!(holder(&[], start + 256, start + 320).is_ok());
+
+        let items = [Late::Run(Flight {
+            number: 1,
+            fence: 1,
+            lists: Vec::new(),
+            order: Vec::new(),
+            card: None,
+            back: vec![(shadow.clone(), vec![(start, start + 4096)])],
+            own: None,
+            texture_back_ranges: vec![(start + 256, start + 512)],
+        })];
+        let active = writers(&items);
+        assert!(
+            active.iter().any(|w| w.shadow.is_none() && (w.from, w.to) == (start + 256, start + 512) && !w.copy),
+            "writers must record Writer {{ shadow: None }} for flight.texture_back_ranges"
+        );
+        // Overlapping the pending texture readback refuses the stale Shadow copy.
+        assert_eq!(holder(&active, start + 300, start + 364).err(), Some("a read-back or a value behind a flight is written there"));
+        // Non-overlapping bytes in the same Shadow remain accessible.
+        assert!(holder(&active, start + 1024, start + 1088).is_ok());
     }
 
     /// Reads are all before writes, between two buffers and within one, and
