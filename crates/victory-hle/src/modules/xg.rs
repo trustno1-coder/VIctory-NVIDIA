@@ -219,17 +219,6 @@ const _: () = assert!(size_of::<MipOut>() == 0x70);
 const _: () = assert!(size_of::<PlaneOut>() == 0x6c8);
 const _: () = assert!(size_of::<LayoutOut>() == 0x1b40);
 
-/// The mode a tail mip is reported in: the 256-byte one of its kind (3 for
-/// the render kind, which GFX10 lacks), the depth mode itself.
-fn tail_swizzle(swizzle: Swizzle) -> u32 {
-    match swizzle.0 {
-        2 | 6 | 10 | 18 | 22 | 26 => Swizzle::SW_256B_D.0,
-        23 | 27 => 3,
-        24 => swizzle.0,
-        _ => Swizzle::SW_256B_S.0,
-    }
-}
-
 fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
     let m = &l.mips[i];
     let bpe = u64::from(l.desc.element_bytes);
@@ -245,6 +234,9 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
         depth_or_array: if three_d { m.depth } else { array },
         samples: l.desc.samples,
         slice_depth: l.block[2],
+        // Tail mips too: the tail sits inside one block of the surface's
+        // own mode, and `Layout::offset` addresses it with that pattern.
+        swizzle: l.desc.swizzle.0,
         ..MipOut::default()
     };
     let slice = u64::from(m.pitch) * u64::from(m.rows) * bpe;
@@ -255,12 +247,10 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
             out.slice_size = slice * u64::from(l.desc.samples);
             out.size = out.slice_size * depth;
             out.alignment = l.alignment as u32;
-            out.swizzle = l.desc.swizzle.0;
         }
         Some(t) => {
             out.in_tail = 1;
             out.alignment = 256;
-            out.swizzle = tail_swizzle(l.desc.swizzle);
             if l.thick {
                 // A 3D tail mip is placed by position, not by offset.
                 out.slice_size = l.alignment / u64::from(l.block[2]);
@@ -688,6 +678,8 @@ mod tests {
         assert_eq!((p.standard_mips, p.tail_mips, p.element_bytes), (1, 8, 16));
         assert_eq!((p.mips[0].offset, p.mips[0].pitch_bytes), (65536, 1024));
         assert_eq!((p.mips[1].offset, p.mips[1].in_tail), (32768, 1));
+        // Every mip, in the tail or not, reports the surface's mode.
+        assert!(p.mips[..9].iter().all(|m| m.swizzle == 10));
 
         type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
         type From =
