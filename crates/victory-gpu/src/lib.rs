@@ -43,6 +43,8 @@ mod book;
 #[cfg(windows)]
 mod heap_marks;
 #[cfg(windows)]
+mod heap_worker;
+#[cfg(windows)]
 mod host;
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
