@@ -103,6 +103,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("an event asked for", this as usize, value);
+    #[cfg(windows)]
+    crate::queue::title_waits(this, value);
     if event.is_null() {
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are

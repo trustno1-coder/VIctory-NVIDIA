@@ -454,6 +454,15 @@ pub(crate) fn line_on() -> bool {
     behind::on()
 }
 
+/// A thread of the title's waits for `fence` to reach `value`: what holds
+/// its signal back in the line may have to go ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn title_waits(fence: This, value: u64) {
+    if behind::on() {
+        behind::urge(fence, value);
+    }
+}
+
 /// Lists in the line may have been translated ([`crate::list::thin`]).
 #[cfg(windows)]
 pub(crate) fn line_moved() {

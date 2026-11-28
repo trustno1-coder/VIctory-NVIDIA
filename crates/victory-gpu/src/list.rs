@@ -2150,6 +2150,18 @@ impl ValueWait {
         (self.address as usize, if self.wide { 8 } else { 4 })
     }
 
+    /// The value waited for.
+    pub(crate) fn reference(&self) -> u64 {
+        self.reference
+    }
+
+    /// What its address holds now (None: not readable).
+    pub(crate) fn current(&self) -> Option<u64> {
+        let mut raw = [0u8; 8];
+        let bytes = if self.wide { 8 } else { 4 };
+        crate::host::read_into(self.address as *const u8, &mut raw[..bytes]).then(|| u64::from_le_bytes(raw))
+    }
+
     /// Whether the wait is met with `value` at its address (its low half
     /// for a 32-bit wait).
     pub(crate) fn holds_for(&self, value: u64) -> bool {
