@@ -31,6 +31,10 @@ windows-sys = { workspace = true, features = [
 [dev-dependencies]
 tempfile.workspace = true
 
+# The publish benchmark's peak memory (`publish::tests::bench_publish_step`).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
 [features]
 # Debugging switches (scheduled stack dumps and the like).
 diagnostics = []
