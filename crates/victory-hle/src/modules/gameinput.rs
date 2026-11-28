@@ -204,20 +204,21 @@ fn merged(a: PadState, b: PadState) -> PadState {
     }
 }
 
-/// The mouse as the stand-in pad's right stick (the camera) and triggers:
-/// the title takes mouse readings and turns no camera with them, while the
-/// stand-in pad's right stick (I/J/K/L) does. On whenever the mouse is
-/// captured (`VICTORY_MOUSE_CAPTURE=1`); `VICTORY_MOUSE_STICK=0` leaves the
-/// pad alone, another number is the sensitivity (1 by default).
+/// The mouse as the stand-in pad's right stick (the camera) and triggers,
+/// asked for with `VICTORY_MOUSE_STICK` (`1`, or another number as the
+/// sensitivity; F1 menu) beside `VICTORY_MOUSE_CAPTURE=1`: on the PC this
+/// was written for the title took the mouse device's readings and turned no
+/// camera with them, while the stand-in pad's right stick (I/J/K/L) did.
+/// Left unset, the pad is as before. With `VICTORY_ONE_PAD=0` the stand-in
+/// pad, and so the mouse's stick, is there only while no pad is connected.
 fn mouse_stick() -> Option<f32> {
-    mouse_stick_from(std::env::var("VICTORY_MOUSE_STICK").ok().as_deref())
+    static STICK: LazyLock<Option<f32>> =
+        LazyLock::new(|| mouse_stick_from(std::env::var("VICTORY_MOUSE_STICK").ok().as_deref()));
+    *STICK
 }
 
 fn mouse_stick_from(value: Option<&str>) -> Option<f32> {
-    match value.map(str::trim) {
-        None | Some("") => Some(1.0),
-        Some(v) => v.parse::<f32>().ok().filter(|s| s.is_finite() && *s > 0.0),
-    }
+    value?.trim().parse::<f32>().ok().filter(|s| s.is_finite() && *s > 0.0)
 }
 
 /// Whether the pointer goes back to the window's centre after every sample:
@@ -232,57 +233,65 @@ pub(super) fn mouse_warp() -> bool {
     }
 }
 
-/// Mouse counts in one poll that push the stick all the way, at sensitivity 1.
-const LOOK_FULL: f32 = 24.0;
-/// How much of a poll's motion the stick takes up at once; the rest follows
-/// in the next polls. The title reads the pad once a frame, several polls
-/// apart, and a mouse reports in bursts.
-const LOOK_FOLLOW: f32 = 0.5;
-/// Below this the stick is at rest.
-const LOOK_REST: f32 = 0.02;
+/// Mouse counts a second that hold the stick all the way, at sensitivity 1.
+const LOOK_FULL: f32 = 3000.0;
+/// The motion kept at most, as seconds of the stick all the way: what a
+/// fast mouse brings beyond it is dropped, so the camera stops soon after
+/// the hand does.
+const LOOK_KEPT: f32 = 0.024;
+/// The stick lets go at least this fast, as a part of all the way, so that
+/// the last of the motion is gone within a few polls.
+const LOOK_LET_GO: f32 = 0.25;
 /// Where the stick starts once it moves: under a title's dead zone a slow
 /// mouse would turn nothing.
 const LOOK_DEAD_ZONE: f32 = 0.2;
 
 /// Mouse motion and buttons as a pad: the right stick, the left button as
-/// the right trigger and the right button as the left trigger.
+/// the right trigger and the right button as the left trigger. Motion is
+/// kept as counts still to be turned: each poll the stick stands where the
+/// kept counts put it and takes away what that turn is worth, so a count
+/// turns the same whichever poll the title reads.
 #[derive(Default)]
 struct Look {
-    /// The cumulative position of the last poll.
-    last: Option<(i64, i64)>,
-    x: f32,
-    y: f32,
+    /// The cumulative position and the time (microseconds) of the last poll.
+    last: Option<((i64, i64), u64)>,
+    /// Counts, times the sensitivity, not turned yet.
+    kept: (f32, f32),
 }
 
 impl Look {
-    fn pad(&mut self, mouse: Option<MouseState>, sensitivity: Option<f32>) -> PadState {
+    fn pad(&mut self, mouse: Option<MouseState>, sensitivity: Option<f32>, now: u64) -> PadState {
         let (Some(mouse), Some(sensitivity)) = (mouse, sensitivity) else {
             *self = Look::default();
             return PadState::default();
         };
         let here = (mouse.position_x, mouse.position_y);
-        let (dx, dy) = self.last.map_or((0, 0), |(x, y)| (here.0 - x, here.1 - y));
-        self.last = Some(here);
-        let aim = |d: i64| (d as f32 * sensitivity / LOOK_FULL).clamp(-1.0, 1.0);
-        self.x += (aim(dx) - self.x) * LOOK_FOLLOW;
-        self.y += (aim(dy) - self.y) * LOOK_FOLLOW;
-        let length = self.x.hypot(self.y);
-        let (right_x, right_y) = if length < LOOK_REST {
-            (self.x, self.y) = (0.0, 0.0);
-            (0.0, 0.0)
-        } else {
-            let pushed = LOOK_DEAD_ZONE + (1.0 - LOOK_DEAD_ZONE) * length.min(1.0);
-            // The pointer's y grows downwards, the stick's upwards.
-            (self.x / length * pushed, -self.y / length * pushed)
-        };
-        let held = |bit: u32| if mouse.buttons & bit != 0 { 1.0 } else { 0.0 };
-        PadState {
-            right_trigger: held(1),
-            left_trigger: held(2),
-            right_x,
-            right_y,
-            ..Default::default()
+        let ((dx, dy), seconds) = self.last.map_or(((0, 0), 0.008), |((x, y), then)| {
+            let seconds = now.saturating_sub(then) as f32 / 1e6;
+            ((here.0 - x, here.1 - y), seconds.clamp(0.004, 0.05))
+        });
+        self.last = Some((here, now));
+        let most = LOOK_FULL * LOOK_KEPT;
+        let (mut x, mut y) = (self.kept.0 + dx as f32 * sensitivity, self.kept.1 + dy as f32 * sensitivity);
+        let length = x.hypot(y);
+        if length > most {
+            (x, y) = (x / length * most, y / length * most);
         }
+        let length = length.min(most);
+        let held = |bit: u32| if mouse.buttons & bit != 0 { 1.0 } else { 0.0 };
+        let mut pad = PadState { right_trigger: held(1), left_trigger: held(2), ..Default::default() };
+        if length < 0.05 {
+            self.kept = (0.0, 0.0);
+            return pad;
+        }
+        let stick = length / most;
+        let pushed = LOOK_DEAD_ZONE + (1.0 - LOOK_DEAD_ZONE) * stick;
+        // The pointer's y grows downwards, the stick's upwards.
+        (pad.right_x, pad.right_y) = (x / length * pushed, -y / length * pushed);
+        let turned = (stick.max(LOOK_LET_GO) * LOOK_FULL * seconds).min(length);
+        let left = (length - turned) / length;
+        self.kept = (x * left, y * left);
+        pad
     }
 }
 
@@ -631,7 +640,7 @@ impl State {
         let mut events = std::mem::take(&mut self.pending);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
         // The keyboard's pad, and the mouse's right stick and triggers with it.
-        let stand_in = merged(fallback(&keys), self.look.pad(mouse, mouse_stick));
+        let stand_in = merged(fallback(&keys), self.look.pad(mouse, mouse_stick, now));
         if one_pad {
             let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
@@ -1827,28 +1836,22 @@ mod tests {
             let p = pad(hub);
             assert!(p.right_x > LOOK_DEAD_ZONE / 2.0 && p.right_y > 0.0 && p.right_x <= 1.0, "{p:?}");
             assert_eq!((p.right_trigger, p.left_trigger, p.left_x, p.left_y), (1.0, 0.0, 0.0, 0.0));
-            // A fast mouse pushes the stick no further than all the way.
-            for step in 1..=8 {
-                at(512 + step * 400, 494, 2);
-            }
+            // The keyboard's stick and the mouse's are one pad.
+            host.lock().unwrap().keys = vec![key(b'D')];
+            at(912, 494, 2);
             let p = pad(hub);
-            assert!((p.right_x - 1.0).abs() < 0.02 && p.right_y.abs() < 0.05, "{p:?}");
-            assert_eq!((p.right_trigger, p.left_trigger), (0.0, 1.0));
+            assert!((p.right_x - 1.0).abs() < 0.01 && p.right_y.abs() < 0.1, "{p:?}");
+            assert_eq!((p.left_x, p.right_trigger, p.left_trigger), (1.0, 0.0, 1.0));
+            host.lock().unwrap().keys.clear();
             // The mouse at rest: the stick comes back to rest, and stays.
-            for _ in 0..12 {
-                at(3712, 494, 0);
+            for _ in 0..40 {
+                at(912, 494, 0);
             }
             assert_eq!(pad(hub), PadState::default());
-            // The keyboard's stick and the mouse's are one pad.
-            host.lock().unwrap().keys = vec![key(b'D'), key(b'J')];
-            at(3712, 494, 0);
-            let p = pad(hub);
-            assert_eq!((p.left_x, p.right_x), (1.0, -1.0));
-            host.lock().unwrap().keys.clear();
             // The capture gone (focus lost): the stick lets go at once, and
             // the way the pointer went meanwhile turns nothing afterwards.
-            at(3736, 494, 1);
-            assert!(pad(hub).right_x > 0.0);
+            at(1312, 494, 1);
+            assert!(pad(hub).right_x > 0.9);
             host.lock().unwrap().mouse = None;
             hub.poll();
             assert_eq!(pad(hub), PadState::default());
@@ -1858,8 +1861,8 @@ mod tests {
     }
 
     #[test]
-    fn the_mouse_leaves_the_pad_alone_when_told_to() {
-        let (hub, host) = fake_looking(true, None);
+    fn the_mouse_leaves_the_pad_alone_unless_asked() {
+        let (hub, host) = fake_with(true);
         for x in [0, 300, 600] {
             host.lock().unwrap().mouse = Some(MouseState { position_x: x, buttons: 3, ..Default::default() });
             hub.poll();
@@ -1870,13 +1873,65 @@ mod tests {
     }
 
     #[test]
-    fn the_mouse_stick_switch_is_on_unless_zero_and_takes_a_sensitivity() {
-        assert_eq!(mouse_stick_from(None), Some(1.0));
-        assert_eq!(mouse_stick_from(Some("")), Some(1.0));
+    fn the_mouse_stick_is_asked_for_with_one_or_a_sensitivity() {
+        assert_eq!(mouse_stick_from(None), None);
+        assert_eq!(mouse_stick_from(Some("")), None);
         assert_eq!(mouse_stick_from(Some("0")), None);
-        assert_eq!(mouse_stick_from(Some("2.5")), Some(2.5));
+        assert_eq!(mouse_stick_from(Some("1")), Some(1.0));
+        assert_eq!(mouse_stick_from(Some(" 2.5 ")), Some(2.5));
         assert_eq!(mouse_stick_from(Some("-1")), None);
         assert_eq!(mouse_stick_from(Some("fast")), None);
+    }
+
+    /// A poll every 8 ms: the mouse at `x`, `y` (cumulative) at each.
+    fn looked(look: &mut Look, sensitivity: f32, poll: u64, x: i64, y: i64) -> PadState {
+        let mouse = MouseState { position_x: x, position_y: y, ..Default::default() };
+        look.pad(Some(mouse), Some(sensitivity), poll * 8000)
+    }
+
+    #[test]
+    fn a_steady_mouse_holds_the_stick_by_its_speed() {
+        // 12 counts a poll are 1500 a second, half of all the way: the
+        // stick settles half way between the dead zone and the rim.
+        let mut look = Look::default();
+        let mut pad = PadState::default();
+        for poll in 0..60 {
+            pad = looked(&mut look, 1.0, poll, 12 * poll as i64, 0);
+        }
+        let half = LOOK_DEAD_ZONE + (1.0 - LOOK_DEAD_ZONE) * 0.5;
+        assert!((pad.right_x - half).abs() < 0.02 && pad.right_y == 0.0, "{pad:?}");
+        // Twice the sensitivity, half the speed: the same.
+        let mut look = Look::default();
+        for poll in 0..60 {
+            pad = looked(&mut look, 2.0, poll, 6 * poll as i64, 0);
+        }
+        assert!((pad.right_x - half).abs() < 0.02, "{pad:?}");
+    }
+
+    #[test]
+    fn a_slow_mouse_still_moves_the_stick_and_a_stopped_one_lets_it_go() {
+        // One count a poll at half the sensitivity: past the dead zone
+        // every time, down as the pointer goes down.
+        let mut look = Look::default();
+        looked(&mut look, 0.5, 0, 0, 0);
+        for poll in 1..20 {
+            let pad = looked(&mut look, 0.5, poll, 0, poll as i64);
+            assert!(pad.right_y <= -LOOK_DEAD_ZONE && pad.right_y > -0.3 && pad.right_x == 0.0, "{pad:?}");
+        }
+        // Stopped: at rest by the next poll.
+        looked(&mut look, 0.5, 20, 0, 19);
+        assert_eq!(looked(&mut look, 0.5, 21, 0, 19), PadState::default());
+        // A flick far beyond all the way: at rest again within 80 ms.
+        looked(&mut look, 1.0, 22, 5000, 19);
+        let mut pad = PadState::default();
+        for poll in 23..33 {
+            pad = looked(&mut look, 1.0, poll, 5000, 19);
+        }
+        assert_eq!(pad, PadState::default());
+        // There and back in two polls cancels, with nothing that is not a number.
+        looked(&mut look, 1.0, 40, 5010, 19);
+        let pad = looked(&mut look, 1.0, 41, 5000, 19);
+        assert!(pad.right_x.is_finite() && pad.right_x.abs() <= 1.0, "{pad:?}");
     }
 
     #[test]

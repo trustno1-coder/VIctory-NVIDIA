@@ -100,13 +100,13 @@
   it): DLSS, frame generation, frame rate cap and more.
 - **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
   memory numbers).
-- **Mouse**: F1 menu, MOUSE CAPTURE: ON, then start again. The pointer is
-  hidden and kept in the window, the mouse turns the camera (it moves the
-  right stick of the keyboard's stand-in pad, as I/J/K/L do), the left button
-  is the right trigger and the right button the left trigger. MOUSE TURNS
-  THE CAMERA in the same menu makes it slower or faster, or switches it off
-  (`VICTORY_MOUSE_STICK`: `0` off, another number the sensitivity). The
-  game's own menus still take the keyboard or a pad, not clicks.
+- **Mouse**: F1 menu, MOUSE CAPTURE: ON and MOUSE TURNS THE CAMERA: ON, then
+  start again. The pointer is hidden and kept in the window's centre, the
+  mouse turns the camera (it moves the right stick of the keyboard's stand-in
+  pad, as I/J/K/L do), the left button is the right trigger and the right
+  button the left trigger. ON, SLOW and ON, FAST change the speed
+  (`VICTORY_MOUSE_STICK`: any number is the sensitivity). The game's own
+  menus still take the keyboard or a pad, not clicks.
 
 **Building it yourself instead**
 
