@@ -2312,24 +2312,51 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
-    if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
-    {
-        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-        ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+/// A scratch chunk of `size` bytes or more: one kept ([`SPARE`]) or a new
+/// one; and its size.
+///
+/// A small first chunk ([`SCRATCH_FIRST`]) asked for while none of them is
+/// kept is a kept 4 MiB one. Without that, on an RTX 5080 (Jason's balcony,
+/// Series S) the spares sat at their bound the whole time, all of them
+/// 4 MiB ones, while some 35 small first chunks a frame were made new and
+/// as many came back past the bound and were freed (about 1 ms each, a
+/// committed upload buffer).
+fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
+    if scratch_pool() {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((chunk, size)) = take_kept(&mut spare, size, scratch_any_size()) {
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some((chunk, size));
+        }
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some(Chunk {
+    let chunk = Chunk {
         buffer,
         data: data as usize,
+    };
+    Some((chunk, size))
+}
+
+/// A kept chunk for a list that asks for `size` bytes, and its size: one of
+/// that size, else, for a small first chunk with `any`, a kept 4 MiB one.
+fn take_kept<T>(spare: &mut Spare<T>, size: u64, any: bool) -> Option<(T, u64)> {
+    spare.take(size).map(|c| (c, size)).or_else(|| {
+        (any && size == SCRATCH_FIRST)
+            .then(|| spare.take(SCRATCH_CHUNK).map(|c| (c, SCRATCH_CHUNK)))
+            .flatten()
     })
+}
+
+/// Whether a list's small first chunk may be a kept 4 MiB one
+/// (`VICTORY_SCRATCH_ANY_SIZE`, on; `=0`: only one of its own size).
+fn scratch_any_size() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_ANY_SIZE").is_none_or(|v| v != "0"))
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
@@ -7744,7 +7771,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -8090,7 +8117,7 @@ impl HostList {
         read: (usize, usize),
         fill: impl Fn(usize) + Send + 'static,
     ) -> Option<ID3D12Resource> {
-        let chunk = take_chunk(host()?, size)?;
+        let (chunk, size) = take_chunk(host()?, size)?;
         let source = chunk.buffer.clone();
         let destination = chunk.data;
         let mut deferred = self.deferred();
@@ -11355,6 +11382,26 @@ mod spare {
         assert_eq!(gone.iter().map(|g| g.0).collect::<Vec<_>>(), vec![1, 2], "the oldest go");
         assert_eq!(spare.bytes, 4);
         assert_eq!(spare.take(4), Some(3));
+    }
+
+    /// A list's small first chunk takes a kept 4 MiB one when none of its own
+    /// size is kept (`VICTORY_SCRATCH_ANY_SIZE`), and says so by its size; a
+    /// kept small one comes first, and other sizes take only their own.
+    #[test]
+    fn a_small_first_chunk_takes_a_kept_4_mib_one() {
+        use super::{SCRATCH_CHUNK, SCRATCH_FIRST, take_kept};
+        let mut spare: Spare<u32> = Spare::new();
+        assert_eq!(spare.give(1, SCRATCH_CHUNK, u64::MAX), None);
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, false), None, "switched off: its own size only");
+        assert_eq!(take_kept(&mut spare, 8 << 20, true), None, "only the small first chunk");
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, true), Some((1, SCRATCH_CHUNK)));
+        assert_eq!(spare.bytes, 0);
+        // A kept small one is taken before a 4 MiB one.
+        assert_eq!(spare.give(2, SCRATCH_CHUNK, u64::MAX), None);
+        assert_eq!(spare.give(3, SCRATCH_FIRST, u64::MAX), None);
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, true), Some((3, SCRATCH_FIRST)));
+        assert_eq!(take_kept(&mut spare, SCRATCH_CHUNK, true), Some((2, SCRATCH_CHUNK)));
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, true), None);
     }
 }
 
