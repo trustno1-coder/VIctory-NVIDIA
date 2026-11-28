@@ -49,7 +49,13 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
     CHECKING.store(true, Relaxed);
     if !FG_READY.load(Acquire) { return Err("FG device not ready".into()); }
     if combined && !DLSS_READY.load(Acquire) { return Err("combined SR device not ready".into()); }
-    if combined { lines.push("Combined SR -> FP16 HUD-less colour -> RGBA8 composition -> FG; static reference; first/final SR readback, no generated-image oracle".into()); }
+    let split = combined && super::combined::split_token();
+    if combined {
+        lines.push("Combined SR -> FP16 HUD-less colour -> RGBA8 composition -> FG; static reference; first/final SR readback, no generated-image oracle".into());
+        lines.push(format!("Combined frame token: {}; SR submission: {}",
+            if split { "split SR/FG counters (VICTORY_CHECK_SPLIT_TOKEN=1)" } else { "one index per frame shared by SR constants, FG constants and present markers" },
+            if super::combined::asynchronous() { "unwaited, ordered on the direct queue (VICTORY_CHECK_SR_ASYNC=1)" } else { "waited (default)" }));
+    }
     let get_state = FUNCTIONS.get().and_then(|f| f.dlssg_get_state).ok_or("no FG state query")?;
     let mut caps = abi::DlssgState::default();
     // SAFETY: initialized SDK, live device, valid output. Before any presents; does not drain live counts.
@@ -103,14 +109,23 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
         let mut next = Instant::now();
         let mut last_start: Option<Instant> = None;
         let (mut adv, mut pres, mut settle, mut interval) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // Per measured present: (round, advance, present, settle) ms. Per interval
+        // between measured starts: (ms, row of the present it spans, its sleep's lateness ms).
+        let mut rows: Vec<(u32, f64, f64, f64)> = Vec::new();
+        // (The first interval spans the last warm-up present: no row.)
+        let mut gaps: Vec<(f64, Option<usize>, f64)> = Vec::new();
+        let mut oversleep = 0.0f64;
+        let mut vram_peak = 0u64;
         while measuring_from.is_none_or(|m| round - m < wanted) {
             frame += 1;
+            // One frame-token index per frame for SR, FG and the present markers.
+            let token = (!split).then_some(frame);
             let start = Instant::now();
-            if let Some(s) = &mut sr { s.advance(host, round)?; }
+            if let Some(s) = &mut sr { s.advance(host, round, token)?; }
             if let Some(f) = &fixture { f.advance(host, round % PERIOD)?; }
             let advanced = Instant::now();
             if let Some(s) = &sr {
-                *lock(&SUBMITTED) = Some(Noted { id:NEXT_ID.fetch_add(1,Relaxed)+1,
+                *lock(&SUBMITTED) = Some(Noted { id:token.unwrap_or_else(||NEXT_ID.fetch_add(1,Relaxed)+1),
                     depth:Source::Fixed(s.depth.clone(),SHADER_READ),
                     motion:Source::Fixed(s.motion.clone(),SHADER_READ),camera:s.camera,frame_ms:16.7 });
                 host.present_planes(&s.out, SHADER_READ, Some((&s.overlay, SHADER_READ)), frame)
@@ -137,7 +152,9 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
                 deltas.push(now_shown-last_shown);
                 let ms=|a:Instant,b:Instant|(b-a).as_secs_f64()*1000.0;
                 adv.push(ms(start,advanced)); pres.push(ms(advanced,presented)); settle.push(ms(presented,settled));
-                if let Some(p)=last_start { interval.push(ms(p,start)); }
+                if let Some(p)=last_start { interval.push(ms(p,start)); gaps.push((ms(p,start),rows.len().checked_sub(1),oversleep)); }
+                rows.push((round,ms(start,advanced),ms(advanced,presented),ms(presented,settled)));
+                if let Some(g)=host.video_memory_groups() { vram_peak=vram_peak.max(g[0][1]); }
                 shown+=now_shown-last_shown; on+=now_on-last_on; status|=FG_STATUS.load(Relaxed); times.push(start.elapsed().as_secs_f64()*1000.0);
             } else {
                 let in_front = in_front || host.focus_present_window()==Some(true);
@@ -157,10 +174,11 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
             unsafe { host.device.GetDeviceRemovedReason() }.map_err(err)?;
             if measuring_from.is_some() { last_start=Some(start); }
             next += period;
-            match next.checked_duration_since(Instant::now()) {
-                Some(wait) => std::thread::sleep(wait),
-                None => next = Instant::now(),
-            }
+            // How late the sleep woke (timer granularity), kept for the next present's row.
+            oversleep = match next.checked_duration_since(Instant::now()) {
+                Some(wait) => { std::thread::sleep(wait); Instant::now().saturating_duration_since(next).as_secs_f64()*1000.0 }
+                None => { next = Instant::now(); 0.0 }
+            };
             round += 1;
         }
         let warm = measuring_from.unwrap_or(0);
@@ -173,8 +191,16 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
         let at=|v:&[f64],p:f64|v.get(((v.len() as f64*p).ceil() as usize).saturating_sub(1)).copied().unwrap_or(f64::NAN);
         let pct=|p:f64|at(&times,p);
         lines.push(format!("Phase {name}: size={output:?} requested={mode}x presents={round} warmup={warm} measured={measured} enabled={on} SDK_shown={shown} status={status:#x} focused={focused} pause={} proxy={} PASS={}; synchronized_host_ms p50={:.3} p95={:.3}; memory_before={before:?} memory_after={:?}; dxgi_present_delta={:?} dxgi_stats_delta={:?}; split_ms p50 advance={:.3} present={:.3} settle={:.3}; present_ms p95={:.3}; interval_ms p50={:.3} p95={:.3} max={:.3}",verdict.as_deref().unwrap_or("-"),SWAP_CHAIN_PROXIED.load(Relaxed),verdict.is_ok(),pct(0.5),pct(0.95),host.video_memory(),native.0,native.1,at(&adv,0.5),at(&pres,0.5),at(&settle,0.5),at(&pres,0.95),at(&interval,0.5),at(&interval,0.95),interval.last().copied().unwrap_or(f64::NAN)));
+        gaps.sort_by(|a,b| b.0.total_cmp(&a.0));
+        let slow: Vec<String> = gaps.iter().take(5).map(|&(g,i,late)| match i.and_then(|i| rows.get(i).map(|r| (i, *r))) {
+            Some((i,(r,a,p,s))) => format!("{g:.3}@r{r}(advance={a:.3} present={p:.3} settle={s:.3} sleep_late={late:.3} shown={})", deltas.get(i).copied().unwrap_or(0)),
+            None => format!("{g:.3}@warmup-end(sleep_late={late:.3})"),
+        }).collect();
+        let mem = super::combined::process_memory();
+        lines.push(format!("Phase {name} diagnostics: slowest_intervals_ms {}; vram_local_usage_peak_sampled={vram_peak}; process_private={:?} peak_private={:?} peak_working_set={:?} (bytes; peaks are process-lifetime)",
+            slow.join(" "), mem.map(|m| m.0), mem.map(|m| m.1), mem.map(|m| m.2)));
         if let Err(e)=verdict { failed.push(format!("{name}: {e}")); }
-        if let Some(s) = &sr { lines.push(s.check(host)?); }
+        if let Some(s) = &sr { s.wait(); lines.push(s.check(host)?); }
         // Disable and drop SDK references before the fixture's resources are released.
         resizing();
         *lock(&SUBMITTED)=None;

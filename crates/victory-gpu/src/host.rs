@@ -5614,6 +5614,29 @@ impl Host {
         let _ = self.submit(&[list], &[], false);
     }
 
+    /// Probe only (`upscaler-check --combined`, `VICTORY_CHECK_SR_ASYNC=1`):
+    /// a closed list of raw barriers and SDK calls goes to the direct queue
+    /// behind everything sent before it and is not waited for; `fence` is
+    /// signalled with `value` once it has run. No host state tracking or
+    /// settling applies: the caller keeps the list's resources alive and
+    /// waits for `value` before resetting the list or releasing them. Later
+    /// work on the same queue (the compositor's present) runs after it.
+    pub(crate) fn execute_unwaited(&self, list: &HostList, fence: &ID3D12Fence, value: u64) -> windows::core::Result<()> {
+        // One sender at a time, as for every other submission to this queue.
+        let _order = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a closed list on our queue; the caller keeps it and what it names alive until `value`.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[Some(list.list.cast()?)]);
+            // Execution has already been submitted. Returning an error here
+            // would let the caller release resources without a completion
+            // marker. Use the host's fatal GPU path; do not unwind teardown.
+            if let Err(e) = self.queue.Signal(fence, value) {
+                fail(format_args!("combined SR: queue Signal({value}) failed after submission: {e}"));
+            }
+            Ok(())
+        }
+    }
+
     /// A queue's submission with [`late`]: the host lists `lists`, taken
     /// from the title's, go to the card in `order` and are not waited for.
     /// They join the line of flights and are settled, with the others in

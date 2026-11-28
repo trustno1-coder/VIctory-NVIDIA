@@ -4,6 +4,8 @@ Run `upscaler-check --validate-framegen --combined --output 1920x1080 --frames 1
 
 Each frame evaluates SR at the SDK optimal render extent. The FP16 output feeds both HUD-less FG and the existing two-plane compositor with transparent UI, producing the RGBA8 swapchain input. Depth 0.5, zero motion and stationary split colours are initialized. History resets at phase start. First/final SR readbacks check all RGB pixels for finite/range validity and compare outer-quarter means with references. `VICTORY_CHECK_SKIP_EVALUATE=1` must fail on poisoned output. FG focus/count/DXGI acceptance is inherited from PR #527 (head 111c14ee32b0ab2165b99f78a06aeef4a0264597).
 
+Each frame uses one frame-token index for the SR constants, the FG constants and the present markers (`VICTORY_CHECK_SPLIT_TOKEN=1` restores the earlier separate SR counter, for A/B only). SR is waited for by default, as every default-mode host submission is; `VICTORY_CHECK_SR_ASYNC=1` sends it unwaited on the direct queue, ordered before the compositor's present and fenced before its list is reset or its textures released. Each phase also logs its five slowest measured intervals with the advance/present/settle split, sleep lateness and SDK frames shown, the sampled local-VRAM usage peak, and the process private commit, peak private commit and peak working set (process-lifetime peaks).
+
 Readback reserves packed output storage before mapping and restores the actual entry resource state in the copy submission. Combined readback uses one synchronized submission instead of three. The SR-only wrapper retains its UAV entry state. Boundary logs distinguish readback and CPU inspection from measured presents.
 
 ## Validation
@@ -15,3 +17,9 @@ The 1 Hz sampled end-stage private-memory increment drops from 46.78 MiB to 31.6
 ## Limits
 
 Static synthetic output does not establish generated-image quality, per-frame pixel correctness, physical scanout or leak freedom. Errors fail strictly; graceful fallback and device-loss recovery are not implemented. Repeat runs use fresh processes, not same-process SDK reinitialization. Lifecycle fixture replacement disables FG between phases and does not establish uninterrupted production toggling. Fullscreen, multi-minute stress, full-workspace/all-features suites and the 18000-frame maximum were not tested. Public contribution transplantation is checked separately from the tested local integration; it is not a new hardware run.
+
+## Follow-up integration
+
+SR and FG now share a frame-token index. `VICTORY_CHECK_SR_ASYNC=1` opts into submitting SR without an immediate CPU wait; the default remains synchronous. The fixture waits on its own fence before reusing its command allocator or destroying resources. A Signal failure after submission, a failed fence wait, or device removal uses the existing fatal GPU failure path. These failures are not graceful fallback or recovery: continuing teardown without established completion would be unsafe.
+
+Slow-interval and process peak-memory diagnostics are included. The earlier 21-case RTX 5090 matrix on the follow-up source covered SR modes, 1080p/1440p/4K, supported FG multipliers, repeated processes, lifecycle, debug layer/GBV, and one 18000-frame run. That evidence supersedes the earlier untested-maximum statement for that revision only. Final integration checks are recorded separately; no temporal-quality or leak-free claim is added.

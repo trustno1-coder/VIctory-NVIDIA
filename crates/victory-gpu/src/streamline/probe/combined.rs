@@ -14,6 +14,19 @@ pub(super) struct Combined {
     mode: u32,
     evaluations: u64,
     skip: bool,
+    /// `VICTORY_CHECK_SR_ASYNC=1`: SR is sent without a CPU wait; ordering
+    /// against the compositor comes from the shared direct queue, and
+    /// `fence` reaching `fenced` says the list's last run is done.
+    asynchronous: bool,
+    fence: ID3D12Fence,
+    fenced: u64,
+}
+
+impl Drop for Combined {
+    fn drop(&mut self) {
+        // Textures and the list must outlive an unwaited SR submission.
+        self.wait();
+    }
 }
 
 impl Combined {
@@ -166,22 +179,59 @@ impl Combined {
         list.close();
         host.execute_sync_internal(&list);
         drop(staging);
+        // SAFETY: live device; a plain fence of our own.
+        let fence: ID3D12Fence = unsafe { d.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.map_err(err)?;
         Ok(Self { out, overlay, depth, motion, camera, textures, list, mode,
-            evaluations: 0, skip: std::env::var("VICTORY_CHECK_SKIP_EVALUATE").is_ok_and(|v| v == "1") })
+            evaluations: 0, skip: std::env::var("VICTORY_CHECK_SKIP_EVALUATE").is_ok_and(|v| v == "1"),
+            asynchronous: asynchronous(), fence, fenced: 0 })
     }
 
-    pub(super) fn advance(&mut self, host: &crate::host::Host, round: u32) -> Result<(), String> {
+    /// Blocks until the last unwaited SR submission has run (none: at once).
+    pub(super) fn wait(&self) {
+        // SAFETY: our fence; a null event makes the call block until the value is reached.
+        unsafe {
+            if self.fenced == 0 { return; }
+            let completed = self.fence.GetCompletedValue();
+            if completed == u64::MAX {
+                crate::host::fail(format_args!("combined SR: device removed while waiting for {}", self.fenced));
+            }
+            if completed < self.fenced {
+                if let Err(e) = self.fence.SetEventOnCompletion(self.fenced, windows::Win32::Foundation::HANDLE::default()) {
+                    crate::host::fail(format_args!("combined SR: fence wait failed: {e}"));
+                }
+                let completed = self.fence.GetCompletedValue();
+                if completed == u64::MAX || completed < self.fenced {
+                    crate::host::fail(format_args!("combined SR: fence {completed} did not reach {}", self.fenced));
+                }
+            }
+        }
+    }
+
+    /// One SR evaluation. `token`: the frame-token index shared with this
+    /// frame's FG constants and present markers; `None` keeps the earlier
+    /// separate counter (`VICTORY_CHECK_SPLIT_TOKEN=1`, for A/B only).
+    pub(super) fn advance(&mut self, host: &crate::host::Host, round: u32, token: Option<u64>) -> Result<(), String> {
         self.camera.reset = round == 0;
+        // The list's previous run must be done before its allocator is reset.
+        self.wait();
         self.list.reset();
         transition(&self.list.list, &self.out, SHADER_READ, UNORDERED);
+        let id = token.unwrap_or_else(|| NEXT_ID.fetch_add(1, Relaxed) + 1);
         let recorded = if self.skip { Ok(()) } else {
             record_mode(self.list.list.as_raw(), &self.textures, &self.camera, 1.0,
-                NEXT_ID.fetch_add(1, Relaxed) + 1, Some(self.mode)).map(|_| ())
+                id, Some(self.mode)).map(|_| ())
         };
-        // Even on a recording error, submit/wait before teardown can release inputs.
+        // Even on a recording error, submit (and wait) before teardown can release inputs.
         transition(&self.list.list, &self.out, UNORDERED, SHADER_READ);
         self.list.close();
-        host.execute_sync_internal(&self.list);
+        if self.asynchronous {
+            let sent = host.execute_unwaited(&self.list, &self.fence, self.fenced + 1);
+            if sent.is_ok() { self.fenced += 1; }
+            if recorded.is_err() || sent.is_err() { self.wait(); }
+            sent.map_err(err)?;
+        } else {
+            host.execute_sync_internal(&self.list);
+        }
         recorded?;
         if !self.skip { self.evaluations += 1; }
         if round == 0 { self.check(host)?; }
@@ -198,4 +248,26 @@ impl Combined {
         Ok(format!("Combined SR readback PASS: render={:?} output={:?} evaluations={}; {stats}; blake3={}",
             self.camera.render, self.camera.output, self.evaluations, blake3::hash(&pixels)))
     }
+}
+
+/// `VICTORY_CHECK_SR_ASYNC=1`: send SR without waiting (the `VICTORY_RELAY`
+/// style overlap). Default: waited for, as every default-mode submission is.
+pub(super) fn asynchronous() -> bool {
+    std::env::var("VICTORY_CHECK_SR_ASYNC").is_ok_and(|v| v == "1")
+}
+
+/// `VICTORY_CHECK_SPLIT_TOKEN=1`: SR and FG take separate frame-token
+/// indices, as before VN03E-opt (A/B only).
+pub(super) fn split_token() -> bool {
+    std::env::var("VICTORY_CHECK_SPLIT_TOKEN").is_ok_and(|v| v == "1")
+}
+
+/// Process memory counters: (private commit, peak private commit, peak working set) in bytes.
+pub(super) fn process_memory() -> Option<(usize, usize, usize)> {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+    // SAFETY: our own process and a structure of the size given.
+    (unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0)
+        .then_some((c.PagefileUsage, c.PeakPagefileUsage, c.PeakWorkingSetSize))
 }
