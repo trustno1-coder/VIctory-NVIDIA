@@ -335,6 +335,8 @@ fork has always had; its options:
 | `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
 | `-FrameGenReady` | frame generation made ready but off, so the F1 menu can switch it while playing (costs frame rate: ready, frames go through Streamline's swap chain; without it, a change in F1 takes effect at the next start) |
 | `-FgType auto` / `dlss` / `fsr` | which frame generation (see the top of this page); FSR 3's DLLs from `VICTORY_FIDELITYFX_DIR`, else `amd-sdk\FidelityFX\bin` here |
+| `-Preload` | every shader and the pipelines of earlier runs made before the game starts (once per build or driver; what is done is kept), with a progress window over the title's own splash screen: the step, how far it is, about how long is left, and Skip (or Esc) to start the game at once |
+| `-Splash <file or URL>` / `-NoPreloadWindow` | another picture behind the preload's window (a URL is fetched once into `%LOCALAPPDATA%\victory\splash`) / the preload's progress in the console only |
 | `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
 | `-More @{VICTORY_X='1'}` | add or override any switch |
 

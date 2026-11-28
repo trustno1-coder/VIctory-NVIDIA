@@ -7,6 +7,9 @@
 #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)
 #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
+#   .\scripts\play-foxhound.ps1 -Exe ... -Preload             every shader and pipeline made first, with a progress
+#                                                             window over the title's splash screen (-Splash <file or
+#                                                             URL> for another picture, -NoPreloadWindow for none)
 #
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
 # victory-settings.txt in the repository's folder and is applied here at every start, over the options above;
@@ -44,9 +47,16 @@ param(
     # Every shader and the loading pipelines made first (`victory preload`), then the game; the F1 menu's
     # PRELOAD SHADERS starts this again with it.
     [switch]$Preload,
+    # The preload shows its progress in a window (scripts\preload-window.ps1) over the title's own splash screen
+    # (SplashScreenImage in MicrosoftGame.config beside -Exe), or over the picture -Splash names: a file, or an
+    # http(s) URL fetched once into %LOCALAPPDATA%\victory\splash. -NoPreloadWindow: in this window only.
+    [string]$Splash = '',
+    [switch]$NoPreloadWindow,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot 'preload-window.ps1')
+$preloadWindow = $null
 # The F1 menu's "PRELOAD SHADERS" restarts this with -Preload (and VICTORY_PRELOAD=1, read here before the
 # switches below are cleared).
 $preload = $Preload -or $env:VICTORY_PRELOAD -eq '1'
@@ -155,7 +165,8 @@ $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })" +
+    $(if ($Splash) { " -Splash '$($Splash -replace "'", "''")'" }) + $(if ($NoPreloadWindow) { ' -NoPreloadWindow' })
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
@@ -186,14 +197,23 @@ try {
         # With this start's switches (the translations depend on them); its lines go to the log too.
         Write-Host 'Preloading shaders before the game starts. This takes a while (see the lines below).'
         $began = Get-Date
+        if (-not $NoPreloadWindow) {
+            $preloadWindow = Start-PreloadWindow -Splash (Get-SplashImage $Exe $Splash) -Icon (Get-SplashIcon $Exe) `
+                -StateFile (Join-Path $env:LOCALAPPDATA 'victory\preload-last.txt')
+        }
         # (Split-Path -LiteralPath with -Parent: no such parameter set in Windows PowerShell 5.1.)
-        & $victory preload ([IO.Path]::GetDirectoryName($Exe)) 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine("# preload: $line"); $line }
-        $how = if ($LASTEXITCODE -eq 0) { 'done' } else { "ended with code $LASTEXITCODE" }
-        $said = 'Preload {0} after {1:N1} min. Starting the game.' -f $how, ((Get-Date) - $began).TotalMinutes
+        & $victory preload ([IO.Path]::GetDirectoryName($Exe)) 2>&1 | ForEach-Object {
+            $line = "$_"; $writer.WriteLine("# preload: $line"); Update-PreloadWindow $preloadWindow $line; $line
+        }
+        $code = $LASTEXITCODE
+        $minutes = ((Get-Date) - $began).TotalMinutes
+        $how = if ($preloadWindow -and $preloadWindow.Skipped) { 'skipped (what it did is kept)' } elseif ($code -eq 0) { 'done' } else { "ended with code $code" }
+        $said = 'Preload {0} after {1:N1} min. Starting the game.' -f $how, $minutes
         $writer.WriteLine("# $said"); Write-Host $said
+        Complete-PreloadWindow $preloadWindow ('Preload {0} after {1:N1} min.' -f $how, $minutes) ($code -eq 0)
     }
 }
 finally { Pop-Location }
 Push-Location $repo
 try { & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line } }
-finally { Pop-Location; $writer.Dispose() }
+finally { Pop-Location; $writer.Dispose(); Close-PreloadWindow $preloadWindow }
