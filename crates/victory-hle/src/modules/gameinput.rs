@@ -136,24 +136,25 @@ struct MouseState {
 }
 const _: () = assert!(size_of::<MouseState>() == 40);
 
-/// Applies one captured mouse sample. While the F1 settings menu is open,
-/// motion deltas are discarded and button bits are cleared while keeping the
-/// virtual mouse connected at its last position (so closing the menu causes
-/// no camera jump and no disconnect/reconnect churn).
-fn apply_mouse_sample(
-    mouse: &mut MouseState,
-    (dx, dy): (i64, i64),
-    buttons: u32,
-    menu_open: bool,
-) -> MouseState {
-    if menu_open {
-        mouse.buttons = 0;
-    } else {
-        mouse.position_x += dx;
-        mouse.position_y += dy;
-        mouse.buttons = buttons;
+/// The cumulative mouse reading and the gameplay interval of its last sample.
+#[derive(Default)]
+struct MouseTracker {
+    state: MouseState,
+    interval: Option<u64>,
+}
+
+impl MouseTracker {
+    fn sample(&mut self, (dx, dy): (i64, i64), buttons: u32, start: Option<u64>, end: Option<u64>) -> MouseState {
+        // A delta covers the time since the previous poll. Only use it if
+        // both polls sampled the same uninterrupted gameplay interval.
+        if end.is_some() && self.interval == end && start == end {
+            self.state.position_x += dx;
+            self.state.position_y += dy;
+        }
+        self.interval = if start == end { end } else { None };
+        self.state.buttons = if end.is_some() { buttons } else { 0 };
+        self.state
     }
-    *mouse
 }
 
 /// Host input, or a fake in tests.
@@ -1243,7 +1244,7 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
-        mouse: MouseState,
+        mouse: super::MouseTracker,
         /// The input snapshot for this poll and the HID connection owning each slot.
         pads: [Option<PadState>; PADS],
         hid_slots: [Option<u64>; PADS],
@@ -1267,16 +1268,17 @@ mod host {
 
     impl Source for Host {
         fn mouse(&mut self) -> Option<MouseState> {
+            let start = victory_gpu::mouse_input_interval();
             let delta = crate::modules::lifecycle::captured_mouse_delta()?;
-            let menu_open = victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed);
-            let buttons = if menu_open {
+            let end = victory_gpu::mouse_input_interval();
+            let buttons = if end.is_none() {
                 0
             } else {
                 [0x01, 0x02, 0x04, 0x05, 0x06].into_iter().enumerate()
                     // SAFETY: virtual-key state query.
                     .fold(0, |bits, (i, vk)| bits | ((unsafe { GetAsyncKeyState(vk) } < 0) as u32) << i)
             };
-            Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
+            Some(self.mouse.sample(delta, buttons, start, end))
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             // XInput first; HID PlayStation pads (PS4 and PS5) take the slots XInput leaves free
@@ -1694,8 +1696,15 @@ mod tests {
             register(hub, MOUSE_KIND, 2, &log);
             assert!(log.lock().unwrap().is_empty());
             let sample = MouseState { position_x: 30, position_y: -12, buttons: 1, ..Default::default() };
-            host.lock().unwrap().mouse = Some(sample);
+            {
+                let mut source = host.lock().unwrap();
+                source.keys = vec![key(b'W')];
+                source.mouse = Some(sample);
+            }
             hub.poll();
+            let gamepad = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            assert_eq!(pad(gamepad), PadState { left_y: 1.0, ..Default::default() });
+            release(gamepad);
             let r = current(hub, MOUSE_KIND, MOUSE).unwrap();
             let mut got = MouseState::default();
             let get = slot::<extern "system" fn(*const Reading, *mut MouseState) -> bool, _>(r, 0x80);
@@ -1712,17 +1721,21 @@ mod tests {
 
     #[test]
     fn mouse_motion_and_buttons_are_suppressed_while_settings_menu_is_open() {
-        let mut mouse = MouseState::default();
-        let active = apply_mouse_sample(&mut mouse, (12, -5), 0b11, false);
-        assert_eq!(active, MouseState { position_x: 12, position_y: -5, buttons: 0b11, ..Default::default() });
+        let mut mouse = MouseTracker::default();
+        mouse.sample((0, 0), 0, Some(0), Some(0));
+        let active = mouse.sample((12, -5), 3, Some(0), Some(0));
+        assert_eq!(active, MouseState { position_x: 12, position_y: -5, buttons: 3, ..Default::default() });
 
-        // Opening the F1 menu drops motion deltas and clears buttons while keeping position.
-        let paused = apply_mouse_sample(&mut mouse, (40, 25), 0b01, true);
-        assert_eq!(paused, MouseState { position_x: 12, position_y: -5, buttons: 0, ..Default::default() });
-
-        // Closing the F1 menu resumes cleanly from the preserved position with no jump.
-        let resumed = apply_mouse_sample(&mut mouse, (3, 4), 0b10, false);
-        assert_eq!(resumed, MouseState { position_x: 15, position_y: -1, buttons: 0b10, ..Default::default() });
+        let still = MouseState { buttons: 0, ..active };
+        assert_eq!(mouse.sample((40, 25), 1, None, None), still);
+        // Motion after the final open-menu poll belongs to the menu, too.
+        assert_eq!(mouse.sample((20, 0), 0, Some(1), Some(1)), still);
+        // An entire menu visit can also fall between polls, or during a poll.
+        assert_eq!(mouse.sample((20, 0), 0, Some(2), Some(2)), still);
+        assert_eq!(mouse.sample((20, 0), 0, Some(2), Some(3)), still);
+        assert_eq!(mouse.sample((20, 0), 0, Some(3), Some(3)), still);
+        let resumed = mouse.sample((3, 4), 2, Some(3), Some(3));
+        assert_eq!(resumed, MouseState { position_x: 15, position_y: -1, buttons: 2, ..Default::default() });
     }
 
     #[test]
@@ -1957,3 +1970,6 @@ mod tests {
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
     }
 }
+
+#[cfg(all(test, windows))]
+mod capture_tests;
