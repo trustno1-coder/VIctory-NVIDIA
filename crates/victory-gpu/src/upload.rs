@@ -149,6 +149,12 @@ const POOL_PIECES: usize = 32;
 /// Per piece of the pool: its start and how much of it is handed out.
 static POOL: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
+/// The error (`GetLastError`) that ended the reservation of the pool short of
+/// [`POOL_PIECES`], else 0. Read by the memory line and by the first use of
+/// the pool: [`reserve_space`] runs in `main` before logging is set up, so
+/// what it says there may go nowhere.
+static POOL_ERROR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Reserves the pool (address space only, nothing committed). Called first
 /// thing in `main`; [`reserve`] does it otherwise.
 pub fn reserve_space() {
@@ -157,12 +163,49 @@ pub fn reserve_space() {
     ONCE.call_once(|| {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..POOL_PIECES {
-            let Ok(at) = allocate_in_window(EARLY_PIECE, MEM_RESERVE | MEM_WRITE_WATCH | MEM_TOP_DOWN) else {
-                break;
-            };
-            pool.push((at, 0));
+            match allocate_in_window(EARLY_PIECE, MEM_RESERVE | MEM_WRITE_WATCH | MEM_TOP_DOWN) {
+                Ok(at) => pool.push((at, 0)),
+                Err(error) => {
+                    POOL_ERROR.store(error, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        pieces = pool.len(),
+                        wanted = POOL_PIECES,
+                        error,
+                        "upload pool: VirtualAlloc2 failed before all pieces were reserved"
+                    );
+                    break;
+                }
+            }
         }
     });
+}
+
+/// For the memory line: the pieces of the pool reserved, those wanted, and
+/// the error that stopped the reservation short (0: none).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn pool_state() -> [u64; 3] {
+    let pieces = POOL.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
+    [pieces, POOL_PIECES as u64, u64::from(POOL_ERROR.load(std::sync::atomic::Ordering::Relaxed))]
+}
+
+/// Uploads served from the process heap since the start, because no address
+/// below 2^37 was to be had (ray tracing may miss some of what they hold).
+static HEAP_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// For the memory line: [`HEAP_UPLOADS`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn heap_uploads() -> u64 {
+    HEAP_UPLOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// An upload from the process heap in place of one below 2^37: counted, the
+/// first one logged.
+fn from_heap(len: usize) -> Upload {
+    use std::sync::atomic::Ordering::Relaxed;
+    if HEAP_UPLOADS.fetch_add(1, Relaxed) == 0 {
+        tracing::warn!(bytes = len, "an upload from the process heap instead: ray tracing may miss some of it (counted from here: \"upload pool\" in the memory line)");
+    }
+    Upload(Kind::Heap(vec![0; len]))
 }
 
 /// `len` bytes of the pool committed, from the first piece with room.
@@ -175,6 +218,8 @@ fn from_pool(len: usize) -> Option<usize> {
         let lowest = pool.iter().map(|p| p.0).min().unwrap_or(0);
         tracing::info!(
             pieces = pool.len(),
+            wanted = POOL_PIECES,
+            error = POOL_ERROR.load(std::sync::atomic::Ordering::Relaxed),
             lowest = format_args!("{lowest:#x}"),
             "address space for memory shaders read by address, reserved at the start"
         );
@@ -244,9 +289,7 @@ impl Upload {
                 let Some(at) = reserve(blocks * BLOCK) else {
                     // Better than null, which the title throws on, ending
                     // the game: its shaders may read zeros from this.
-                    static TOLD: std::sync::Once = std::sync::Once::new();
-                    TOLD.call_once(|| tracing::warn!(bytes = len, "an upload from the process heap instead: ray tracing may miss some of it"));
-                    return Some(Upload(Kind::Heap(vec![0; len])));
+                    return Some(from_heap(len));
                 };
                 crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
                 tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
@@ -315,6 +358,24 @@ mod tests {
         // SAFETY: the bytes were handed out.
         unsafe { d.start().add(ARENA).write(1) };
         drop(b);
+    }
+
+    #[test]
+    fn uploads_from_the_heap_are_counted_and_zeroed() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = HEAP_UPLOADS.load(Relaxed);
+        let mut a = from_heap(100);
+        let mut b = from_heap(8);
+        assert!(HEAP_UPLOADS.load(Relaxed) >= before + 2, "each one counted");
+        // SAFETY: the heap blocks hold at least 100 and 8 bytes.
+        unsafe {
+            assert_eq!(*a.start().add(99), 0);
+            assert_eq!(*b.start(), 0);
+        }
+        // The pool is reserved by now and says so.
+        reserve_space();
+        let reserved = POOL.lock().unwrap().len();
+        assert!(reserved <= POOL_PIECES && (reserved == POOL_PIECES || POOL_ERROR.load(Relaxed) != 0), "short only with an error");
     }
 
     #[test]

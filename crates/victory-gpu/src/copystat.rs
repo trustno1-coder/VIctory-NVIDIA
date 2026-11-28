@@ -918,13 +918,15 @@ fn log_memory() {
     // Round 2: what the view table still holds and what goes around it,
     // what host lists cost, the card's share that is the layer's own or
     // the title's no more, and which big blocks are ours.
+    let pool = crate::upload::pool_state();
     let lists: Vec<u64> = crate::host::LISTS.iter().map(|l| l.load(Relaxed)).collect();
     tracing::info!(
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
          views and {} views of placed memory; shapes of placed views kept: {}; ownerless views: \
          {} entries evicted by VICTORY_OWNERLESS_VIEWS, {} lookups of a view whose generation was \
-         gone (read as no view; includes views freed with their resource); \
+         gone (read as no view; includes views freed with their resource); upload pool: {} of {} \
+         pieces reserved (VirtualAlloc2 error {}), {} uploads served from the process heap; \
          host lists: {} \
          made by the host, {} preludes made for them ({} alive), private bytes grew {:.0} MB while \
          lists were made; twins of depth textures: {:.0} MB; host copies of \
@@ -938,6 +940,10 @@ fn log_memory() {
         views[5],
         views[8],
         views[9],
+        pool[0],
+        pool[1],
+        pool[2],
+        crate::upload::heap_uploads(),
         lists[0],
         lists[1],
         crate::host::PRELUDES_ALIVE.load(Relaxed),
