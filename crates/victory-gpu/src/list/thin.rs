@@ -563,10 +563,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
-    // Read here, on the title's thread, while its groups are there: only
-    // whether a wait is needed goes on (`super::selective_barriers`).
-    let count = if !groups.is_null() && super::selective_barriers() && !super::groups_need_wait(count, groups) { 0 } else { count };
+extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
