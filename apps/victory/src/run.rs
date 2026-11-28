@@ -172,10 +172,11 @@ pub fn run(
         }
         let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())
             .map_err(|e| if victory_game::identify(&hash).is_some() { e } else { e.context(changed_copy(exe)) })?;
-        // SAFETY: nothing else runs yet; the title and the display mode list
-        // read these later.
+        // The display mode reported to the title stays the 3840x2160 default
+        // (`dxgi::display_size`), as on Series S: the output is 1440p from the
+        // title's own settings (`native_1440p::prepare`).
+        // SAFETY: nothing else runs yet; the title reads this later.
         unsafe {
-            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
             std::env::set_var("VICTORY_NATIVE_1440P", "1");
         }
         match upscaler.map(|mode| (mode, native_1440p::prepare_upscaler(&mut prepared, mode))) {
