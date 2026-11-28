@@ -389,20 +389,30 @@ pub(crate) fn views_gone(at: usize, len: usize) {
 /// addresses too, in address order, each with those; not the ones it shows
 /// in very many views (`crate::watch::MANY_VIEWS`).
 pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize>)> {
+    shown_elsewhere_in([(start, end)])
+}
+
+/// Resolves all of a landing job's spans under one view-table read lock.
+pub(crate) fn shown_elsewhere_in(spans: impl IntoIterator<Item = (usize, usize)>) -> Vec<(usize, Vec<usize>)> {
     let v = views();
     let mut out = Vec::new();
-    if start >= end || v.pages_twice == 0 {
+    if v.pages_twice == 0 {
         return out;
     }
-    let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
-    for (&base, &(bytes, section, offset)) in v.views.range(first.unwrap_or(start)..end) {
-        let from = start.max(base) & !(K64 - 1);
-        for page in (from..end.min(base + bytes)).step_by(K64) {
-            let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64)) else {
-                continue;
-            };
-            if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
-                out.push((page, shown.iter().copied().filter(|&at| at != page).collect()));
+    for (start, end) in spans {
+        if start >= end {
+            continue;
+        }
+        let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+        for (&base, &(bytes, section, offset)) in v.views.range(first.unwrap_or(start)..end) {
+            let from = start.max(base) & !(K64 - 1);
+            for page in (from..end.min(base + bytes)).step_by(K64) {
+                let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64)) else {
+                    continue;
+                };
+                if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
+                    out.push((page, shown.iter().copied().filter(|&at| at != page).collect()));
+                }
             }
         }
     }
