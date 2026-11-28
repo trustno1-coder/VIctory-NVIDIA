@@ -1872,7 +1872,7 @@ impl<'a> Lower<'a> {
                                 exchange = Some((slot, group <= 32, all));
                                 // (local waves keep the old layout unless the program's LDS is full)
                                 let n = 2 * group.div_ceil(64);
-                                if !LOCAL_WAVES.get() || s.lds_dwords + n < HOST_LDS_DWORDS {
+                                if !LOCAL_WAVES.get() || s.lds_dwords + n <= HOST_LDS_DWORDS {
                                     s.lds_dwords += n;
                                 }
                             }
@@ -9615,6 +9615,10 @@ impl<'a> Lower<'a> {
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     // (console waves meeting on their own: a buffer of the next meeting, which
                     // needs no second meeting before it is written again)
+                    if self.local {
+                        // (local waves have no exchange dwords: the slot is `u32::MAX`)
+                        return Err("a lane read across host waves, with local waves");
+                    }
                     let k = if self.pairs.is_some() { self.exchange_dword() } else { self.exchange_pair(slot) };
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
@@ -9710,6 +9714,10 @@ impl<'a> Lower<'a> {
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
                         // (console waves meeting on their own: both in one meeting)
                         let ((lo_has, hi_has), (lo, hi)) = if self.pairs.is_some() {
+                            if self.local {
+                                // (local waves have no exchange dwords: the slot is `u32::MAX`)
+                                return Err("a lane exchange between console waves, with local waves");
+                            }
                             let both = self.exchange_pairs(&[has, mine]);
                             (both[0], both[1])
                         } else {
