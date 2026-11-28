@@ -179,6 +179,49 @@ pub struct Layout {
     /// Byte offsets inside a block for each coordinate, per axis.
     /// Empty for linear and unsupported modes.
     pattern: &'static SwizzlePattern,
+    render_xor: Option<RenderPipeConfig>,
+}
+
+/// GFX10.3 pipe and packer rows used by the two Series consoles: Series S
+/// has 8 pipes and 4 packers, Series X 32 and 8. XCL (`gpu/texture.rs`)
+/// found every texel of every mode matches the console's own layout
+/// library with these two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderPipeConfig {
+    Pipes8Packers4,
+    Pipes32Packers8,
+}
+
+// AMD addrlib, gfx10SwizzlePattern.h, GFX10_SW_64K_R_X_1xaa_RBPLUS_PATINFO,
+// 4 bytes/element. These are the contributions of X0..X7 and Y0..Y7 to
+// the low 16 address bits. Z, sample, and coordinates above 255 are zero.
+const fn render_axis(bits: [u16; 8]) -> [u16; 256] {
+    let mut offsets = [0; 256];
+    let mut coord = 1usize;
+    while coord < 256 {
+        offsets[coord] = offsets[coord & (coord - 1)] ^ bits[coord.trailing_zeros() as usize];
+        coord += 1;
+    }
+    offsets
+}
+
+impl RenderPipeConfig {
+    fn offset(self, x: usize, y: usize) -> usize {
+        static S: [[u16; 256]; 2] = [
+            render_axis([4, 8, 0x40, 0x800, 0x200, 0x2400, 0x4100, 0x8000]),
+            render_axis([0x10, 0x20, 0x80, 0x1000, 0x300, 0x400, 0x8100, 0x4000]),
+        ];
+        static X: [[u16; 256]; 2] = [
+            render_axis([4, 8, 0x40, 0x2000, 0x200, 0x800, 0x1400, 0x8100]),
+            render_axis([0x10, 0x20, 0x80, 0x4000, 0x300, 0x400, 0x8800, 0x100]),
+        ];
+        let axes = match self {
+            Self::Pipes8Packers4 => &S,
+            Self::Pipes32Packers8 => &X,
+        };
+        let block = (y / 128) * 2 + x / 128;
+        block * 65536 + usize::from(axes[0][x] ^ axes[1][y])
+    }
 }
 
 type SwizzlePattern = [Vec<u32>; 3];
@@ -344,6 +387,7 @@ impl Layout {
             first_tail_mip: d.mips,
             mips,
             pattern: &EMPTY_PATTERN,
+            render_xor: None,
         }
     }
 
@@ -526,18 +570,34 @@ impl Layout {
             first_tail_mip,
             mips,
             pattern,
+            render_xor: None,
+        }
+    }
+
+    /// Enables addressing for a single 256×256 R32 plane in a block-aligned
+    /// allocation. The caller supplies the console's pipe configuration.
+    pub fn configure_render_xor(&mut self, config: RenderPipeConfig) {
+        let d = &self.desc;
+        if d.dimension == Dimension::Tex2d && d.swizzle == Swizzle::SW_64KB_R_X
+            && (d.width, d.height, d.depth, d.mips) == (256, 256, 1, 1)
+            && (d.element_bytes, d.block, d.samples) == (4, 1, 1)
+            && self.block == [128, 128, 1] && self.size == 256 * 256 * 4
+        {
+            self.render_xor = Some(config);
         }
     }
 
     /// Whether [`Layout::offset`] and the copies work for this layout:
-    /// linear and the modes without pipe or bank XOR, single-sampled.
+    /// linear, the modes without pipe or bank XOR (single-sampled), and the
+    /// one XOR layout [`Layout::configure_render_xor`] takes.
     ///
-    /// shortcut: no addressing for the XOR modes (`_X`, `_T`) and MSAA;
-    /// they need the GPU's pipe and bank configuration (Series X and S
-    /// differ). Titles use them for render targets and depth, which the
-    /// host renders; add them when a title copies into or out of one.
+    /// shortcut: no addressing for the other XOR modes (`_X`, `_T`) and
+    /// MSAA; they need the GPU's pipe and bank configuration (Series X and
+    /// S differ). Titles use them for render targets and depth, which the
+    /// host renders; add them when a title copies into or out of one, as
+    /// the ocean's CPU code reads its height map.
     pub fn addressable(&self) -> bool {
-        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
+        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty() || self.render_xor.is_some()
     }
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
@@ -566,6 +626,9 @@ impl Layout {
             } else {
                 Error::Invalid
             });
+        }
+        if let Some(config) = self.render_xor {
+            return Ok(config.offset(x as usize, y as usize) as u64);
         }
         let (slice, z) = self.split(z);
         let base = u64::from(slice) * self.slice_size + m.offset;
@@ -709,6 +772,15 @@ impl Layout {
         let tiled_need = if DETILE { self.bytes_from(mip) } else { self.size };
         if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
+        }
+        if let Some(config) = self.render_xor {
+            for y in 0..256 {
+                // X0 and X1 select adjacent dwords in both equations.
+                for x in (0..256).step_by(4) {
+                    copy_run::<DETILE>(src, dst, config.offset(x, y), y * row_pitch + 4 * x, 16);
+                }
+            }
+            return Ok(());
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
@@ -936,6 +1008,44 @@ impl Texture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_xor_water_matches_both_consoles_with_padded_rows() {
+        // Golden FNV-1a digests of every tiled byte from XCL 85e3826's
+        // independent GFX10 tiler. Each texel stores its own linear index.
+        let desc = Desc { dimension: Dimension::Tex2d, width: 256, height: 256,
+            depth: 1, mips: 1, element_bytes: 4, block: 1, samples: 1,
+            swizzle: Swizzle::SW_64KB_R_X };
+        let pitch = 1040;
+        let mut linear = vec![0xfe; 255 * pitch + 1024];
+        for y in 0..256usize {
+            for x in 0..256usize {
+                let at = y * pitch + 4 * x;
+                linear[at..at + 4].copy_from_slice(&((y * 256 + x) as u32).to_le_bytes());
+            }
+        }
+        for (cfg, expected) in [(RenderPipeConfig::Pipes8Packers4, 0xc0e94c4e1b16af25),
+            (RenderPipeConfig::Pipes32Packers8, 0x49527ce701b6e325)] {
+            let mut layout = Layout::new(&desc).unwrap();
+            assert!(!layout.addressable());
+            layout.configure_render_xor(cfg);
+            let mut tiled = vec![0xbc; layout.size as usize];
+            layout.tile(&mut tiled, 0, 0, &linear, pitch, 256 * pitch).unwrap();
+            let digest = tiled.iter().fold(0xcbf29ce484222325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+            });
+            assert_eq!(digest, expected);
+            for y in 0..256u32 {
+                for x in 0..256u32 {
+                    let at = layout.offset(0, x, y, 0).unwrap() as usize;
+                    assert_eq!(&tiled[at..at + 4], &(y * 256 + x).to_le_bytes());
+                }
+            }
+            let mut round_trip = vec![0xfe; linear.len()];
+            layout.detile(&tiled, 0, 0, &mut round_trip, pitch, 256 * pitch).unwrap();
+            assert_eq!(round_trip, linear);
+        }
+    }
 
     fn desc(w: u32, h: u32, mips: u32, bpe: u32, swizzle: Swizzle) -> Desc {
         Desc {
