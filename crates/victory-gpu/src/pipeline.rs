@@ -794,10 +794,12 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
 }
 
-/// Saves the pipeline cache now if anything was added (at the end of a run).
+/// Saves the pipeline cache now if anything was added (at the end of a
+/// title's run: a library grown too large is rebuilt with the pipelines the
+/// run used, `library::finish`).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
-    library::save(true);
+    library::finish();
 }
 
 #[cfg(test)]
