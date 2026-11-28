@@ -50,6 +50,25 @@ own upscaling and our plain present run as before.
 Windows 10 2004 or later, a GeForce RTX GPU (frame generation: RTX 40 or
 later), hardware-accelerated GPU scheduling on (frame generation needs it).
 
+## Black screen after shader precompilation
+
+The first launch after precompilation or an update can take a few minutes.
+If the screen stays black after three minutes, try these checks one at a time.
+
+1. In the NVIDIA App, open **Graphics → Program Settings**, then select or
+   add `victory.exe`. Set its **DLSS Override** options to **Off** or
+   **Use the 3D application setting**, then launch again.
+2. If the screen is still black, open PowerShell in the folder containing
+   `victory.exe`. Launch once with DLSS off to see whether the picture returns.
+
+   ```powershell
+   .\victory.exe play --dlss off
+   ```
+
+If the problem persists, include the play log from a run of at least three
+minutes when reporting it. See the [README](../README.md) for where to find
+the logs and what to include.
+
 ## Switches
 
 | Variable | Values | Default | What |
