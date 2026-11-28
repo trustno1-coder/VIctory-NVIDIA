@@ -869,7 +869,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             staging.expected.store(there, Relaxed);
         }
         let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
-        list.defer_prelude_upload(PreludeUpload { staging, copy, on_demand });
+        list.defer_prelude_upload(PreludeUpload { staging, copy, on_demand, resource: resource as usize });
         return;
     }
     // The host texture has the staging buffer's contents: only the check
@@ -982,6 +982,21 @@ pub(crate) struct PreludeUpload {
     staging: Arc<Staging>,
     pub(crate) copy: Arc<crate::resource::HostTexture>,
     on_demand: Option<crate::resource::OnDemand>,
+    /// The title's texture, for the check at submission that the host has
+    /// not written it since the list was recorded ([`host_written`]).
+    resource: usize,
+}
+
+/// Whether a host copy or resolve has written the title's texture `resource`.
+fn is_host_written(resource: usize) -> bool {
+    HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|set| set.contains(&resource))
+}
+
+/// `VICTORY_PRELUDE_RECHECK=0`: a prelude upload is not checked again at
+/// submission for a host write made after its list was recorded (as before).
+fn prelude_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_RECHECK").is_none_or(|v| v != "0"))
 }
 
 impl PreludeUpload {
@@ -997,6 +1012,30 @@ impl PreludeUpload {
     /// levels on demand given memory, what the host copy holds).
     pub(crate) fn finish_refresh(&self) -> Option<bool> {
         use std::sync::atomic::Ordering::Relaxed;
+        // The host wrote the texture (a bake's copy into it) after this list
+        // was recorded, on another recording thread: its title memory holds
+        // what it held before, often another texture's bytes, and copying it
+        // over the host's contents left them there for good (no later list
+        // uploads a host-written texture): a character's baked skin drawn as
+        // coloured specks or a blue face for a whole scene, in about half the
+        // runs (the diner's bartender).
+        if prelude_recheck() && is_host_written(self.resource) {
+            static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SKIPPED.fetch_add(1, Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                // SAFETY: a live texture.
+                let desc = unsafe { self.copy.texture.GetDesc() };
+                tracing::warn!(
+                    n,
+                    resource = format_args!("{:#x}", self.resource),
+                    width = desc.Width,
+                    height = desc.Height,
+                    format = desc.Format.0,
+                    "prelude upload left out: the host wrote the texture after the list that samples it was recorded"
+                );
+            }
+            return None;
+        }
         let Some(first_upload) = claim_upload(&self.staging.uploaded, &self.staging.dirty) else {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexSkipped, 1);
