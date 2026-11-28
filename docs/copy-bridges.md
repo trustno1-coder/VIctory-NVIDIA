@@ -503,3 +503,65 @@ direct run has its measurement without forcing `VICTORY_MEMORY_REPORT=1`.
   documented in `memory-separation.md` section 8.1; the changed lines add no lint.
 - `cargo test` cannot link on this host (GNU raw-dylib needs a working `dlltool`); the tests run
   on `windows-latest` (WARP) in CI.
+
+## 13. Phase 3 implemented: the page-pool prototype
+
+The first direct-access prototype for the memory the port could not reach: the page pool's view
+memory, at any address. It is behind its own switch, off by default.
+
+### 13.1 The mechanism
+
+`inplace::place_view_part(device, start, len)` places a window (or buffer) over page-pool memory:
+
+1. the 64 KiB-aligned range around `[start, start + len)` must be one contiguous run of one
+   section in the title's view registry (`cover` gives `Run(section, offset)`); a scattered run
+   or a hole is refused before anything is created;
+2. `inplace::SectionView` maps **our own view** of that run of the section (the port's old
+   mechanism, generalised and now owned by the Phase 2 registry);
+3. every page of the view must be committed; a reserved section maps only committed pages;
+4. `OpenExistingHeapFromAddress1` opens a heap on our view, and a placed cross-adapter UAV buffer
+   covers the run;
+5. `Shadow::placed` shapes it as a copy, so binding, descriptors and lifetime work unchanged,
+   while refresh, snapshot, write declaration and copy-back stay no-ops for it.
+
+`inplace::place_view(start, len, window)` is the policy around it: `VICTORY_INPLACE_VIEW=1`
+enables windows, `=2` also title buffers; the in-place byte cap (`VICTORY_INPLACE_MB`, default
+4 GiB, measured in whole view bytes because opening pins them) applies; and a placement is only
+tried while no submission can be in the air (`shadow::flights_air()`: the relay or the late
+wait). The flight gate is the Phase 5 prerequisite: a placed copy declares no shader writes yet,
+so the layer's own CPU reads of title memory (constant fills, the title's buffer copies, texture
+staging) cannot be ordered against a flight's writes through it. Without the gate the prototype is
+unsafe in the product path, where the launcher leaves the relay on; with it, the prototype runs
+with `VICTORY_RELAY=0` and no `VICTORY_LATE_WAIT`. Phase 5 replaces the gate with declarations.
+
+### 13.2 Where it is used
+
+The window path (`shadow::loose`) asks the direct placement **after** the device-local admission
+refused the window, so a window that would have got a VRAM side is never replaced (the
+memory-class rule of section 9). A placed window makes no staging buffer, no card side, no
+refresh/write-watch state, no compare and no copy-back; the GPU reads and writes the title's own
+pages over PCIe, which is the memory class the refused window would have stayed in anyway. Every
+refusal (not one run, not committed, cap, host refused, in flight) is counted with its reason in
+the placement ledger and leaves the old copy path in place.
+
+### 13.3 Tests and checks
+
+- `warp_a_page_pool_window_is_placed_over_our_view_of_its_run`: a placeholder above 4 GiB, a
+  reserved section, two title views that follow in memory and in the section; a 5 KiB window that
+  crosses both is placed and the card reads the title's bytes at the right offset and writes them
+  back into the title's own views; with the heap standing a title view is made read-only and then
+  another unmapped, and the placed buffer still reads the section's pages; the last holder going
+  unmaps our view and the address is free again.
+- `place_view_part_refuses_scattered_and_private_memory`: adjacent views from two sections are
+  refused as scattered, and private memory is refused (it belongs to the other opening).
+- The existing port and in-place WARP tests still cover the older mechanisms.
+- `cargo check --workspace --all-targets --locked`: PASS; clippy shows only the pre-existing
+  baseline lint.
+
+### 13.4 What it does not do
+
+Scattered or holed ranges (multi-run composition is unresolved), memory shown in very many views,
+title buffers until `VICTORY_INPLACE_VIEW=2` is wired and the flight gate is lifted, and any
+claim about the target driver's pinning, coherency or cost. Each placement opens its own heap and
+view (no region cache yet); that is acceptable for a prototype and is where a region registry
+would matter for the buffer class.

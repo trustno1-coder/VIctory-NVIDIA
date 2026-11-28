@@ -348,9 +348,12 @@ pub(crate) enum NoDirect {
     HostRefused,
     /// No host device, or no `ID3D12Device13` for the part-opening call.
     HostUnavailable,
+    /// Submissions were in the air (`shadow::flights_air`): a placed copy declares no shader
+    /// writes yet, so a direct placement is only made while nothing can be in flight.
+    InFlight,
 }
 
-const NO_DIRECT: usize = 4;
+const NO_DIRECT: usize = 5;
 
 impl NoDirect {
     fn index(self) -> usize {
@@ -359,6 +362,7 @@ impl NoDirect {
             NoDirect::Cap => 1,
             NoDirect::HostRefused => 2,
             NoDirect::HostUnavailable => 3,
+            NoDirect::InFlight => 4,
         }
     }
 
@@ -368,6 +372,7 @@ impl NoDirect {
             NoDirect::Cap => "cap",
             NoDirect::HostRefused => "host refused",
             NoDirect::HostUnavailable => "host unavailable",
+            NoDirect::InFlight => "submissions in the air",
         }
     }
 }
@@ -507,7 +512,7 @@ pub(crate) fn placement_line(memory: Option<[[u64; 4]; 2]>) {
     let (direct_live_count, direct_live) = (dw_n + db_n, live_direct);
     let (direct_total_count, direct_total_bytes) = (dw_tn + db_tn, dw_tb + db_tb);
     let mut refused = String::new();
-    for why in [NoDirect::NotOpenable, NoDirect::Cap, NoDirect::HostRefused, NoDirect::HostUnavailable] {
+    for why in [NoDirect::NotOpenable, NoDirect::Cap, NoDirect::HostRefused, NoDirect::HostUnavailable, NoDirect::InFlight] {
         let n = NO_DIRECT_TOTAL[why.index()][0].load(Ordering::Relaxed);
         if n != 0 {
             let bytes = NO_DIRECT_TOTAL[why.index()][1].load(Ordering::Relaxed);

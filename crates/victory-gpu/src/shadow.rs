@@ -1142,6 +1142,15 @@ pub(crate) fn relay() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
 }
 
+/// Whether a submission may be in the air when a copy is prepared: the relay, or the late wait.
+/// A direct placement (`crate::inplace::place_view`) is only tried while this is false: a placed
+/// copy declares no shader writes yet, so the layer's own CPU reads of title memory (constant
+/// fills, the title's buffer copies, texture staging) could otherwise read ahead of a flight's
+/// writes through the placed buffer.
+pub(crate) fn flights_air() -> bool {
+    relay() || crate::host::late()
+}
+
 /// The submission being prepared (its number among those started): what
 /// [`Shadow::writing`] counts a declared range for ([`Flights`]).
 static PREPARED: AtomicU64 = AtomicU64::new(0);
@@ -6057,6 +6066,18 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // The device-local side is decided first, as `lookup` does for a title buffer: a direct
     // placement tries after this decision and only when it refused.
     let admission = window_admission(len);
+    // Page-pool view memory, in place, where the window would otherwise be a system-memory copy:
+    // `place_view` asks its own switch, the flight gate and the in-place byte cap; a refusal
+    // leaves the copy path as it was.
+    if admission.is_err()
+        && let Some(placed) = crate::inplace::place_view(start, len, true)
+    {
+        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        remember_placed(&shadow);
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
     let (staging, data) = host()?.shared_buffer(len)?;
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a

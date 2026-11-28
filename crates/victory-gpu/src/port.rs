@@ -54,8 +54,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
-use windows_sys::Win32::System::Memory as mem;
-
 use crate::inplace::{Placed, cover, stretch};
 
 const K64: u64 = 64 << 10;
@@ -207,7 +205,7 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     let Some(view) = crate::inplace::SectionView::map(section, offset, bytes as usize) else {
         return Err((5, format!("no view of the stretch: {bytes:#x} bytes at offset {offset:#x}")));
     };
-    if !committed(view.base(), bytes as usize) {
+    if !crate::inplace::committed(view.base(), bytes as usize) {
         return Err((4, "pages of the stretch are not committed".to_owned()));
     }
     match crate::inplace::open(device, crate::inplace::From::Part(view.base(), bytes as usize)) {
@@ -224,21 +222,6 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
         }
         Err(e) => Err((5, format!("refused by the host: {e}"))),
     }
-}
-
-/// Whether every page of `[at, at + len)` is committed.
-fn committed(at: usize, len: usize) -> bool {
-    let mut here = at;
-    while here < at + len {
-        // SAFETY: plain data filled in by the query.
-        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        if unsafe { mem::VirtualQuery(here as *const _, &mut info, size_of_val(&info)) } == 0 || info.State != mem::MEM_COMMIT {
-            return false;
-        }
-        here = (info.BaseAddress as usize).saturating_add(info.RegionSize);
-    }
-    true
 }
 
 fn bounds(regions: &[Region]) {
@@ -326,6 +309,7 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Memory as mem;
 
     /// Only the title's 32-bit memory is asked for.
     #[test]
