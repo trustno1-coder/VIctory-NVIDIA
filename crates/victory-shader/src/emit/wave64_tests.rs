@@ -592,6 +592,11 @@ fn a_wave_or_inside(skip: u32, name: &str) {
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
 fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
+    whole_uav(shader, constants, 1).map(|out| out[0])
+}
+
+/// As [`on_the_card`], and gives the first `dwords` dwords of the UAV.
+pub(super) fn whole_uav(shader: &HostShader, constants: [u32; 2], dwords: u32) -> Option<Vec<u32>> {
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; not run");
         return None;
@@ -612,13 +617,13 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
             &pso,
             &Dispatch {
                 roots: vec![(0, Root::Constants(ud))],
-                views: &[View::RawUav(1)],
+                views: &[View::RawUav(dwords)],
                 samplers: &[],
                 groups: [1, 1, 1],
             },
         )
         .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
-    Some(out[0][0])
+    Some(out[0].clone())
 }
 
 /// A 64-bit mask the program does not track, read as a number by a select, in a console wave of

@@ -68,6 +68,9 @@ pub(crate) struct Lowered {
     /// Whether the program declares D3D12's early depth-stencil test.
     #[cfg(test)]
     pub early_depth: bool,
+    /// The group-shared memory declared, in dwords.
+    #[cfg(test)]
+    pub lds_dwords: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2805,6 +2808,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             early_depth: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
+            #[cfg(test)]
+            lds_dwords: self.s.lds_dwords,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,

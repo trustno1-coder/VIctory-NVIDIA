@@ -93,6 +93,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lds_exact;
+#[cfg(test)]
+mod lds_exact_tests;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -510,6 +512,12 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The group-shared memory (dwords) of the program `emit_program` made last on this thread.
+    static TEST_LAST_LDS_DWORDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Emits a program whose earlier stages already ran ([`emit_once`]). A wave64 compute program
@@ -1163,6 +1171,8 @@ fn emit_program_plain(
         EARLY_DEPTH_COUNTS[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let wave_size = l.wave_size;
+    #[cfg(test)]
+    TEST_LAST_LDS_DWORDS.set(l.lds_dwords);
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
