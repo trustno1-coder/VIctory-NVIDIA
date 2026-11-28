@@ -78,6 +78,19 @@ impl Mode {
     pub fn render_size(self, output: [u32; 2]) -> [u32; 2] {
         output.map(|v| (v as f32 * self.scale()) as u32)
     }
+
+    /// This mode, or the one the console's title takes in its place: on
+    /// Series S, DLAA is quality. The Series S title renders its scene at
+    /// 1280x720 for its 1920x1080 picture (quality's scale). With the scene
+    /// at DLAA's 1920x1080 it stops on a check during the boot screens
+    /// (0x80000003 at +0x2219650), its registers there the same each time
+    /// (a 0x882000-byte request, 64 KiB aligned), whether DLSS asked for
+    /// that scale or frame generation alone kept the scene at the picture's
+    /// size: issues #308, #331, #663, #707 and #710, with and without FSR 3
+    /// frame generation (#663's same start at quality went on).
+    pub fn on_console(self, series_s: bool) -> Self {
+        if series_s && self == Mode::Dlaa { Mode::Quality } else { self }
+    }
 }
 
 /// `VICTORY_DLSS_PRESET`: the DLSS model for every mode (`sl::DLSSPreset`).
@@ -383,6 +396,23 @@ mod tests {
         assert_eq!(pick_mode([2561, 1440], out, optimal_1440p), None);
         assert_eq!(pick_mode([0, 1440], out, optimal_1440p), None);
         assert_eq!(pick_mode([1280, 720], out, |_| None), None);
+    }
+
+    /// Series S has no DLAA: its title stops with the scene at that scale.
+    /// Every other mode, and every mode on Series X, stays as asked.
+    #[test]
+    fn series_s_takes_dlaa_at_quality() {
+        let all = [Mode::Dlaa, Mode::Quality, Mode::Balanced, Mode::Performance, Mode::UltraPerformance];
+        assert_eq!(Mode::Dlaa.on_console(true), Mode::Quality);
+        for mode in all {
+            assert_eq!(mode.on_console(false), mode);
+            if mode != Mode::Dlaa {
+                assert_eq!(mode.on_console(true), mode);
+            }
+            // never above the Series S title's own 1280x720 scene
+            let [w, h] = mode.on_console(true).render_size([1920, 1080]);
+            assert!(w <= 1280 && h <= 720, "{mode:?}: {w}x{h}");
+        }
     }
 
     #[test]

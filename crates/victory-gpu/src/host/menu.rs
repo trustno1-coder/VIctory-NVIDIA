@@ -118,11 +118,13 @@ const S_RES: &str = "VICTORY_MENU_S_RES";
 /// The Series S scene sizes and the DLSS mode of each (the picture is 1920x1080). Only DLSS
 /// changes it: the title's own FidelityFX path from 540 stopped it at the start (0xc0000094,
 /// a division by zero in the title, 2026-11-28), so with DLSS off the scene stays at 720.
-const S_MODES: [(&str, &str); 4] = [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance")];
+/// No 1080 and no DLAA: with its scene at 1920x1080 the Series S title stops during the boot
+/// screens (`streamline::Mode::on_console`, #707, #710).
+const S_MODES: [(&str, &str); 3] = [("720", "quality"), ("626", "balanced"), ("540", "performance")];
 const ABOUT_S_RES: [&str; 3] = [
     "THE SIZE THE GAME RENDERS AT. THE PICTURE IS 1920X1080.",
-    "OTHER THAN 720 NEEDS DLSS: THIS SETS ITS MODE (1080 IS",
-    "DLAA, 720 QUALITY, 626 BALANCED, 540 PERFORMANCE).",
+    "OTHER THAN 720 NEEDS DLSS: THIS SETS ITS MODE (720 QUALITY,",
+    "626 BALANCED, 540 PERFORMANCE). NO DLAA: IT STOPS THE GAME.",
 ];
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
@@ -163,7 +165,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
     Item { var: X_RES, label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
     // In place of SERIES X PICTURE when CONSOLE is Series S.
-    Item { var: S_RES, label: "SERIES S PICTURE", values: &[("1080", "1920X1080 (DLAA)"), ("720", "1280X720 (THE GAME)"), ("626", "1113X626"), ("540", "960X540 (FASTEST)")], live: false },
+    Item { var: S_RES, label: "SERIES S PICTURE", values: &[("720", "1280X720 (THE GAME)"), ("626", "1113X626"), ("540", "960X540 (FASTEST)")], live: false },
     // The layer's switches.
     Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
     Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
@@ -610,7 +612,11 @@ impl Menu {
         let item = &ITEMS[i];
         let n = item.values.len() as isize;
         let now = index_of(item, &self.values[i]).map_or(-1, |x| x as isize);
-        let next = if now < 0 { if step > 0 { 0 } else { n - 1 } } else { (now + step).rem_euclid(n) };
+        let mut next = if now < 0 { if step > 0 { 0 } else { n - 1 } } else { (now + step).rem_euclid(n) };
+        // No DLAA on Series S (`S_MODES`): the DLSS line goes past it.
+        if item.var == DLSS && item.values[next as usize].0 == "dlaa" && self.value(CONSOLE) == "series-s" {
+            next = (next + step.signum()).rem_euclid(n);
+        }
         self.values[i] = item.values[next as usize].0.to_owned();
         if live(item) {
             self.apply_live(i);
@@ -629,6 +635,12 @@ impl Menu {
             return;
         };
         if self.value(CONSOLE) != "series-s" {
+            return;
+        }
+        // DLAA, picked on Series X before the console changed: the game's 720 at quality.
+        if self.values[dlss] == "dlaa" {
+            "quality".clone_into(&mut self.values[dlss]);
+            "720".clone_into(&mut self.values[res]);
             return;
         }
         let off = matches!(self.values[dlss].as_str(), "" | "off");
@@ -1174,7 +1186,20 @@ mod tests {
         menu.change(dlss, -1);
         assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("720", "off"));
         menu.change(s, -1);
-        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("1080", "dlaa"));
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("540", "performance"));
+        // no DLAA on Series S: no 1080, and the DLSS line goes past DLAA both ways
+        assert!(ITEMS[s].values.iter().all(|(v, _)| *v != "1080"));
+        menu.change(dlss, 1);
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("720", "off"));
+        menu.change(dlss, -1);
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("540", "performance"));
+        // Series X keeps DLAA; picked there, it is 720 at quality once the console is Series S
+        "series-x".clone_into(&mut menu.values[console]);
+        menu.change(dlss, 1);
+        assert_eq!(menu.values[dlss], "dlaa");
+        menu.change(console, 1);
+        assert_eq!(menu.values[console], "series-s");
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("720", "quality"));
         "off".clone_into(&mut menu.values[dlss]);
         "626".clone_into(&mut menu.values[s]);
         menu.change(s, -1);

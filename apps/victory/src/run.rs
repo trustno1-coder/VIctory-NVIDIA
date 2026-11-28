@@ -126,6 +126,11 @@ pub fn run(
     // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
     let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
     asked.series_s = matches!(console, Console::SeriesS);
+    // No DLAA on Series S (`Mode::on_console`): the scene stays the title's own 1280x720,
+    // also when frame generation alone would keep it at the picture's size.
+    if asked.fit_console() {
+        println!("upscaling      no DLAA on Series S: its 1920x1080 scene stops the game at the start; the game's 1280x720 (quality) instead");
+    }
     let available = victory_hle::streamline::init(&asked);
     // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
     // scale with its own FidelityFX upscaling (no Streamline): DLSS's
