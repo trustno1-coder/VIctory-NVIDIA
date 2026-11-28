@@ -36,3 +36,6 @@ pub enum ShaderError {
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
 }
+
+#[cfg(all(test, agility_runtime))]
+mod agility;

@@ -140,3 +140,6 @@ pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
     title_memory_written, use_lazy_views, use_soft_views, writing as kernel_will_write,
 };
+
+#[cfg(all(test, agility_runtime))]
+mod agility;
