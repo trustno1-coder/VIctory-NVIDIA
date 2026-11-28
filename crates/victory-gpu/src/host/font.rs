@@ -2,6 +2,8 @@
 //! (`menu.rs`, every build) are written with, and the pixels they are painted in.
 
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::Foundation::{COLORREF, SIZE};
+use windows::Win32::Graphics::Gdi::*;
 
 /// Seven rows of five dots, the leftmost the highest bit.
 #[rustfmt::skip]
@@ -76,4 +78,105 @@ pub(super) fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
         ],
         _ => return None,
     })
+}
+
+struct TextSurface {
+    dc: HDC,
+    font: HFONT,
+    bitmap: HBITMAP,
+}
+
+impl Drop for TextSurface {
+    fn drop(&mut self) {
+        // SAFETY: these handles belong to this surface. Deleting the DC
+        // releases its selections before the bitmap and font are deleted.
+        unsafe {
+            let _ = DeleteDC(self.dc);
+            if !self.bitmap.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+            }
+            if !self.font.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+        }
+    }
+}
+
+pub(super) struct TextMask {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+/// Rasterizes the guide into a mask using a Windows system font.
+pub(super) fn text_mask(
+    lines: &[&str],
+    (max_width, max_height): (u32, u32),
+    pixels: u32,
+    rim: u32,
+) -> Option<TextMask> {
+    if lines.is_empty() || max_width == 0 || max_height == 0 {
+        return None;
+    }
+    let lines: Vec<Vec<u16>> = lines.iter().map(|line| line.encode_utf16().collect()).collect();
+    // SAFETY: the memory DC, selected GDI objects, and DIB pixels all live
+    // for the duration of this call. BI_RGB with 32 bits has no row padding.
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() {
+            return None;
+        }
+        let mut surface = TextSurface { dc, font: HFONT::default(), bitmap: HBITMAP::default() };
+        surface.font = CreateFontW(-(pixels as i32), 0, 0, 0, FW_NORMAL.0 as i32,
+            0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY, 0, windows::core::w!("Microsoft YaHei UI"));
+        if surface.font.is_invalid() || SelectObject(dc, HGDIOBJ(surface.font.0)).is_invalid() {
+            return None;
+        }
+        let mut row_height = pixels;
+        let mut width = 0;
+        for line in &lines {
+            let mut extent = SIZE::default();
+            if !GetTextExtentPoint32W(dc, line, &mut extent).as_bool() {
+                return None;
+            }
+            row_height = row_height.max(extent.cy as u32);
+            width = width.max(extent.cx as u32);
+        }
+        row_height += 3;
+        let size = ((width + 2 * rim).min(max_width),
+            (row_height * lines.len() as u32 + 2 * rim).min(max_height));
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size.0 as i32,
+                biHeight: -(size.1 as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        surface.bitmap = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() || SelectObject(dc, HGDIOBJ(surface.bitmap.0)).is_invalid() {
+            return None;
+        }
+        let len = size.0 as usize * size.1 as usize;
+        std::ptr::write_bytes(bits.cast::<u32>(), 0, len);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, COLORREF(0x00ff_ffff));
+        for (row, line) in lines.iter().enumerate() {
+            if !TextOutW(dc, rim as i32, (rim + row as u32 * row_height) as i32, line).as_bool() {
+                return None;
+            }
+        }
+        if !GdiFlush().as_bool() {
+            return None;
+        }
+        let mask = std::slice::from_raw_parts(bits.cast::<u32>(), len)
+            .iter().map(|pixel| u8::from(pixel & 0xff >= 0x80)).collect();
+        Some(TextMask { width: size.0, height: size.1, pixels: mask })
+    }
 }

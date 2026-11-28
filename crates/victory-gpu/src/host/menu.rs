@@ -28,12 +28,21 @@ use std::time::Duration;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::font::{colours, glyph};
+use super::font::{TextMask, colours, glyph, text_mask};
 use super::{Host, HostList, transition};
+
+// Keep these key names in sync with the stand-in pad in victory-hle's GameInput.
+const ZH_CONTROLS: [&str; 5] = [
+    "键盘模拟手柄（美式键位）",
+    "左摇杆 W A S D    右摇杆 I J K L    方向键 ↑ ↓ ← →",
+    "A 回车    B 退格    X 键 X    Y 键 Y",
+    "肩键 Q / E    扳机 Z / C    摇杆按下 F / H",
+    "菜单 Esc    视图 Tab    F2 隐藏或显示",
+];
 
 const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
@@ -348,7 +357,7 @@ fn keys() -> &'static Mutex<Vec<u16>> {
     static KEYS: OnceLock<Mutex<Vec<u16>>> = OnceLock::new();
     KEYS.get_or_init(|| {
         let _ = std::thread::Builder::new().name("settings menu keys".into()).spawn(|| {
-            const WATCHED: [u16; 7] = [VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE];
+            const WATCHED: [u16; 8] = [VK_F1, VK_F2, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE];
             let mut was = [false; WATCHED.len()];
             loop {
                 std::thread::sleep(Duration::from_millis(10));
@@ -412,6 +421,8 @@ struct Buffers {
     format: DXGI_FORMAT,
     scale: u32,
     pitch: u32,
+    guide: OnceLock<Option<TextMask>>,
+    drawn: (u32, u32),
     uploads: Vec<(ID3D12Resource, *mut u8)>,
     card: ID3D12Resource,
     turn: usize,
@@ -448,12 +459,46 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, used: false })
+        Some(Buffers { format, scale, pitch, guide: OnceLock::new(), drawn: (0, 0), uploads, card: card?, turn: 0, fresh: false, used: false })
     }
 
-    fn write(&mut self, lines: &[String]) {
+    fn write(&mut self, lines: &[String], open: bool, show_guide: bool) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.scale, colours, self.pitch as usize);
+        let scale = self.scale;
+        let pitch = self.pitch as usize;
+        let mut picture = painted(lines, scale, colours, pitch);
+        self.drawn = if open {
+            size(scale)
+        } else if let Some(line) = lines.first() {
+            ((line.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale)
+        } else {
+            (0, 0)
+        };
+
+        if show_guide {
+            let guide = self.guide.get_or_init(|| {
+                let (width, height) = size(scale);
+                let pixels = (14 + (scale - 1) * 4).min(34);
+                let mask = text_mask(&ZH_CONTROLS, (width, height - CELL.1 * scale), pixels, RIM * scale);
+                if mask.is_none() {
+                    tracing::warn!("could not draw the Chinese keyboard guide");
+                }
+                mask
+            });
+            if let Some(guide) = guide {
+                // Begin after the FPS glyphs, keeping the same black background.
+                let top = (CELL.1 * scale) * u32::from(!lines.is_empty());
+                let bytes = colours[0].len();
+                for (row, target) in guide.pixels.chunks_exact(guide.width as usize)
+                    .zip(picture[top as usize * pitch..].chunks_exact_mut(pitch))
+                {
+                    for (&dot, pixel) in row.iter().zip(target.chunks_exact_mut(bytes)) {
+                        pixel.copy_from_slice(colours[usize::from(dot)]);
+                    }
+                }
+                self.drawn = (self.drawn.0.max(guide.width), self.drawn.1.max(top + guide.height));
+            }
+        }
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read frames ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -473,6 +518,8 @@ pub(super) struct Menu {
     changed: bool,
     /// What the buffer holds: the frame-rate line, or (none) the menu's lines.
     painted: Option<String>,
+    /// Some when enabled at launch, with the current F2 visibility.
+    guide: Option<bool>,
     buffers: Option<Buffers>,
     failed: bool,
     /// The saves in `Saves` that can be imported (read when the menu opens), and the line
@@ -491,7 +538,8 @@ impl Menu {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false }
+        let guide = std::env::var_os("VICTORY_ZH_CONTROLS").filter(|v| v == "1").map(|_| true);
+        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, guide, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false }
     }
 
     fn open() -> bool {
@@ -868,11 +916,19 @@ impl Menu {
     pub(super) fn frame(&mut self) {
         self.warmup();
         let pressed = std::mem::take(&mut *keys().lock().unwrap_or_else(|e| e.into_inner()));
-        if pressed.is_empty() {
-            return;
-        }
+        self.handle_keys(pressed);
+    }
+
+    fn handle_keys(&mut self, pressed: Vec<u16>) {
         for vk in pressed {
             let open = Self::open();
+            if !open && vk == VK_F2 {
+                if let Some(visible) = &mut self.guide {
+                    *visible = !*visible;
+                    self.changed = true;
+                }
+                continue;
+            }
             // Esc in the list of saves goes back to the settings.
             if open && self.picking && vk == VK_ESCAPE {
                 self.picking = false;
@@ -952,10 +1008,11 @@ impl Menu {
         if self.failed {
             return;
         }
-        // Closed: the frame-rate line in the top left corner, if it is wanted and there is a rate.
+        // While the menu is closed, the FPS line and guide share the top left corner.
         let open = Self::open();
         let line = if open { None } else { fps_line() };
-        if !open && line.is_none() {
+        let show_guide = !open && self.guide == Some(true);
+        if !open && line.is_none() && !show_guide {
             return;
         }
         // Our own copies are not part of a recorded frame (the recorder is in diagnostics builds).
@@ -972,19 +1029,19 @@ impl Menu {
             self.painted = line.clone();
             self.changed = true;
         }
-        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(), |l| vec![l.clone()])) } else { None };
+        let lines = self.changed.then(|| {
+            if open { self.lines() } else { line.into_iter().collect() }
+        });
         let Some(buffers) = &mut self.buffers else { return };
         if let Some(lines) = lines {
             self.changed = false;
-            buffers.write(&lines);
+            buffers.write(&lines, open, show_guide);
         }
-        // The whole box in the middle, or of it the first line's part in the corner.
-        let (w, h) = match &line {
-            Some(l) => ((l.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
-            None => size(scale),
-        };
-        let (w, h) = (w.min(width), h.min(height));
-        let (x, y) = if line.is_some() { (0, 0) } else { ((width - w) / 2, (height - h) / 2) };
+        let (w, h) = (buffers.drawn.0.min(width), buffers.drawn.1.min(height));
+        if w == 0 || h == 0 {
+            return;
+        }
+        let (x, y) = if open { ((width - w) / 2, (height - h) / 2) } else { (0, 0) };
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
@@ -1020,6 +1077,32 @@ impl Menu {
 mod tests {
     use super::*;
 
+    #[test]
+    fn chinese_guide_draws_distinct_glyphs() {
+        let (width, height) = size(1);
+        let guide = text_mask(&ZH_CONTROLS, (width, height - CELL.1), 14, RIM).unwrap();
+        assert!(guide.width < width);
+        assert!(guide.height < height - CELL.1);
+        assert!(guide.pixels.contains(&1));
+        let move_key = text_mask(&["移"], (width, height), 18, RIM).unwrap();
+        let mouse_key = text_mask(&["鼠"], (width, height), 18, RIM).unwrap();
+        assert_ne!(move_key.pixels, mouse_key.pixels);
+    }
+
+    #[test]
+    fn f2_toggles_only_an_enabled_guide() {
+        let mut menu = Menu { values: Vec::new(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, guide: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        menu.handle_keys(vec![VK_F2]);
+        assert_eq!(menu.guide, None);
+        assert!(!menu.changed);
+        menu.guide = Some(true);
+        menu.handle_keys(vec![VK_F2]);
+        assert_eq!(menu.guide, Some(false));
+        assert!(menu.changed);
+        menu.handle_keys(vec![VK_F2]);
+        assert_eq!(menu.guide, Some(true));
+    }
+
     /// A mark that lands ends the warm-up; one that cannot (here, beside a
     /// file of the same name) does not: the launcher arms a new warm-up
     /// whenever no mark exists, and a restart without one would come back
@@ -1042,7 +1125,7 @@ mod tests {
             std::env::remove_var("VICTORY_MENU_FILE");
             std::env::set_var("VICTORY_HOME", &home);
         }
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, guide: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
         menu.change_and_save(dlss, 1);
@@ -1059,7 +1142,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, guide: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;
@@ -1074,7 +1157,7 @@ mod tests {
 
     #[test]
     fn the_link_is_always_right_under_the_note() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, guide: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         for note in ["", "SAVED"] {
             menu.note = note.to_owned();
@@ -1146,7 +1229,7 @@ mod tests {
 
     #[test]
     fn the_picture_line_is_the_consoles() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, guide: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         let at = |var: &str| ITEMS.iter().position(|i| i.var == var).expect("in the menu");
         let (console, x, s, dlss) = (at(CONSOLE), at(X_RES), at(S_RES), at(DLSS));
@@ -1190,7 +1273,7 @@ mod tests {
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, guide: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         let n = ITEMS[0].values.len();
         for _ in 0..n {
@@ -1204,7 +1287,7 @@ mod tests {
     #[test]
     fn a_shared_save_name_is_shown_in_letters_the_menu_has() {
         let names = vec!["save 2026-11-27 23-45-10.zip".to_owned(), "Jason's boat ~ 100% [\u{e9}] and a very long name that goes on and on.zip".to_owned()];
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, guide: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true };
         menu.started = menu.values.clone();
         let check = |menu: &Menu| {
             let lines = menu.lines();

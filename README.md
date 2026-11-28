@@ -14,6 +14,16 @@
 >
 > Also say which GPU, Windows version (10 or 11) and release you used.
 
+## Chinese keyboard guide
+
+On Windows, run the following from PowerShell to show the Chinese guide
+for VIctory's keyboard-as-gamepad layout. It uses US key positions.
+Press F2 to hide or show it during play.
+
+```powershell
+.\victory.exe play --set VICTORY_ZH_CONTROLS=1
+```
+
 ## Frame generation: what your card supports
 
 | Your card | Frame generation | Limits |
