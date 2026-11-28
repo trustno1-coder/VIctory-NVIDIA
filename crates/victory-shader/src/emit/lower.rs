@@ -1440,10 +1440,12 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
+/// wave, the view heap's limit (bit 31: view indices are placed through the
+/// host's table, `set_view_remap`), where the raw twins of its views start,
+/// and what it writes for the console's own hardware.
 pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+    let limit = super::shader::view_heap_limit() | u32::from(super::shader::view_remap()) << 31;
+    [host_max_wave(), limit, super::shader::raw_views(), host_rdna()]
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

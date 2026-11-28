@@ -235,6 +235,51 @@ pub(crate) struct HostHeap {
     /// another's view made stale stays, which says only "may"): a write of
     /// any other view needs nothing of `placed` ([`spans_quick`]).
     spanned: Slots,
+    /// Capped view heaps whose title slots are placed through a table
+    /// ([`Places`]; else none: slot `i` is place `i`).
+    places: Option<Places>,
+}
+
+/// Where a view heap smaller than the title's (NVIDIA: 1,000,000 views; the
+/// retail game's heap has 1,245,184) puts the slots past what it can keep
+/// one to one. Title slots below `as_is` are the places of the same number;
+/// one from `as_is` on that gets a view is given a place of the pool, freed
+/// when it is made null again; dynamic slot `count + k` is place
+/// `dynamic_at + k`. Shaders read every view index's place from the
+/// strides table (`victory_shader::emit::set_view_remap`), dword
+/// `SLOT_STRIDES_COUNT + index`.
+///
+/// The title's views lie all over its heap (the views of one frame among
+/// them), so no fold of the slot numbers keeps them apart.
+struct Places {
+    as_is: u32,
+    /// Title slots: `as_is` up to this.
+    count: u32,
+    /// Where dynamic slots start, and the null place every index without a
+    /// place reads.
+    dynamic_at: u32,
+    null_at: u32,
+    /// Where a view goes that finds the pool empty: a place no index reads.
+    sink: u32,
+    /// Per title slot from `as_is` on: its place plus one (0: none).
+    of: Vec<std::sync::atomic::AtomicU32>,
+    /// Free places of the pool, the longest free first: a place given back
+    /// is given out again only after every other, by when the frames that
+    /// read it have run.
+    free: Mutex<std::collections::VecDeque<u32>>,
+}
+
+/// Title slots kept one to one in a capped view heap ([`Places`]); every
+/// place from there to the dynamic slots is the pool's. In its world the
+/// title keeps 400,000 to 570,000 views past this at once and turns over
+/// some 130,000 a second (a pool of 65,536 ran out 33 s in).
+const AS_IS: u32 = 1 << 16;
+
+/// Whether a capped view heap places the title's slots through a table
+/// ([`Places`]; `VICTORY_VIEW_REMAP=0`: slots past what fits read null, as
+/// before).
+fn view_remap_on() -> bool {
+    std::env::var_os("VICTORY_VIEW_REMAP").is_none_or(|v| v != "0")
 }
 
 /// Since the last frame line: writes that left `placed` alone
@@ -1781,7 +1826,10 @@ pub(crate) fn shown_bytes(at: u32, n: u32) -> Option<(u32, Vec<u8>, u32)> {
             return None;
         }
         let mut bytes = vec![0u8; n as usize * 32];
-        crate::host::read_into(host.cpu(at).ptr as *const u8, &mut bytes).then_some((at, bytes, end))
+        // (Placed slots lie apart: one at a time.)
+        let n = if host.places.as_ref().is_some_and(|p| at >= p.as_is && at < p.count) { 1 } else { n };
+        bytes.truncate(n as usize * 32);
+        crate::host::read_into(host.cpu_at(host.place(at)).ptr as *const u8, &mut bytes).then_some((at, bytes, end))
     })?
 }
 
@@ -1936,6 +1984,17 @@ pub(crate) fn probe_view_limit() {
         } else {
             PORTABLE_VIEWS
         };
+        if views == PORTABLE_VIEWS && view_remap_on() {
+            // Indices are keys up to the last dword of the strides table,
+            // and their places are read there (`Places`).
+            tracing::info!(
+                views,
+                "host view heaps hold {views} views, fewer than a title's heap may have; view indices are placed through a table from the first shader on"
+            );
+            victory_shader::emit::set_view_remap(true);
+            victory_shader::emit::set_view_heap_limit(victory_shader::emit::SLOT_STRIDES_COUNT - 1);
+            return;
+        }
         tracing::info!(
             views,
             raw_twins = twins,
@@ -1972,7 +2031,7 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(DYNAMIC << 2)
     });
-    if null < PORTABLE_VIEWS {
+    if null < PORTABLE_VIEWS || victory_shader::emit::view_remap() {
         return DYNAMIC;
     }
     null.saturating_sub(count).min(most).max(DYNAMIC)
@@ -2020,7 +2079,13 @@ impl HostHeap {
                 }
             }
         } else {
-            let size = if raw == 0 { null + 1 } else { 2 * raw };
+            let size = if victory_shader::emit::view_remap() {
+                PORTABLE_VIEWS
+            } else if raw == 0 {
+                null + 1
+            } else {
+                2 * raw
+            };
             let fitted = if count + extra <= null {
                 count
             } else {
@@ -2053,9 +2118,31 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        let places = (!sampler && victory_shader::emit::view_remap()).then(|| {
+            let dynamic_at = size - 1 - extra;
+            let as_is = count.min(AS_IS);
+            let pool = dynamic_at - 1 - as_is;
+            tracing::info!(
+                title_slots = count,
+                as_is,
+                pool,
+                dynamic_at,
+                "view heap: title slots from {as_is} on are placed in a pool of {pool}"
+            );
+            Places {
+                as_is,
+                count,
+                dynamic_at,
+                null_at: size - 1,
+                sink: dynamic_at - 1,
+                of: (as_is..count).map(|_| std::sync::atomic::AtomicU32::new(0)).collect(),
+                free: Mutex::new((as_is..dynamic_at - 1).collect()),
+            }
+        });
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                let tables = if places.is_some() { 2 } else { 1 };
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4 * tables;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -2111,7 +2198,9 @@ impl HostHeap {
                 spans
             },
             spanned: Slots::new((count + extra) as usize),
+            places,
         };
+        h.place_all();
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
@@ -2163,7 +2252,7 @@ impl HostHeap {
                 }
                 while done < end {
                     let n = BLOCK.min(end - done);
-                    host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
+                    host.device.CopyDescriptorsSimple(n, self.cpu_at(done), start, kind);
                     done += n;
                 }
             }
@@ -3205,6 +3294,7 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 0);
         self.keep(index, None);
+        self.place_back(index);
     }
 
     /// The slots [`HostHeap::note_buffer`] found stale for slot `index`, with
@@ -3604,6 +3694,7 @@ impl HostHeap {
         }
         self.clear_twin(index);
         self.keep(index, None);
+        self.place_back(index);
     }
 
     /// Where the raw twin of slot `index` is made.
@@ -3777,7 +3868,7 @@ impl HostHeap {
         // SAFETY: a live shader-visible heap.
         let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: start + u64::from(self.place(index)) * u64::from(self.step),
         }
     }
 
@@ -3869,9 +3960,92 @@ impl HostHeap {
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, kind) };
     }
 
+    /// Where slot `index`'s descriptor is written: its place, given one now
+    /// if it is a title slot that has none ([`Places`]).
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        self.cpu_at(self.place_for(index))
+    }
+
+    /// The handle of place `at` of the host's heap.
+    fn cpu_at(&self, at: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: self.cpu + index as usize * self.step as usize,
+            ptr: self.cpu + at as usize * self.step as usize,
+        }
+    }
+
+    /// The place of slot `index` in the host's heap ([`Places`]).
+    pub(crate) fn place(&self, index: u32) -> u32 {
+        let Some(p) = &self.places else { return index };
+        if index < p.as_is {
+            index
+        } else if index < p.count {
+            p.of[(index - p.as_is) as usize].load(std::sync::atomic::Ordering::Acquire).checked_sub(1).unwrap_or(p.null_at)
+        } else if index < p.count + self.dynamic {
+            p.dynamic_at + (index - p.count)
+        } else {
+            p.null_at
+        }
+    }
+
+    /// [`HostHeap::place`], with a place of the pool given to a title slot
+    /// that has none (or the sink, which no index reads, if none is free).
+    fn place_for(&self, index: u32) -> u32 {
+        use std::sync::atomic::Ordering::Acquire;
+        let Some(p) = &self.places else { return index };
+        if index < p.as_is || index >= p.count {
+            return self.place(index);
+        }
+        let of = &p.of[(index - p.as_is) as usize];
+        if let Some(at) = of.load(Acquire).checked_sub(1) {
+            return at;
+        }
+        let mut free = p.free.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = of.load(Acquire).checked_sub(1) {
+            return at;
+        }
+        let Some(at) = free.pop_front() else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(index, "no free place for a title view slot; it reads null"));
+            return p.sink;
+        };
+        // (The place is null: made so, or given back after its slot was.)
+        of.store(at + 1, std::sync::atomic::Ordering::Release);
+        self.write_place(index, at);
+        at
+    }
+
+    /// Title slot `index`, made null, gives its place back ([`Places`]).
+    fn place_back(&self, index: u32) {
+        let Some(p) = &self.places else { return };
+        if index < p.as_is || index >= p.count {
+            return;
+        }
+        let mut free = p.free.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = p.of[(index - p.as_is) as usize].swap(0, std::sync::atomic::Ordering::AcqRel).checked_sub(1) {
+            self.write_place(index, p.null_at);
+            free.push_back(at);
+        }
+    }
+
+    /// Writes the place of view index `index` where shaders read it.
+    fn write_place(&self, index: u32, at: u32) {
+        let n = victory_shader::emit::SLOT_STRIDES_COUNT;
+        if let Some((_, _, data)) = &self.strides
+            && self.places.is_some()
+            && index < n
+        {
+            // SAFETY: inside the mapping (twice `n` dwords with places);
+            // a single aligned dword, either value one the index had.
+            unsafe { (*data as *mut u32).add((n + index) as usize).write_volatile(at) };
+        }
+    }
+
+    /// Writes the places of every view index ([`Places`]).
+    fn place_all(&self) {
+        if self.places.is_some() {
+            for index in 0..victory_shader::emit::SLOT_STRIDES_COUNT {
+                self.write_place(index, self.place(index));
+            }
         }
     }
 
@@ -4097,6 +4271,11 @@ impl HostHeap {
             }
             if kept.is_some() || !self.sampler {
                 self.put(index);
+            }
+            // (A slot left null, a buffer view waiting for a draw or the
+            // pass, keeps no place: those may wait forever.)
+            if kept.is_none() {
+                self.place_back(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
