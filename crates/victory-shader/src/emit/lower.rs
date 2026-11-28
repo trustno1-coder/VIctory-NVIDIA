@@ -1755,14 +1755,14 @@ impl<'a> Lower<'a> {
         let mut pairs: Option<u32> = None;
         let mut pair_waves = 0;
         // (and only around the LDS accesses whose order counts)
-        let lds_order = {
-            let all = if PAIR_MEETINGS.get() || LOCAL_WAVES.get() || loop_atomics_on() {
+        let mut lds_order = {
+            let all = if PAIR_MEETINGS.get() || loop_atomics_on() {
                 lds_order(p, x.st)
             } else {
                 LdsOrder::default()
             };
             let looped = if loop_atomics_on() { all.looped } else { HashSet::new() };
-            if PAIR_MEETINGS.get() || LOCAL_WAVES.get() {
+            if PAIR_MEETINGS.get() {
                 LdsOrder { looped, unordered: all.unordered, unstable: all.unstable }
             } else {
                 LdsOrder { looped, ..LdsOrder::default() }
@@ -1819,28 +1819,43 @@ impl<'a> Lower<'a> {
                     // no guard), else a barrier would hang the group
                     // (with console waves meeting on their own, only the accesses whose order
                     // counts: [`LdsOrder`])
-                    let lds = |b: usize, k: usize, i: &Inst| {
+                    let is_ordered_lds = |b: usize, k: usize, i: &Inst, unordered: &HashSet<(usize, usize)>| {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
-                            && !lds_order.unordered.contains(&(b, k))
+                            && !unordered.contains(&(b, k))
                     };
                     if let Some(all) = all_lane_blocks(x.st) {
-                        let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
-                            blk.insts.iter().enumerate().all(|(k, inst)| {
-                                !lds(b, k, inst) || all.get(b).copied().unwrap_or(false)
-                            })
-                        });
-                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, &lds_order.unordered) {
-                            lds_meet = Some((all.clone(), meet));
-                            lds_ok = true;
+                        let check_lds = |unordered: &HashSet<(usize, usize)>| {
+                            let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
+                                blk.insts.iter().enumerate().all(|(k, inst)| {
+                                    !is_ordered_lds(b, k, inst, unordered) || all.get(b).copied().unwrap_or(false)
+                                })
+                            });
+                            if !(s.lds_dwords > 0 && group > 32) || ok {
+                                (true, None)
+                            } else if let Some(meet) = lds_meetings(p, x.st, &all, unordered) {
+                                (true, Some((all.clone(), meet)))
+                            } else {
+                                (false, None)
+                            }
+                        };
+                        let (mut lds_ok, mut meet) = check_lds(&lds_order.unordered);
+                        if !lds_ok && LOCAL_WAVES.get() {
+                            let order = self::lds_order(p, x.st);
+                            let (ok2, meet2) = check_lds(&order.unordered);
+                            if ok2 {
+                                lds_order.unordered = order.unordered;
+                                lds_ok = true;
+                                meet = meet2;
+                            }
                         }
+                        lds_meet = meet;
                         if !lds_ok {
                             // (the blocks whose LDS accesses not every lane runs: with the
                             // branches around them taken wave-wide they get their barriers)
                             for (b, blk) in p.blocks.iter().enumerate() {
                                 if !all.get(b).copied().unwrap_or(false)
-                                    && blk.insts.iter().enumerate().any(|(k, inst)| lds(b, k, inst))
+                                    && blk.insts.iter().enumerate().any(|(k, inst)| is_ordered_lds(b, k, inst, &lds_order.unordered))
                                 {
                                     need(b);
                                 }
@@ -1853,7 +1868,8 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 // (local waves never exchange across halves)
-                                exchange = Some((s.lds_dwords, group <= 32, all));
+                                let slot = if LOCAL_WAVES.get() { u32::MAX } else { s.lds_dwords };
+                                exchange = Some((slot, group <= 32, all));
                                 if !LOCAL_WAVES.get() {
                                     s.lds_dwords += 2 * group.div_ceil(64);
                                 }
@@ -4708,6 +4724,7 @@ impl<'a> Lower<'a> {
     /// exchange is one meeting. (Both halves meet as often; between two of its meetings a half
     /// finds the counter at twice its meetings, or one more.)
     fn exchange_dword(&mut self) -> V {
+        debug_assert!(!self.local, "local waves never exchange through LDS");
         let c = self.cur;
         let counter = self.meeting_index();
         let lds = self.s.lds();
@@ -4831,6 +4848,7 @@ impl<'a> Lower<'a> {
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
     /// block): a group of several console waves has a pair for each.
     fn exchange_pair(&mut self, slot: u32) -> V {
+        debug_assert!(!self.local, "local waves never exchange through LDS");
         if let Some(v) = self.pair {
             return v;
         }

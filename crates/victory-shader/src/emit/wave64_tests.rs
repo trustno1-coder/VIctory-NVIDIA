@@ -1178,3 +1178,57 @@ fn full_lds_local_wave_lds_atomic_allocation_lowers_to_wave32() {
     assert!(out[0][active as usize..128].iter().all(|&x| x == 0));
     eprintln!("ran on the hardware device: 75 of 128 threads allocated unique slots in 32 KiB LDS");
 }
+
+/// In local-waves mode, `console_lane()` still returns the console lane (0..63, so 32..63 for
+/// the upper host wave) whenever LDS has room for the `halves` counter, and only falls back to
+/// the host lane (0..31) when `halves` is `None` at 32 KiB LDS.
+#[test]
+fn local_waves_console_lane_keeps_upper_half_when_lds_has_room() {
+    let words = [
+        0xD765_0003,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0xD766_0004,
+        0x0002_06C1, // v_mbcnt_hi_u32_b32 v4, -1, v3
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8002_0402, // buffer_store_dword v4, v2, s[8:11], 0 offen
+    ];
+    let lower_with_lds = |lds_blocks: u32| {
+        let mut native = native_of(&words, true, 128);
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= lds_blocks << 15;
+        }
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        lower::with_local_waves(|| lowered_on(&native, &p, &HashSet::new(), 32)).expect("lower")
+    };
+    let with_room = lower_with_lds(1);
+    let full_lds = lower_with_lds(64);
+    assert_ne!(with_room.dxil, full_lds.dxil, "halves counter vs host lane fallback");
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let run = |shader: &HostShader| -> Option<Vec<u32>> {
+        let (root, pso) = host.compute_pipeline(shader).ok()?;
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out[0][..128].to_vec())
+    };
+    let Some(got_room) = run(&with_room) else { return };
+    assert_eq!(got_room.iter().filter(|&&x| x >= 32).count(), 64, "upper host waves keep 32..63");
+    let Some(got_full) = run(&full_lds) else { return };
+    assert_eq!(got_full.iter().filter(|&&x| x >= 32).count(), 0, "full 32 KiB LDS falls back to 0..31");
+    eprintln!("ran on the hardware device: local_waves with room keeps 32..63, full LDS uses 0..31");
+}
