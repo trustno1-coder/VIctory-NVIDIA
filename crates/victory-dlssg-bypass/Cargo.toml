@@ -1,0 +1,14 @@
+[package]
+name = "victory-dlssg-bypass"
+description = "Built-in RTX 30 (Ampere) DLSS Frame Generation / MFG bypass (from rodjunger/opendlssgenabler)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[build-dependencies]
+cc = "1.11.3"
+
+[lints]
+workspace = true

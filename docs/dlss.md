@@ -47,6 +47,18 @@ own upscaling and our plain present run as before.
      upscalings with a present after each through Streamline's proxy of our
      swap chain (no "presentCommon() was not observed" may follow).
 
+On GeForce RTX 30 (Ampere) cards, `victory` includes a built-in DLSS Frame
+Generation / MFG bypass (derived from `rodjunger/opendlssgenabler`,
+GPL-3.0-or-later) that activates automatically when no external unlocker is
+set (`VICTORY_DLSSG_BYPASS=0` disables it; `VICTORY_DLSSG_BYPASS=1` forces it).
+Third-party external DLSS-G unlocker DLLs (such as `MFGUnlocker.dll` from
+`dashdogy/MFG-Unlocker`, `RTX40MFGCore.dll` from `mcsoderh/RTX30MFG-Unlock`, or
+`opendlssgenabler.dll` from `rodjunger/opendlssgenabler`) are not shipped with
+this repository. If you supply one, set `VICTORY_DLSSG_UNLOCKER` to the DLL
+file or a folder containing it (loaded before `sl.interposer.dll` without
+requiring a signature) and check compatibility first with
+`victory upscaler-check --device --present`.
+
 Windows 10 2004 or later, a GeForce RTX GPU (frame generation: RTX 40 or
 later), hardware-accelerated GPU scheduling on (frame generation needs it).
 
@@ -59,6 +71,8 @@ later), hardware-accelerated GPU scheduling on (frame generation needs it).
 | `VICTORY_DLSS_MODE` | `dlaa`, `quality`, `balanced`, `performance`, `ultraperformance` | `quality` (`dlaa` with frame generation alone) | the scene's size: 1, 2/3, 0.58, 1/2, 1/3 of the output; the DLSS mode follows the sizes the title then passes |
 | `VICTORY_DLSS_PRESET` | `default`, `j`, `k`, `l`, `m` (`e`, `f` deprecated) | `default` | the DLSS model, for every mode |
 | `VICTORY_STREAMLINE_DIR` | a folder | see above | where `sl.interposer.dll` and the rest are |
+| `VICTORY_DLSSG_BYPASS` | `1`, `0` | auto on RTX 30 | built-in RTX 30 (Ampere) DLSS-G / MFG bypass (`0` disables, `1` forces) |
+| `VICTORY_DLSSG_UNLOCKER` | a DLL or folder | off | optional third-party DLSS-G unlocker (`MFGUnlocker.dll`, `RTX40MFGCore.dll`, or `opendlssgenabler.dll`), loaded before `sl.interposer.dll` |
 | `VICTORY_STREAMLINE_LOG` | a folder | none | Streamline's own log files there, verbose |
 | `VICTORY_DLSS_JITTER` | `x,y` | `1,1` | multipliers for the jitter DLSS is given (`-1,1` flips x) |
 | `VICTORY_DLSS_MV` | `x,y` | `1,1` | multipliers for the motion-vector scale |

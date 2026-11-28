@@ -51,7 +51,24 @@ switch ($Mode) {
     '5' { $opts = @{ SeriesS = $true; Dlss = 'performance'; FrameGen = $true; Fps = 1000 }; $what = 'EXTREME: Series S, DLSS Performance, frame generation 2x, no cap, big pools, High priority' }
     '6' { $opts = @{ Dlss = 'performance'; FrameGen = $true; Fps = 1000 }; $what = 'EXTREME: Series X 2560x1440, DLSS Performance, frame generation 2x, no cap, big pools, High priority' }
 }
-$sl = Join-Path $repo 'nvidia-sdk\Streamline\bin\x64'
+$slCandidates = @($env:VICTORY_STREAMLINE_DIR, (Join-Path $repo 'nvidia-sdk\Streamline\bin\x64'), (Join-Path $env:LOCALAPPDATA 'victory\nvidia-sdk\Streamline\bin\x64')) | Where-Object { $_ }
+$sl = ($slCandidates | Where-Object { Test-Path (Join-Path $_ 'sl.interposer.dll') } | Select-Object -First 1)
+if (-not $sl) { $sl = Join-Path $repo 'nvidia-sdk\Streamline\bin\x64' }
+$unlocker = $null
+if ($env:VICTORY_DLSSG_UNLOCKER -ne '0') {
+    if ($env:VICTORY_DLSSG_UNLOCKER) {
+        $unlocker = $env:VICTORY_DLSSG_UNLOCKER
+    } else {
+        $unlockerDirs = @($repo, (Join-Path $env:LOCALAPPDATA 'victory'), (Join-Path $env:LOCALAPPDATA 'victory\dlssg-unlocker'))
+        foreach ($d in $unlockerDirs) {
+            foreach ($n in @('MFGUnlocker.dll', 'RTX40MFGCore.dll', 'opendlssgenabler.dll')) {
+                $cand = Join-Path $d $n
+                if (Test-Path -LiteralPath $cand -PathType Leaf) { $unlocker = $cand; break }
+            }
+            if ($unlocker) { break }
+        }
+    }
+}
 $victory = Join-Path $repo 'target\release\victory.exe'
 $hags = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -Name HwSchMode -ErrorAction SilentlyContinue).HwSchMode
 $isWin11 = [Environment]::OSVersion.Version.Build -ge 22000
@@ -69,6 +86,7 @@ if ($Check) {
     Write-Host "game:    $gameExe"
     Write-Host "mode:    $Mode ($what)"
     Write-Host "DLSS:    $(if (Test-Path (Join-Path $sl 'sl.interposer.dll')) { 'present' } else { 'not yet (downloaded at first start)' })"
+    Write-Host "unlocker: $(if ($unlocker) { $unlocker } else { 'none' })"
     Write-Host "built:   $(if (Test-Path $victory) { 'yes' } else { 'no (built at first start)' })"
     Write-Host "HAGS:    $hagsText"
     exit 0
@@ -129,6 +147,10 @@ if ($opts.FrameGen) {
     elseif ($gpuName -match 'RTX\s*50\d\d') { $opts.FrameGenX = 4 }
     $fgx = if ($opts.FrameGenX) { $opts.FrameGenX } else { 2 }
     Write-Host ('GPU: {0}; frame generation {1}x' -f $gpuName, $fgx)
+    if ($unlocker) {
+        $env:VICTORY_DLSSG_UNLOCKER = $unlocker
+        Write-Host "DLSS-G unlocker: $unlocker"
+    }
 }
 if ($Mode -in @('5', '6')) {
     # Raise the game to High priority once it is up (the submitting thread is the limit).

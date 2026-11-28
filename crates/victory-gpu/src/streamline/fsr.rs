@@ -883,6 +883,8 @@ mod tests {
             files_missing: false,
             dlss_fg_asked: true,
             dlss_fg_supported,
+            unlocker_loaded: false,
+            builtin_bypass: false,
             fsr_asked: true,
             fsr_loaded,
             fsr_needs_dlss: !dlss,
