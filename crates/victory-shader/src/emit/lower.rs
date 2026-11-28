@@ -334,7 +334,7 @@ struct Lower<'a> {
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
-    /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
+    /// it, and whether the host waves meet at its start and before its exit ([`super::lds::analyze`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
@@ -456,7 +456,7 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+pub(super) fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     all_lane_blocks_of(st, false)
 }
 
@@ -1178,81 +1178,76 @@ pub(super) fn lds_order(p: &crate::ir::Program, st: &Structured) -> LdsOrder {
     out
 }
 
-/// there: before the exit of an all-lane block into a region with LDS accesses, and at the
-/// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
-/// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
-/// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(
+/// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
+/// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
+/// group barrier) at its start and before its exit (`Err` with the specific [`super::lds::Refusal`]
+/// if barriers cannot keep order).
+/// Delegates to [`super::lds::analyze`] for hazard/disjointness/lane-privacy proof.
+fn lds_analyze(
     p: &crate::ir::Program,
     st: &Structured,
+    io: &crate::io::Io,
+    res: &crate::resource::Resources,
+    cs: crate::native::ComputeIo,
     all: &[bool],
     unordered: &HashSet<(usize, usize)>,
-) -> Option<Vec<(bool, bool)>> {
-    let n = st.exits.len();
-    let succ = |b: usize| -> Vec<usize> {
-        match st.exits[b] {
-            LaneExit::Jump(t) => vec![t],
-            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
-            LaneExit::End | LaneExit::Indirect => Vec::new(),
-        }
-    };
-    // regions: blocks not every lane runs, joined by the edges between them
-    let mut region: Vec<usize> = (0..n).collect();
-    fn find(region: &mut [usize], mut b: usize) -> usize {
-        while region[b] != b {
-            region[b] = region[region[b]];
-            b = region[b];
-        }
-        b
-    }
-    for b in 0..n {
-        for t in succ(b) {
-            if !all[b] && !all[t] {
-                let (x, y) = (find(&mut region, b), find(&mut region, t));
-                region[x] = y;
-            }
-        }
-    }
-    // per region: LDS reads, LDS writes
-    let mut reads = vec![false; n];
-    let mut writes = vec![false; n];
-    for (b, block) in p.blocks.iter().enumerate().take(n) {
-        if all[b] {
+) -> Result<Vec<(bool, bool)>, super::lds::Refusal> {
+    super::lds::analyze(p, st, io, res, cs, all, unordered)
+}
+
+pub(super) fn wave64_why_reasons(
+    p: &crate::ir::Program,
+    st: &Structured,
+    group: u32,
+    has_lds: bool,
+    indirect_exit: bool,
+    lds_refusal: Option<super::lds::Refusal>,
+) -> Vec<&'static str> {
+    let mut why: Vec<&'static str> = Vec::new();
+    for i in p.blocks.iter().flat_map(|b| &b.insts) {
+        let n = i.name();
+        let r = if n.starts_with("v_mbcnt") {
+            "v_mbcnt"
+        } else if n == "v_readlane_b32" {
+            "v_readlane"
+        } else if n == "v_writelane_b32" {
+            "v_writelane"
+        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
+            "ds_(b)permute"
+        } else if reads_mask_as_data(st, i) {
+            "mask as data"
+        } else {
             continue;
-        }
-        let r = find(&mut region, b);
-        for (k, i) in block.insts.iter().enumerate() {
-            let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                continue;
-            }
-            if unordered.contains(&(b, k)) {
-                continue; // (no meeting: [`LdsOrder`])
-            }
-            if name.starts_with("ds_read") {
-                reads[r] = true;
-            } else {
-                writes[r] = true;
-            }
+        };
+        if !why.contains(&r) {
+            why.push(r);
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        return None;
+    if lane_constant_masks(st) {
+        why.push("lane-constant mask");
     }
-    let mut meet = vec![(false, false); n];
-    for b in 0..n {
-        for t in succ(b) {
-            if all[b] && !all[t] {
-                let r = find(&mut region, t);
-                meet[b].1 |= reads[r] || writes[r];
-            } else if !all[b] && all[t] {
-                let r = find(&mut region, b);
-                meet[t].0 |= reads[r] || writes[r];
-            }
+    if has_lds && group > 32 {
+        why.push("LDS in a group over 32");
+        if indirect_exit {
+            why.push("an indirect exit");
+        } else if let Some(reason) = lds_refusal {
+            why.push(reason.reason());
         }
     }
-    Some(meet)
+    why.sort_unstable();
+    why
+}
+
+fn log_wave64_why(
+    p: &crate::ir::Program,
+    st: &Structured,
+    group: u32,
+    has_lds: bool,
+    indirect_exit: bool,
+    lds_refusal: Option<super::lds::Refusal>,
+) {
+    let why = wave64_why_reasons(p, st, group, has_lds, indirect_exit, lds_refusal);
+    eprintln!("WAVE64-WHY group={group} lds={has_lds} [{}]", why.join(", "));
 }
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
@@ -1740,7 +1735,7 @@ impl<'a> Lower<'a> {
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
-        // where the host waves meet around those branches (`lds_meetings`)
+        // where the host waves meet around those branches (`lds_analyze`)
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
@@ -1824,9 +1819,17 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, &lds_order.unordered) {
-                            lds_meet = Some((all.clone(), meet));
-                            lds_ok = true;
+                        let mut lds_refusal: Option<super::lds::Refusal> = None;
+                        if !lds_ok {
+                            match lds_analyze(p, x.st, x.io, x.res, cs, &all, &lds_order.unordered) {
+                                Ok(meet) => {
+                                    lds_meet = Some((all.clone(), meet));
+                                    lds_ok = true;
+                                }
+                                Err(reason) => {
+                                    lds_refusal = Some(reason);
+                                }
+                            }
                         }
                         if !lds_ok {
                             // (the blocks whose LDS accesses not every lane runs: with the
@@ -1849,45 +1852,13 @@ impl<'a> Lower<'a> {
                                 s.lds_dwords += 2 * group.div_ceil(64);
                             }
                         }
-                    }
-                }
-                // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
-                if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
-                    let mut why: Vec<&str> = Vec::new();
-                    for i in insts() {
-                        let n = i.name();
-                        let r = if n.starts_with("v_mbcnt") {
-                            "v_mbcnt"
-                        } else if n == "v_readlane_b32" {
-                            "v_readlane"
-                        } else if n == "v_writelane_b32" {
-                            "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                            "ds_(b)permute"
-                        } else if reads_mask_as_data(x.st, i) {
-                            "mask as data"
-                        } else {
-                            continue;
-                        };
-                        if !why.contains(&r) {
-                            why.push(r);
+                        // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
+                        if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                            log_wave64_why(p, x.st, group, s.lds_dwords > 0, false, lds_refusal);
                         }
+                    } else if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                        log_wave64_why(p, x.st, group, s.lds_dwords > 0, true, None);
                     }
-                    if lane_constant_masks(x.st) {
-                        why.push("lane-constant mask");
-                    }
-                    if s.lds_dwords > 0 && group > 32 {
-                        why.push("LDS in a group over 32");
-                        match all_lane_blocks(x.st) {
-                            None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all, &lds_order.unordered).is_none() => {
-                                why.push("an LDS read and write in one lane-branch region")
-                            }
-                            Some(_) => {}
-                        }
-                    }
-                    why.sort_unstable();
-                    eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
             if wave == 32 && x.native.wave64 {

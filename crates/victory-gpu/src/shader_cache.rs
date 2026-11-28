@@ -69,6 +69,7 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
+            "VICTORY_LDS_WRITE_ONLY_OK",
             "VICTORY_F16_NEAREST",
             "VICTORY_FILTER_3D",
             "VICTORY_HELPER_OWN",
