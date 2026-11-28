@@ -150,13 +150,18 @@ struct MouseCapture {
 static MOUSE_CAPTURE: std::sync::LazyLock<Mutex<MouseCapture>> =
     std::sync::LazyLock::new(|| Mutex::new(MouseCapture::default()));
 
+static MOUSE_DRAGGING: AtomicBool = AtomicBool::new(false);
+
 fn capture_mouse(hwnd: HWND, active: bool) {
     if !enabled("VICTORY_MOUSE_CAPTURE") { return; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: runs on the window thread; local geometry, balanced cursor count.
     unsafe {
         if active && !wm::GetParent(hwnd).is_null() { return; }
-        let active = active && wm::GetForegroundWindow() == hwnd && wm::IsIconic(hwnd) == 0;
+        let active = active
+            && !MOUSE_DRAGGING.load(Ordering::Relaxed)
+            && wm::GetForegroundWindow() == hwnd
+            && wm::IsIconic(hwnd) == 0;
         if !active {
             if state.window == hwnd as usize {
                 wm::ClipCursor(std::ptr::null());
@@ -188,7 +193,12 @@ pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: sampling and warping serialize with capture/focus messages.
     unsafe {
-        if state.window == 0 || wm::GetForegroundWindow() as usize != state.window { return None; }
+        if state.window == 0
+            || MOUSE_DRAGGING.load(Ordering::Relaxed)
+            || wm::GetForegroundWindow() as usize != state.window
+        {
+            return None;
+        }
         let mut point = POINT::default();
         if wm::GetCursorPos(&mut point) == 0 { state.reference = None; return None; }
         let point = (point.x, point.y);
@@ -365,9 +375,32 @@ extern "system" fn window_proc(
         english_input();
     }
     match message {
-        wm::WM_KILLFOCUS | wm::WM_NCDESTROY => capture_mouse(hwnd, false),
-        wm::WM_ACTIVATE => capture_mouse(hwnd, wparam & 0xffff != wm::WA_INACTIVE as usize),
-        wm::WM_SETFOCUS | wm::WM_MOVE | wm::WM_SIZE => capture_mouse(hwnd, true),
+        wm::WM_KILLFOCUS | wm::WM_NCDESTROY => {
+            MOUSE_DRAGGING.store(false, Ordering::Relaxed);
+            capture_mouse(hwnd, false);
+        }
+        wm::WM_ENTERSIZEMOVE | wm::WM_NCLBUTTONDOWN => {
+            MOUSE_DRAGGING.store(true, Ordering::Relaxed);
+            capture_mouse(hwnd, false);
+        }
+        wm::WM_EXITSIZEMOVE | wm::WM_LBUTTONDOWN => {
+            if MOUSE_DRAGGING.swap(false, Ordering::Relaxed) || message == wm::WM_LBUTTONDOWN {
+                capture_mouse(hwnd, true);
+            }
+        }
+        wm::WM_ACTIVATE => {
+            let active = wparam & 0xffff != wm::WA_INACTIVE as usize;
+            if !active {
+                MOUSE_DRAGGING.store(false, Ordering::Relaxed);
+            }
+            capture_mouse(hwnd, active);
+        }
+        wm::WM_SETFOCUS => capture_mouse(hwnd, true),
+        wm::WM_MOVE | wm::WM_SIZE => {
+            if !MOUSE_DRAGGING.load(Ordering::Relaxed) {
+                capture_mouse(hwnd, true);
+            }
+        }
         _ => {}
     }
     // A user close (close button, Alt+F4, window or taskbar menu); a
