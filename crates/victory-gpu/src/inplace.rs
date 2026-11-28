@@ -96,8 +96,8 @@ pub(crate) fn level() -> u8 {
 /// `VICTORY_INPLACE_VIEW`: 0 (unset) off. 1: a window of title memory outside buffers that
 /// lies in view memory (one contiguous run of one page-pool section) is placed over our own view
 /// of that run instead of being copied - only where the window would otherwise be a copy in
-/// system memory, and only while nothing can be in flight (`crate::shadow::flights_air`: a placed
-/// copy declares no shader writes until the declaration work lands). 2: title buffers too.
+/// system memory. The placed copy declares its shader writes to the copy machinery (Phase 5 of
+/// `docs/copy-bridges.md`), so there is no flight gate. 2: title buffers too.
 pub(crate) fn view_on() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_INPLACE_VIEW").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
@@ -252,8 +252,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 }
 
 /// Private title memory in place, if it can be opened; `None` leaves the caller to make a copy.
-/// No switch or flight gate here: the callers that ask it have done that ([`place_for`],
-/// [`place_fallback`]).
+/// No switch here: the callers that ask it have done that ([`place_for`], [`place_fallback`]).
 fn place_private(start: u64, len: u64, window: bool) -> Option<Placed> {
     // What the backing is, without opening anything. Only private memory is opened by this
     // stage; view memory is turned down here (a later stage opens a view of a section run) and
@@ -410,7 +409,7 @@ fn place_view_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed
     Ok(Placed { buffer, heap, gpu, bias: start - at, keep: Some(view) })
 }
 
-/// [`place_fallback`]'s view-memory path, without the switch and the flight gate: our own view
+/// [`place_fallback`]'s view-memory path, without the switch: our own view
 /// of the aligned run of the section that holds `[start, start + len)`, a heap on it and a buffer
 /// placed over it, with the in-place byte cap and the refusals counted.
 fn place_view_checked(start: u64, len: u64, window: bool) -> Option<Placed> {

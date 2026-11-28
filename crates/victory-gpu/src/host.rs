@@ -880,8 +880,8 @@ pub(crate) fn host() -> Option<&'static Host> {
 /// unsupported, with submissions in the air (level 2 and up with late waits).
 /// Values, not spellings: `inplace::level()` trims and parses a number.
 fn inplace_notes(level: u8, late: bool) -> (bool, bool) {
-    // =3 and more is the fallback substitution, which is gated off while submissions are in the
-    // air (a placed copy declares no shader writes yet), so it is not the unsupported combination.
+    // =3 and more is the fallback substitution, which declares its shader writes (Phase 5 of
+    // docs/copy-bridges.md), so it is not the unsupported combination.
     (level >= 1, (1..=2).contains(&level) && late)
 }
 

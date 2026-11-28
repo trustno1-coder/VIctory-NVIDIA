@@ -6074,8 +6074,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let admission = window_admission(len);
     // Title memory in place, where the window would otherwise stay in system memory: the page
     // pool's view memory (`VICTORY_INPLACE_VIEW`) or private memory (`VICTORY_INPLACE=3`), with
-    // the flight gate and the in-place byte cap asked inside; a refusal leaves the copy path as
-    // it was. The mirror is never made for a placement that succeeds.
+    // the in-place byte cap asked inside; a refusal leaves the copy path as it was. The mirror is
+    // never made for a placement that succeeds.
     if admission.is_err()
         && let Some(placed) = crate::inplace::place_fallback(start, len, true)
     {
