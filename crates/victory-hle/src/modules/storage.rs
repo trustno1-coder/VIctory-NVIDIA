@@ -9,7 +9,7 @@ use std::path::Path;
 use super::xasync::{self, AsyncBlock, E_ABORT};
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, S_OK, add_ref, missing, put,
-    put_string,
+    put_string, with_spare,
 };
 use crate::runtime;
 
@@ -161,7 +161,7 @@ extern "system" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     xasync::XAsyncGetResult(block, (&raw const PROMPT).cast(), 0, none, none.cast())
 }
 
-static VTABLE: Methods<8> = Methods([
+static VTABLE: Methods<16> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -176,6 +176,11 @@ static VTABLE: Methods<8> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn the_storage_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 8);
+    }
 
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {

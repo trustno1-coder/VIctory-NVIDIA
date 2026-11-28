@@ -4,7 +4,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string,
+    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string, with_spare,
 };
 
 pub const PROVIDER: Guid = Guid::new(
@@ -114,7 +114,7 @@ extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut Anal
     out
 }
 
-static VTABLE: Methods<6> = Methods([
+static VTABLE: Methods<14> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -123,7 +123,7 @@ static VTABLE: Methods<6> = Methods([
     device_id as *const (),  // 0x28
 ]);
 
-static ANALYTICS_VTABLE: Methods<4> = Methods([
+static ANALYTICS_VTABLE: Methods<12> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -369,6 +369,16 @@ pub(crate) use device_type::module;
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::{S_OK, method};
+
+    #[test]
+    fn the_system_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 6);
+    }
+
+    #[test]
+    fn the_analytics_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::ANALYTICS_VTABLE, 4);
+    }
 
     #[test]
     fn identity_strings_fit_the_documented_sizes() {

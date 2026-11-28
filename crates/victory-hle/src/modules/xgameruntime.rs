@@ -94,6 +94,30 @@ pub struct Methods<const N: usize>(pub [*const (); N]);
 // SAFETY: function addresses only.
 unsafe impl<const N: usize> Sync for Methods<N> {}
 
+macro_rules! spare {
+    ($($slot:literal)*) => { [$(missing::<$slot> as *const ()),*] };
+}
+
+/// A table of `N` entries: `known`, then [`missing`] ones. Tables are made
+/// longer than the methods we know, so that a method a newer title adds
+/// logs instead of jumping into whatever follows the table.
+pub const fn with_spare<const K: usize, const N: usize>(known: [*const (); K]) -> Methods<N> {
+    let spare = spare!(
+        0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+        24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47
+        48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71
+        72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95
+    );
+    assert!(K <= N && N <= spare.len());
+    let mut table = [std::ptr::null(); N];
+    let mut i = 0;
+    while i < N {
+        table[i] = if i < K { known[i] } else { spare[i] };
+        i += 1;
+    }
+    Methods(table)
+}
+
 /// A (provider, interface id) pair a title may ask for, and our object.
 pub type Interface = (Guid, Guid, &'static Object);
 
@@ -178,6 +202,27 @@ pub(crate) fn method<F: Copy>(object: &Object, slot: usize) -> F {
     // SAFETY: the caller names the slot's signature; tables cover the slots
     // tests use.
     unsafe { std::mem::transmute_copy(&*object.vtable.add(slot / 8)) }
+}
+
+/// The eight entries after the table's first `old_len` (what it had before
+/// they were added) are there, are all different, log their slot and answer
+/// `E_NOTIMPL`, like the table's other unwritten entries.
+#[cfg(test)]
+pub(crate) fn assert_room<const N: usize>(methods: &'static Methods<N>, old_len: usize) {
+    assert!(N >= old_len + 8, "{N} entries, {old_len} before");
+    let object = Object::new("test", methods);
+    let spare = &methods.0[old_len..old_len + 8];
+    for (i, &entry) in spare.iter().enumerate() {
+        assert!(!entry.is_null(), "entry {}", old_len + i);
+        assert!(!spare[..i].contains(&entry), "entry {i} repeats");
+        type Spare = extern "system" fn(*const Object) -> HRESULT;
+        assert_eq!(
+            method::<Spare>(&object, (old_len + i) * 8)(&object),
+            xasync::E_NOTIMPL,
+            "entry {}",
+            old_len + i
+        );
+    }
 }
 
 pub extern "system" fn XGameRuntimeInitialize() -> HRESULT {

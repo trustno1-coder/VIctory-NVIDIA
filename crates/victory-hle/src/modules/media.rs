@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use super::files;
+use super::xasync::E_NOTIMPL;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
@@ -193,6 +194,15 @@ pub struct Resolver {
 
 type Unknown = *mut c_void;
 
+/// Past the methods we know: a newer title's.
+extern "system" fn beyond<const SLOT: usize>(_: *mut Resolver) -> HRESULT {
+    tracing::warn!(
+        slot = format_args!("{SLOT:#x}"),
+        "source resolver method not implemented"
+    );
+    E_NOTIMPL
+}
+
 #[repr(C)]
 struct Methods {
     query_interface:
@@ -238,6 +248,9 @@ struct Methods {
     ) -> HRESULT,
     end_from_stream: extern "system" fn(*mut Resolver, Unknown, *mut u32, *mut Unknown) -> HRESULT,
     cancel: extern "system" fn(*mut Resolver, Unknown) -> HRESULT,
+    /// So that a method a newer title adds logs instead of jumping into
+    /// whatever follows the table.
+    spare: [extern "system" fn(*mut Resolver) -> HRESULT; 8],
 }
 
 static METHODS: Methods = Methods {
@@ -251,6 +264,16 @@ static METHODS: Methods = Methods {
     begin_from_stream,
     end_from_stream,
     cancel,
+    spare: [
+        beyond::<0x50>,
+        beyond::<0x58>,
+        beyond::<0x60>,
+        beyond::<0x68>,
+        beyond::<0x70>,
+        beyond::<0x78>,
+        beyond::<0x80>,
+        beyond::<0x88>,
+    ],
 };
 
 fn host(this: *mut Resolver) -> *mut Host {
@@ -487,6 +510,28 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_resolver_table_has_room_after_its_last_method() {
+        let bytes = size_of::<Methods>();
+        assert!(bytes >= (10 + 8) * 8, "{bytes} bytes of table");
+        let table = std::ptr::from_ref(&METHODS).cast::<*const ()>();
+        let mut seen = Vec::new();
+        for index in 10..10 + 8 {
+            // SAFETY: a `repr(C)` table of function pointers, of at least this many.
+            let entry = unsafe { table.add(index).read() };
+            assert!(!entry.is_null(), "entry {index}");
+            assert!(!seen.contains(&entry), "entry {index} repeats");
+            seen.push(entry);
+            type Spare = extern "system" fn(*mut Resolver) -> HRESULT;
+            // SAFETY: a spare entry, which takes the object and returns a result.
+            let spare: Spare = unsafe { std::mem::transmute(entry) };
+            assert_eq!(
+                spare(std::ptr::null_mut()),
+                crate::modules::xasync::E_NOTIMPL
+            );
+        }
+    }
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()

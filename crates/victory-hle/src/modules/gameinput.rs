@@ -264,13 +264,13 @@ unsafe impl<const N: usize> Sync for Table<N> {}
 /// The input object; one per hub.
 #[repr(C)]
 pub struct Object {
-    vtable: &'static Table<22>,
+    vtable: &'static Table<30>,
     hub: *const Hub,
 }
 
 #[repr(C)]
 pub struct Device {
-    vtable: &'static Table<21>,
+    vtable: &'static Table<29>,
     hub: *const Hub,
     index: usize,
     info: DeviceInfo,
@@ -348,7 +348,7 @@ enum Value {
 
 #[repr(C)]
 pub struct Reading {
-    vtable: &'static Table<25>,
+    vtable: &'static Table<33>,
     refs: AtomicU32,
     device: *const Device,
     sequence: u64,
@@ -1005,7 +1005,7 @@ extern "system" fn enable_oem_device(
 }
 extern "system" fn set_focus_policy(_: This, _policy: u32) {}
 
-static INPUT: Table<22> = Table([
+static INPUT: Table<30> = Table([
     no_interface as *const (),        // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
@@ -1028,6 +1028,14 @@ static INPUT: Table<22> = Table([
     find_device as *const (),         // 0x98 by platform string
     enable_oem_device as *const (),   // 0xa0
     set_focus_policy as *const (),    // 0xa8
+    beyond_input::<0xb0> as *const (),
+    beyond_input::<0xb8> as *const (),
+    beyond_input::<0xc0> as *const (),
+    beyond_input::<0xc8> as *const (),
+    beyond_input::<0xd0> as *const (),
+    beyond_input::<0xd8> as *const (),
+    beyond_input::<0xe0> as *const (),
+    beyond_input::<0xe8> as *const (),
 ]);
 
 extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
@@ -1081,7 +1089,36 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     E_NOTIMPL
 }
 
-static DEVICE: Table<21> = Table([
+/// Past the methods we know, so that a method a newer title adds logs
+/// instead of jumping into whatever follows the table. The input object's.
+extern "system" fn beyond_input<const SLOT: usize>(_: *const c_void) -> HRESULT {
+    tracing::warn!(
+        slot = format_args!("{SLOT:#x}"),
+        "input object method not implemented"
+    );
+    E_NOTIMPL
+}
+
+/// The same for a device's.
+extern "system" fn beyond_device<const SLOT: usize>(_: *const c_void) -> HRESULT {
+    tracing::warn!(
+        slot = format_args!("{SLOT:#x}"),
+        "input device method not implemented"
+    );
+    E_NOTIMPL
+}
+
+/// The same for a reading's. Its methods return a bool, a count, a value or
+/// nothing, never a result code, so this answers 0 like the unwritten ones.
+extern "system" fn beyond_reading<const SLOT: usize>(_: *const c_void) -> usize {
+    tracing::warn!(
+        slot = format_args!("{SLOT:#x}"),
+        "input reading method not implemented"
+    );
+    0
+}
+
+static DEVICE: Table<29> = Table([
     no_interface as *const (),        // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
@@ -1103,6 +1140,14 @@ static DEVICE: Table<21> = Table([
     unsupported::<0x90> as *const (), //
     unsupported::<0x98> as *const (), //
     unsupported::<0xa0> as *const (), //
+    beyond_device::<0xa8> as *const (),
+    beyond_device::<0xb0> as *const (),
+    beyond_device::<0xb8> as *const (),
+    beyond_device::<0xc0> as *const (),
+    beyond_device::<0xc8> as *const (),
+    beyond_device::<0xd0> as *const (),
+    beyond_device::<0xd8> as *const (),
+    beyond_device::<0xe0> as *const (),
 ]);
 
 fn reading<'a>(this: *const Reading) -> &'a Reading {
@@ -1181,7 +1226,7 @@ extern "system" fn nothing(_: *const c_void) -> usize {
     0
 }
 
-static READING: Table<25> = Table([
+static READING: Table<33> = Table([
     no_interface as *const (),      // 0x00
     reading_add_ref as *const (),   // 0x08
     reading_release as *const (),   // 0x10
@@ -1207,6 +1252,14 @@ static READING: Table<25> = Table([
     gamepad_state as *const (),     // 0xb0
     nothing as *const (),           // 0xb8 racing wheel
     nothing as *const (),           // 0xc0 UI navigation
+    beyond_reading::<0xc8> as *const (),
+    beyond_reading::<0xd0> as *const (),
+    beyond_reading::<0xd8> as *const (),
+    beyond_reading::<0xe0> as *const (),
+    beyond_reading::<0xe8> as *const (),
+    beyond_reading::<0xf0> as *const (),
+    beyond_reading::<0xf8> as *const (),
+    beyond_reading::<0x100> as *const (),
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -1580,6 +1633,45 @@ mod tests {
     use crate::HostPolicy;
     use victory_loader::Provenance;
     use victory_pe::ImportSymbol;
+
+    /// The eight entries after the table's first `old_len` (what it had
+    /// before they were added) are there, are all different and answer like
+    /// the table's unwritten ones: `E_NOTIMPL`, or 0 for a reading's.
+    fn assert_room<const N: usize>(table: &super::Table<N>, old_len: usize, reading: bool) {
+        assert!(N >= old_len + 8, "{N} entries, {old_len} before");
+        let spare = &table.0[old_len..old_len + 8];
+        for (i, &entry) in spare.iter().enumerate() {
+            assert!(!entry.is_null(), "entry {}", old_len + i);
+            assert!(!spare[..i].contains(&entry), "entry {i} repeats");
+            if reading {
+                type Spare = extern "system" fn(*const std::ffi::c_void) -> usize;
+                // SAFETY: a spare entry, which takes the object and returns a value.
+                let spare: Spare = unsafe { std::mem::transmute(entry) };
+                assert_eq!(spare(std::ptr::null()), 0);
+            } else {
+                type Spare = extern "system" fn(*const std::ffi::c_void) -> i32;
+                // SAFETY: a spare entry, which takes the object and returns a result.
+                let spare: Spare = unsafe { std::mem::transmute(entry) };
+                assert_eq!(spare(std::ptr::null()), super::E_NOTIMPL);
+            }
+        }
+    }
+
+    #[test]
+    fn the_input_table_has_room_after_its_last_method() {
+        assert_room(&super::INPUT, 22, false);
+    }
+
+    #[test]
+    fn the_device_table_has_room_after_its_last_method() {
+        // 0xa0 is the last of the table, 21 entries.
+        assert_room(&super::DEVICE, 21, false);
+    }
+
+    #[test]
+    fn the_reading_table_has_room_after_its_last_method() {
+        assert_room(&super::READING, 25, true);
+    }
 
     #[derive(Default)]
     struct FakeHost {

@@ -6,6 +6,7 @@ use std::ffi::{c_char, c_void};
 
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
+    with_spare,
 };
 
 /// HDR mode; asked for with this interface id since 2020.
@@ -136,7 +137,7 @@ extern "system" fn take_screenshot(_: This, _user: *const c_void, _result: *mut 
     NOT_SUPPORTED
 }
 
-static HDR_VTABLE: Methods<5> = Methods([
+static HDR_VTABLE: Methods<13> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -145,7 +146,7 @@ static HDR_VTABLE: Methods<5> = Methods([
 ]);
 
 #[cfg(windows)]
-static SHELL_VTABLE: Methods<6> = Methods([
+static SHELL_VTABLE: Methods<14> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -154,14 +155,14 @@ static SHELL_VTABLE: Methods<6> = Methods([
     close_deferral as *const (),   // 0x28
 ]);
 #[cfg(not(windows))]
-static SHELL_VTABLE: Methods<4> = Methods([
+static SHELL_VTABLE: Methods<12> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
     launch_uri as *const (),
 ]);
 
-static CAPTURE_VTABLE: Methods<6> = Methods([
+static CAPTURE_VTABLE: Methods<14> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -174,6 +175,24 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::{S_OK, method};
+
+    #[test]
+    fn the_hdr_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::HDR_VTABLE, 5);
+    }
+
+    #[test]
+    fn the_shell_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(
+            &super::SHELL_VTABLE,
+            if cfg!(windows) { 6 } else { 4 },
+        );
+    }
+
+    #[test]
+    fn the_capture_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::CAPTURE_VTABLE, 6);
+    }
 
     #[test]
     fn sdr_and_display_deferrals() {

@@ -576,8 +576,17 @@ extern "system" fn unused(this: This) -> HRESULT {
     E_NOTIMPL
 }
 
+/// Past the methods we know: a newer title's.
+extern "system" fn beyond<const SLOT: usize>(_: This) -> HRESULT {
+    tracing::warn!(
+        slot = format_args!("{SLOT:#x}"),
+        "texture computer method not implemented"
+    );
+    E_NOTIMPL
+}
+
 #[repr(C)]
-struct Vtable([*const (); 13]);
+struct Vtable([*const (); 21]);
 // SAFETY: function addresses only.
 unsafe impl Sync for Vtable {}
 
@@ -595,6 +604,14 @@ static VTABLE: Vtable = Vtable([
     tiling as *const (),    // 0x50
     unused as *const (),    // 0x58 view descriptor
     unused as *const (),    // 0x60 tiled resource?
+    beyond::<0x68> as *const (),
+    beyond::<0x70> as *const (),
+    beyond::<0x78> as *const (),
+    beyond::<0x80> as *const (),
+    beyond::<0x88> as *const (),
+    beyond::<0x90> as *const (),
+    beyond::<0x98> as *const (),
+    beyond::<0xa0> as *const (),
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -611,6 +628,20 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_computer_table_has_room_after_its_last_method() {
+        // The last known method is at 0x60.
+        let n = VTABLE.0.len();
+        assert!(n >= 0x60 / 8 + 9, "{n} entries");
+        for (i, &entry) in VTABLE.0[0x60 / 8 + 1..0x60 / 8 + 9].iter().enumerate() {
+            let before = &VTABLE.0[0x60 / 8 + 1..0x60 / 8 + 1 + i];
+            assert!(!entry.is_null() && !before.contains(&entry), "entry {i}");
+            // SAFETY: a spare entry, which takes the object and returns a result.
+            let spare: extern "system" fn(This) -> HRESULT = unsafe { std::mem::transmute(entry) };
+            assert_eq!(spare(std::ptr::null_mut()), E_NOTIMPL);
+        }
+    }
 
     fn desc(width: u64, height: u32, mips: u16, format: u32, layout: u32) -> ResourceDesc {
         ResourceDesc {

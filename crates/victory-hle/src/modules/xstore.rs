@@ -9,7 +9,8 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL, E_INVALIDARG};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text,
+    token, with_spare,
 };
 use super::xpackage;
 use crate::runtime;
@@ -333,7 +334,7 @@ extern "system" fn unregister(_: This, _: Handle, _token: u64, _wait: bool) -> b
     true
 }
 
-static VTABLE: Methods<77> = Methods([
+static VTABLE: Methods<85> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -417,6 +418,11 @@ static VTABLE: Methods<77> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn the_store_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 77);
+    }
 
     fn block() -> AsyncBlock {
         AsyncBlock {

@@ -22,7 +22,7 @@ use std::ffi::c_void;
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
-use super::xasync::E_INVALIDARG;
+use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
@@ -796,6 +796,15 @@ pub struct Acp {
     state: Mutex<State>,
 }
 
+/// Past the methods we know: a newer title's.
+extern "system" fn beyond<const SLOT: usize>(_: *mut Acp) -> HRESULT {
+    tracing::warn!(
+        slot = format_args!("{SLOT:#x}"),
+        "audio coprocessor method not implemented"
+    );
+    E_NOTIMPL
+}
+
 #[repr(C)]
 struct AcpMethods {
     connect: extern "system" fn(*mut Acp, u32, u32) -> HRESULT,
@@ -804,6 +813,9 @@ struct AcpMethods {
     pop_message: extern "system" fn(*mut Acp, *mut Message) -> bool,
     message_count: extern "system" fn(*mut Acp) -> u32,
     release: extern "system" fn(*mut Acp),
+    /// So that a method a newer title adds logs instead of jumping into
+    /// whatever follows the table.
+    spare: [extern "system" fn(*mut Acp) -> HRESULT; 8],
 }
 
 static ACP_METHODS: AcpMethods = AcpMethods {
@@ -813,6 +825,16 @@ static ACP_METHODS: AcpMethods = AcpMethods {
     pop_message,
     message_count,
     release,
+    spare: [
+        beyond::<0x30>,
+        beyond::<0x38>,
+        beyond::<0x40>,
+        beyond::<0x48>,
+        beyond::<0x50>,
+        beyond::<0x58>,
+        beyond::<0x60>,
+        beyond::<0x68>,
+    ],
 };
 
 fn state(this: *mut Acp) -> MutexGuard<'static, State> {
@@ -952,6 +974,28 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_coprocessor_table_has_room_after_its_last_method() {
+        let bytes = size_of::<AcpMethods>();
+        assert!(bytes >= (6 + 8) * 8, "{bytes} bytes of table");
+        let table = std::ptr::from_ref(&ACP_METHODS).cast::<*const ()>();
+        let mut seen = Vec::new();
+        for index in 6..6 + 8 {
+            // SAFETY: a `repr(C)` table of function pointers, of at least this many.
+            let entry = unsafe { table.add(index).read() };
+            assert!(!entry.is_null(), "entry {index}");
+            assert!(!seen.contains(&entry), "entry {index} repeats");
+            seen.push(entry);
+            type Spare = extern "system" fn(*mut Acp) -> HRESULT;
+            // SAFETY: a spare entry, which takes the object and returns a result.
+            let spare: Spare = unsafe { std::mem::transmute(entry) };
+            assert_eq!(
+                spare(std::ptr::null_mut()),
+                crate::modules::xasync::E_NOTIMPL
+            );
+        }
+    }
 
     #[test]
     fn heap_maps_every_byte_of_a_block() {

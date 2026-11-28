@@ -10,7 +10,7 @@
 use std::ffi::{c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, with_spare,
 };
 
 /// Closed captions, high contrast, speech to text and synthesis.
@@ -95,7 +95,7 @@ extern "system" fn stream_data(
     S_OK
 }
 
-static VTABLE: Methods<22> = Methods([
+static VTABLE: Methods<30> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -124,6 +124,11 @@ static VTABLE: Methods<22> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn the_accessibility_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 22);
+    }
 
     #[test]
     fn streams_are_empty_wave_files() {

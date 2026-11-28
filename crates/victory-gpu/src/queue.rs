@@ -1289,8 +1289,8 @@ const fn newer_slot(slot: usize) -> usize {
     if slot >= 14 { slot + 2 } else { slot }
 }
 
-const fn queue_table(newer: bool) -> [*const (); 36] {
-    let mut f = object::d3d12_object(object::missing_table::<QUEUE, 36>());
+const fn queue_table(newer: bool) -> [*const (); 44] {
+    let mut f = object::d3d12_object(object::missing_table::<QUEUE, 44>());
     let mut i = 0;
     while i < METHODS.len() {
         let (slot, method) = METHODS[i];
@@ -1300,13 +1300,23 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
     f
 }
 
-static FUNCTIONS: Table<36> = Table(queue_table(false));
-static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
+static FUNCTIONS: Table<44> = Table(queue_table(false));
+static NEWER_FUNCTIONS: Table<44> = Table(queue_table(true));
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn the_queue_table_has_room_after_its_last_method() {
+        crate::object::assert_room::<QUEUE, 44>(&super::FUNCTIONS, 36);
+    }
+
+    #[test]
+    fn the_newer_queue_table_has_room_after_its_last_method() {
+        crate::object::assert_room::<QUEUE, 44>(&super::NEWER_FUNCTIONS, 36);
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's

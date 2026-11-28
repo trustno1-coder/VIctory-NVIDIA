@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
-use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
+use super::xgameruntime::{
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, with_spare,
+};
 
 /// The task-queue provider; it is also the interface id titles ask for.
 pub const PROVIDER: Guid = Guid {
@@ -1084,7 +1086,7 @@ extern "system" fn m_set_process_queue(_: This, q: *const Queue) {
 /// which every runtime call in a title makes first.
 extern "system" fn m_check_thread(_: This) {}
 
-static VTABLE: Methods<31> = Methods([
+static VTABLE: Methods<39> = with_spare([
     missing::<0> as *const (),         // 0x00 QueryInterface
     add_ref as *const (),              // 0x08 AddRef
     add_ref as *const (),              // 0x10 Release: the object is static
@@ -1122,6 +1124,11 @@ static VTABLE: Methods<31> = Methods([
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn the_task_queue_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 31);
+    }
 
     fn slot<F: Copy>(offset: usize) -> F {
         crate::modules::xgameruntime::method(&OBJECT, offset)

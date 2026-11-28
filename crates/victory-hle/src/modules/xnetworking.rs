@@ -8,7 +8,7 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put, text, token,
+    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put, text, token, with_spare,
 };
 
 pub const PROVIDER: Guid = Guid::new(
@@ -157,7 +157,7 @@ extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true
 }
 
-static VTABLE: Methods<18> = Methods([
+static VTABLE: Methods<26> = with_spare([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -182,6 +182,11 @@ static VTABLE: Methods<18> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::{S_OK, method};
+
+    #[test]
+    fn the_networking_table_has_room_after_its_last_method() {
+        crate::modules::xgameruntime::assert_room(&super::VTABLE, 18);
+    }
 
     fn block() -> AsyncBlock {
         AsyncBlock {

@@ -205,8 +205,8 @@ static ADAPTER_FUNCTIONS: Table<24> = {
 };
 
 /// IUnknown 3, object 4, factory 5 + 2 + 11.
-static FACTORY_FUNCTIONS: Table<32> = {
-    let mut f = object::missing_table::<FACTORY, 32>();
+static FACTORY_FUNCTIONS: Table<40> = {
+    let mut f = object::missing_table::<FACTORY, 40>();
     f[0] = factory_query as *const ();
     f[7] = factory_adapters as *const (); // 0x38
     f[12] = factory_adapters as *const (); // 0x60, the same for version 1
@@ -325,6 +325,11 @@ static OUTPUT_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::{E_NOINTERFACE, slot};
+
+    #[test]
+    fn the_factory_table_has_room_after_its_last_method() {
+        crate::object::assert_room::<{ crate::object::FACTORY }, 40>(&super::FACTORY_FUNCTIONS, 32);
+    }
 
     type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
     type Get = extern "system" fn(This, *mut This) -> HRESULT;
