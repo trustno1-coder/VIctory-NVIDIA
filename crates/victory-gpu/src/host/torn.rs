@@ -108,8 +108,10 @@ impl Check {
             *at = copies[i].3 + (*lo - copies[i].1) as u64;
             within.push(i);
         }
-        // (The last flight's stands.)
-        for r in plans.flat_map(|plan| &plan.ranges).filter(|r| r.compared && !r.picked) {
+        // (The last flight's stands. A piece compared ahead of its
+        // submission's sends was hashed before its lists ran: not what it
+        // ended with.)
+        for r in plans.flat_map(|plan| &plan.ranges).filter(|r| r.compared && !r.picked && !r.ahead) {
             for p in 0..r.span.pieces {
                 if let Some(&i) = index.get(&(r.shadow.id(), r.span.first + p))
                     && let Some(&d) = differs.get((r.at + p) as usize)
