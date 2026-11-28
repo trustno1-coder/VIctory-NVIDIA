@@ -671,6 +671,14 @@ fn emit_once(
         // each its own way: their host waves meet per console wave ([`widen`]). (Its
         // `CS_CollectTriangles_Meshlets`, groups of 1024, does not fit that way: its own LDS
         // is the host group's whole 32 KiB.)
+        // `CS_IrradianceCache_IntegrateIrradianceSH_cb05754f` (`#0a5d4f9047b3dce4`,
+        // groups of 64) performs a 5-stage LDS tree reduction across all 64 lanes
+        // followed by a bounded (<= 6 iterations) SH ringing-suppression loop
+        // (`002b68..002c98`) where `exec == -1` and every lane evaluates the exact
+        // same wave64-reduced scalar minimum and loop counter `v45`. Without
+        // wave-wide lowering it falls back to `local waves (APPROXIMATE, any mask)`,
+        // dropping the cross-half LDS barrier and masking `v_readlane(..., 32)` to
+        // lane 0, corrupting the 3D IrradianceCache SH buffer.
         let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
             && matches!(
                 c.digest,
@@ -679,6 +687,7 @@ fn emit_once(
                     | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
                     | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
                     | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
+                    | [0xeb, 0x1c, 0x06, 0x2c, 0xf6, 0xb4, 0x91, 0xb7, 0xf4, 0xaf, 0xa6, 0x5b, 0xd8, 0x1f, 0x0e, 0x48]
             )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
@@ -691,6 +700,17 @@ fn emit_once(
             && c.part(FourCC::ACCC).is_some()
             && matches!(&original, Err(ShaderError::Unsupported { what, .. })
                 if *what == lower::DIVERGENT_MASK_EXCHANGE);
+        // Single-wave64 compute groups (`threads == 64`): widening forward
+        // branches that are outside any divergent (per-lane) loop never puts a
+        // barrier inside a divergent loop and keeps both 32-lane halves in
+        // lockstep. This prevents critical 64-lane shaders such as
+        // `CS_GenerateShaderBinOffsets` and `CS_IrradianceCache_IntegrateIrradianceSH`
+        // from falling back to `local waves (APPROXIMATE, any mask)`, which
+        // breaks cross-half prefix sums, LDS reductions, and lane-63 broadcasts.
+        let safe_single_wave = wide_option.is_none()
+            && !wide_on
+            && !driver_loop
+            && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -712,7 +732,7 @@ fn emit_once(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on || driver_loop {
+                if wide_on || driver_loop || safe_single_wave {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -720,7 +740,14 @@ fn emit_once(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop, wide_on);
+                        let mode = if wide_on {
+                            WidenMode::All
+                        } else if driver_loop {
+                            WidenMode::DriverLoop
+                        } else {
+                            WidenMode::SafeSingleWave
+                        };
+                        let again = widen(c, native, base, why, mode, wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -782,7 +809,7 @@ fn emit_once(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false, false);
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), WidenMode::All, false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -817,6 +844,159 @@ fn emit_once(
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WidenMode {
+    /// Any branch (explicit `VICTORY_WAVE_WIDE=1`, `scene_kernel`, or 32-lane `LANE_MASK`).
+    All,
+    /// Single-wave64 group: only widen forward branches, and only when every
+    /// natural loop enclosing a block in `needs` or `more` has strictly
+    /// uniform back-edges and exits (so both 32-lane halves execute the exact
+    /// same iterations and can never deadlock at a group barrier).
+    SafeSingleWave,
+    /// Driver compute route: only a single active-lane loop latch.
+    DriverLoop,
+}
+
+/// Checks whether widening `more` for exchanges in `needs` is deadlock-free for
+/// a single-wave64 group (`threads == 64`):
+/// 1. Every branch in `more` is strictly forward in RPO (never widens a loop latch).
+/// 2. Every natural loop (defined by a back-edge `latch -> header` with
+///    `rpo[header] <= rpo[latch]`) that contains any block in `needs` or `more`
+///    is reducible and has ONLY strictly uniform exits and back-edges
+///    (`Atom::Uniform` only, no `wave_any`, no `End`/`Indirect`).
+fn safe_single_wave_widen(
+    p: &ir::Program,
+    st: &structure::Structured,
+    rpo: &[usize],
+    needs: &[usize],
+    more: &[usize],
+    why: bool,
+) -> bool {
+    let n = p.blocks.len();
+    // 1. Reject any widened branch that is a back-edge.
+    for &b in more {
+        if matches!(
+            p.blocks[b].exit,
+            ir::Exit::Branch { taken, not_taken } if rpo[taken] <= rpo[b] || rpo[not_taken] <= rpo[b]
+        ) {
+            if why {
+                eprintln!("WAVE64-WIDE stopped: back-edge branch B{b} in safe single-wave mode");
+            }
+            return false;
+        }
+    }
+
+    // Build adjacency + reverse adjacency + collect back-edges.
+    let mut succ = vec![Vec::new(); n];
+    let mut pred = vec![Vec::new(); n];
+    let mut back_edges = Vec::new();
+    for (b, blk) in p.blocks.iter().enumerate() {
+        if rpo[b] == usize::MAX {
+            continue;
+        }
+        match blk.exit {
+            ir::Exit::Jump(t) => {
+                succ[b].push(t);
+                pred[t].push(b);
+                if rpo[t] <= rpo[b] {
+                    back_edges.push((b, t));
+                }
+            }
+            ir::Exit::Branch { taken, not_taken } => {
+                succ[b].push(taken);
+                succ[b].push(not_taken);
+                pred[taken].push(b);
+                pred[not_taken].push(b);
+                if rpo[taken] <= rpo[b] {
+                    back_edges.push((b, taken));
+                }
+                if rpo[not_taken] <= rpo[b] {
+                    back_edges.push((b, not_taken));
+                }
+            }
+            ir::Exit::End | ir::Exit::Indirect => {}
+        }
+    }
+
+    if back_edges.is_empty() {
+        return true;
+    }
+
+    let is_strictly_uniform = |u: usize| -> bool {
+        match st.exits[u] {
+            structure::LaneExit::Jump(_) => true,
+            structure::LaneExit::Branch { when, .. } => {
+                st.wave_any[u].is_none()
+                    && st
+                        .bools
+                        .support(when)
+                        .iter()
+                        .all(|a| matches!(a, structure::Atom::Uniform(_)))
+            }
+            structure::LaneExit::End | structure::LaneExit::Indirect => false,
+        }
+    };
+
+    // 2. For every back-edge `latch -> header`, compute its natural loop body.
+    //    If it contains any block of `needs` or `more`, require reducibility
+    //    and strictly uniform back-edges / exits.
+    let mut in_loop = vec![false; n];
+    let mut stack = Vec::new();
+    for &(latch, header) in &back_edges {
+        in_loop.fill(false);
+        in_loop[header] = true;
+        stack.clear();
+        if !in_loop[latch] {
+            in_loop[latch] = true;
+            stack.push(latch);
+        }
+        while let Some(v) = stack.pop() {
+            for &pr in &pred[v] {
+                if !in_loop[pr] {
+                    in_loop[pr] = true;
+                    stack.push(pr);
+                }
+            }
+        }
+        let touches = needs.iter().chain(more.iter()).any(|&b| in_loop[b]);
+        if !touches {
+            continue;
+        }
+        // Check every block in this natural loop.
+        for u in 0..n {
+            if !in_loop[u] {
+                continue;
+            }
+            // No irreducible entry from outside the loop into a non-header block.
+            if u != header && pred[u].iter().any(|&pr| !in_loop[pr]) {
+                if why {
+                    eprintln!("WAVE64-WIDE stopped: irreducible loop H=B{header} entry at B{u}");
+                }
+                return false;
+            }
+            // No early program end / indirect exit inside the loop.
+            if matches!(st.exits[u], structure::LaneExit::End | structure::LaneExit::Indirect) {
+                if why {
+                    eprintln!("WAVE64-WIDE stopped: end/indirect inside loop H=B{header} at B{u}");
+                }
+                return false;
+            }
+            // Any block exiting the loop or taking a back-edge must be strictly uniform.
+            let exits_or_back = succ[u].iter().any(|&t| !in_loop[t] || rpo[t] <= rpo[u]);
+            if exits_or_back && !is_strictly_uniform(u) {
+                if why {
+                    let nm = p.blocks[u].insts.last().map_or("?", |i| i.name());
+                    eprintln!(
+                        "WAVE64-WIDE stopped: non-uniform loop control at B{u}({nm}) in loop H=B{header}..B{latch}"
+                    );
+                }
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
@@ -830,7 +1010,7 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
-    active_loop_only: bool,
+    mode: WidenMode,
     groups: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
@@ -854,6 +1034,14 @@ fn widen(
     let pairs = native.wave64
         && lower::host_max_wave() == 32
         && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
+    let rpo = (mode == WidenMode::SafeSingleWave).then(|| {
+        let order = ir::reverse_postorder(&p.blocks);
+        let mut idx = vec![usize::MAX; p.blocks.len()];
+        for (i, &b) in order.iter().enumerate() {
+            idx[b] = i;
+        }
+        idx
+    });
     let mut wide = std::collections::HashSet::new();
     loop {
         let st = structure::structure_wide(p, &wide)?;
@@ -904,7 +1092,12 @@ fn widen(
             }
             return r;
         }
-        if active_loop_only {
+        if let Some(rpo) = &rpo
+            && !safe_single_wave_widen(p, &st, rpo, &needs, &more, why)
+        {
+            return r;
+        }
+        if mode == WidenMode::DriverLoop {
             // Only a single backward branch on the SCC just set by
             // s_andn2_wrexec_b64. This instruction restricts EXEC to the
             // unfinished lanes. The guest repeats the loop if *either*
