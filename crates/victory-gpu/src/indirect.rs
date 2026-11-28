@@ -276,21 +276,36 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// its last 1,905 tiles, the lowest of the picture. The console runs what it
 /// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
 /// dispatch packets and group numbers are the same; D3D12 does not look at
-/// indirect counts. Other cards stay at 65,535.
-fn widest(amd: bool) -> u32 {
+/// indirect counts. So does an NVIDIA card (its compute launches take 2^31 - 1
+/// groups in x, as its Vulkan driver reports): clamped at 65,535, the bottom
+/// fifth of dense 1440p tile lists never ran final gather passes. Other cards
+/// stay at 65,535.
+fn widest(wide: bool) -> u32 {
     let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
-    if amd && on { 1 << 20 } else { 65_535 }
+    if wide && on { 1 << 20 } else { 65_535 }
+}
+
+/// Whether `device` runs indirect dispatches wider than 65,535 groups in x
+/// as asked ([`widest`]): AMD or NVIDIA adapters.
+pub(crate) fn runs_wide(device: &ID3D12Device) -> bool {
+    matches!(vendor(device), Some(0x1002 | 0x10de))
 }
 
 /// Whether `device` is an AMD card's.
 pub(crate) fn amd(device: &ID3D12Device) -> bool {
+    vendor(device) == Some(0x1002)
+}
+
+/// PCI vendor ID of `device`'s adapter.
+fn vendor(device: &ID3D12Device) -> Option<u32> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
     // SAFETY: plain queries.
     unsafe {
         CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
             .and_then(|a| a.GetDesc1())
-            .is_ok_and(|d| d.VendorId == 0x1002)
+            .ok()
+            .map(|d| d.VendorId)
     }
 }
 
@@ -305,7 +320,7 @@ fn rest() -> u32 {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(runs_wide(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -2960,7 +2975,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         sig.unwrap()
     }
 
-    /// An AMD card runs every group of an indirect dispatch of more than
+    /// An AMD or NVIDIA card runs every group of an indirect dispatch of more than
     /// 65,535, each under its own number: the title's tile lists
     /// ([`widest`]), clamped one by one and in a batch. Others are not asked.
     #[test]
@@ -2981,7 +2996,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut gpu) = WarpHarness::on(false) else {
             return;
         };
-        if !amd(&gpu.device) || widest(true) == 65_535 {
+        if !runs_wide(&gpu.device) || widest(true) == 65_535 {
             return;
         }
         let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
