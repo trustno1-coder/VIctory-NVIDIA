@@ -62,7 +62,9 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_CARD_REHASH_RUNS", "1"),
     ("VICTORY_JOIN_COPIES", "1"),
     ("VICTORY_CARD_STEPS", "2"),
-    ("VICTORY_CARD_AWAKE", "1"),
+    // Not VICTORY_CARD_AWAKE (a compute job kept running between the submissions): measured in
+    // the game it was slower, 17.4 frames a second against 19.0 on an RTX 4070 Ti SUPER, and it
+    // held a menu back (#771). `--set VICTORY_CARD_AWAKE=1` turns it on.
     ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
     ("VICTORY_INDIRECT_WINDOW", "1"),
     ("VICTORY_INDIRECT_BATCH", "2"),
