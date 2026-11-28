@@ -4,6 +4,7 @@
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
 //! See `victory.example.toml` at the repository root.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -46,31 +47,46 @@ struct FilePaths {
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = explicit_config_path(|k| std::env::var_os(k));
-        let path = explicit
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("victory.toml"));
-        let file = if path.is_file() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            Some((path, text))
-        } else if let Some(p) = explicit {
-            anyhow::bail!(
-                "VICTORY_CONFIG points at {}, which does not exist",
-                p.display()
-            );
-        } else {
-            None
-        };
-        let (source, parsed) = match file {
-            Some((path, text)) => {
+        Self::load_from(Path::new("victory.toml"), |k| std::env::var_os(k))
+    }
+
+    fn load_from(
+        default_path: &Path,
+        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Result<Self> {
+        let explicit = explicit_config_path(&env);
+        let path = explicit.as_deref().unwrap_or(default_path);
+        let (source, parsed) = match std::fs::symlink_metadata(path) {
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                anyhow::ensure!(
+                    explicit.is_none(),
+                    "VICTORY_CONFIG points at {}, which does not exist",
+                    path.display()
+                );
+                (None, FileConfig::default())
+            }
+            result => {
+                let metadata = result.with_context(|| format!("checking {}", path.display()))?;
+                // Follow links, but don't treat a dangling link as a missing optional file.
+                let metadata = if metadata.is_symlink() {
+                    std::fs::metadata(path)
+                        .with_context(|| format!("resolving {}", path.display()))?
+                } else {
+                    metadata
+                };
+                anyhow::ensure!(
+                    metadata.is_file(),
+                    "{} is not a regular file",
+                    path.display()
+                );
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?;
                 let parsed: FileConfig =
                     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-                (Some(path), parsed)
+                (Some(path.to_path_buf()), parsed)
             }
-            None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed.paths, source, env)
     }
 
     fn resolve(
@@ -167,6 +183,94 @@ fn default_dir(name: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    fn isolated_paths(dir: &Path) -> impl Fn(&str) -> Option<OsString> {
+        move |key| match key {
+            "VICTORY_CACHE_DIR" => Some(dir.join("cache").into_os_string()),
+            "VICTORY_DATA_DIR" => Some(dir.join("data").into_os_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn default_config_path_cannot_be_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("victory.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        let error = Config::load_from(&path, |_| None).unwrap_err().to_string();
+        assert!(error.contains("victory.toml"), "{error}");
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn explicit_config_path_cannot_be_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("custom.toml");
+        std::fs::create_dir(&path).unwrap();
+        let env = |k: &str| (k == "VICTORY_CONFIG").then(|| path.clone().into_os_string());
+
+        let error = Config::load_from(&tmp.path().join("victory.toml"), env)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("custom.toml"), "{error}");
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn missing_default_config_is_optional() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("victory.toml");
+        let cfg = Config::load_from(&path, isolated_paths(tmp.path())).unwrap();
+        assert!(cfg.source.is_none());
+    }
+
+    #[test]
+    fn missing_explicit_config_does_not_fall_back_to_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("custom.toml");
+        let default = tmp.path().join("victory.toml");
+        std::fs::write(&default, "[paths]\n").unwrap();
+        let env = |k: &str| (k == "VICTORY_CONFIG").then(|| path.clone().into_os_string());
+
+        let error = Config::load_from(&default, env).unwrap_err().to_string();
+        assert!(
+            error.contains("VICTORY_CONFIG") && error.contains("custom.toml"),
+            "{error}"
+        );
+        assert!(error.contains("does not exist"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_config_can_link_to_a_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("victory.toml");
+        std::fs::write(
+            tmp.path().join("shared.toml"),
+            "[paths]\ngame_dir = 'my-game'\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("shared.toml", &path).unwrap();
+
+        let cfg = Config::load_from(&path, isolated_paths(tmp.path())).unwrap();
+        assert_eq!(cfg.source, Some(path));
+        assert_eq!(cfg.game_dir, Some(PathBuf::from("my-game")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_default_config_link_is_not_treated_as_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("victory.toml");
+        std::os::unix::fs::symlink("missing.toml", &path).unwrap();
+
+        let error = Config::load_from(&path, |_| None).unwrap_err().to_string();
+        assert!(
+            error.contains("resolving") && error.contains("victory.toml"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn environment_overrides_file() {
