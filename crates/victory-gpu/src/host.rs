@@ -4200,6 +4200,7 @@ mod card_steps;
 pub(crate) mod indirects;
 mod font;
 mod menu;
+pub use menu::{settings_pad_capture, settings_pad_key};
 mod panel;
 mod place;
 mod send;

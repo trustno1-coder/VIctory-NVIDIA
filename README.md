@@ -99,6 +99,21 @@
 
 - **F1** brings up the settings menu (arrow keys pick and change, Enter does
   it): DLSS, frame generation, frame rate cap and more.
+- For controller navigation in F1, set `VICTORY_MENU_PAD=menu` before
+  launch. Open F1 with the keyboard or a spare controller button mapped
+  to F1 in your input software. On the physical pad in slot 0, D-pad
+  up/down picks a row, left/right changes its value, A (Cross) activates it
+  and B (Circle) goes back. Select **STATS PANEL (F3)** to toggle F3.
+- To also open or close F1 with L3+R3, use `VICTORY_MENU_PAD=1`. Press the
+  two sticks within 250 ms of each other while they overlap. Release both
+  to rearm. Both clicks always reach the game on their original samples,
+  so this shortcut can also trigger a game binding. Use `menu` with a
+  dedicated F1 binding if the game uses that combination.
+- Controller navigation is off by default. It takes only fresh navigation
+  presses while F1 is open, focused and has no controller toggle pending.
+  A consumed press stays held back until release or focus loss. In the
+  background the full pad passes through. Other controller slots, analog
+  sticks and triggers pass through.
 - **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
   memory numbers).
 
