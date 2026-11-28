@@ -62,7 +62,7 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_CARD_REHASH_RUNS", "1"),
     ("VICTORY_JOIN_COPIES", "1"),
     ("VICTORY_CARD_STEPS", "2"),
-    ("VICTORY_CARD_AWAKE", "1"),
+    ("VICTORY_CARD_AWAKE", "0"),
     ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
     ("VICTORY_INDIRECT_WINDOW", "1"),
     ("VICTORY_INDIRECT_BATCH", "2"),
