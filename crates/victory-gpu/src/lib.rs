@@ -44,6 +44,25 @@ mod book;
 mod heap_marks;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+pub use host::{settings_pad_capture, settings_pad_key};
+/// Controller access to the in-process settings menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsPadMode {
+    Off,
+    MenuOnly,
+    StickShortcut,
+}
+
+#[cfg(windows)]
+pub fn settings_pad_mode() -> SettingsPadMode {
+    static MODE: std::sync::OnceLock<SettingsPadMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_MENU_PAD").as_deref() {
+        Ok("menu") => SettingsPadMode::MenuOnly,
+        Ok("1") => SettingsPadMode::StickShortcut,
+        _ => SettingsPadMode::Off,
+    })
+}
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
 pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

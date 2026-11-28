@@ -28,6 +28,9 @@ use crate::{HleExport, HleModule};
 #[cfg(any(windows, test))]
 mod playstation;
 
+#[cfg(any(windows, test))]
+mod menu_pad;
+
 /// Stops the motors of the PlayStation pads read over HID, before the
 /// process ends (XInput pads stop by themselves when it does).
 pub(crate) fn stop_rumble() {
@@ -1285,6 +1288,7 @@ mod host {
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
         mouse: MouseState,
+        menu_pad: menu_pad::MenuPad,
         /// The input snapshot for this poll and the HID connection owning each slot.
         pads: [Option<PadState>; PADS],
         hid_slots: [Option<u64>; PADS],
@@ -1324,11 +1328,27 @@ mod host {
             // (`VICTORY_DUALSENSE`: 0 off, 1 both).
             if slot == 0 {
                 let xinput = std::array::from_fn(|slot| self.xinput(slot));
+                let previous_hid = self.hid_slots[0];
                 self.pads = super::playstation::slots(
                     super::playstation::mode(),
                     xinput,
                     &mut self.hid_slots,
                     super::playstation::pads,
+                );
+                let mode = victory_gpu::settings_pad_mode();
+                // XInput and Sony HID can trade slot zero without an empty sample in between.
+                if mode != victory_gpu::SettingsPadMode::Off && previous_hid != self.hid_slots[0] && self.pads[0].is_some() {
+                    self.menu_pad.disconnected(victory_gpu::settings_pad_key);
+                }
+                self.menu_pad.filter(
+                    &mut self.pads[0],
+                    mode,
+                    || {
+                        let (open, pending) = victory_gpu::settings_pad_capture();
+                        (focused(), open, pending)
+                    },
+                    Instant::now,
+                    victory_gpu::settings_pad_key,
                 );
             }
             #[allow(unused_mut)]

@@ -5,7 +5,9 @@
 //! shader before the title starts again (`VICTORY_PRELOAD=1`, `victory
 //! preload`); it asks for a second Enter first. While it is
 //! shown the title sees no keyboard (`crate::SETTINGS_MENU_OPEN`, read by the
-//! input module); a pad still works.
+//! input module). By default a pad still works. With `VICTORY_MENU_PAD=1`,
+//! press both stick buttons on the physical pad in slot 0 to toggle F1. Use the D-pad to
+//! navigate, A to select, and B to go back.
 //!
 //! The settings are read once at start, so a change is saved at once (as well as by the save
 //! lines) to the file
@@ -21,7 +23,7 @@
 //! that panel is: white text on a black box, copied onto the swap chain's
 //! buffer, in the middle of the picture.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -342,32 +344,79 @@ fn shown_value(item: &Item, value: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+enum MenuKey {
+    Keyboard(u16),
+    Pad(u16),
+}
+
+static MENU_KEYS: Mutex<Vec<MenuKey>> = Mutex::new(Vec::new());
+
+// A toggle stays pending until the frame has applied it or focus loss cancels it.
+// The input sampler can run many times before a single presented frame.
+static PAD_TOGGLES: AtomicUsize = AtomicUsize::new(0);
+// Invalidate pad events even if a frame has already taken them out of the queue.
+static PAD_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether F1 is open, and whether a controller toggle is queued or being processed.
+pub fn settings_pad_capture() -> (bool, bool) {
+    let pending = PAD_TOGGLES.load(Ordering::Acquire) != 0;
+    (crate::SETTINGS_MENU_OPEN.load(Ordering::Relaxed), pending)
+}
+
+/// Queue a controller action from GameInput's pad sampler. When the pad loses
+/// focus or disconnects, cancel its unconsumed actions. Keyboard events retain
+/// their original order in both cases.
+pub fn settings_pad_key(key: Option<u16>) {
+    let mut keys = MENU_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    match key {
+        Some(vk) => {
+            if vk == VK_F1 {
+                PAD_TOGGLES.fetch_add(1, Ordering::Relaxed);
+            }
+            keys.push(MenuKey::Pad(vk));
+        }
+        None => {
+            PAD_GENERATION.fetch_add(1, Ordering::Release);
+            keys.retain(|key| {
+                if matches!(key, MenuKey::Pad(VK_F1)) {
+                    PAD_TOGGLES.fetch_sub(1, Ordering::Release);
+                }
+                matches!(key, MenuKey::Keyboard(_))
+            });
+        }
+    }
+}
+
+fn focused() -> bool {
+    let mut process = 0;
+    // SAFETY: plain queries; room for the answer.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
+    process == std::process::id()
+}
+
 /// Keys pressed, gathered on a thread of their own every 10 ms: a frame
 /// lasts 50 ms and more, and a short press would fall between two frames.
-fn keys() -> &'static Mutex<Vec<u16>> {
-    static KEYS: OnceLock<Mutex<Vec<u16>>> = OnceLock::new();
-    KEYS.get_or_init(|| {
+fn watch_keys() {
+    static WATCH: std::sync::Once = std::sync::Once::new();
+    WATCH.call_once(|| {
         let _ = std::thread::Builder::new().name("settings menu keys".into()).spawn(|| {
             const WATCHED: [u16; 7] = [VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE];
             let mut was = [false; WATCHED.len()];
             loop {
                 std::thread::sleep(Duration::from_millis(10));
-                let mut process = 0;
-                // SAFETY: plain queries; room for the answer.
-                unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
-                let ours = process == std::process::id();
+                let ours = focused();
                 for (i, &vk) in WATCHED.iter().enumerate() {
                     // SAFETY: a plain query.
                     let down = ours && unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
                     if down && !was[i] {
-                        keys().lock().unwrap_or_else(|e| e.into_inner()).push(vk);
+                        MENU_KEYS.lock().unwrap_or_else(|e| e.into_inner()).push(MenuKey::Keyboard(vk));
                     }
                     was[i] = down;
                 }
             }
         });
-        Mutex::new(Vec::new())
-    })
+    });
 }
 
 /// The box's size in pixels.
@@ -485,7 +534,7 @@ pub(super) struct Menu {
 impl Menu {
     pub(super) fn new() -> Menu {
         // Start the key thread now: F1 must be seen while the menu is closed.
-        let _ = keys();
+        watch_keys();
         // `VICTORY_MENU_OPEN=1`: shown from the start (to look at it in a run nobody presses keys in).
         if std::env::var_os("VICTORY_MENU_OPEN").is_some_and(|v| v == "1") {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
@@ -532,11 +581,13 @@ impl Menu {
         let total = rows.len();
         let at = rows.iter().position(|r| *r == self.at).unwrap_or(0);
         let first = at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
-        let mut out = vec![
-            "SETTINGS                       F1 OR ESC CLOSES".to_owned(),
-            "UP/DOWN PICK  LEFT/RIGHT CHANGE  ENTER DOES IT".to_owned(),
-            String::new(),
-        ];
+        let pad_help = "D-PAD/ARROWS PICK OR CHANGE   A/CROSS OR ENTER SELECTS";
+        let (title, help) = match crate::settings_pad_mode() {
+            crate::SettingsPadMode::StickShortcut => ("SETTINGS       F1/ESC OR L3+R3 OR B/CIRCLE CLOSES", pad_help),
+            crate::SettingsPadMode::MenuOnly => ("SETTINGS       F1/ESC OR B/CIRCLE CLOSES", pad_help),
+            crate::SettingsPadMode::Off => ("SETTINGS                       F1 OR ESC CLOSES", "UP/DOWN PICK  LEFT/RIGHT CHANGE  ENTER DOES IT"),
+        };
+        let mut out = vec![title.to_owned(), help.to_owned(), String::new()];
         for &row in &rows[first..(first + ROWS).min(total)] {
             let cursor = if row == self.at { '>' } else { ' ' };
             let line = if let Some(item) = ITEMS.get(row) {
@@ -583,7 +634,12 @@ impl Menu {
 
     /// The list IMPORT SAVE opens, in the box's lines.
     fn pick_lines(&self) -> Vec<String> {
-        let mut out = vec![PICK_TITLE.to_owned(), PICK_HELP.to_owned(), String::new()];
+        let (title, help) = if crate::settings_pad_mode() != crate::SettingsPadMode::Off {
+            ("IMPORT SAVE                 ESC OR B/CIRCLE GOES BACK", "UP/DOWN PICK   ENTER OR A/CROSS TWICE TO IMPORT")
+        } else {
+            (PICK_TITLE, PICK_HELP)
+        };
+        let mut out = vec![title.to_owned(), help.to_owned(), String::new()];
         if self.imports.is_empty() {
             out.push(PICK_NONE.to_owned());
         }
@@ -867,11 +923,20 @@ impl Menu {
     /// A frame was presented: the keys pressed since the last one.
     pub(super) fn frame(&mut self) {
         self.warmup();
-        let pressed = std::mem::take(&mut *keys().lock().unwrap_or_else(|e| e.into_inner()));
+        let (pressed, generation) = {
+            let mut keys = MENU_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+            (std::mem::take(&mut *keys), PAD_GENERATION.load(Ordering::Relaxed))
+        };
         if pressed.is_empty() {
             return;
         }
-        for vk in pressed {
+        let toggles = pressed.iter().filter(|key| matches!(key, MenuKey::Pad(VK_F1))).count();
+        for event in pressed {
+            let vk = match event {
+                MenuKey::Keyboard(vk) => vk,
+                MenuKey::Pad(vk) if focused() && generation == PAD_GENERATION.load(Ordering::Acquire) => vk,
+                MenuKey::Pad(_) => continue,
+            };
             let open = Self::open();
             // Esc in the list of saves goes back to the settings.
             if open && self.picking && vk == VK_ESCAPE {
@@ -944,6 +1009,9 @@ impl Menu {
                 _ => {}
             }
             self.changed = true;
+        }
+        if toggles != 0 {
+            PAD_TOGGLES.fetch_sub(toggles, Ordering::Release);
         }
     }
 
