@@ -51,6 +51,17 @@ fn first() -> usize {
     })
 }
 
+/// How many buffers of a kind the thread makes at once, with one call that asks for their
+/// memory and one copy that waits for it (`VICTORY_AHEAD_BATCH`, 16; 1: one at a time, as
+/// before). One at a time, each buffer cost a call and a round trip of its own, and the store,
+/// emptied by the frame a scene starts in, refilled slower than the title took from it.
+fn batch() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_AHEAD_BATCH").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(16).clamp(1, 256)
+    })
+}
+
 /// Starts the thread that makes the buffers, once. Called when the first title buffer of any
 /// size gets a copy in the card's memory ([`want_card`]), which is in a run's first second:
 /// the store is full long before the first frame with a scene (started at the first buffer of
@@ -151,15 +162,20 @@ fn fill() {
             std::thread::sleep(std::time::Duration::from_millis(if said { 20 } else { 50 }));
             continue;
         }
-        if more_shared
-            && let Some((buffer, data)) = host.shared_buffer_now(SIZE)
-        {
-            SHARED.lock().unwrap_or_else(|e| e.into_inner()).push(Shared(buffer, data as usize));
+        let mut any = false;
+        if more_shared {
+            let made = host.shared_buffers_now(SIZE, batch().min(want - shared));
+            any |= !made.is_empty();
+            SHARED.lock().unwrap_or_else(|e| e.into_inner()).extend(made.into_iter().map(|(b, data)| Shared(b, data as usize)));
         }
-        if more_card
-            && let Some(buffer) = host.uav_buffer(SIZE)
-        {
-            CARD.lock().unwrap_or_else(|e| e.into_inner()).push(Card(buffer));
+        if more_card {
+            let made = host.uav_buffers(SIZE, batch().min(want - card));
+            any |= !made.is_empty();
+            CARD.lock().unwrap_or_else(|e| e.into_inner()).extend(made.into_iter().map(Card));
+        }
+        if !any {
+            // The host refused: not asked again at once.
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 }
