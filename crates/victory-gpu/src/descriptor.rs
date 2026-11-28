@@ -898,8 +898,13 @@ pub(crate) fn constant_slot(
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
-        heaps.retain(|&(_, _, h)| h != at);
+        {
+            let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+            heaps.retain(|&(_, _, h)| h != at);
+        }
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::release_heap(std::ptr::from_ref(host) as usize);
+        }
     }
 }
 
@@ -2067,6 +2072,76 @@ static FUNCTIONS: Table<24> = {
     f[10] = start as *const (); // 0x50 GPU
     Table(f)
 };
+
+#[cfg(all(test, windows))]
+mod safety_tests {
+    use super::*;
+    use crate::object::S_OK;
+
+    #[test]
+    fn released_view_heap_evicts_memory_heap_entry() {
+        #[repr(C)]
+        struct Extended(HeapDesc, Placement);
+
+        struct HeapGuard(This);
+        impl HeapGuard {
+            fn release_now(&mut self) -> u32 {
+                let ptr = std::mem::replace(&mut self.0, std::ptr::null());
+                if ptr.is_null() { 0 } else { release(ptr) }
+            }
+        }
+        impl Drop for HeapGuard {
+            fn drop(&mut self) {
+                let _ = self.release_now();
+            }
+        }
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let extended = Extended(
+            HeapDesc {
+                kind: VIEWS_KIND,
+                count: 64,
+                flags: SHADER_VISIBLE,
+                nodes: 1,
+            },
+            Placement {
+                address: 0,
+                size: 0,
+            },
+        );
+        let mut raw = std::ptr::null();
+        assert_eq!(
+            create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut raw),
+            S_OK
+        );
+        let mut h = HeapGuard(raw);
+        let Some(host_heap) = heap(h.0).host() else {
+            return;
+        };
+        let key = std::ptr::from_ref(host_heap) as usize;
+        if crate::memory::ready(
+            &list,
+            host_heap,
+            &[],
+            &[],
+            &[],
+            crate::memory::Use::Reads,
+            None,
+        )
+        .is_none()
+        {
+            return;
+        }
+        assert!(crate::memory::has_heap(key));
+        assert_eq!(h.release_now(), 0);
+        assert!(!crate::memory::has_heap(key));
+    }
+}
 
 #[cfg(test)]
 mod tests {

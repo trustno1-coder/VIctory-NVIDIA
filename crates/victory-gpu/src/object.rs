@@ -72,12 +72,25 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
 }
 
 /// A reference more to `this` only while it still has one: `false` if it is
-/// being released (its count reached 0). From CuteBooty/victory-8gb (after
-/// fxceless, victory-fork d4a528ba), for [`crate::resource::alias_of`].
+/// being released (its count reached 0) or would overflow `u32::MAX`. From
+/// CuteBooty/victory-8gb (after fxceless, victory-fork d4a528ba), for
+/// [`crate::resource::alias_of`].
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn add_ref_alive(this: This) -> bool {
     // SAFETY: `this` is one of our objects, not freed yet.
     let refs = &unsafe { &*this }.refs;
-    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then(|| n + 1)).is_ok()
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        if n > 0 { n.checked_add(1) } else { None }
+    })
+    .is_ok()
+}
+
+/// Whether `this` still has at least one live reference: `false` once its
+/// count has reached 0 and it is being released.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_alive(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, not freed yet.
+    unsafe { &*this }.refs.load(Ordering::Acquire) > 0
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {
@@ -569,5 +582,25 @@ mod tests {
         );
         assert!(found.is_null());
         slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+    }
+
+    #[test]
+    fn add_ref_alive_and_is_alive_check_refcount_bounds() {
+        static TABLE: Table<0> = Table([]);
+        let object = Object::new(&TABLE);
+        let this: This = &object;
+        assert!(!is_alive(this));
+        assert!(!add_ref_alive(this));
+        assert_eq!(object.refs.load(Ordering::Relaxed), 0);
+
+        object.refs.store(1, Ordering::Relaxed);
+        assert!(is_alive(this));
+        assert!(add_ref_alive(this));
+        assert_eq!(object.refs.load(Ordering::Relaxed), 2);
+
+        object.refs.store(u32::MAX, Ordering::Relaxed);
+        assert!(is_alive(this));
+        assert!(!add_ref_alive(this));
+        assert_eq!(object.refs.load(Ordering::Relaxed), u32::MAX);
     }
 }

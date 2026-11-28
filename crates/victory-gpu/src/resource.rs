@@ -1531,12 +1531,12 @@ pub(crate) fn alias_of(this: This) -> Option<Held> {
     alias_with(this, |other| crate::object::add_ref_alive(other).then(|| Held(other))).flatten()
 }
 
-/// Whether [`alias_of`] would find a texture for `this`, for callers that
-/// only ask: nothing is pinned, so none of them can end up dropping the
-/// texture's last reference.
+/// Whether [`alias_of`] would find a live texture for `this`, for callers
+/// that only ask: checks liveness under the table lock without bumping or
+/// dropping the texture's reference count.
 #[cfg(windows)]
 pub(crate) fn is_aliased(this: This) -> bool {
-    alias_with(this, |_| ()).is_some()
+    alias_with(this, crate::object::is_alive).unwrap_or(false)
 }
 
 /// The lookup behind [`alias_of`]: `found` runs on the texture while the
@@ -5274,40 +5274,116 @@ float4 lit() : SV_Target { return 1.0; }
     /// is held while the caller copies it: the title may let go of its own
     /// reference between the lookup and the copy (or a recording thread
     /// may), and the copy still needs it.
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     #[test]
     fn an_alias_source_is_held_after_the_title_releases_it() {
         use std::sync::atomic::Ordering::Relaxed;
+
+        struct ResourceGuard(This);
+        impl ResourceGuard {
+            fn release_now(&mut self) -> u32 {
+                let ptr = std::mem::replace(&mut self.0, std::ptr::null());
+                if ptr.is_null() { 0 } else { resource_release(ptr) }
+            }
+        }
+        impl Drop for ResourceGuard {
+            fn drop(&mut self) {
+                let _ = self.release_now();
+            }
+        }
 
         let Some(_host) = crate::host::host() else {
             return;
         };
         let null = std::ptr::null();
-        let mut source = null;
-        let mut view = null;
+        let mut raw_source = null;
+        let mut raw_view = null;
         let source_desc = ResourceDesc {
             flags: 4,
             ..texture(4, 4, 42, 1)
         };
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source),
+            create_committed(null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut raw_source),
             S_OK
         );
+        let mut source = ResourceGuard(raw_source);
         assert_eq!(
-            create_at_address(null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut view),
+            create_at_address(null, resource(source.0).data() as u64, &texture(4, 4, 67, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut raw_view),
             S_OK
         );
-        resource(view).host.placed.store(true, Relaxed);
-        assert!(is_aliased(view), "the lookup alone finds it too");
-        let held = alias_of(view).expect("an alias source");
-        assert_eq!(held.get(), source);
+        let mut view = ResourceGuard(raw_view);
+        resource(view.0).host.placed.store(true, Relaxed);
+        assert!(is_aliased(view.0), "the lookup alone finds it too");
+        let held = alias_of(view.0).expect("an alias source");
+        assert_eq!(held.get(), source.0);
+        let source_addr = source.0 as usize;
         // The title lets go: the pin, not the title's reference, keeps the
         // source (and the copy about to be made from it) alive.
-        resource_release(source);
+        assert_eq!(source.release_now(), 1);
+        assert!(is_aliased(view.0), "the pinned source is still live");
         assert!(host_resource(held.get()).is_some(), "a held source is still copyable");
-        assert!(textures().contains(&(source as usize)), "the held source is not freed");
+        assert!(textures().contains(&source_addr), "the held source is not freed");
         drop(held);
-        assert!(!textures().contains(&(source as usize)), "the last reference frees it");
-        resource_release(view);
+        assert!(!textures().contains(&source_addr), "the last reference frees it");
+        assert!(!is_aliased(view.0));
+        assert!(alias_of(view.0).is_none());
+        assert_eq!(view.release_now(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_aliased_ignores_dying_target_with_zero_refcount() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        struct ResourceGuard(This);
+        impl ResourceGuard {
+            fn release_now(&mut self) -> u32 {
+                let ptr = std::mem::replace(&mut self.0, std::ptr::null());
+                if ptr.is_null() { 0 } else { resource_release(ptr) }
+            }
+        }
+        impl Drop for ResourceGuard {
+            fn drop(&mut self) {
+                let _ = self.release_now();
+            }
+        }
+
+        struct RefRestore(This);
+        impl Drop for RefRestore {
+            fn drop(&mut self) {
+                crate::object::add_ref(self.0);
+            }
+        }
+
+        let null = std::ptr::null();
+        let mut raw_source = null;
+        let mut raw_view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut raw_source),
+            S_OK
+        );
+        let mut source = ResourceGuard(raw_source);
+        assert_eq!(
+            create_at_address(null, resource(source.0).data() as u64, &texture(4, 4, 67, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut raw_view),
+            S_OK
+        );
+        let mut view = ResourceGuard(raw_view);
+        resource(view.0).host.placed.store(true, Relaxed);
+        assert!(is_aliased(view.0));
+        {
+            // Simulate the window between `release_boxed` dropping `refs` to 0
+            // and `Resource::drop` removing the entry from `TARGETS_AT`.
+            assert_eq!(crate::object::release(source.0), 0);
+            let _restore = RefRestore(source.0);
+            assert!(!is_aliased(view.0), "dying target must not appear aliased");
+            assert!(alias_of(view.0).is_none(), "dying target must not be pinned");
+        }
+        assert!(is_aliased(view.0));
+        assert_eq!(source.release_now(), 0);
+        assert_eq!(view.release_now(), 0);
     }
 }
