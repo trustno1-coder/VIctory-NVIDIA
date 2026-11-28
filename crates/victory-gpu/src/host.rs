@@ -455,6 +455,7 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        crate::texback::trim_read_backs();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -2719,7 +2720,7 @@ struct Deferred {
     /// has run: the host buffer the list copies the texels into, the title
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
-    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    backs: Vec<(crate::texback::ReadBack, usize, [usize; 3])>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
     back_wanted: Vec<crate::texback::Target>,
@@ -3564,6 +3565,7 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
         let deferred = list.deferred();
         written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
         written.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
+        written.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
@@ -4369,30 +4371,31 @@ fn read_backs(list: &HostList) {
         crate::texback::land(back);
     }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
-        let mut data = std::ptr::null_mut();
-        // SAFETY: a read-back buffer of ours, written by the list that has
-        // run; the title's destination holds every row (checked when the
-        // copy was recorded).
+        let stride = row.next_multiple_of(256);
+        let needed = rows.saturating_sub(1) * stride + *row;
+        if needed > buffer.capacity() as usize {
+            continue;
+        }
+        let from = buffer.data();
+        // SAFETY: a persistently mapped read-back buffer of ours, written by
+        // the list that has run; the title's destination holds every row
+        // (checked when the copy was recorded).
         unsafe {
-            if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
-                let from = data.cast::<u8>().cast_const();
-                for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
-                }
-                // The walls trace: what the title is handed (one row of at
-                // most 24 values: its 5x1 and 1x1 float targets).
-                if walls_trace() && *rows == 1 && *row <= 96 {
-                    let mut values = [0f32; 24];
-                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), *row & !3);
-                    tracing::info!(
-                        frame = crate::frame::current(),
-                        to = format_args!("{:#x}", *at),
-                        bytes = *row,
-                        values = ?&values[..*row / 4],
-                        "walls trace: a read-back lands in title memory"
-                    );
-                }
-                buffer.Unmap(0, None);
+            for line in 0..*rows {
+                std::ptr::copy_nonoverlapping(from.add(line * stride), (*at as *mut u8).add(line * pitch), *row);
+            }
+            // The walls trace: what the title is handed (one row of at
+            // most 24 values: its 5x1 and 1x1 float targets).
+            if walls_trace() && *rows == 1 && *row <= 96 {
+                let mut values = [0f32; 24];
+                std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), *row & !3);
+                tracing::info!(
+                    frame = crate::frame::current(),
+                    to = format_args!("{:#x}", *at),
+                    bytes = *row,
+                    values = ?&values[..*row / 4],
+                    "walls trace: a read-back lands in title memory"
+                );
             }
         }
     }
@@ -6950,6 +6953,25 @@ impl HostList {
         }
     }
 
+    /// Returns this list's read-back buffers straight to the pool. Call only
+    /// after every submission of the list has finished on the card (or if the
+    /// list was never submitted).
+    pub(crate) fn recycle_read_backs(&self) {
+        let (backs, texture_backs) = {
+            let mut deferred = self.deferred();
+            (
+                std::mem::take(&mut deferred.backs),
+                std::mem::take(&mut deferred.texture_backs),
+            )
+        };
+        for (buffer, _, _) in backs {
+            buffer.recycle();
+        }
+        for back in texture_backs {
+            back.recycle();
+        }
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
@@ -6965,6 +6987,7 @@ impl HostList {
         self.upscale.store(0, Ordering::Relaxed);
         self.hudless.store(0, Ordering::Relaxed);
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.recycle_read_backs();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7683,8 +7706,13 @@ impl HostList {
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
     /// the list is reset.
-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
+    pub(crate) fn defer_read_back(&self, buffer: crate::texback::ReadBack, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defer_texture_back(&self, back: crate::texback::Back) {
+        self.deferred().texture_backs.push(back);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -9505,6 +9533,12 @@ impl Host {
     /// given memory ahead of the list that uploads them).
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
         &self.queue
+    }
+
+    /// A pooled, persistently mapped read-back buffer of at least `size`
+    /// bytes (`crate::texback::ReadBack`).
+    pub(crate) fn read_back(&self, size: u64) -> Option<crate::texback::ReadBack> {
+        crate::texback::take_read_back(self, size)
     }
 
     /// A buffer in the upload heap, mapped for writing.
@@ -12149,6 +12183,43 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    /// Part `N` writing a texture readback (`deferred.texture_backs`) over
+    /// `[a, b)` cannot be joined with part `N+1` reading `[a, b)` on the CPU
+    /// (`Step::Fill`), while non-overlapping ranges still join.
+    #[test]
+    fn joinable_waits_for_texture_backs_and_joins_disjoint_parts() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let ahead = host.new_list().unwrap();
+        let (a, b) = (0x20_0000usize, 0x28_0000usize);
+        ahead.deferred().texture_backs.push(crate::texback::Back::test_range(a, b));
+
+        // Overlapping `Step::Fill` (> 64 KiB so `fill_is_titles` never masks it) is blocked.
+        let next_overlap = host.new_list().unwrap();
+        next_overlap.defer_fill(0x1000 as *mut u8, (a + 0x1_0000) as *const u8, 0x2_0000);
+        assert!(!super::joinable(std::iter::once(&ahead), &[&next_overlap]));
+
+        // Single-byte overlap at the start boundary `[a - 0x2_0000 + 1, a + 1)` is also blocked.
+        let next_edge = host.new_list().unwrap();
+        next_edge.defer_fill(0x1000 as *mut u8, (a - 0x2_0000 + 1) as *const u8, 0x2_0000);
+        assert!(!super::joinable(std::iter::once(&ahead), &[&next_edge]));
+
+        // Adjacent `[a - 0x2_0000, a)` and disjoint `[b, b + 0x2_0000)` ranges still join.
+        let next_before = host.new_list().unwrap();
+        next_before.defer_fill(0x1000 as *mut u8, (a - 0x2_0000) as *const u8, 0x2_0000);
+        assert!(super::joinable(std::iter::once(&ahead), &[&next_before]));
+
+        let next_after = host.new_list().unwrap();
+        next_after.defer_fill(0x1000 as *mut u8, b as *const u8, 0x2_0000);
+        assert!(super::joinable(std::iter::once(&ahead), &[&next_after]));
+
+        for list in [&ahead, &next_overlap, &next_edge, &next_before, &next_after] {
+            list.close();
+            list.reset();
+        }
     }
 }
 

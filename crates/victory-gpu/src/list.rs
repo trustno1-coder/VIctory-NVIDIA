@@ -373,6 +373,11 @@ fn fresh_list() -> Option<crate::host::HostList> {
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
+        for &i in ran {
+            if let Some(item) = lists.get(i) {
+                item.host.recycle_read_backs();
+            }
+        }
         return;
     }
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
@@ -383,8 +388,9 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             continue;
         }
         if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
-            // Its submission has run: its prelude serves another list.
+            // Its submission has run: its prelude and read-backs serve another list.
             host.give_prelude();
+            host.recycle_read_backs();
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -1343,7 +1349,7 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
-    let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
+    let buffer = host.read_back(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
@@ -1354,7 +1360,7 @@ fn read_back(
     let mut from = src;
     from.resource = texture.as_raw().cast_const().cast();
     let mut to = dst;
-    to.resource = buffer.as_raw().cast_const().cast();
+    to.resource = buffer.resource().as_raw().cast_const().cast();
     to.footprint = footprint;
     let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
     #[cfg(feature = "diagnostics")]
