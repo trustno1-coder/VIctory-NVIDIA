@@ -26,7 +26,41 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
+/// Apply `victory-settings.txt` and `play` shader defaults so `victory warm`
+/// warms pipelines under the same shader cache key that `victory play` uses
+/// (e.g. `VICTORY_EARLY_DEPTH=1`, `VICTORY_NAN_SCRUB=1`, `VICTORY_AMBIENT`).
+fn apply_play_shader_env() {
+    let settings_path = std::env::var_os("VICTORY_MENU_FILE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("VICTORY_HOME").map(|h| PathBuf::from(h).join("victory-settings.txt")))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(|h| PathBuf::from(h).join("victory").join("victory-settings.txt")));
+    if let Some(path) = settings_path
+        && let Ok(text) = std::fs::read_to_string(path)
+    {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let (k, v) = (k.trim(), v.trim());
+                if k.starts_with("VICTORY_") && !v.is_empty() && std::env::var_os(k).is_none() {
+                    // SAFETY: called at start of `warm::run` before spawning worker threads.
+                    unsafe { std::env::set_var(k, v) };
+                }
+            }
+        }
+    }
+    for (k, v) in [("VICTORY_EARLY_DEPTH", "1"), ("VICTORY_AMBIENT_SPECULAR", "1"), ("VICTORY_WATER_LIGHT", "1")] {
+        if std::env::var_os(k).is_none() {
+            // SAFETY: called at start of `warm::run` before spawning worker threads.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+}
+
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+    apply_play_shader_env();
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
