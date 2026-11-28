@@ -38,6 +38,149 @@ fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
     if fast.len() == sets.len() { Vec::new() } else { fast }
 }
 
+/// The last-level cache of each processor set of group 0, by set id: its
+/// bytes, and the mask of the processors that share it (which tells one
+/// core complex from another). None known: empty.
+fn l3_of_sets() -> Vec<(u32, u32, u64)> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, GetSystemCpuSetInformation, RelationCache, SYSTEM_CPU_SET_INFORMATION,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // The largest cache of each logical processor of group 0, by its index,
+    // and the processors that share it.
+    let mut by_processor = [(0u32, 0u64); 64];
+    let mut bytes = 0u32;
+    // SAFETY: a size query, then the call into a buffer of that size.
+    unsafe { GetLogicalProcessorInformationEx(RelationCache, std::ptr::null_mut(), &mut bytes) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
+    let ok = unsafe { GetLogicalProcessorInformationEx(RelationCache, buffer.as_mut_ptr().cast(), &mut bytes) };
+    let mut at = 0usize;
+    while ok != 0 && at + size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() <= bytes as usize {
+        // SAFETY: a record inside the buffer; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()) };
+        if info.Size == 0 {
+            break;
+        }
+        if info.Relationship == RelationCache {
+            // SAFETY: a cache record (asked for), with at least its first group mask.
+            let cache = unsafe { &info.Anonymous.Cache };
+            let mask = unsafe { cache.Anonymous.GroupMask };
+            if mask.Group == 0 {
+                for (p, last) in by_processor.iter_mut().enumerate() {
+                    if mask.Mask >> p & 1 != 0 && cache.CacheSize > last.0 {
+                        *last = (cache.CacheSize, mask.Mask as u64);
+                    }
+                }
+            }
+        }
+        at += info.Size as usize;
+    }
+    // Processor indices to set ids.
+    let mut bytes = 0u32;
+    // SAFETY: as for `cpu_sets`.
+    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: as above.
+    let ok = unsafe { GetSystemCpuSetInformation(buffer.as_mut_ptr().cast(), bytes, &mut bytes, GetCurrentProcess(), 0) };
+    let mut caches = Vec::new();
+    let mut at = 0usize;
+    while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
+        // SAFETY: a record inside the buffer; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_CPU_SET_INFORMATION>()) };
+        if info.Size == 0 {
+            break;
+        }
+        // SAFETY: the record's type is CpuSet (the only one there is).
+        let set = unsafe { &info.Anonymous.CpuSet };
+        if set.Group == 0 && let Some(&(size, shared)) = by_processor.get(set.LogicalProcessorIndex as usize) {
+            caches.push((set.Id, size, shared));
+        }
+        at += info.Size as usize;
+    }
+    caches
+}
+
+/// Whether our threads keep to one core complex where the processor has
+/// several of one kind (`VICTORY_CCD_CORES=1`; off by default while it is
+/// tested; `VICTORY_AB` can flip it while the title runs). On a Ryzen of two
+/// complexes (7900X, 7950X, 9900X, 9950X, and the X3D ones) every core reports
+/// the same efficiency class, so nothing was asked for: the submitting thread
+/// and those it shares its work with ran on either, and every lock, claim and
+/// handoff between two of them could cross from one complex to the other:
+/// 180 ns a way on a 7900X, against 20 ns inside one.
+fn ccd_cores() -> bool {
+    crate::asked_for!("VICTORY_CCD_CORES")
+}
+
+/// The sets of one last-level cache (`l3`: bytes and sharers by set id), if
+/// there are several: the one shared by the most sets (of those alike, the
+/// largest cache, which is the stacked one of an X3D; then the lowest id), at
+/// least eight of them.
+fn fast_by_complex(sets: &[(u32, u8)], l3: &[(u32, u32, u64)]) -> Vec<u32> {
+    let cache = |id: u32| l3.iter().find(|s| s.0 == id).map_or((0, 0), |s| (s.1, s.2));
+    let mut complexes: Vec<(u64, u32, Vec<u32>)> = Vec::new();
+    for s in sets {
+        let (size, mask) = cache(s.0);
+        if mask == 0 {
+            return Vec::new();
+        }
+        match complexes.iter_mut().find(|c| c.0 == mask) {
+            Some(c) => c.2.push(s.0),
+            None => complexes.push((mask, size, vec![s.0])),
+        }
+    }
+    if complexes.len() < 2 {
+        return Vec::new();
+    }
+    use std::cmp::Reverse;
+    let best = complexes.into_iter().min_by_key(|c| (Reverse(c.2.len()), Reverse(c.1), c.2.iter().copied().min()));
+    best.map(|c| c.2).filter(|f| f.len() >= 8).unwrap_or_default()
+}
+
+/// The sets our threads are asked to run on: those of the fastest class if
+/// there are slower ones, else those of one core complex ([`ccd_cores`]);
+/// none: any. `now`: as things are at this moment (else whether there could
+/// be any, for threads to ask at all).
+fn fast_sets(sets: &[(u32, u8)], now: bool) -> Vec<u32> {
+    static L3: std::sync::OnceLock<Vec<(u32, u32, u64)>> = std::sync::OnceLock::new();
+    fast_sets_with(sets, || L3.get_or_init(l3_of_sets), !now || ccd_cores())
+}
+
+/// [`fast_sets`] with the caches given, and whether one complex is asked for.
+fn fast_sets_with<'a>(sets: &[(u32, u8)], l3: impl FnOnce() -> &'a [(u32, u32, u64)], complex: bool) -> Vec<u32> {
+    let by_class = fast_of(sets);
+    if !by_class.is_empty() || !complex {
+        return by_class;
+    }
+    fast_by_complex(sets, l3())
+}
+
+/// Asks the system to run that thread on those sets (none: any).
+fn place(thread: windows_sys::Win32::Foundation::HANDLE, fast: &[u32]) -> bool {
+    use windows_sys::Win32::System::Threading::SetThreadSelectedCpuSets;
+    let at = if fast.is_empty() { std::ptr::null() } else { fast.as_ptr() };
+    // SAFETY: a thread handle that is open, and the system's own set ids.
+    unsafe { SetThreadSelectedCpuSets(thread, at, fast.len() as u32) != 0 }
+}
+
+/// Our threads that asked, by a handle of each kept open for [`settle`].
+static ASKED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Tells each of our threads that asked where to run now ([`ccd_cores`] may
+/// have changed).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn settle() {
+    let sets = cpu_sets();
+    let asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    let fast = fast_sets(&sets, true);
+    for &thread in asked.iter() {
+        place(thread as _, &fast);
+    }
+    tracing::info!(fast = fast.len(), of = sets.len(), threads = asked.len(), "our threads' processors (VICTORY_CCD_CORES)");
+}
+
 /// `VICTORY_FAST_CORES`: 0: no thread asks; 1: the threads a frame waits for
 /// one by one; 2 (the default): the threads they share their work with too;
 /// 3: those that work beside the rest as well (lists translated, descriptors
@@ -84,7 +227,10 @@ fn helper_priority() -> Option<i32> {
 }
 
 fn ask(what: &str, from: u32) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, SetThreadSelectedCpuSets};
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, GetCurrentThreadId, OpenThread, SetThreadPriority, THREAD_SET_LIMITED_INFORMATION,
+    };
     if let Some(priority) = helper_priority() {
         // SAFETY: this thread's own priority.
         let set = unsafe { SetThreadPriority(GetCurrentThread(), priority) } != 0;
@@ -93,21 +239,32 @@ fn ask(what: &str, from: u32) {
     if stage() < from {
         return;
     }
-    static FAST: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
-    let (fast, of) = FAST.get_or_init(|| {
+    static COULD: std::sync::OnceLock<(bool, usize)> = std::sync::OnceLock::new();
+    let &(could, of) = COULD.get_or_init(|| {
         let sets = cpu_sets();
-        (fast_of(&sets), sets.len())
+        // (whether there can be fast sets at all: `VICTORY_CCD_CORES` may
+        // change while the title runs, and `settle` follows it)
+        (!fast_sets(&sets, false).is_empty(), sets.len())
     });
     // All alike (or nothing known): nothing to ask for.
-    if fast.is_empty() {
+    if !could {
         return;
     }
-    // SAFETY: our own thread and a list of the system's own set ids.
-    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) };
-    if ok == 0 {
+    // SAFETY: our own thread; the handle stays open for `settle`.
+    let thread = unsafe { OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, GetCurrentThreadId()) };
+    if thread.is_null() {
         tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
+        return;
+    }
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    let fast = fast_sets(&cpu_sets(), true);
+    if place(thread, &fast) {
+        asked.push(thread as usize);
+        tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not; VICTORY_CCD_CORES)");
     } else {
-        tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
+        // SAFETY: the handle opened above, not kept.
+        unsafe { CloseHandle(thread) };
     }
 }
 
@@ -170,5 +327,70 @@ mod tests {
         assert!(fast_of(&[]).is_empty());
         assert!(!cpu_sets().is_empty());
         std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
+    }
+
+    const MB: u32 = 1 << 20;
+
+    /// `n` sets of one class from id 256.
+    fn alike(n: u32) -> Vec<(u32, u8)> {
+        (0..n).map(|i| (256 + i, 0)).collect()
+    }
+
+    /// The caches of `n` sets from id 256, `per` of them to a complex, with
+    /// the bytes `size` gives each set.
+    fn caches(n: u32, per: u32, size: impl Fn(u32) -> u32) -> Vec<(u32, u32, u64)> {
+        (0..n).map(|i| (256 + i, size(i), ((1u64 << per) - 1) << (i / per * per))).collect()
+    }
+
+    #[test]
+    fn one_complex_is_kept_to_where_there_are_several() {
+        // 7900X: two complexes of 12 sets, caches alike: the first.
+        let l3 = caches(24, 12, |_| 32 * MB);
+        assert_eq!(fast_by_complex(&alike(24), &l3), (256..268).collect::<Vec<_>>());
+        // 9950X3D with the stacked cache on the second complex: that one.
+        let x3d = caches(32, 16, |i| if i < 16 { 32 * MB } else { 96 * MB });
+        assert_eq!(fast_by_complex(&alike(32), &x3d), (272..288).collect::<Vec<_>>());
+        // Of complexes of unlike size, the larger (12 and 8 sets).
+        let uneven: Vec<_> = (0..20).map(|i| (256 + i, 32 * MB, if i < 8 { 0xff } else { 0xfff00 })).collect();
+        assert_eq!(fast_by_complex(&alike(20), &uneven), (264..276).collect::<Vec<_>>());
+        // One complex (7800X3D, 9700X): nothing.
+        assert!(fast_by_complex(&alike(16), &caches(16, 16, |_| 96 * MB)).is_empty());
+        // Caches not known, or not for every set: nothing.
+        assert!(fast_by_complex(&alike(24), &[]).is_empty());
+        assert!(fast_by_complex(&alike(24), &l3[..12]).is_empty());
+        // Complexes of under eight sets (a 5600X-like part of two): nothing.
+        assert!(fast_by_complex(&alike(12), &caches(12, 6, |_| 16 * MB)).is_empty());
+    }
+
+    #[test]
+    fn the_switch_decides_only_where_the_cores_are_of_one_class() {
+        let l3 = caches(24, 12, |_| 32 * MB);
+        assert_eq!(fast_sets_with(&alike(24), || &l3, true), (256..268).collect::<Vec<_>>());
+        assert!(fast_sets_with(&alike(24), || panic!("caches read with the switch off"), false).is_empty());
+        // Eight fast cores (two sets each) and eight slow ones, the caches told
+        // to be of other complexes too: the class decides.
+        let hybrid: Vec<(u32, u8)> = (0..16).map(|n| (n, 1)).chain((16..24).map(|n| (n, 0))).collect();
+        let l3: Vec<(u32, u32, u64)> = (0..24).map(|n| (n, 30 * MB, 1 << (n / 4))).collect();
+        for complex in [true, false] {
+            assert_eq!(fast_sets_with(&hybrid, || &l3, complex), (0..16).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn the_caches_here_are_known() {
+        let sets = cpu_sets();
+        let l3 = l3_of_sets();
+        let mut shared: Vec<u64> = l3.iter().map(|c| c.2).collect();
+        shared.sort_unstable();
+        shared.dedup();
+        println!("{} sets, {} last-level caches, one complex: {} sets", sets.len(), shared.len(), fast_by_complex(&sets, &l3).len());
+        assert_eq!(l3.len(), sets.len());
+        assert!(!shared.is_empty() && !shared.contains(&0));
+        std::thread::spawn(|| {
+            keep_helper_on_fast_cores("test");
+            settle();
+        })
+        .join()
+        .unwrap();
     }
 }

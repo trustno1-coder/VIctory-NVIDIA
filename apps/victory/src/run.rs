@@ -27,7 +27,9 @@ fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()>
 }
 
 /// Pre-flight check before executing title code: Xbox Series binaries are
-/// compiled for Zen 2 and require AVX2.
+/// compiled for Zen 2 and require AVX2. (The workspace's own build targets
+/// x86-64-v3 (`.cargo/config.toml`), so this only speaks for builds made
+/// with other `RUSTFLAGS`: elsewhere the process stops before it.)
 #[cfg(windows)]
 fn check_cpu_features() -> Result<()> {
     #[cfg(target_arch = "x86_64")]

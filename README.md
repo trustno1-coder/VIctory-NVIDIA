@@ -297,7 +297,8 @@ What is known to be wrong:
 
 ## How to run it
 
-You need Windows 10 or 11 (x64), a CPU with AVX2, 32 GB of RAM or more, an
+You need Windows 10 or 11 (x64), a CPU with AVX2 (the build targets
+x86-64-v3), 32 GB of RAM or more, an
 SSD, an NVIDIA GeForce RTX card with a recent driver (RTX 40 or later for frame
 generation, with hardware-accelerated GPU scheduling on; more than 2x needs an
 RTX 50), [Rust](https://rustup.rs) (the toolchain is pinned), the Visual Studio
