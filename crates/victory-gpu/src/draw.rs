@@ -1904,18 +1904,21 @@ impl State {
             if sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut n_heaps = 0;
             if let Some(h) = view_heap {
                 list.keep(&h);
-                heaps.push(Some(h));
+                heaps[n_heaps] = Some(h);
+                n_heaps += 1;
             }
             if let Some(h) = sampler_heap {
                 list.keep(&h);
-                heaps.push(Some(h));
+                heaps[n_heaps] = Some(h);
+                n_heaps += 1;
             }
-            if !heaps.is_empty() {
+            if n_heaps > 0 {
                 // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+                unsafe { l.SetDescriptorHeaps(&heaps[..n_heaps]) };
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
