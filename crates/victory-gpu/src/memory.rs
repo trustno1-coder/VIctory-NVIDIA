@@ -226,6 +226,8 @@ impl Memory {
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
+        // Ours alone to write ([`fill`]): its writes are told, not asked for.
+        crate::watch::own(entries, bytes as usize);
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
         let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
@@ -423,8 +425,13 @@ impl Memory {
             failed(0);
             return false;
         };
+        // Written here alone ([`Memory::bring`], [`Memory::take`]), and every
+        // write told: the kernel is not asked about 64 MiB for each list
+        // that brings the arenas up to date.
+        crate::watch::own(at, ARENA as usize);
         let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
             failed(1);
+            crate::watch::disown(at);
             // SAFETY: the reservation just made, which nothing else knows of.
             unsafe {
                 windows_sys::Win32::System::Memory::VirtualFree(at as *mut _, 0, windows_sys::Win32::System::Memory::MEM_RELEASE)
@@ -456,6 +463,7 @@ impl Memory {
                 self.pages.remove(&page);
                 // SAFETY: an entry of the directory, under the mutex.
                 unsafe { self.entry(page).write_volatile(0) };
+                crate::watch::owner_wrote(self.entry(page) as usize, 8);
             }
         }
         self.stats.gone += 1;
@@ -565,13 +573,22 @@ impl Memory {
             let shadow = &self.copies[held.copy];
             let base = held.at - shadow.span().0 as usize;
             let mut title = [0u8; PIECE];
+            // The pieces that took something: from the first to past the last.
+            let mut wrote = (usize::MAX, 0);
             for piece in (0..PAGE as usize).step_by(PIECE) {
                 let from = (page * PAGE) as usize + piece;
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
                 // SAFETY: a page of an arena of ours, under the mutex.
                 let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
-                self.stats.changed += merge(&title, ours, never) as u64 * 4;
+                let changed = merge(&title, ours, never);
+                if changed != 0 {
+                    wrote = (wrote.0.min(piece), piece + PIECE);
+                }
+                self.stats.changed += changed as u64 * 4;
+            }
+            if wrote.0 < wrote.1 {
+                crate::watch::owner_wrote(held.at + wrote.0, wrote.1 - wrote.0);
             }
             if never {
                 shadow.resend(base, base + PAGE as usize);
@@ -660,7 +677,6 @@ impl Memory {
             return false;
         };
         self.hold(page, at, copy);
-        crate::watch::wrote(self.entry(page) as usize, 8);
         self.take(page, 0, PAGE as usize, true);
         true
     }
@@ -681,7 +697,7 @@ impl Memory {
             let ours = unsafe { std::slice::from_raw_parts_mut((held.at + at) as *mut u8, n) };
             if *ours != title[..n] {
                 ours.copy_from_slice(&title[..n]);
-                crate::watch::wrote(held.at + at, n);
+                crate::watch::owner_wrote(held.at + at, n);
             }
             at += n;
         }
@@ -889,6 +905,7 @@ fn fill(entry: *mut u32, n: usize, offset: u64) {
         entry.add(1).write_volatile(offset as u32);
         entry.write_volatile(n as u32 + 1);
     }
+    crate::watch::owner_wrote(entry as usize, 8);
 }
 
 /// The bytes of a packed structure whose first two dwords these are: the
