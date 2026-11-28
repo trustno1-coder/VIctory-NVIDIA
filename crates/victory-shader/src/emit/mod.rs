@@ -511,8 +511,44 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran ([`emit_once`]). A wave64 compute program
+/// that does not translate with the branches that close or leave its loops taken by each host
+/// wave together ([`loops_wave`]) is tried once more without them, as before that step: the
+/// underwater picture's program (`926c46bab3b86bd6`) translated before it and no longer did, so
+/// its dispatch was dropped and diving showed a field of white flares (#539, #570).
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let first = emit_once(c, native, p, st, io, res);
+    if !matches!(first, Err(ShaderError::Unsupported { .. })) || !loops_wave(native) {
+        return first;
+    }
+    LOOPS_OFF.with(|off| off.set(true));
+    let again = emit_once(c, native, p, st, io, res);
+    LOOPS_OFF.with(|off| off.set(false));
+    match again {
+        Ok(shader) => {
+            if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                eprintln!("WAVE-LOOPS left out: the program translates without them");
+            }
+            Ok(shader)
+        }
+        Err(_) => first,
+    }
+}
+
+thread_local! {
+    /// [`emit`]'s second try: [`loops_wave`] off.
+    static LOOPS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One try of [`emit`].
+fn emit_once(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -625,7 +661,7 @@ pub fn emit(
         // Both archived kernels use one logical wave per group and have
         // validated wave32 PSOs on RTX. Explicit policy wins.
         // The volumetric light's two tiled programs (`CS_TransmissionVolumetrics_Tiled`
-        // and `_Tiled_LocalLights`, GTA VI 1.0.2.1) are of that shape too: groups of 64,
+        // and `_Tiled_LocalLights`, the game, build 1.0.2.1) are of that shape too: groups of 64,
         // an LDS read and write in one lane-branch region, so no other form translates
         // them on 32-lane hosts and their dispatches were dropped (no volumetric light
         // or fog on NVIDIA). Widened, they translate (4 and 7 branches taken wave-wide).
@@ -897,7 +933,83 @@ fn widen(
 }
 
 /// The translated program, and the wave size it requires of the host.
+/// Which programs get the branches that close or leave their loops taken by each host wave
+/// together where cross-lane code depends on the wave ([`emit_program`]):
+/// - unset or `1`: console wave64 compute programs on a host of 32-lane waves;
+/// - `2`: every compute program;
+/// - `0`: none, as before.
+fn loops_wave(native: &NativeProgram) -> bool {
+    if native.stage != HwStage::Cs || LOOPS_OFF.with(std::cell::Cell::get) {
+        return false;
+    }
+    match std::env::var("VICTORY_LOOPS_WAVE").ok().as_deref().map(str::trim) {
+        Some("0") => false,
+        Some("2") => true,
+        _ => native.wave64 && lower::host_max_wave() == 32,
+    }
+}
+
+/// [`emit_program_plain`]; a program that comes out depending on the host's waves is
+/// translated once more with the per-lane branches that close or leave its loops taken by
+/// each host wave together ([`structure::structure_wide_host`]), and that translation is the
+/// one given if it needs no wider waves.
+///
+/// Why: the lowering turns the console's wave loops into loops each lane leaves on its own,
+/// and takes the code behind a loop as code the whole wave runs together. On NVIDIA the lanes
+/// that left a loop early run on as a wave of their own, so a ballot, a first-lane read or an
+/// exchange between the halves of a console wave behind the loop saw a part of the wave.
+/// Seen in `water_shading:CS_TransmissionVolumetrics_GenerateTiles` (the game, build 1.0.2.1, capture
+/// water2): the tiles with local lights never counted themselves in (the lanes without one
+/// arrived later and wrote "no lane" over their ballot), their list stayed empty and those
+/// tiles of the water kept no light: dark rectangles beside lit objects.
 fn emit_program(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let first = emit_program_plain(c, native, p, st, io, res);
+    let Ok((_, Some(wave))) = &first else {
+        return first;
+    };
+    if !loops_wave(native) || !st.host_wide.is_empty() {
+        return first;
+    }
+    let loops = lower::loop_branches(p, st);
+    if loops.is_empty() {
+        return first;
+    }
+    let needs = lower::take_needs();
+    let again = structure::structure_wide_host(p, &st.wide, &loops).and_then(|st| {
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        emit_program_plain(c, native, p, &st, io, &res)
+    });
+    let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    match again {
+        Ok((shader, Some(w))) if w <= *wave => {
+            if why {
+                eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
+            }
+            lower::take_needs();
+            Ok((shader, Some(w)))
+        }
+        other => {
+            if why {
+                let what = match &other {
+                    Ok((_, w)) => format!("wave {w:?}"),
+                    Err(e) => e.to_string(),
+                };
+                eprintln!("WAVE-LOOPS not taken ({} loop branches): {what}", loops.len());
+            }
+            lower::set_needs(needs);
+            first
+        }
+    }
+}
+
+fn emit_program_plain(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -2570,6 +2682,142 @@ mod tests {
             }
             eprintln!("offsets {s0} and {s1}, four dwords a call: {wide}: {:x?}", &out[0][..28]);
             assert_eq!(out[0][..28], want[..], "offsets {s0} and {s1}, four dwords a call: {wide}");
+        }
+    }
+
+    // Exercise the fixup with independent q/den/num, not only a complete
+    // division sequence: the important q=NaN corner cannot be assumed away.
+    fn div_fixup_corner_fixture() -> super::lower::Lowered {
+        let words: &[u32] = &[
+            0xBE85_0380,
+            0xF408_0202, 0xFA00_0000,
+            0xF408_0302, 0xFA00_0020,
+            0x340E_0084, // v7 = 16 * lane
+            0xE038_1000, 0x8002_0107, // load v1..v4 (q, denominator, numerator, pad)
+            0xD55F_0001, 0x040E_0501, // fixup v1, v1, v2, v3
+            0x340E_0082,
+            0xE070_1000, 0x8003_0107,
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 9,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::UsedResource {
+                    kind: crate::ResourceType::Srv,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Uav,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [12, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        l
+    }
+
+    #[test]
+    fn div_fixup_corner_program_lowers_without_gpu() {
+        let l = div_fixup_corner_fixture();
+        assert!(!l.dxil.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an explicitly available D3D12 adapter"]
+    fn div_fixup_corner_program_executes_on_gpu() {
+        let l = div_fixup_corner_fixture();
+        let dxil = l.dxil;
+        let host = super::host::Host::new(false).expect("D3D12 adapter required for this test");
+        let cs = super::HostShader {
+            stage: super::HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+        };
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        let cases: [(u32, u32, u32, u32); 12] = [
+            (0x7fc00000, 0x3f800000, 0x00000000, 0x00000000),
+            (0x7fc00000, 0xbf800000, 0x00000000, 0x80000000),
+            (0x7fc00000, 0xbf800000, 0x80000000, 0x00000000),
+            (0x7fc00000, 0x7f800000, 0x3f800000, 0x00000000),
+            (0x7fc00000, 0xff800000, 0x40400000, 0x80000000),
+            (0x7fc00000, 0x00000000, 0x3f800000, 0x7f800000),
+            (0x7fc00000, 0x3f800000, 0x7f800000, 0x7f800000),
+            (0x7fc00000, 0x3f800000, 0x3f800000, 0x7f800000),
+            (0x7fc00000, 0x00000000, 0x00000000, 0xffc00000),
+            (0x7fc00000, 0x7f800000, 0x7f800000, 0xffc00000),
+            (0x40000000, 0x3f800000, 0x7fa00000, 0x7fe00000),
+            (0x40000000, 0xffa00000, 0x3f800000, 0xffe00000),
+        ];
+        let inputs: Vec<u32> = cases.iter().flat_map(|&(q, d, n, _)| [q, d, n, 0]).collect();
+        let out = host.dispatch(&root, &pso, &super::host::Dispatch {
+            roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+            views: &[
+                super::host::View::Buffer { data: &inputs, stride: super::host::Stride::Raw },
+                super::host::View::RawUav(64),
+            ],
+            samplers: &[], groups: [1, 1, 1],
+        }).unwrap();
+        for (i, case) in cases.iter().enumerate() {
+            assert_eq!(out[0][i], case.3, "q={:#010x} den={:#010x} num={:#010x}", case.0, case.1, case.2);
         }
     }
 

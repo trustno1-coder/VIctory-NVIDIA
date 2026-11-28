@@ -61,7 +61,9 @@ fn book() -> Option<&'static Mutex<Book>> {
         let mut keys = HashSet::new();
         let mut shaders = HashSet::new();
         let ends = [
-            walk_shaders(&dir, |_, hash, _, _| drop(shaders.insert(hash))),
+            walk_shaders(&dir, |_, hash, _, _| {
+                shaders.insert(hash);
+            }),
             walk_pipelines(&dir, |_, bytes| {
                 keys.extend(bytes.first_chunk::<16>().copied());
             }),
@@ -205,6 +207,7 @@ pub fn fingerprint() -> String {
     if let Some(host) = crate::host::host() {
         h.update(&host.driver().to_le_bytes());
     }
+    h.update(&super::samplers::order());
     h.finalize().to_hex()[..16].to_owned()
 }
 
@@ -214,13 +217,28 @@ pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
+/// The translations and the host pipeline library of a run are in the cache
+/// folder `shaders`'s neighbours: what [`make`] makes from now on is stored in
+/// that library (`victory preload`), which the runs load at their start.
+pub fn use_library(shaders: PathBuf) {
+    super::library::use_pipeline_cache(shaders.with_file_name("pipelines"));
+    crate::shader_cache::use_shader_cache(shaders);
+}
+
+/// Writes the library [`use_library`] filled.
+pub fn keep_library() {
+    super::library::save(true);
+}
+
 /// Makes the host pipelines of those of `which` (numbers in the file) and
 /// lets each go again: the driver's cache on disk keeps them. `each` is told
 /// the number before, and what came of it after: milliseconds and whether
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
     let mut places = HashMap::new();
-    walk_shaders(dir, |stage, hash, at, len| drop(places.insert(hash, (stage, at, len))));
+    walk_shaders(dir, |stage, hash, at, len| {
+        places.insert(hash, (stage, at, len));
+    });
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();
