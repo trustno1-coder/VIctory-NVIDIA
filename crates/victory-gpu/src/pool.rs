@@ -1224,6 +1224,35 @@ mod tests {
         );
     }
 
+    /// Bench (`--ignored --nocapture`, with `VICTORY_RIPE_BLOCKS=0`): one
+    /// texture of 16 MiB placed every 4 ms (four fill a block), as
+    /// `VICTORY_BLOCK_AHEAD` says (run once with `=0`, once without).
+    #[test]
+    #[ignore]
+    fn bench_textures_that_need_new_blocks() {
+        let Some(host) = crate::host::host() else { return };
+        let big = square(2048);
+        let mut held = std::collections::VecDeque::new();
+        let mut ms = Vec::new();
+        for _ in 0..96 {
+            let began = std::time::Instant::now();
+            // SAFETY: a valid description.
+            held.extend(unsafe { texture(&host.device, &big, D3D12_RESOURCE_STATE_COMMON) });
+            ms.push(began.elapsed().as_secs_f64() * 1e3);
+            if held.len() > 32 {
+                held.pop_front();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        // (The first makes the first block, with nothing made ahead yet.)
+        eprintln!(
+            "textures of 16 MiB, one every 4 ms (a block made ahead: {}), the first {:.3} ms, then {}",
+            block_ahead() && blocks_unlocked() && ahead() == 0,
+            ms[0],
+            spread(ms[1..].to_vec())
+        );
+    }
+
     /// Threads that place textures at once, some of them making new blocks
     /// (outside the pool's lock, [`blocks_unlocked`]), get every texture,
     /// each in a piece of its own.
