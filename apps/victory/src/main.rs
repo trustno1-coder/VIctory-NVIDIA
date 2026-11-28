@@ -414,11 +414,17 @@ fn main() -> Result<()> {
     if let Command::Play(options) = &cli.command {
         // (Read before `prepare` clears the `VICTORY_...` variables: the menu's restart sets it.)
         let preload = options.preload || std::env::var_os("VICTORY_PRELOAD").is_some_and(|v| v == "1");
+        let clear_shaders = std::env::var_os("VICTORY_CLEAR_SHADERS").is_some_and(|v| v == "1");
         let done = play::prepare(options).and_then(|ready| {
+            victory_core::logging::init("info");
+            // F1's CLEAR SHADERS, read above before `prepare` cleared the variable: the caches
+            // go before this run opens them, and before a preload would fill them again.
+            if clear_shaders {
+                play::clear_shader_caches();
+            }
             if preload {
                 play::preload(&ready.exe);
             }
-            victory_core::logging::init("info");
             // F1's MFG UNLOCKER: the mod, before the layer makes its device or loads Streamline.
             play::load_mfg();
             let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };

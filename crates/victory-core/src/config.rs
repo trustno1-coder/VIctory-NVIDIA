@@ -117,6 +117,23 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+
+    /// Removes the preloaded shader caches: `<cache>/shaders` (the
+    /// translated shaders) and its sibling `pipelines` folder (the host
+    /// pipelines made ahead) — what F1's CLEAR SHADERS asks a start for.
+    /// Nothing else under the victory home is touched, and a missing folder
+    /// is not an error. What went: the files and their bytes, for the log.
+    pub fn clear_shader_caches(&self) -> Result<(u64, u64)> {
+        let shaders = self.cache_subdir("shaders")?;
+        let pipelines = shaders.with_file_name("pipelines");
+        let (mut files, mut bytes) = (0, 0);
+        for dir in [&shaders, &pipelines] {
+            let (f, b) = remove_folder(dir)?;
+            files += f;
+            bytes += b;
+        }
+        Ok((files, bytes))
+    }
 }
 
 /// The config file explicitly named by the environment, if any. An empty
@@ -132,6 +149,30 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     ensure_outside_repo(&dir)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Removes `dir` with everything in it, saying how much went: the files and
+/// their bytes. A folder that is not there is nothing removed, not an error.
+fn remove_folder(dir: &Path) -> Result<(u64, u64)> {
+    if !dir.is_dir() {
+        return Ok((0, 0));
+    }
+    let (mut files, mut bytes) = (0, 0);
+    let mut folders = vec![dir.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        let read = std::fs::read_dir(&folder).with_context(|| format!("reading {}", folder.display()))?;
+        for entry in read {
+            let entry = entry.with_context(|| format!("reading {}", folder.display()))?;
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                folders.push(entry.path());
+            } else {
+                files += 1;
+                bytes += entry.metadata().map_or(0, |m| m.len());
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?;
+    Ok((files, bytes))
 }
 
 /// The folder for everything of ours (settings, logs, caches, saves,
@@ -243,5 +284,59 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.data_subdir("x").is_err());
+    }
+
+    #[test]
+    fn clearing_the_shaders_takes_only_the_caches() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            cache_dir: home.path().join("cache"),
+            data_dir: home.path().join("data"),
+            ..Default::default()
+        };
+        // What a preload leaves: the translated shaders (a folder inside
+        // them too) and the pipelines made ahead.
+        for (dir, file, bytes) in [
+            (cfg.cache_dir.join("shaders"), "one", 100usize),
+            (cfg.cache_dir.join("shaders").join("inside"), "two", 50),
+            (cfg.cache_dir.join("pipelines"), "three", 25),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{file}.bin")), vec![0u8; bytes]).unwrap();
+        }
+        // What a clear must leave alone: the menu's settings, the saves, the
+        // logs and every other folder under the victory home.
+        std::fs::write(home.path().join("victory-settings.txt"), b"saved by the menu").unwrap();
+        std::fs::create_dir_all(cfg.data_dir.join("00000000").join("storage")).unwrap();
+        std::fs::write(cfg.data_dir.join("00000000").join("storage").join("save.bin"), b"save")
+            .unwrap();
+        std::fs::create_dir_all(home.path().join("logs")).unwrap();
+        std::fs::write(home.path().join("logs").join("a.log"), b"log").unwrap();
+        std::fs::create_dir_all(cfg.cache_dir.join("images")).unwrap();
+        std::fs::write(cfg.cache_dir.join("images").join("picture.bin"), b"picture").unwrap();
+
+        let (files, bytes) = cfg.clear_shader_caches().unwrap();
+        assert_eq!((files, bytes), (3, 175));
+        assert!(!cfg.cache_dir.join("shaders").exists());
+        assert!(!cfg.cache_dir.join("pipelines").exists());
+        assert!(home.path().join("victory-settings.txt").is_file());
+        assert!(cfg.data_dir.join("00000000").join("storage").join("save.bin").is_file());
+        assert!(home.path().join("logs").join("a.log").is_file());
+        assert!(cfg.cache_dir.join("images").join("picture.bin").is_file());
+    }
+
+    #[test]
+    fn clearing_without_the_folders_is_no_error() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            cache_dir: home.path().join("cache"),
+            data_dir: home.path().join("data"),
+            ..Default::default()
+        };
+        // Neither folder is there (the shaders one is made and taken away
+        // again): nothing removed, no error.
+        assert_eq!(cfg.clear_shader_caches().unwrap(), (0, 0));
+        assert!(!cfg.cache_dir.join("shaders").exists());
+        assert!(!cfg.cache_dir.join("pipelines").exists());
     }
 }

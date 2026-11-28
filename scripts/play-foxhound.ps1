@@ -10,7 +10,9 @@
 #
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
 # victory-settings.txt in the repository's folder and is applied here at every start, over the options above;
-# delete that file to go back to them.
+# delete that file to go back to them. PRELOAD SHADERS and CLEAR SHADERS (each after a second Enter) close the
+# game and restart this: the one makes every shader ahead, the other removes the preloaded shader and pipeline
+# caches for a fresh start (VICTORY_PRELOAD=1 / VICTORY_CLEAR_SHADERS=1).
 #
 # Build first (README). Run from a normal window, not as administrator. Each run writes a log to
 # %LOCALAPPDATA%\victory\logs. Every VICTORY_... switch is described in a comment where the code reads it.
@@ -47,6 +49,10 @@ $repo = Split-Path $PSScriptRoot -Parent
 # The F1 menu's "PRELOAD SHADERS" restarts this with -Preload (and VICTORY_PRELOAD=1, read here before the
 # switches below are cleared).
 $preload = $Preload -or $env:VICTORY_PRELOAD -eq '1'
+# The F1 menu's "CLEAR SHADERS" restarts this with VICTORY_CLEAR_SHADERS=1, likewise read here before the
+# switches are cleared and handed to victory.exe below (its run removes the shader and pipeline caches
+# before it opens them, this start alone).
+$clearShaders = $env:VICTORY_CLEAR_SHADERS -eq '1'
 # What the F1 menu saved: its own choices (VICTORY_MENU_...) stand in for this script's options, and its
 # switches go over the settings below. An empty value unsets a switch.
 $menuFile = Join-Path $repo 'victory-settings.txt'
@@ -149,6 +155,9 @@ $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
 $settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+# F1's CLEAR SHADERS asked of this start (read above): victory.exe removes the preloaded shader and
+# pipeline caches before its run opens them, for this start alone.
+if ($clearShaders) { $settings.VICTORY_CLEAR_SHADERS = '1' }
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {

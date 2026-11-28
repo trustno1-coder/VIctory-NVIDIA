@@ -120,6 +120,17 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // `VICTORY_CLEAR_SHADERS=1` (set for that one start by the F1 menu's CLEAR SHADERS; the
+    // script launcher reads it and hands it to this command, `victory play` reads it in main):
+    // the preloaded shader and pipeline caches are removed before this run opens them. Unset
+    // at once, so a later restart from the menu does not clear again.
+    if std::env::var_os("VICTORY_CLEAR_SHADERS").is_some_and(|v| v == "1") {
+        // SAFETY: before any thread of ours or the title's runs; Windows' environment block is
+        // locked by the process heap's routines, and std holds its own lock (the menu changes
+        // variables the same way while the game runs).
+        unsafe { std::env::remove_var("VICTORY_CLEAR_SHADERS") };
+        crate::play::clear_shader_caches();
+    }
     // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): Streamline
     // is loaded before anything of the title or the host GPU, and fails soft;
     // only if it offers one of them does the title render through its

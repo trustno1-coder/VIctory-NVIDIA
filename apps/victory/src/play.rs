@@ -201,6 +201,34 @@ pub(crate) fn preload(exe: &Path) {
     }
 }
 
+/// F1's CLEAR SHADERS (`VICTORY_CLEAR_SHADERS=1`, set for that one start by
+/// the menu's restart): removes the preloaded shader and pipeline caches
+/// before the run opens them. Nothing else under the victory home is
+/// touched, and a missing folder is nothing removed. What went is said here
+/// and put in the start's log.
+pub(crate) fn clear_shader_caches() {
+    let cleared = victory_core::Config::load().and_then(|cfg| cfg.clear_shader_caches());
+    let said = match cleared {
+        Ok((files, bytes)) => {
+            println!("Shaders cleared: {files} files, {bytes} bytes of shader and pipeline caches removed.");
+            println!("The game makes them again as it needs them; F1, PRELOAD SHADERS makes them ahead.");
+            format!("# shaders cleared: {files} files, {bytes} bytes of shader and pipeline caches removed")
+        }
+        Err(e) => {
+            println!("The shader caches were not cleared ({e:#}); the game goes on with what is there.");
+            format!("# shaders not cleared: {e:#}")
+        }
+    };
+    // The start's log (`victory play` names it; the script launcher keeps its
+    // own, with our lines above in it).
+    if let Some(log) = std::env::var_os("VICTORY_LOG_FILE").filter(|v| !v.is_empty())
+        && let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&log)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{said}");
+    }
+}
+
 /// `%LOCALAPPDATA%\victory`, or the folder `VICTORY_HOME` names.
 fn home() -> Result<PathBuf> {
     if let Some(home) = victory_core::config::home_override() {
