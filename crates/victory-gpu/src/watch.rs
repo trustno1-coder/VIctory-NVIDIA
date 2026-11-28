@@ -1063,6 +1063,9 @@ struct Opened {
     at: std::time::Instant,
     others: Vec<usize>,
     hot: Option<std::time::Duration>,
+    /// The fault made the block writable; false when another fault opened it
+    /// and it was settled in between, so a newer guard must be kept.
+    took: bool,
 }
 
 /// Those whose notes are not settled yet ([`settle`]), and how many.
@@ -1070,8 +1073,8 @@ static OPENED: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
 static TO_SETTLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether a write fault opens a guarded block without the guards' lock
-/// (`VICTORY_FAULT_UNLOCKED=1`; off unless asked for, or flipped while the
-/// title runs by `VICTORY_AB`).
+/// (`VICTORY_FAULT_UNLOCKED=0` turns it off; on by default, or flipped while
+/// the title runs by `VICTORY_AB`).
 ///
 /// Under the lock the title's threads waited for it more than they did
 /// anything else in a fault: of 281 ms in the handler in 14 frames of play
@@ -1090,7 +1093,7 @@ fn unlocked() -> bool {
     if UNLOCKED_IN_TEST.get() {
         return true;
     }
-    crate::asked_for!("VICTORY_FAULT_UNLOCKED")
+    crate::toggled!("VICTORY_FAULT_UNLOCKED")
 }
 
 #[cfg(test)]
@@ -1144,6 +1147,9 @@ fn open_unlocked(block: usize) -> bool {
     let mut old = 0;
     // SAFETY: a block we made read-only.
     let mut done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
+    // `old == PAGE_READWRITE`: another fault had already made it writable,
+    // and this one found it so; a guard taken since must be kept.
+    let took = !(done && old == PAGE_READWRITE);
     if done && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
         // Not what we left there (as in `unguard`): other memory's, which
         // keeps its protection.
@@ -1156,7 +1162,7 @@ fn open_unlocked(block: usize) -> bool {
     // After the protection: who settles it may let the block be guarded again.
     {
         let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
-        opened.push(Opened { block, at, others, hot: hot() });
+        opened.push(Opened { block, at, others, hot: hot(), took });
         TO_SETTLE.store(opened.len(), SeqCst);
     }
     #[cfg(feature = "diagnostics")]
@@ -1186,7 +1192,18 @@ fn settle(g: &mut Guards) {
         TO_SETTLE.store(0, SeqCst);
         std::mem::take(&mut *opened)
     };
-    for Opened { block, at, mut others, hot } in opened {
+    for Opened { block, at, mut others, hot, took } in opened {
+        if !took {
+            // Another fault opened this block and was settled in between, so
+            // a guard taken since is still the one that owns the memory.
+            // Leave it, its notes and PUBLISHED alone: clear only this
+            // entry's bits, or `unsettled` would stay true for ever.
+            for &other in &others {
+                TOLD.clear(other);
+            }
+            OPENING.clear(block);
+            continue;
+        }
         if g.aliased.contains(block) {
             if others.is_empty() {
                 // Guarded with its other views after the fault looked: they
@@ -2016,6 +2033,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let rest = rest();
     let mut g = guards_timed();
+    // Read under the lock: a view made real meanwhile (`title_memory_made_real`, which
+    // opens it under this lock) must not be taken as still soft, guarded with no protection.
+    let soft = soft_runs(first * BLOCK, (last - first) * BLOCK);
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     for &(block, view) in &came {
@@ -2036,7 +2056,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if let Some((from, to)) = run
             && to != block
         {
-            protect(&mut g, from, to);
+            protect(&mut g, from, to, &soft);
             run = None;
             // Faults of the title's wait for the lock: each block is done on
             // its own, and looked at anew below.
@@ -2048,7 +2068,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         // is (`OPENING`).
         if unsettled(block, block + 1) {
             if let Some((from, to)) = run.take() {
-                protect(&mut g, from, to);
+                protect(&mut g, from, to, &soft);
             }
             continue;
         }
@@ -2061,7 +2081,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             // because one could not be made so. (Or clean, and bytes were put
             // in beside the guard: it stays.)
             if let Some((from, to)) = run.take() {
-                protect(&mut g, from, to);
+                protect(&mut g, from, to, &soft);
             }
             if g.clean.contains(block) {
                 continue;
@@ -2072,11 +2092,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
-            protect(&mut g, from, to);
+            protect(&mut g, from, to, &soft);
         }
     }
     if let Some((from, to)) = run {
-        protect(&mut g, from, to);
+        protect(&mut g, from, to, &soft);
     }
     drop(g);
     #[cfg(feature = "diagnostics")]
@@ -2134,10 +2154,10 @@ fn is_view(start: usize, end: usize) -> bool {
 /// at every other view of them are made read-only too: a write through
 /// one of those is this memory written, and only a fault can say so.
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
-fn protect(g: &mut Guards, from: usize, to: usize) {
+fn protect(g: &mut Guards, from: usize, to: usize, soft: &[(usize, usize)]) {
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
-    protect_here(g, from, to);
+    protect_here(g, from, to, soft);
     cover(g, from, to);
 }
 
@@ -2249,7 +2269,7 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
 }
 
 /// [`protect`] for one range, without the other views of its pages.
-fn protect_here(g: &mut Guards, from: usize, to: usize) {
+fn protect_here(g: &mut Guards, from: usize, to: usize, soft: &[(usize, usize)]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -2289,9 +2309,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     // and the block would count as not there. Nothing writes through one
     // before a fault makes it real, which opens it
     // ([`title_memory_made_real`]).
-    let soft = soft_runs(from * BLOCK, (to - from) * BLOCK);
+    let any_soft = soft.iter().any(|&(at, n)| at < to * BLOCK && at + n > from * BLOCK);
     let in_books = |block: usize| soft.iter().any(|&(at, n)| at <= block * BLOCK && (block + 1) * BLOCK <= at + n);
-    if soft.is_empty() && set(from, to) {
+    if !any_soft && set(from, to) {
         note(g, from, to);
         return;
     }
@@ -4650,6 +4670,74 @@ mod tests {
         drop_views(section, &[one, two], BLOCK);
     }
 
+    /// A late entry of a fault that found the block already writable must not
+    /// undo a guard taken since: the block stays read-only with its PROTECTED
+    /// bit and clean notes, and the title's next write still faults into the
+    /// handler and is reported at the next asking. The other view the fault
+    /// told as written keeps its guard notes too.
+    #[test]
+    fn a_late_fault_leaves_the_guard_taken_since() {
+        let (section, one, two) = two_views(BLOCK);
+        let block = |view: usize| view / BLOCK;
+        assert_eq!(guard(one, one + BLOCK), Some(vec![block(one)]));
+        assert_eq!(guard(two, two + BLOCK), Some(vec![block(two)]));
+        assert!(!writable(one) && !writable(two));
+        {
+            let g = guards();
+            assert!(g.protected.contains(block(one)) && g.protected.contains(block(two)));
+            assert!(g.clean.contains(block(one)) && g.clean.contains(block(two)));
+        }
+        assert!(PROTECTED.any(block(one), block(one) + 1) && PROTECTED.any(block(two), block(two) + 1));
+        assert!(!OPENING.any(block(two), block(two) + 1) && !unsettled(block(two), block(two) + 1));
+
+        // The entry of a fault that found the block already writable, settled
+        // after this guard was taken: its own VirtualProtect did not change
+        // the protection, so the memory is still read-only. As `open_unlocked`
+        // does, tell the other view as written and mark both views beside a
+        // guard, clearing PUBLISHED, before queuing the entry.
+        assert!(!OPENING.swap_on(block(two)));
+        TOLD.set(block(one));
+        BESIDE.set(block(one));
+        BESIDE.set(block(two));
+        PUBLISHED.clear(block(one));
+        PUBLISHED.clear(block(two));
+        {
+            let mut opened = OPENED.lock().unwrap();
+            opened.push(Opened { block: block(two), at: std::time::Instant::now(), others: vec![block(one)], hot: None, took: false });
+            TO_SETTLE.store(opened.len(), std::sync::atomic::Ordering::SeqCst);
+        }
+        assert!(unsettled(block(one), block(one) + 1));
+        assert!(unsettled(block(two), block(two) + 1));
+        assert!(!writable(two));
+        {
+            // Whoever takes the lock next settles it: only this entry's bits
+            // go; the guard taken since keeps its notes at both views.
+            let g = guards();
+            assert!(g.protected.contains(block(two)) && g.clean.contains(block(two)));
+            assert!(g.protected.contains(block(one)) && g.clean.contains(block(one)));
+            assert!(PROTECTED.any(block(two), block(two) + 1) && PROTECTED.any(block(one), block(one) + 1));
+            assert!(!TOLD.any(block(one), block(one) + 1));
+            assert!(!unsettled(block(one), block(one) + 1));
+            assert!(!OPENING.any(block(two), block(two) + 1) && !unsettled(block(two), block(two) + 1));
+        }
+        assert!(!writable(one) && !writable(two), "the guard taken since is still there");
+
+        // The block is still ours: a genuine fault opens it, and the next
+        // asking reports it once and then nothing.
+        UNLOCKED_IN_TEST.set(true);
+        // SAFETY: the guarded view, opened by the handler.
+        unsafe { ((two + 16) as *mut u8).write(2) };
+        UNLOCKED_IN_TEST.set(false);
+        assert!(writable(two));
+        {
+            let g = guards();
+            assert!(!g.protected.contains(block(two)) && !PROTECTED.any(block(two), block(two) + 1));
+        }
+        assert_eq!(guard(one, one + BLOCK), Some(vec![block(one)]));
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        drop_views(section, &[one, two], BLOCK);
+    }
+
     /// What the holders of the lock do with a block a fault is opening
     /// without it, before that is settled: it is told as written and left as
     /// it is, and another view of its page is not counted read-only for it,
@@ -4683,7 +4771,7 @@ mod tests {
         unsafe { windows_sys::Win32::System::Memory::VirtualProtect(two as *const _, BLOCK, PAGE_READWRITE, &mut old) };
         {
             let mut opened = OPENED.lock().unwrap();
-            opened.push(Opened { block: block(two), at: std::time::Instant::now(), others: vec![block(one)], hot: None });
+            opened.push(Opened { block: block(two), at: std::time::Instant::now(), others: vec![block(one)], hot: None, took: true });
             TO_SETTLE.store(opened.len(), SeqCst);
         }
         assert_eq!(guard(one, one + BLOCK), Some(vec![block(one)]));
