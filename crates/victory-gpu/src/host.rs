@@ -456,6 +456,7 @@ fn sweep() {
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
+    uav_pool::sweep_uav_spare();
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
@@ -518,6 +519,7 @@ fn bury_lag() -> u64 {
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
+    uav_pool::drain_retired_uavs(finished);
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
@@ -1388,6 +1390,16 @@ impl Drop for HostList {
         if self.prelude.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
             PRELUDES_ALIVE.fetch_sub(1, Ordering::Relaxed);
         }
+        let mut uavs = Vec::new();
+        if let Some(card) = self.card_budget.take().flatten() {
+            uavs.push((card, uav_pool::CARD_BUDGET_BYTES));
+        }
+        if let Some(ind) = self.indirect_args.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            uavs.push(ind);
+        }
+        let batches = std::mem::take(&mut self.batch_args.get_mut().unwrap_or_else(|e| e.into_inner()).0);
+        uavs.extend(batches.into_iter().map(|b| (b, uav_pool::BATCH_ARGS_BYTES)));
+        uav_pool::retire_uavs(uavs);
     }
 }
 
@@ -2285,8 +2297,13 @@ impl<T> Spare<T> {
     /// all that time), to be freed. The first trim knows no window yet and
     /// takes nothing.
     fn trim(&mut self) -> Vec<(T, u64)> {
+        self.trim_above(0)
+    }
+
+    /// As [`Spare::trim`], keeping at least `floor` bytes warm.
+    fn trim_above(&mut self, floor: u64) -> Vec<(T, u64)> {
         let mut out = Vec::new();
-        let mut left = self.low;
+        let mut left = self.low.saturating_sub(floor);
         while let Some(at) = self.kept.iter().position(|(_, s)| *s <= left) {
             let (thing, size) = self.kept.remove(at);
             left -= size;
@@ -2294,6 +2311,18 @@ impl<T> Spare<T> {
             out.push((thing, size));
         }
         self.low = self.bytes;
+        out
+    }
+
+    /// Evicts oldest kept entries until `self.bytes <= max_bytes`.
+    fn trim_to(&mut self, max_bytes: u64) -> Vec<(T, u64)> {
+        let mut out = Vec::new();
+        while self.bytes > max_bytes && !self.kept.is_empty() {
+            let (thing, size) = self.kept.remove(0);
+            self.bytes -= size;
+            out.push((thing, size));
+        }
+        self.low = self.low.min(self.bytes);
         out
     }
 
@@ -2395,6 +2424,7 @@ pub(crate) static SPARE_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomi
 
 /// Drops spare scratch chunks kept idle when host memory is pressured.
 fn trim_spare_chunks() {
+    uav_pool::trim_uav_spare_pressure();
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
@@ -2733,6 +2763,11 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Device-local buffers of `HostList::between` left in `COPY_SOURCE` until
+    /// `HostList::close` returns them to `COMMON`.
+    between_uavs: Vec<(ID3D12Resource, u64)>,
+    /// Device-local scratch buffers already in `COMMON`, recycled on drop.
+    retired_uavs: Vec<(ID3D12Resource, u64)>,
 }
 
 impl Deferred {
@@ -2757,6 +2792,9 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
+        let mut uavs = std::mem::take(&mut self.retired_uavs);
+        uavs.append(&mut self.between_uavs);
+        uav_pool::retire_uavs(uavs);
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -4211,6 +4249,7 @@ mod torn;
 mod traffic;
 pub(crate) mod two_queues;
 pub(crate) mod upcheck;
+mod uav_pool;
 #[cfg(feature = "diagnostics")]
 mod stamps;
 #[cfg(feature = "diagnostics")]
@@ -6840,6 +6879,7 @@ impl HostList {
             self.indirect_common(&scratch);
         }
         self.batches_common();
+        self.between_common();
         self.card_budget_out();
         self.take_coming();
         #[cfg(feature = "diagnostics")]
@@ -6965,7 +7005,8 @@ impl HostList {
         self.upscale.store(0, Ordering::Relaxed);
         self.hudless.store(0, Ordering::Relaxed);
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.deferred() = Deferred::default();
+        drop(std::mem::take(&mut *self.deferred()));
+        self.batch_args.lock().unwrap_or_else(|e| e.into_inner()).1 = 0;
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7809,7 +7850,7 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        let buffer = uav_pool::take_uav(host()?, uav_pool::CARD_BUDGET_BYTES)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -7879,7 +7920,7 @@ impl HostList {
     /// list. Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
-        let needed = size.max(64 << 10);
+        let needed = size.max(crate::ahead::SIZE);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((buffer, cap)) = &*slot
             && *cap >= needed
@@ -7887,18 +7928,15 @@ impl HostList {
             return Some(buffer.clone());
         }
         let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
-        let alloc = prev
-            .saturating_mul(2)
-            .max(needed)
-            .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
+        let alloc = uav_pool::uav_bucket_size(prev.saturating_mul(2).max(needed));
+        let buffer = uav_pool::take_uav(host()?, alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
-        if let Some((old_buf, _)) = old {
+        if let Some((old_buf, old_cap)) = old {
             // It ends the list common, as every scratch buffer does.
             self.indirect_common(&old_buf);
-            self.keep(&old_buf);
+            self.deferred().retired_uavs.push((old_buf, old_cap));
         }
         Some(buffer)
     }
@@ -7912,8 +7950,8 @@ impl HostList {
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
-            let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
+            let size = uav_pool::BATCH_ARGS_BYTES;
+            let made = uav_pool::take_uav(host()?, size)?;
             name(&made, || format!("indirect batches {size:#x}"));
             args.0.push(made);
         }
@@ -7922,6 +7960,23 @@ impl HostList {
         // `batches_common`.)
         let state = if i == 0 { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT };
         Some((args.0[buffer].clone(), i * JOBS * SLOT, state))
+    }
+
+    /// Before the list closes: the buffers of `HostList::between` go back to
+    /// the common state, so repeated submissions and pool reuse find them so.
+    fn between_common(&self) {
+        let between = std::mem::take(&mut self.deferred().between_uavs);
+        if between.is_empty() {
+            return;
+        }
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = between
+            .iter()
+            .map(|(b, _)| transition(b, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON))
+            .collect();
+        // SAFETY: an open list and live buffers this recording left in
+        // `COPY_SOURCE`.
+        unsafe { self.list.ResourceBarrier(&barriers) };
+        self.deferred().retired_uavs.extend(between);
     }
 
     /// Before the list closes: the scratch buffers of the batched clamps go
@@ -10994,6 +11049,17 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        // (one made ahead, if title buffers already want card copies and one is in store)
+        if size == crate::ahead::SIZE
+            && let Some(made) = crate::ahead::card_if_ready()
+        {
+            return Some(made);
+        }
+        self.uav_buffer_now(size)
+    }
+
+    /// [`Host::uav_buffer`], made now.
+    pub(crate) fn uav_buffer_now(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {

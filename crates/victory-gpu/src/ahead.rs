@@ -101,6 +101,17 @@ pub(crate) fn card() -> Option<ID3D12Resource> {
     Some(made.0)
 }
 
+/// A buffer of [`SIZE`] in the card's memory, if [`CARD_WANTED`] is already set and one is
+/// in store. Never starts [`fill`], so tools like `victory warm` do not spawn it.
+pub(crate) fn card_if_ready() -> Option<ID3D12Resource> {
+    if first() == 0 || !CARD_WANTED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let made = CARD.lock().unwrap_or_else(|e| e.into_inner()).pop()?;
+    TAKEN[1].fetch_add(1, Ordering::Relaxed);
+    Some(made.0)
+}
+
 fn fill() {
     #[cfg(windows)]
     {
@@ -157,9 +168,22 @@ fn fill() {
             SHARED.lock().unwrap_or_else(|e| e.into_inner()).push(Shared(buffer, data as usize));
         }
         if more_card
-            && let Some(buffer) = host.uav_buffer(SIZE)
+            && let Some(buffer) = host.uav_buffer_now(SIZE)
         {
             CARD.lock().unwrap_or_else(|e| e.into_inner()).push(Card(buffer));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn card_if_ready_stays_inert_without_starting_ahead_thread() {
+        if !CARD_WANTED.load(Ordering::Relaxed) {
+            assert!(card_if_ready().is_none());
+            assert!(!CARD_WANTED.load(Ordering::Relaxed));
         }
     }
 }
