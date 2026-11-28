@@ -1694,9 +1694,9 @@ impl PlanePass {
     fn make(steps: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
         use windows::core::s;
         let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-        let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
+        let vs = crate::dxc::compile(PLANE_CORNERS, "corner", "vs_5_1")?;
         let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
-        let ps = compile(source, s!("plane"), s!("ps_5_1"))?;
+        let ps = crate::dxc::compile(source, "plane", "ps_5_1")?;
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
@@ -4654,38 +4654,17 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        let bytes = crate::dxc::compile(CARD_COMPARE, "main", "cs_5_1")?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
+        // SAFETY: the shader contains its root signature and its bytes live
+        // through pipeline creation.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -11944,3 +11923,13 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+#[cfg(test)]
+mod card_compare_tests {
+    #[test]
+    #[ignore = "requires a physical D3D12 device"]
+    fn card_copy_compare_builds_on_the_configured_device() {
+        let host = super::host().expect("the hardware test requires a D3D12 device");
+        let _work = host.make_card_work().expect("create the card compare pipeline and lists");
+    }
+}

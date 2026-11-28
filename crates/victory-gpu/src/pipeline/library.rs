@@ -510,9 +510,23 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
+        // vkd3d-proton (and Proton in general) rejects a non-null pointer
+        // with a zero length; pass a null pointer for an empty blob.
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            let mut result: *mut core::ffi::c_void = std::ptr::null_mut();
+            let ptr = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr() };
+            let hr = (windows::core::Interface::vtable(device).CreatePipelineLibrary)(
+                windows::core::Interface::as_raw(device),
+                ptr.cast(),
+                bytes.len(),
+                &ID3D12PipelineLibrary::IID,
+                &mut result,
+            );
+            hr.ok()?;
+            let nn = core::ptr::NonNull::new(result).ok_or(windows::core::Error::empty())?;
+            let lib: ID3D12PipelineLibrary = windows::core::Interface::from_raw(nn.as_ptr());
+            lib.cast()
         }
     };
     if !blob.bytes().is_empty() {

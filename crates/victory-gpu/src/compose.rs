@@ -2,7 +2,6 @@
 //! (the interface) over the first (the scene), each scaled to the screen.
 //! The game presents so on Series S.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -31,6 +30,24 @@ float4 ps(V v) : SV_Target {
 }
 "#;
 
+const SOURCE_NO_RS: &str = r#"
+Texture2D<float4> scene : register(t0);
+Texture2D<float4> over : register(t1);
+SamplerState smooth_ : register(s0);
+struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
+V vs(uint id : SV_VertexID) {
+    V v;
+    v.uv = float2((id << 1) & 2, id & 2);
+    v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return v;
+}
+float4 ps(V v) : SV_Target {
+    float4 s = scene.SampleLevel(smooth_, v.uv, 0);
+    float4 o = over.SampleLevel(smooth_, v.uv, 0);
+    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+}
+"#;
+
 pub(crate) struct Composer {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -42,44 +59,73 @@ unsafe impl Send for Composer {}
 // SAFETY: as above.
 unsafe impl Sync for Composer {}
 
-fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
-    let mut code: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; the out pointer is
-    // ours.
-    unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("compose"),
-            None,
-            None,
-            entry,
-            target,
-            0,
-            0,
-            &mut code,
-            None,
-        )?;
-    }
-    code.ok_or_else(windows::core::Error::empty)
+fn compile(entry: &str) -> windows::core::Result<Vec<u8>> {
+    let target = if entry == "vs" { "vs_5_1" } else { "ps_5_1" };
+    crate::dxc::compile(SOURCE_NO_RS, entry, target)
 }
 
 impl Composer {
     pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
-        let (vs, ps) = (
-            compile(s!("vs"), s!("vs_5_1"))?,
-            compile(s!("ps"), s!("ps_5_1"))?,
-        );
+        let vs = compile("vs")?;
+        let ps = compile("ps")?;
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
-            let bytes = |b: &ID3DBlob| {
-                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
-            };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
-            let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
-                pShaderBytecode: b.GetBufferPointer(),
-                BytecodeLength: b.GetBufferSize(),
+            // Build the root signature explicitly in Rust (no DXC extraction).
+            let range = D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 2,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE,
+                OffsetInDescriptorsFromTableStart: 0,
+            };
+            let param = D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let sampler = D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK,
+                MinLOD: 0.0,
+                MaxLOD: 3.402823466e38,
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+                Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                    Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                        NumParameters: 1,
+                        pParameters: &param,
+                        NumStaticSamplers: 1,
+                        pStaticSamplers: &sampler,
+                        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                    },
+                },
+            };
+            let mut blob: Option<ID3DBlob> = None;
+            let mut err: Option<ID3DBlob> = None;
+            D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut err))?;
+            let blob = blob.ok_or_else(windows::core::Error::empty)?;
+            let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let code = |b: &Vec<u8>| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.as_ptr().cast(),
+                BytecodeLength: b.len(),
             };
             let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
