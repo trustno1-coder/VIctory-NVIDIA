@@ -9550,6 +9550,17 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.try_upload_buffer(size)
+            .inspect_err(|e| Self::report_upload_error(size, e))
+            .ok()
+    }
+
+    pub(crate) fn report_upload_error(size: u64, error: &windows::core::Error) {
+        crate::residency::allocation_error(error);
+        tracing::warn!(%error, size, "no upload buffer");
+    }
+
+    pub(crate) fn try_upload_buffer(&self, size: u64) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9572,7 +9583,7 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
+        unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
@@ -9587,21 +9598,11 @@ impl Host {
                     resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
-        };
+        }?;
+        let buffer = buffer.ok_or_else(windows::core::Error::empty)?;
         #[cfg(feature = "diagnostics")]
-        if made.is_ok()
-            && let Some(b) = &buffer
-        {
-            crate::book::made(b, || "an upload buffer".into());
-        }
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                crate::residency::allocation_error(&e);
-                tracing::warn!(error = %e, size, "no upload buffer");
-                None
-            }
-        }
+        crate::book::made(&buffer, || "an upload buffer".into());
+        Ok((buffer, data.cast()))
     }
 }
 
