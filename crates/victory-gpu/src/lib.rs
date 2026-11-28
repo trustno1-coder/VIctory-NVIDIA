@@ -109,6 +109,9 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+/// The launcher's window, shown before the game (`host/launcher.rs`); its exit code says what was picked.
+#[cfg(windows)]
+pub use host::launcher;
 /// Reserves the address space for memory shaders read by address; call it
 /// first thing, before the process's other allocations can fill [4 GiB, 2^37).
 #[cfg(windows)]

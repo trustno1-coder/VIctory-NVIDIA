@@ -4200,6 +4200,7 @@ mod card_steps;
 pub(crate) mod indirects;
 mod font;
 mod menu;
+pub use menu::launcher::run as launcher;
 mod panel;
 mod place;
 mod send;
