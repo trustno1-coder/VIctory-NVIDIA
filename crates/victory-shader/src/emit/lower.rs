@@ -4562,18 +4562,23 @@ impl<'a> Lower<'a> {
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
     /// wave holds a 32-aligned run of console lanes. Without `exchange` or `halves`: the host lane.
     fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() && self.halves.is_none() {
-            return self.lane_index();
-        }
         if let Some(v) = self.clane {
             return v;
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
-        let f = self.console_thread();
-        let _ = i32t;
-        let k63 = self.s.m.i32(63);
-        let cl = self.s.m.bin(e, Bin::And, f, k63);
-        self.s.flags |= flags::WAVE_OPS;
+        let cl = if self.exchange.is_none() && self.halves.is_none() {
+            if self.s.mesh.is_some() {
+                self.lane_index()
+            } else {
+                self.s.flags |= flags::WAVE_OPS;
+                self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[])
+            }
+        } else {
+            let f = self.console_thread();
+            let k63 = self.s.m.i32(63);
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.m.bin(e, Bin::And, f, k63)
+        };
         self.clane = Some(cl);
         cl
     }
@@ -5182,41 +5187,7 @@ impl<'a> Lower<'a> {
         }
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
-        let i32t = self.s.t.i32;
-        if self.halves.is_some() || self.ticket.is_some() {
-            let f = self.console_thread();
-            self.s.flags |= flags::WAVE_OPS;
-            let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
-            return Val::I32(match c {
-                0 => self.s.m.bin(e, Bin::URem, f, xk),
-                1 => {
-                    let t = self.s.m.bin(e, Bin::UDiv, f, xk);
-                    self.s.m.bin(e, Bin::URem, t, yk)
-                }
-                _ => self.s.m.bin(e, Bin::UDiv, f, xy),
-            });
-        }
-        let flat = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
-        let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        let f = self.console_thread();
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
