@@ -217,16 +217,18 @@ pub(crate) fn warmup_notice(seconds: u64) -> Vec<String> {
 /// (`std::process::Command` always hands its child this process's standard handles: the restarted
 /// launcher then wrote into the old launcher's pipe and log, not its own window, and kept the old
 /// launcher waiting on that pipe.)
-fn new_console(command_line: &str) -> std::io::Result<()> {
+fn new_console(command_line: &str, cwd: Option<&std::ffi::OsStr>) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW};
     let mut line: Vec<u16> = command_line.encode_utf16().chain(Some(0)).collect();
+    let cwd = cwd.map(|p| p.encode_wide().chain(Some(0)).collect::<Vec<_>>());
     // SAFETY: plain structs, zero is their empty value.
     let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: `line` is a writable, terminated UTF-16 string; no handles inherited; this
-    // process's environment and folder.
+    // process's environment. The optional directory stays alive through the call.
     let made = unsafe {
         CreateProcessW(
             std::ptr::null(),
@@ -236,7 +238,7 @@ fn new_console(command_line: &str) -> std::io::Result<()> {
             0,
             CREATE_NEW_CONSOLE,
             std::ptr::null(),
-            std::ptr::null(),
+            cwd.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
             &startup,
             &mut process,
         )
@@ -616,21 +618,22 @@ impl Menu {
     /// Starts the launcher again in a new console, a few seconds on, and ends this run.
     /// `preload`: the launcher makes every shader first (`VICTORY_PRELOAD=1`, for that start alone).
     fn restart(&mut self, preload: bool) {
-        let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
+        if std::env::var_os("VICTORY_MENU_PLAY").is_none() {
             self.note = "SAVED. START THE LAUNCHER AGAIN YOURSELF".to_owned();
             return;
-        };
-        let play = play.to_string_lossy().replace('\'', "''");
+        }
         let args = get("VICTORY_MENU_ARGS");
+        let cwd = std::env::var_os("VICTORY_MENU_CWD").filter(|p| !p.is_empty());
         // The preload is asked by VICTORY_PRELOAD=1, which both launchers read (victory.exe's is
         // `--preload`, the script's `-Preload`: the script's flag given to victory.exe was refused,
         // and the window closed before it could be read, 2026-11-27). A launcher that fails keeps
         // its window until Enter.
         let command = format!(
-            "Start-Sleep 3; {}& '{play}' {args}; if ($LASTEXITCODE) {{ Read-Host 'The start failed (see above). Press Enter to close this window' }}",
+            "Start-Sleep 3; {}& $env:VICTORY_MENU_PLAY {args}; if ($LASTEXITCODE) {{ Read-Host 'The start failed (see above). Press Enter to close this window' }}",
             if preload { "$env:VICTORY_PRELOAD='1'; " } else { "" }
         );
-        match new_console(&format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{}\"", command.replace('"', "\\\""))) {
+        let shell = format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{}\"", command.replace('"', "\\\""));
+        match new_console(&shell, cwd.as_deref()) {
             Ok(()) => {
                 tracing::info!(command, preload, "settings menu: restarting");
                 // Ended at once: std::process::exit runs the DLLs' unloading, which with
@@ -917,6 +920,55 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preload_restart_preserves_paths_and_working_directory() {
+        // A successful menu restart exits its process. Only the child takes that path.
+        const RESULT: &str = "VICTORY_TEST_PRELOAD_RESTART_RESULT";
+        if std::env::var_os(RESULT).is_some() {
+            let mut menu = Menu::new();
+            menu.restart(true);
+            panic!("restart returned: {}", menu.note);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("Launcher 雪");
+        let game_dir = tmp.path().join("Game directory");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&game_dir).unwrap();
+        let play = original.join("Player’s launcher.ps1");
+        let title = game_dir.join("Player’s game.exe");
+        let result = tmp.path().join("result.txt");
+        std::fs::write(original.join("launcher.txt"), "").unwrap();
+        std::fs::write(&play, r#"param([string]$Exe)
+[IO.File]::WriteAllLines($env:VICTORY_TEST_PRELOAD_RESTART_RESULT, [string[]]@(
+    $Exe, $env:VICTORY_PRELOAD, (Test-Path -LiteralPath '.\launcher.txt')
+))
+"#).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(std::thread::current().name().unwrap())
+            .current_dir(game_dir)
+            .env(RESULT, &result)
+            .env("VICTORY_MENU_PLAY", play)
+            .env("VICTORY_MENU_EXE", &title)
+            .env("VICTORY_MENU_ARGS", "-Exe $env:VICTORY_MENU_EXE")
+            .env("VICTORY_MENU_CWD", original)
+            .env_remove("VICTORY_PRELOAD")
+            .status().unwrap();
+        assert!(status.success(), "menu process exited with {status}");
+        let began = std::time::Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&result)
+                && text.ends_with('\n')
+            {
+                assert_eq!(text.lines().collect::<Vec<_>>(), [title.to_str().unwrap(), "1", "True"]);
+                break;
+            }
+            assert!(began.elapsed() < std::time::Duration::from_secs(30), "the restarted launcher did not report");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 
     #[test]
     fn a_change_is_saved_at_once_however_the_game_was_started() {

@@ -780,6 +780,18 @@ fn warmup_mark(home: &Path, program: &Path) -> Option<PathBuf> {
     Some(home.join("warmed").join(&hash.as_str()[..16]))
 }
 
+/// Keep paths as environment values when PowerShell starts the launcher again.
+fn set_restart(settings: &mut BTreeMap<String, String>, program: &Path, exe: &Path, options: &Play) {
+    settings.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
+    settings.insert("VICTORY_MENU_EXE".to_owned(), exe.to_string_lossy().into_owned());
+    // The title can change the process directory. Relative config paths must still
+    // resolve from the directory in which the launcher was started.
+    if let Ok(cwd) = std::env::current_dir() {
+        settings.insert("VICTORY_MENU_CWD".to_owned(), cwd.to_string_lossy().into_owned());
+    }
+    settings.insert("VICTORY_MENU_ARGS".to_owned(), restart_args(options));
+}
+
 /// What a start needs once its settings are in the environment.
 pub(crate) struct Ready {
     pub(crate) exe: PathBuf,
@@ -864,8 +876,7 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     }
     // Where the menu saves, and how it starts the title again: with this start's options.
     s.insert("VICTORY_MENU_FILE".to_owned(), menu_file.to_string_lossy().into_owned());
-    s.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
-    s.insert("VICTORY_MENU_ARGS".to_owned(), restart_args(o, &exe));
+    set_restart(&mut s, &program, &exe, o);
     let log = log_file(&home.join("logs"))?;
     let console = if series_s { "series-s" } else { "series-x" };
     let line: Vec<String> = s.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -902,12 +913,12 @@ fn quoted(text: &str) -> String {
 }
 
 /// The arguments the warm-up and the F1 menu's restarts start the title
-/// again with (`VICTORY_MENU_ARGS`, after `& '<victory.exe>'` in PowerShell):
+/// again with (`VICTORY_MENU_ARGS`, after `& $env:VICTORY_MENU_PLAY` in PowerShell):
 /// this start's own options, so those given on the command line (`--series-s`,
 /// `--dlss`, `--framegen`, `--set` ...) are kept. Values saved in the F1 menu
 /// still win over them, as at every start. A preload is not asked again.
-fn restart_args(o: &Play, exe: &Path) -> String {
-    let mut args = vec!["play".to_owned(), quoted(&exe.to_string_lossy())];
+fn restart_args(o: &Play) -> String {
+    let mut args = vec!["play".to_owned(), "$env:VICTORY_MENU_EXE".to_owned()];
     if o.series_s {
         args.push("--series-s".to_owned());
     }
@@ -955,6 +966,23 @@ mod tests {
     }
 
     #[test]
+    fn restart_arguments_keep_the_title_path_out_of_powershell_source() {
+        let launcher = Path::new(r"C:\Player’s files\victory.exe");
+        let title = Path::new(r"D:\Jeux 雪\Player's game.exe");
+        let mut settings = BTreeMap::new();
+        for flag in [false, true] {
+            let o = Play { no_framegen_ready: flag, ..options() };
+            set_restart(&mut settings, launcher, title, &o);
+            assert_eq!(Path::new(&settings["VICTORY_MENU_PLAY"]), launcher);
+            assert_eq!(Path::new(&settings["VICTORY_MENU_EXE"]), title);
+            assert_eq!(Path::new(&settings["VICTORY_MENU_CWD"]), std::env::current_dir().unwrap());
+            let args = &settings["VICTORY_MENU_ARGS"];
+            assert!(args.starts_with("play $env:VICTORY_MENU_EXE "));
+            assert_eq!(args.split_whitespace().any(|arg| arg == "--no-framegen-ready"), flag);
+        }
+    }
+
+    #[test]
     fn a_restart_keeps_the_options_of_the_command_line() {
         use clap::Parser;
         #[derive(clap::Parser)]
@@ -962,16 +990,15 @@ mod tests {
             #[command(flatten)]
             play: Play,
         }
-        let exe = Path::new(r"C:\Games\GTA VI's\game_scarlett_master.exe");
         let first = [
             "x", "--series-s", "--dlss", "performance", "--framegen", "2", "--fg-type", "dlss", "--set", "VICTORY_MFG_UNLOCKER=1", "--set",
-            "VICTORY_X=a b", "--preload",
+            "VICTORY_X=a b's", "--preload",
         ];
         let o = Line::try_parse_from(first).unwrap().play;
-        let args = restart_args(&o, exe);
+        let args = restart_args(&o);
         assert_eq!(
             args,
-            r"play 'C:\Games\GTA VI''s\game_scarlett_master.exe' --series-s --res '1440' --dlss 'performance' --framegen 2 --fg-type 'dlss' --fps 1000 --set 'VICTORY_MFG_UNLOCKER=1' --set 'VICTORY_X=a b'"
+            r"play $env:VICTORY_MENU_EXE --series-s --res '1440' --dlss 'performance' --framegen 2 --fg-type 'dlss' --fps 1000 --set 'VICTORY_MFG_UNLOCKER=1' --set 'VICTORY_X=a b''s'"
         );
         // Read back as PowerShell reads it: the same options again, and no preload.
         let mut words: Vec<String> = Vec::new();
@@ -988,14 +1015,14 @@ mod tests {
             }
         }
         words.push(word);
-        assert_eq!(words[1], exe.to_string_lossy());
+        assert_eq!(words[1], "$env:VICTORY_MENU_EXE");
         let again = Line::try_parse_from(std::iter::once("x".to_owned()).chain(words.into_iter().skip(2))).unwrap().play;
-        assert_eq!(restart_args(&again, exe), args);
+        assert_eq!(restart_args(&again), args);
         assert!(o.preload && !again.preload);
         let plain = Line::try_parse_from(["x"]).unwrap().play;
         assert_eq!(
-            restart_args(&plain, exe),
-            r"play 'C:\Games\GTA VI''s\game_scarlett_master.exe' --res '1440' --dlss 'quality' --fg-type 'auto' --fps 1000"
+            restart_args(&plain),
+            r"play $env:VICTORY_MENU_EXE --res '1440' --dlss 'quality' --fg-type 'auto' --fps 1000"
         );
     }
 
