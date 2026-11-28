@@ -16,12 +16,12 @@ use crate::{io, ir, resource, structure};
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// SOP1 `s_mov_b32 sdst, src0`.
-const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
+pub(super) const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
     0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
 }
 
 /// SOP2 `op sdst, src0, src1`.
-const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
+pub(super) const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
     0x8000_0000
         | (op as u32 & 0x7F) << 23
         | (sdst as u32 & 0x7F) << 16
@@ -38,18 +38,18 @@ const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
 }
 
 /// VOP1 `op vdst, src0` (`src0`: 0..105 = SGPR, 256..511 = VGPR).
-const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
+pub(super) const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
     0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
 /// VOP3 `op vdst, src0, src1, src2` (no modifiers).
-const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+pub(super) const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     vop3_mod(op, vdst, src0, src1, src2, 0, 0, 0, false)
 }
 
 /// VOP3 `op vdst, src0, src1, src2` with explicit `abs`, `neg`, `omod`, `clamp`.
 #[allow(clippy::too_many_arguments)]
-const fn vop3_mod(
+pub(super) const fn vop3_mod(
     op: u16,
     vdst: u8,
     src0: u16,
@@ -82,11 +82,11 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     ]
 }
 
-const fn sgpr(n: u8) -> u16 {
+pub(super) const fn sgpr(n: u8) -> u16 {
     n as u16
 }
 
-const fn vgpr(n: u8) -> u16 {
+pub(super) const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
@@ -99,7 +99,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
-fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+pub(super) fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -2041,9 +2041,9 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         let mut got: Vec<Vec<u32>> = Vec::new();
         let mut written = Vec::new();
         for bits in [0, super::rdna::ALL] {
-            lower::TEST_RDNA.set(Some(bits));
+            lower::TEST_NATIVE_FLOAT.set(Some(bits));
             let shader = build_valu_cs(&body);
-            lower::TEST_RDNA.set(None);
+            lower::TEST_NATIVE_FLOAT.set(None);
             written.push(shader.dxil.clone());
             let mut all = Vec::new();
             run_cases_on(&shader, &cases, &[("hardware", false)], |_, _, _, r| all.push(r));

@@ -432,6 +432,35 @@ impl Module {
         }
     }
 
+    /// Whether the 32 bits of `v` can be the constant -0 as a driver can
+    /// tell from the module: given as bits, as the negation of a constant +0,
+    /// behind casts there and back, or one side of a select. Joins of blocks
+    /// are not followed.
+    pub(crate) fn negative_zero(&self, v: V, depth: u32) -> bool {
+        const BITS: u32 = 0x8000_0000;
+        let i = match v {
+            V::Const(c) => {
+                return match &self.consts[c as usize].1 {
+                    Const::Float(bits) => *bits == BITS,
+                    _ => self.int_k(v) == Some((32, u64::from(BITS))),
+                };
+            }
+            V::Inst(i) => i,
+            _ => return false,
+        };
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        match &self.insts[i as usize].op {
+            Op::Cast(Cast::Bitcast, x) => self.negative_zero(*x, depth),
+            Op::Select(_, a, b) => self.negative_zero(*a, depth) || self.negative_zero(*b, depth),
+            Op::Bin(Bin::Sub, z, x) => {
+                self.float_k(*z).is_some_and(|z| z.to_bits() == BITS) && self.float_k(*x).is_some_and(|x| x.to_bits() == 0)
+            }
+            _ => false,
+        }
+    }
+
     /// For a float that is a number and not an infinity whatever the program
     /// reads: a power of two its magnitude does not pass.
     pub(crate) fn bounded(&self, v: V, depth: u32) -> Option<f32> {

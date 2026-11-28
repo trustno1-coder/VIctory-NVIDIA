@@ -988,6 +988,7 @@ fn create() -> windows::core::Result<Host> {
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
+            victory_shader::emit::set_host_nvidia(crate::indirect::nvidia(&device));
         }
         // Every translated shader is SM 6.6: below it each pipeline is refused (E_INVALIDARG),
         // and the title falls over within seconds (Windows 10's own D3D12, 2026-11-27).

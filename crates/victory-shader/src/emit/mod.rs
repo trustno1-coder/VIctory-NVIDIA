@@ -93,6 +93,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(all(test, windows))]
+mod native_float_tests;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -120,7 +122,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
+pub use lower::{host_settings, set_host_max_wave, set_host_nvidia, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -327,7 +329,29 @@ pub fn rdna_float() -> u32 {
     })
 }
 
-/// The bits of [`rdna_float`].
+/// On an NVIDIA card ([`set_host_nvidia`]): which of the console's float
+/// instructions are written as the host's own operation. Only those of
+/// [`rdna::NVIDIA`]: FMax and FMin order -0 below +0 there and skip NaNs as
+/// the console's do, bit for bit (`native_float_tests`, an RTX 3060), while
+/// its Frc gives 1.0 for a tiny negative number and a plain product's zero may
+/// differ in sign from a legacy one's. `VICTORY_NVIDIA_FLOAT`: a set of those
+/// bits (decimal or `0x` hex); all of them when it is unset, `0` none.
+///
+/// Measured on an RTX 3060 (`native_float_costs`, kernels of arithmetic with
+/// one, two and three in six of them a maximum, minimum or median): 26 %,
+/// 33 % and 54 % less time on the card. What a frame of the title gains has
+/// not been measured.
+///
+/// Part of the translation: the shader cache keys on it ([`host_settings`]).
+pub fn nvidia_float() -> u32 {
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        let value = std::env::var("VICTORY_NVIDIA_FLOAT").ok();
+        parse_set(value.as_deref(), rdna::NVIDIA, rdna::NVIDIA)
+    })
+}
+
+/// The bits of [`rdna_float`] and [`nvidia_float`].
 pub mod rdna {
     /// `v_max_f32` and the like: the host's FMax and FMin, without the code
     /// that orders -0 below +0.
@@ -342,6 +366,8 @@ pub mod rdna {
     /// `v_fract_f32`: the host's Frc as it is.
     pub const FRACT: u32 = 8;
     pub const ALL: u32 = 15;
+    /// Those an NVIDIA card's own operations match too.
+    pub const NVIDIA: u32 = MAX_MIN | MED3;
 }
 
 /// A switch's set of bits; `unset` when it is unset or unreadable. Pure, for
@@ -376,7 +402,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
         out.push(0);
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
-    out.extend_from_slice(&lower::host_rdna().to_le_bytes());
+    out.extend_from_slice(&lower::native_float().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());

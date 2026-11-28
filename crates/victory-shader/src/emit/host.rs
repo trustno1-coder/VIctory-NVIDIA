@@ -1081,7 +1081,7 @@ impl Host {
 }
 
 #[cfg(test)]
-fn transition(
+pub(super) fn transition(
     r: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,

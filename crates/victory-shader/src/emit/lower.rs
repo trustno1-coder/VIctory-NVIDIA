@@ -1441,12 +1441,13 @@ fn own_bits_on() -> bool {
 
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
+/// which float instructions it writes as the host's own.
 pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), native_float()]
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HOST_NVIDIA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tells the translator that the host's shaders run on AMD RDNA hardware
 /// ([`super::rdna_float`]).
@@ -1454,19 +1455,32 @@ pub fn set_host_rdna(on: bool) {
     HOST_RDNA.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Tells the translator that the host's shaders run on an NVIDIA card
+/// ([`super::nvidia_float`]).
+pub fn set_host_nvidia(on: bool) {
+    HOST_NVIDIA.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(test)]
 thread_local! {
-    /// A test's choice for [`host_rdna`], for its thread only.
-    pub(super) static TEST_RDNA: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`native_float`], for its thread only.
+    pub(super) static TEST_NATIVE_FLOAT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// The bits of [`super::rdna`] that count on this host.
-pub(super) fn host_rdna() -> u32 {
+pub(super) fn native_float() -> u32 {
     #[cfg(test)]
-    if let Some(bits) = TEST_RDNA.get() {
+    if let Some(bits) = TEST_NATIVE_FLOAT.get() {
         return bits;
     }
-    if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
+    let on = |host: &std::sync::atomic::AtomicBool| host.load(std::sync::atomic::Ordering::Relaxed);
+    if on(&HOST_RDNA) {
+        super::rdna_float()
+    } else if on(&HOST_NVIDIA) {
+        super::nvidia_float()
+    } else {
+        0
+    }
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -4109,11 +4123,14 @@ impl<'a> Lower<'a> {
 
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
     /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
-    /// the compare and select DXIL specifies gives either zero.
+    /// the compare and select DXIL specifies gives either zero. Where the
+    /// host's own do order them ([`native_float`]), they are written alone,
+    /// unless an operand is a constant -0: NVIDIA's driver makes a saturate
+    /// of `min(max(x, -0), 1)`, which gives +0 where the console gives -0.
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
-        if host_rdna() & super::rdna::MAX_MIN != 0 {
+        if native_float() & super::rdna::MAX_MIN != 0 && ![a, b].iter().any(|&x| self.s.m.negative_zero(x, 4)) {
             return r;
         }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
@@ -4250,7 +4267,8 @@ impl<'a> Lower<'a> {
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         // Between two constants in order: the lower one for a NaN either way.
-        if host_rdna() & super::rdna::MED3 != 0 {
+        // (Neither of them -0: see `max_min`.)
+        if native_float() & super::rdna::MED3 != 0 {
             let k = [a, b, third].map(|x| self.s.m.float_k(x));
             let ordered = match k {
                 [None, Some(x), Some(y)] => Some((a, b, third, x, y)),
@@ -4262,6 +4280,7 @@ impl<'a> Lower<'a> {
                 && !x.is_nan()
                 && !y.is_nan()
                 && x != y
+                && ![x, y].iter().any(|k| k.to_bits() == 0x8000_0000)
             {
                 let (low, high) = if x < y { (p, q) } else { (q, p) };
                 let t = self.binary(35, v, low);
@@ -4290,7 +4309,7 @@ impl<'a> Lower<'a> {
     fn fract(&mut self, a: V, threshold: f32, below_one: f32) -> V {
         let c = self.cur;
         let r = self.unary(22, a);
-        if host_rdna() & super::rdna::FRACT != 0 && below_one == f32::from_bits(0x3F7F_FFFF) {
+        if native_float() & super::rdna::FRACT != 0 && below_one == f32::from_bits(0x3F7F_FFFF) {
             return r;
         }
         let limit = self.s.m.f32(threshold.to_bits());
@@ -4342,7 +4361,7 @@ impl<'a> Lower<'a> {
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
-        if host_rdna() & super::rdna::LEGACY != 0 {
+        if native_float() & super::rdna::LEGACY != 0 {
             let m = self.s.m.bin(c, Bin::Mul, a, b);
             let zero = self.s.m.f32(0);
             // A product is not 0 only where one factor is 0 and the other an
