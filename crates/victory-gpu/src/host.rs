@@ -43,10 +43,13 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
+    // Kept alive so `rtv_start` remains valid.
+    #[allow(dead_code)]
     rtvs: ID3D12DescriptorHeap,
     rtv_start: usize,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
+    #[allow(dead_code)]
     dsvs: ID3D12DescriptorHeap,
     dsv_start: usize,
     dsv_size: u32,
@@ -1037,9 +1040,8 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        // SAFETY: live descriptor heaps.
-        let rtv_start = unsafe { rtvs.GetCPUDescriptorHandleForHeapStart().ptr };
-        let dsv_start = unsafe { dsvs.GetCPUDescriptorHandleForHeapStart().ptr };
+        let rtv_start = rtvs.GetCPUDescriptorHandleForHeapStart().ptr;
+        let dsv_start = dsvs.GetCPUDescriptorHandleForHeapStart().ptr;
         tracing::info!("host D3D12 device ready");
         crate::upload::reserve_early();
         Ok(Host {
