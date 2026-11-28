@@ -24,6 +24,8 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    #[cfg(windows)]
+    crate::pipeline::samplers::use_folder(dir.with_file_name("pipelines"));
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
@@ -77,6 +79,8 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_THREAD_TICKET",
+            "VICTORY_LDS_LOOP_ATOMICS",
+            "VICTORY_LDS_BOUNDS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -128,10 +132,14 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
+    let shader = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
-    }
+    }?;
+    // Its static samplers into the list every process makes them from.
+    #[cfg(windows)]
+    crate::pipeline::samplers::know(&shader.static_samplers);
+    Ok(shader)
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -151,6 +159,8 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
+        // On a miss the cache concatenates [build, container] back into
+        // `input` for us; the build prefix is always 32 bytes.
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
@@ -162,14 +172,15 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
+        // Chunks API: on a hit no concatenation happens, so a warm cache
+        // adds no per-shader allocation beyond reading the entry.
         let path = cache
-            .get_or_convert(&converter, &input)
+            .get_or_convert_chunks(&converter, &[&build[..], container])
             .map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {

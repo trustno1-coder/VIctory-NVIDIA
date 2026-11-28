@@ -15,11 +15,20 @@ pub struct CacheKey(blake3::Hash);
 
 impl CacheKey {
     pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+        Self::from_chunks(converter, &[input])
+    }
+
+    /// Like [`CacheKey::new`] but hashes a sequence of chunks in order
+    /// without concatenating them first. The result matches what `new`
+    /// would produce on the same bytes joined end-to-end.
+    pub fn from_chunks(converter: &dyn Converter, chunks: &[&[u8]]) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(converter.id().as_bytes());
         h.update(&[0]);
         h.update(&converter.version().to_le_bytes());
-        h.update(input);
+        for c in chunks {
+            h.update(c);
+        }
         CacheKey(h.finalize())
     }
 
@@ -82,6 +91,40 @@ impl Cache {
     /// read the published path.
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
+        self.get_or_convert_inner(converter, key, || converter.convert(input))
+    }
+
+    /// As [`get_or_convert`], but hashes a sequence of chunks in order
+    /// without concatenating them. On a hit nothing is allocated; on a
+    /// miss the chunks are concatenated exactly once before being handed
+    /// to `Converter::convert`.
+    ///
+    /// Useful when the cache input is naturally built from a fixed prefix
+    /// (a build fingerprint, settings) plus one large payload: concatenating
+    /// those on every call allocates and memcpys bytes that never need to
+    /// exist together in memory unless there is a cache miss.
+    pub fn get_or_convert_chunks(
+        &self,
+        converter: &dyn Converter,
+        chunks: &[&[u8]],
+    ) -> Result<PathBuf> {
+        let key = CacheKey::from_chunks(converter, chunks);
+        self.get_or_convert_inner(converter, key, || {
+            let total: usize = chunks.iter().map(|c| c.len()).sum();
+            let mut input = Vec::with_capacity(total);
+            for c in chunks {
+                input.extend_from_slice(c);
+            }
+            converter.convert(&input)
+        })
+    }
+
+    fn get_or_convert_inner(
+        &self,
+        converter: &dyn Converter,
+        key: CacheKey,
+        convert: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+    ) -> Result<PathBuf> {
         let path = self.path_for(&key);
         if path.is_file() {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
@@ -105,7 +148,7 @@ impl Cache {
         }
 
         let result = (|| -> Result<PathBuf> {
-            let output = converter.convert(input).with_context(|| {
+            let output = convert().with_context(|| {
                 format!("converter {} v{}", converter.id(), converter.version())
             })?;
             let dir = path.parent().expect("hashed path has a parent");
@@ -244,6 +287,57 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn chunks_hash_matches_concatenation_and_skips_concat_on_hit() {
+        use std::cell::Cell;
+
+        // A converter that records how many bytes its `convert` saw. Its
+        // key hash still matches whatever `CacheKey::new` produces on the
+        // concatenated bytes.
+        struct Recording {
+            seen: Cell<usize>,
+        }
+        // SAFETY: not actually sent between threads in this test.
+        unsafe impl Send for Recording {}
+        unsafe impl Sync for Recording {}
+        impl Converter for Recording {
+            fn id(&self) -> &'static str {
+                "test.recording"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                self.seen.set(input.len());
+                Ok(input.to_vec())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Recording { seen: Cell::new(0) };
+        let prefix: &[u8] = b"build-prefix";
+        let body: &[u8] = b"container-body-xyz";
+
+        // The chunked key matches the key of the joined bytes.
+        let joined: Vec<u8> = [prefix, body].concat();
+        assert_eq!(
+            CacheKey::from_chunks(&conv, &[prefix, body]),
+            CacheKey::new(&conv, &joined),
+        );
+
+        // First call misses: convert runs with the concatenated bytes.
+        let path = cache.get_or_convert_chunks(&conv, &[prefix, body]).unwrap();
+        assert_eq!(conv.seen.get(), prefix.len() + body.len());
+        assert_eq!(std::fs::read(&path).unwrap(), joined);
+
+        // Second call hits: convert is not called.
+        conv.seen.set(usize::MAX);
+        let again = cache.get_or_convert_chunks(&conv, &[prefix, body]).unwrap();
+        assert_eq!(path, again);
+        assert_eq!(conv.seen.get(), usize::MAX, "convert must not run on hit");
     }
 
     #[test]
