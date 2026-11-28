@@ -683,12 +683,16 @@ pub fn highest_shader_model() -> Option<(u32, u32)> {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     // SAFETY: plain DXGI and D3D12 calls with owned results.
     let device = unsafe {
-        let adapter = match victory_shader::emit::host::hardware_adapter() {
-            Some((adapter, ..)) => adapter,
-            None => CreateDXGIFactory1::<IDXGIFactory1>().ok()?.EnumAdapters1(0).ok()?,
-        };
         let mut device: Option<ID3D12Device> = None;
-        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
+        // As the title's device (`host::create`): on the first adapter where
+        // the card takes none.
+        if let Some((adapter, ..)) = victory_shader::emit::host::hardware_adapter() {
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device);
+        }
+        if device.is_none() {
+            let adapter = CreateDXGIFactory1::<IDXGIFactory1>().ok()?.EnumAdapters1(0).ok()?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
+        }
         device?
     };
     device_shader_model(&device)
