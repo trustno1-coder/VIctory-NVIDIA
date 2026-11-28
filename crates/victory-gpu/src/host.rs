@@ -2648,6 +2648,8 @@ struct CardPlan {
     looks: Option<upcheck::Looks>,
     /// With [`send`]: the memory its sends come from.
     sends: Option<send::Memory>,
+    /// Held through completion of the DIRECT commands consuming the copy.
+    upload_slot: Option<upq::Slot>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -4211,6 +4213,7 @@ mod torn;
 mod traffic;
 pub(crate) mod two_queues;
 pub(crate) mod upcheck;
+mod upq;
 #[cfg(feature = "diagnostics")]
 mod stamps;
 #[cfg(feature = "diagnostics")]
@@ -4817,6 +4820,7 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
+        let mut upload_slot = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
@@ -4843,7 +4847,19 @@ impl Host {
                     let mut sent = Vec::new();
                     let mut transitioned = Vec::new();
                     if let Some(own) = &own {
-                        own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
+                        // Only the private snapshot is immutable for the entire
+                        // asynchronous transfer. Keep shared staging on DIRECT.
+                        if upq::on() && looks.is_none() {
+                            let (source, used) = own.source();
+                            if upq::wants(used) {
+                                upload_slot = upq::send(self, &self.queue, source, used);
+                                if upload_slot.is_none() && used != 0 {
+                                    upq::fallback();
+                                }
+                            }
+                        }
+                        own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)),
+                            upload_slot.as_ref().and_then(upq::Slot::bounce));
                     }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, _)) = shadow.card_sides() else {
@@ -4931,6 +4947,7 @@ impl Host {
             sent_as,
             looks,
             sends: own.map(send::Own::memory),
+            upload_slot,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5048,6 +5065,9 @@ impl Host {
     /// when nothing of ours is on the card, so the compare's results start
     /// from the beginning again.
     fn card_done(&self, plan: CardPlan) {
+        if let Some(slot) = plan.upload_slot {
+            upq::give_back(slot);
+        }
         if let Some(looks) = plan.looks {
             looks.read();
         }
@@ -9790,6 +9810,7 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
         );
         crate::indirect::merge::line(frames);
+        upq::line(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
