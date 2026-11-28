@@ -914,7 +914,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+/// Frames presented so far (also for `crate::host::awake`, in every build).
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
