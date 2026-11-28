@@ -1,10 +1,13 @@
 //! XNetworking as an offline console answers it: the network stack is up
 //! (titles wait for that before anything else) but reaches nothing, the
-//! connectivity hint never changes, and the title's security allow list,
-//! which comes from the service, cannot be fetched.
+//! connectivity hint never changes after the first notification, and the
+//! title's security allow list, which comes from the service, cannot be
+//! fetched.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::BTreeSet;
 use std::ffi::{c_char, c_void};
+use std::sync::Mutex;
 
 use super::xasync::{self, AsyncBlock};
 use super::xgameruntime::{
@@ -143,17 +146,98 @@ extern "system" fn connectivity_hint(_: This, out: *mut ConnectivityHint) -> HRE
     put(out, OFFLINE)
 }
 
-/// The hint and preferred port never change offline, so callbacks never run.
-extern "system" fn register(
-    _: This,
-    _queue: *const c_void,
-    _context: *mut c_void,
-    _callback: *const c_void,
+/// `XTaskQueuePort::Completion`.
+const COMPLETION: u32 = 1;
+
+type HintCallback = extern "system" fn(*mut c_void, *const ConnectivityHint);
+type PortCallback = extern "system" fn(*mut c_void, u16);
+
+/// Registrations not taken back, by token.
+static REGISTERED: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+
+fn registered() -> std::sync::MutexGuard<'static, BTreeSet<u64>> {
+    REGISTERED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A registration's initial notification, on its way through the queue.
+struct Initial {
+    token: u64,
+    context: usize,
+    callback: Callback,
+}
+
+#[derive(Clone, Copy)]
+enum Callback {
+    Hint(HintCallback),
+    Port(PortCallback),
+}
+
+/// The initial notification, from the queue's completion port: the hint or
+/// the port as they are (and stay). Not if the registration was taken back
+/// meanwhile, or the queue terminated.
+extern "system" fn notify(context: *mut c_void, canceled: bool) {
+    // SAFETY: boxed in `register`; the queue runs each callback once.
+    let initial = unsafe { Box::from_raw(context.cast::<Initial>()) };
+    if canceled || !registered().contains(&initial.token) {
+        return;
+    }
+    let context = initial.context as *mut c_void;
+    match initial.callback {
+        Callback::Hint(callback) => callback(context, &OFFLINE),
+        Callback::Port(callback) => callback(context, UDP_PORT),
+    }
+}
+
+/// Both registrations "fire an initial notification callback", on the
+/// queue they are given (null: the process queue). The hint and preferred
+/// port never change offline, so no other callback runs.
+fn register(
+    queue: *const c_void,
+    context: *mut c_void,
+    callback: Option<Callback>,
     out: *mut u64,
 ) -> HRESULT {
-    put(out, token())
+    if out.is_null() {
+        return xasync::E_INVALIDARG;
+    }
+    let token = token();
+    registered().insert(token);
+    if let Some(callback) = callback {
+        let initial = Box::into_raw(Box::new(Initial {
+            token,
+            context: context as usize,
+            callback,
+        }));
+        let hr = xasync::XTaskQueueSubmitDelayedCallback(queue.cast(), COMPLETION, 0, initial.cast(), Some(notify));
+        if hr < 0 {
+            // SAFETY: not queued, so still ours.
+            drop(unsafe { Box::from_raw(initial) });
+            registered().remove(&token);
+            return hr;
+        }
+    }
+    put(out, token)
 }
-extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
+extern "system" fn register_hint(
+    _: This,
+    queue: *const c_void,
+    context: *mut c_void,
+    callback: Option<HintCallback>,
+    out: *mut u64,
+) -> HRESULT {
+    register(queue, context, callback.map(Callback::Hint), out)
+}
+extern "system" fn register_port(
+    _: This,
+    queue: *const c_void,
+    context: *mut c_void,
+    callback: Option<PortCallback>,
+    out: *mut u64,
+) -> HRESULT {
+    register(queue, context, callback.map(Callback::Port), out)
+}
+extern "system" fn unregister(_: This, token: u64, _wait: bool) -> bool {
+    registered().remove(&token);
     true
 }
 
@@ -164,7 +248,7 @@ static VTABLE: Methods<18> = Methods([
     udp_port as *const (),                  // 0x18
     udp_port_async as *const (),            // 0x20
     udp_port_result as *const (),           // 0x28
-    register as *const (),                  // 0x30 port changed (never)
+    register_port as *const (),             // 0x30 port changed
     unregister as *const (),                // 0x38
     security_info_async as *const (),       // 0x40
     security_info_size as *const (),        // 0x48
@@ -174,7 +258,7 @@ static VTABLE: Methods<18> = Methods([
     security_info_result as *const (),      // 0x68
     verify_certificate as *const (),        // 0x70
     connectivity_hint as *const (),         // 0x78
-    register as *const (),                  // 0x80 hint changed (never)
+    register_hint as *const (),             // 0x80 hint changed
     unregister as *const (),                // 0x88
 ]);
 
@@ -275,5 +359,53 @@ mod tests {
         );
         assert_ne!(token, 0);
         assert!(method::<Unregister>(&OBJECT, 0x88)(this, token, false));
+    }
+
+    /// Each registration sends its initial notification once, on the
+    /// completion port of the queue it was given; one taken back first
+    /// sends none.
+    #[test]
+    fn registrations_send_an_initial_notification_on_their_queue() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static HINTS: AtomicU32 = AtomicU32::new(0);
+        static PORT: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn hint(context: *mut c_void, hint: *const ConnectivityHint) {
+            assert_eq!(context as usize, 7);
+            // SAFETY: the hint we pass.
+            assert!(unsafe { &*hint }.initialized);
+            HINTS.fetch_add(1, Ordering::SeqCst);
+        }
+        extern "system" fn port(_: *mut c_void, port: u16) {
+            PORT.store(u32::from(port), Ordering::SeqCst);
+        }
+        type Register<F> = extern "system" fn(This, *const xasync::Queue, *mut c_void, F, *mut u64) -> HRESULT;
+        type Unregister = extern "system" fn(This, u64, bool) -> bool;
+        let this: This = &OBJECT;
+        let mut q = std::ptr::null();
+        assert_eq!(xasync::XTaskQueueCreate(0, 0, &mut q), S_OK); // manual
+        let dispatch = |port| xasync::XTaskQueueDispatch(q, port, 0);
+
+        let mut token = 0;
+        let register = method::<Register<HintCallback>>(&OBJECT, 0x80);
+        assert_eq!(register(this, q, 7 as *mut c_void, hint, &mut token), S_OK);
+        assert!(!dispatch(0), "nothing on the work port");
+        assert_eq!(HINTS.load(Ordering::SeqCst), 0, "not before the queue runs it");
+        assert!(dispatch(COMPLETION));
+        assert_eq!(HINTS.load(Ordering::SeqCst), 1);
+        assert!(!dispatch(COMPLETION), "once");
+        assert!(method::<Unregister>(&OBJECT, 0x88)(this, token, false));
+
+        let register = method::<Register<PortCallback>>(&OBJECT, 0x30);
+        assert_eq!(register(this, q, std::ptr::null_mut(), port, &mut token), S_OK);
+        assert!(dispatch(COMPLETION));
+        assert_eq!(PORT.load(Ordering::SeqCst), u32::from(UDP_PORT));
+
+        // Taken back before the queue runs it.
+        let register = method::<Register<HintCallback>>(&OBJECT, 0x80);
+        assert_eq!(register(this, q, 7 as *mut c_void, hint, &mut token), S_OK);
+        assert!(method::<Unregister>(&OBJECT, 0x88)(this, token, false));
+        assert!(dispatch(COMPLETION));
+        assert_eq!(HINTS.load(Ordering::SeqCst), 1);
+        xasync::XTaskQueueCloseHandle(q);
     }
 }
