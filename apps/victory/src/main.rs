@@ -361,17 +361,18 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
-    /// PlayStation button prompts (and with --picture the Settings
-    /// controller picture) built from your copy of the game, written as a
-    /// VICTORY_FILE_PATCH list into the cache folder. Prompt symbols:
-    /// Kenney's Input Prompts (CC0); the picture is a PNG of yours (a
-    /// DualSense, any size, RGBA with transparency). A start with
-    /// VICTORY_PS_PROMPTS=1 builds the same list by itself.
+    /// PlayStation button prompts and the Settings controller picture,
+    /// built from your copy of the game, written as a VICTORY_FILE_PATCH
+    /// list into the cache folder. Prompt symbols: Kenney's Input Prompts
+    /// (CC0); the picture is the DualSense render that ships with VIctory,
+    /// or a PNG of yours with --picture. A start with VICTORY_PS_PROMPTS=1
+    /// builds the same list by itself.
     Glyphs {
         /// The game folder (default: the configured one).
         #[arg(long)]
         game: Option<PathBuf>,
-        /// The Settings controller picture: a PNG, any size, with transparency.
+        /// The Settings controller picture: a PNG, any size, with
+        /// transparency (default: the DualSense render that ships with VIctory).
         #[arg(long)]
         picture: Option<PathBuf>,
         /// Where to write (default: <cache>/file-patches/playstation).

@@ -20,11 +20,12 @@
 //! long as the original (zeros after its `End` tag), and its zlib stream
 //! exactly as long as the original stream (`victory_formats::zlib_exact`).
 //!
-//! The Settings picture is a PNG of the user's (any size, RGBA with
-//! transparency): the controller the Settings menu shows. One that cannot
-//! be read or built is left out with a warning, and the list says so: the
-//! prompts show all the same, and the archive is not read again at every
-//! start for a picture that stays as it is.
+//! The Settings picture is a PNG (any size, RGBA with transparency): the
+//! controller the Settings menu shows. The user's own when they name one,
+//! else the DualSense render that ships with VIctory ([`bundled_picture`]).
+//! One that cannot be read or built is left out with a warning, and the
+//! list says so: the prompts show all the same, and the archive is not read
+//! again at every start for a picture that stays as it is.
 //!
 //! Nothing of the title is stored in the repository: what is written goes
 //! to the cache folder, which `victory_core::ensure_outside_repo` checks.
@@ -48,12 +49,34 @@ const DIAGRAM: &str = "data/ttdb/ui/platform.ttpf";
 /// picture's new bytes.
 pub(crate) const LIST: &str = "patches.txt";
 const PICTURE: &str = "settings-controller.bin";
+/// How the list names the picture it was made from (one line, when it was
+/// made with one): a different picture makes it [`stale`].
+const FROM: &str = "# picture: ";
 /// How the list notes a picture that was given and could not be built.
 const LEFT_OUT: &str = "# settings-controller.bin was left out: ";
 /// The longest side of the picture read (256 MiB of pixels at most). The
 /// Settings texture it becomes is 1024x512; a file that claims more (a
 /// broken one, gigabytes) is refused, not allocated.
 const MAX_PICTURE_SIDE: u32 = 8192;
+/// The DualSense render that ships with VIctory (1024x683 RGBA, its
+/// contributor's own work under the repository's licence): the Settings
+/// picture when the user names none.
+const BUNDLED_PICTURE: &[u8] = include_bytes!("../assets/ps5-controller.png");
+/// Its file in the folder the patches are written to.
+const BUNDLED_PICTURE_FILE: &str = "ps5-controller.png";
+
+/// The bundled picture as a file in `out`, written when it is not there or
+/// differs (a newer VIctory's): its modification time then makes the list
+/// [`stale`], so the Settings picture is built again from it.
+pub(crate) fn bundled_picture(out: &Path) -> Result<PathBuf> {
+    let path = out.join(BUNDLED_PICTURE_FILE);
+    if std::fs::read(&path).ok().as_deref() != Some(BUNDLED_PICTURE) {
+        victory_core::ensure_outside_repo(out)?;
+        std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+        std::fs::write(&path, BUNDLED_PICTURE).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(path)
+}
 
 /// `victory glyphs`: says what was built, and where the list is.
 pub fn run(game: Option<PathBuf>, picture: Option<PathBuf>, out: Option<PathBuf>) -> Result<()> {
@@ -63,16 +86,20 @@ pub fn run(game: Option<PathBuf>, picture: Option<PathBuf>, out: Option<PathBuf>
         None => cfg.require_game_dir()?.to_path_buf(),
     };
     let out = out.unwrap_or_else(|| cfg.cache_dir.join("file-patches").join("playstation"));
+    let picture = match picture {
+        Some(p) => p,
+        None => bundled_picture(&out)?,
+    };
     println!("looking for the prompt icons in {} ...", game.join(ARCHIVE).display());
-    let built = make(&game, picture.as_deref(), &out)?;
+    let built = make(&game, Some(&picture), &out)?;
     for (offset, stream_len) in &built.prompts {
         println!("  prompt icons at {offset:#x} ({stream_len} bytes): rebuilt");
     }
-    let from = picture.as_deref().unwrap_or(std::path::Path::new("")).display();
+    let from = picture.display();
     match &built.picture {
         Ok(Some(stream_len)) => println!("  Settings controller picture ({stream_len} bytes): rebuilt from {from}"),
         Err(why) => println!("  Settings controller picture: skipped ({why}: {from})"),
-        Ok(None) => println!("  Settings controller picture: skipped (pass --picture <a PNG of the controller>)"),
+        Ok(None) => println!("  Settings controller picture: skipped"),
     }
     println!(
         "\nwritten: {}\nto use it: set VICTORY_FILE_PATCH={}",
@@ -91,22 +118,23 @@ pub(crate) fn build(game: &Path, picture: Option<&Path>, out: &Path) -> Result<P
 }
 
 /// Whether the list in `out` has to be made again for `picture`: there is
-/// none yet, or, with a picture at hand, it was made without one, or the
-/// picture file is newer than the list. A list that notes a picture it left
-/// out counts as made with one: that picture is not tried again at every
-/// start until its file changes.
+/// none yet, or, with a picture at hand, it was made from another one (or
+/// none), or the picture file is newer than the list. A list that notes a
+/// picture it left out counts as made from it: that picture is not tried
+/// again at every start until its file changes.
 pub(crate) fn stale(out: &Path, picture: Option<&Path>) -> bool {
     let list = out.join(LIST);
     let Ok(text) = std::fs::read_to_string(&list) else {
         return true;
     };
-    picture.is_some_and(|picture| !has_picture(&text) || newer(picture, &list))
+    picture.is_some_and(|picture| !made_from(&text, picture) || newer(picture, &list))
 }
 
-/// Whether the list's text has the Settings picture: its patch, or the note
-/// of one that was left out.
-fn has_picture(list: &str) -> bool {
-    list.lines().any(|line| line.trim_end().ends_with(PICTURE) || line.starts_with(LEFT_OUT))
+/// Whether the list's text says it was made from the picture `picture`
+/// (its [`FROM`] line).
+fn made_from(list: &str, picture: &Path) -> bool {
+    let from = format!("{FROM}{}", picture.display());
+    list.lines().any(|line| line.trim_end() == from)
 }
 
 /// Whether `file` was changed after `other`, by their modification times:
@@ -135,6 +163,9 @@ fn make(game: &Path, picture: Option<&Path>, out: &Path) -> Result<Built> {
          # <file name> <offset> <blake3 of the original range> <file with the new bytes>\n",
     );
 
+    if let Some(path) = picture {
+        writeln!(list, "{FROM}{}", path.display())?;
+    }
     // The picture before the archive: little work, and whether it can be
     // built is known before the long read. (Its line goes last.)
     let pic = picture.map(|path| (path, picture_patch(game, path)));
@@ -306,7 +337,7 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, SystemTime};
 
-    use super::{LEFT_OUT, LIST, PICTURE, Patch, has_picture, load_png, read_png, stale};
+    use super::{BUNDLED_PICTURE, FROM, LIST, PICTURE, Patch, bundled_picture, load_png, made_from, read_png, stale};
 
     const PROMPTS: &str = "# made\ndata.rpf 0x1234 <hash> prompt-icons-1234.bin\n";
 
@@ -315,34 +346,58 @@ mod tests {
         std::fs::OpenOptions::new().write(true).open(path).unwrap().set_modified(when).unwrap();
     }
 
-    /// A list has the picture with its patch, or with the note of one left out.
+    /// A list names the picture it was made from, and only that one.
     #[test]
-    fn the_list_says_whether_it_has_the_picture() {
-        assert!(!has_picture(PROMPTS));
-        assert!(has_picture(&format!("{PROMPTS}platform.ttpf 0x20 <hash> {PICTURE}\r\n")));
-        assert!(has_picture(&format!("{PROMPTS}{LEFT_OUT}not a PNG")));
+    fn the_list_says_which_picture_it_was_made_from() {
+        let (mine, other) = (Path::new(r"C:\pics\mine.png"), Path::new(r"C:\pics\other.png"));
+        assert!(!made_from(PROMPTS, mine));
+        let list = format!("{FROM}{}\r\n{PROMPTS}platform.ttpf 0x20 <hash> {PICTURE}\r\n", mine.display());
+        assert!(made_from(&list, mine));
+        assert!(!made_from(&list, other));
+    }
+
+    /// The bundled picture is written once as an RGBA PNG the picture is
+    /// built from, and not again while it is there unchanged (so the list
+    /// made from it stays current).
+    #[test]
+    fn the_bundled_picture_is_written_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = bundled_picture(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), BUNDLED_PICTURE);
+        let (width, height, _) = load_png(&path).unwrap();
+        assert_eq!((width, height), (1024, 683));
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        changed_at(&path, old);
+        bundled_picture(dir.path()).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), old, "rewritten unchanged");
+        std::fs::write(&path, b"an older picture").unwrap();
+        bundled_picture(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), BUNDLED_PICTURE);
     }
 
     /// The list is made again when there is none, when a picture is at hand
-    /// that it lacks, or when the picture file is newer: not for one it
-    /// notes as left out, nor without a picture at hand.
+    /// it was not made from, or when the picture file is newer: not for one
+    /// it notes as left out, nor without a picture at hand.
     #[test]
     fn the_list_is_made_again_only_when_needed() {
         let dir = tempfile::tempdir().unwrap();
         let (out, list) = (dir.path().join("out"), dir.path().join("out").join(LIST));
         let picture = dir.path().join("controller.png");
         std::fs::write(&picture, b"a png").unwrap();
+        let from = format!("{FROM}{}\n", picture.display());
         assert!(stale(&out, None), "no folder yet");
         std::fs::create_dir_all(&out).unwrap();
         assert!(stale(&out, Some(&picture)), "no list yet, with a picture at hand");
         std::fs::write(&list, PROMPTS).unwrap();
         assert!(!stale(&out, None), "a list, no picture at hand");
-        assert!(stale(&out, Some(&picture)), "the list lacks the picture at hand");
-        std::fs::write(&list, format!("{PROMPTS}{LEFT_OUT}not a PNG")).unwrap();
+        assert!(stale(&out, Some(&picture)), "the list was made without the picture at hand");
+        std::fs::write(&list, format!("{FROM}another.png\n{PROMPTS}platform.ttpf 0x20 <hash> {PICTURE}\n")).unwrap();
+        assert!(stale(&out, Some(&picture)), "the list was made from another picture");
+        std::fs::write(&list, format!("{from}{PROMPTS}{}not a PNG", super::LEFT_OUT)).unwrap();
         assert!(!stale(&out, Some(&picture)), "a picture left out is not tried again");
         let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
         changed_at(&picture, old - Duration::from_secs(60));
-        std::fs::write(&list, format!("{PROMPTS}platform.ttpf 0x20 <hash> {PICTURE}\n")).unwrap();
+        std::fs::write(&list, format!("{from}{PROMPTS}platform.ttpf 0x20 <hash> {PICTURE}\n")).unwrap();
         changed_at(&list, old);
         assert!(!stale(&out, Some(&picture)), "the picture is older than the list");
         changed_at(&picture, old + Duration::from_secs(60));

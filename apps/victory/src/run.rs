@@ -403,30 +403,35 @@ const PS_PICTURE: &str = "ps5-controller.png";
 /// the cache, and their list given to the DirectStorage hook, which serves
 /// them over the title's reads (`glyphs`). The Settings controller picture
 /// is the PNG `VICTORY_PS_PICTURE` names, else `ps5-controller.png` in
-/// VIctory's home folder, where there is one. Nothing here stops the start:
-/// without the patches the title shows its Xbox prompts.
+/// VIctory's home folder where there is one, else the DualSense render that
+/// ships with VIctory. Nothing here stops the start: without the patches
+/// the title shows its Xbox prompts.
 #[cfg(windows)]
 fn playstation_prompts(cfg: &victory_core::Config, game: &Path) {
     use crate::glyphs;
 
-    let picture = std::env::var_os("VICTORY_PS_PICTURE")
+    let own = std::env::var_os("VICTORY_PS_PICTURE")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
         .or_else(|| crate::play::home().ok().map(|home| home.join(PS_PICTURE)).filter(|p| p.is_file()));
     let began = std::time::Instant::now();
     let list = cfg.cache_subdir("file-patches/playstation").and_then(|out| -> Result<std::path::PathBuf> {
+        let picture = match own {
+            Some(own) => own,
+            None => glyphs::bundled_picture(&out)?,
+        };
         // The list is reused rather than built again at every start:
         // building it reads the whole archive, and the hook checks each
         // patch's hash of the bytes it replaces, so a list made for another
         // version of the game is not applied. (After an update of the game,
         // delete the folder: the list is not built again while it is there.)
         let list = out.join(glyphs::LIST);
-        if !glyphs::stale(&out, picture.as_deref()) {
+        if !glyphs::stale(&out, Some(&picture)) {
             tracing::info!(list = %list.display(), "playstation prompts: the list made earlier is used as it is");
             return Ok(std::path::absolute(list)?);
         }
         tracing::info!(game = %game.display(), "playstation prompts: building the patches from this copy of the game, once (they are kept in the cache)");
-        let list = glyphs::build(game, picture.as_deref(), &out)?;
+        let list = glyphs::build(game, Some(&picture), &out)?;
         tracing::info!(list = %list.display(), "playstation prompts: the patches are built, in {:.1} s", began.elapsed().as_secs_f64());
         // Absolute: the title may change the working directory before it opens its files.
         Ok(std::path::absolute(list)?)

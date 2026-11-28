@@ -11,7 +11,7 @@ next start ("SAVE AND RESTART NOW" does that for you).
 |---|---|---|---|
 | `VICTORY_DUALSENSE` | `0`, `1` | not set: AUTO | whether PlayStation pads are read: AUTO only while XInput lists no pad, `1` beside XInput's pads, `0` none (F1: PLAYSTATION PAD) |
 | `VICTORY_PS_PROMPTS` | `1` | off | the game's button prompts are PlayStation's, built once at the next start from the copy being played (F1: PLAYSTATION BUTTON ICONS) |
-| `VICTORY_PS_PICTURE` | a PNG file | `ps5-controller.png` in the home folder | the controller picture at Settings, Controls |
+| `VICTORY_PS_PICTURE` | a PNG file | `ps5-controller.png` in the home folder, else the render that ships with VIctory | the controller picture at Settings, Controls |
 | `VICTORY_FILE_PATCH` | a list file | none | byte ranges of the game's files served from other files at read time (below) |
 
 ## PlayStation pads
@@ -44,8 +44,8 @@ the copy being played, and from then on the game shows them:
   The symbols are Kenney's Input Prompts (CC0), drawn inside the game's own
   button frames. Menu (the same icon as Options), the sticks and the D-pad
   stay as they are.
-- The controller picture at Settings, Controls is a picture of your own, when
-  you supply one (below).
+- The controller picture at Settings, Controls is a DualSense: the render
+  that ships with VIctory, or a picture of your own (below).
 
 No file in the game's folder is written. The patches go to
 `<cache>\file-patches\playstation\patches.txt`, with the new bytes in files
@@ -59,8 +59,8 @@ The list is used again at every later start and not built again: before a
 patch is applied, the game's bytes at its range are checked against the hash
 in the list, so after an update of the game it is not applied (the log says
 so). Delete the folder `file-patches\playstation` to have it built again. It
-is built again by itself when a picture is there and the list has none yet,
-or when the picture file is newer than the list. With `VICTORY_FILE_PATCH`
+is built again by itself when the list was made from another picture, or
+when the picture file is newer than the list. With `VICTORY_FILE_PATCH`
 set too, that list is used and nothing is built.
 
 The same by hand, or for another copy:
@@ -74,15 +74,20 @@ victory glyphs [--game <game folder>] [--picture <png>] [--out <folder>]
 `<cache>\file-patches\playstation` (else the folder `--out` names) and prints
 the path of the list; set `VICTORY_FILE_PATCH` to it.
 
-**The controller picture.** `VICTORY_PS_PICTURE` is a PNG of your own: the
-DualSense as you want it shown, of any size, transparent where the menu is to
-show through. Not set, it is `ps5-controller.png` in victory's home folder
-(`%LOCALAPPDATA%\victory`, or the folder `VICTORY_HOME` names). With no
-picture there, the prompts are built alone. A picture that cannot be read
-(not a PNG with transparency) is said in the log and left out, until the
-file changes. The picture is drawn into a 1024x512 texture, which the menu
-shows at 0.75 of its width, so the picture is drawn wider in it: one of
-1536x1024 comes out in its own proportions.
+**The controller picture.** Without one of your own it is the DualSense
+render that ships with VIctory (`apps\victory\assets\ps5-controller.png`,
+1024x683, made by its contributor for VIctory and under the repository's
+licence; an exception in `xtask\src\policy.rs` says so). `VICTORY_PS_PICTURE`
+names a PNG of your own instead: the DualSense as you want it shown, of any
+size, transparent where the menu is to show through. Not set, it is
+`ps5-controller.png` in victory's home folder (`%LOCALAPPDATA%\victory`, or
+the folder `VICTORY_HOME` names) where there is one. The list names the
+picture it was made from, and is built again when another picture is
+chosen or the picture file changes. A picture that cannot be read (not a PNG
+with transparency) is said in the log and left out, until the file changes.
+The picture is drawn into a 1024x512 texture, which the menu shows at 0.75
+of its width, so the picture is drawn wider in it: one of 3:2 proportions
+comes out in its own.
 
 ## Mods: `VICTORY_FILE_PATCH`
 
@@ -200,6 +205,7 @@ Ported from [Marvisak/VIctory PR #3399](https://github.com/Marvisak/VIctory/pull
 by anoyarou (GPL-3.0-or-later), where the author checked the prompts and the
 controller picture in game, on Linux under Wine (Proton, RX 9070 XT). Prompt
 symbols: Kenney's [Input Prompts](https://kenney.nl/assets/input-prompts)
-(CC0). The controller picture is the user's own; nothing of it is in this
-repository. PlayStation and DualSense are trademarks of Sony Interactive
+(CC0). The default controller picture is a DualSense render made for VIctory
+by its contributor, under the repository's licence; nothing of it comes from
+the game. PlayStation and DualSense are trademarks of Sony Interactive
 Entertainment.
