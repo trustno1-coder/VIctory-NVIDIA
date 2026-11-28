@@ -660,12 +660,15 @@ fn emit_once(
         Err(_) => false,
     };
     let pairs_on = wave_pairs_on() && !listed;
+    // Not instead of a translation that is there already: main's lowering of the water
+    // light's programs (`VICTORY_LOOPS_WAVE`, `VICTORY_LDS_FIRST_INIT`) is right on 32-lane
+    // hosts, and taken over by this form those programs left the open water dark (RTX 3060).
     if wave32_compute
         && pairs_on
         && !stuck
+        && original.is_err()
         && (matches!(native.io, crate::native::StageIo::Cs(cs) if cs.lds_bytes() > 0)
-            || lower::crosses_halves(p, st)
-                && (original.is_err() || lower::wave_local(p, st).is_err()))
+            || lower::crosses_halves(p, st))
     {
         let again = paired_with(c, native, p, Some((io, res)));
         if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
@@ -804,13 +807,6 @@ fn emit_once(
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
             if !exact {
-                if pairs_on {
-                    let again = paired_with(c, native, p, Some((io, res)));
-                    report("paired Wave64", &again);
-                    if done(&again) {
-                        return again.map(|(shader, _)| shader);
-                    }
-                }
                 // Before anything approximate, the exact forms that cost group barriers.
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
@@ -841,6 +837,15 @@ fn emit_once(
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
                         }
+                    }
+                }
+                // Then the paired form (`VICTORY_WAVE_PAIRS=1`): exact too, but after main's
+                // exact forms, ahead of the approximate ones.
+                if pairs_on {
+                    let again = paired_with(c, native, p, Some((io, res)));
+                    report("paired Wave64", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
                     }
                 }
                 if strict {
