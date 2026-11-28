@@ -112,6 +112,8 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(test)]
+mod speed_bench;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -854,7 +856,7 @@ fn widen(
     let pairs = native.wave64
         && lower::host_max_wave() == 32
         && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
-    let mut wide = std::collections::HashSet::new();
+    let mut wide = crate::fxmap::HashSet::default();
     loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;

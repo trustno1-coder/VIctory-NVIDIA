@@ -66,7 +66,10 @@
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
 
-use std::collections::HashMap;
+/// Our own tables of addresses and page numbers: hashed by [`crate::host::AddressHash`]
+/// (SipHash, the standard one, costs some five times as much a look).
+type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::host::AddressHash>>;
+type HashSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<crate::host::AddressHash>>;
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
@@ -168,7 +171,7 @@ struct Memory {
     /// Places of pages that are free: the copy, the address in the arena.
     free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
-    open: std::collections::HashSet<usize>,
+    open: HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
     /// Per host view heap (by address): the first slot of its run, and how
@@ -177,7 +180,7 @@ struct Memory {
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
-    refused: std::collections::HashSet<u64>,
+    refused: HashSet<u64>,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -238,19 +241,19 @@ impl Memory {
             directory: (entries as *mut u32, directory),
             faults: (faults, data.cast::<u32>(), gpu),
             copies: Vec::new(),
-            numbers: HashMap::new(),
+            numbers: HashMap::default(),
             arenas: Vec::new(),
-            pages: HashMap::new(),
+            pages: HashMap::default(),
             order: Vec::new(),
             sweep: 0,
             windows: 0,
-            packed: HashMap::new(),
+            packed: HashMap::default(),
             packed_order: Vec::new(),
             packed_sweep: 0,
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
-            heaps: HashMap::new(),
+            heaps: HashMap::default(),
             frame: u64::MAX,
             refused: Default::default(),
             stats: Stats::default(),

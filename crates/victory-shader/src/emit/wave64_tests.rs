@@ -3,7 +3,7 @@
 //! so that the two host waves can exchange their halves inside it. Lowered, validated by
 //! `dxil.dll` when present, and run on the host GPU when it takes waves of 32.
 
-use std::collections::HashSet;
+use crate::fxmap::HashSet;
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -167,7 +167,7 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     assert_eq!(p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == "v_add_f16").count(), 6);
-    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    let shader = lowered(&native, &p, &HashSet::default()).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -407,7 +407,7 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
     words[1] = 0xBF88_0000 | (words.len() as u32 - 2);
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = lowered_on(&native, &p, &HashSet::new(), 64).expect("lower");
+    let shader = lowered_on(&native, &p, &HashSet::default(), 64).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -472,7 +472,7 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for nearest in [false, true] {
         let was = lower::TEST_F16_NEAREST.replace(Some(nearest));
-        let shader = lowered(&native, &p, &HashSet::new());
+        let shader = lowered(&native, &p, &HashSet::default());
         lower::TEST_F16_NEAREST.set(was);
         let shader = shader.expect("lower");
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -525,7 +525,7 @@ fn a_wave_or_inside(skip: u32, name: &str) {
         .expect("the branch");
     // per lane, the two host waves cannot meet inside the branch
     lower::take_needs();
-    let per_lane = lowered(&native, &p, &HashSet::new());
+    let per_lane = lowered(&native, &p, &HashSet::default());
     assert!(
         matches!(&per_lane, Err(ShaderError::Unsupported { what, .. }) if *what == "a wave reduction where not every lane runs"),
         "{:?}",
@@ -538,7 +538,7 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     // (taken, past the body, when every lane's bit is clear)
     assert_eq!(st.wave_any[branch], Some(false));
     // wave-wide, every lane runs the reduction (EXEC stays a guard on what it does there)
-    let wide = HashSet::from([branch]);
+    let wide = [branch].into_iter().collect::<HashSet<_>>();
     let st = structure::structure_wide(&p, &wide).expect("structure");
     let inside = match p.blocks[branch].exit {
         ir::Exit::Branch { not_taken, .. } => not_taken,
@@ -677,7 +677,7 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
     ];
     let native = native_of(&words, false, 32);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    let shader = lowered(&native, &p, &HashSet::default()).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -718,7 +718,7 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
         .expect("the skip");
     lower::take_needs();
-    let per_lane = lowered(&native, &p, &HashSet::new());
+    let per_lane = lowered(&native, &p, &HashSet::default());
     assert!(
         matches!(&per_lane, Err(ShaderError::Unsupported { what, .. }) if *what == "a lane mask read as data"),
         "{:?}",
@@ -726,7 +726,7 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     );
     let st = structure::structure(&p).expect("structure");
     assert_eq!(lower::branches_around(&st, &lower::take_needs()), Some(vec![branch]));
-    let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
+    let shader = lowered(&native, &p, &[branch].into_iter().collect::<HashSet<_>>()).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -751,7 +751,7 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         0xe0c8_1000, 0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
     ]);
     let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let shader = lowered_counted(&native, &p, &HashSet::new(), 64, true).unwrap();
+    let shader = lowered_counted(&native, &p, &HashSet::default(), 64, true).unwrap();
     let limit = shader
         .user_data
         .iter()
@@ -864,13 +864,13 @@ fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
     // per lane, the loop's LDS write and read stand where not every lane runs: still 64 lanes,
     // and the lowering names the loop
     lower::take_needs();
-    let (wave, _) = lower::with_pair_meetings(|| lowered_with_wave(&native, &p, &HashSet::new()));
+    let (wave, _) = lower::with_pair_meetings(|| lowered_with_wave(&native, &p, &HashSet::default()));
     assert_eq!(wave, Some(64));
     let needs = lower::take_needs();
     let st = structure::structure(&p).expect("structure");
     assert_eq!(lower::with_pair_meetings(|| lower::branches_around(&st, &needs)), Some(vec![back]));
     // the back edge taken per console wave: waves of 32, meeting per console wave
-    let wide = HashSet::from([back]);
+    let wide = [back].into_iter().collect::<HashSet<_>>();
     let (wave, shader) = lower::with_pair_meetings(|| lowered_with_wave(&native, &p, &wide));
     assert_eq!(wave, Some(32));
     assert!(lower::take_needs().is_empty());
@@ -1006,7 +1006,7 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     let lower_with = |ticket: bool| {
         // SAFETY: tests that read this switch hold ONE_AT_A_TIME
         unsafe { std::env::set_var("VICTORY_THREAD_TICKET", if ticket { "1" } else { "0" }) };
-        let shader = lowered_on(&native, &p, &HashSet::new(), 32);
+        let shader = lowered_on(&native, &p, &HashSet::default(), 32);
         unsafe { std::env::remove_var("VICTORY_THREAD_TICKET") };
         shader.expect("lower")
     };

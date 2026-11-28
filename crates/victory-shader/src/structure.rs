@@ -16,7 +16,7 @@
 //! their side effects are dropped too, and what they compute is only read
 //! through derivatives.
 
-use std::collections::{HashMap, HashSet};
+use crate::fxmap::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::ShaderError;
@@ -67,7 +67,7 @@ pub struct Bools {
 }
 
 /// The tables below have small integer keys; SipHash dominated run time.
-type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+type Map<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<Fx>>;
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
@@ -143,14 +143,18 @@ impl Bools {
     }
 
     fn vars(&self, b: Bool) -> Vec<u32> {
-        let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
+        // Nodes and variables already met: a hash set each, not a list
+        // searched from the start (that made this quadratic in the size of
+        // the function, the largest part of translating big programs).
+        let mut seen: std::collections::HashSet<Bool, BuildHasherDefault<Fx>> = Default::default();
+        let mut have: std::collections::HashSet<u32, BuildHasherDefault<Fx>> = Default::default();
+        let (mut vars, mut stack) = (Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
             let (v, lo, hi) = self.nodes[b.0 as usize];
-            if v == TERMINAL || seen.contains(&b) {
+            if v == TERMINAL || !seen.insert(b) {
                 continue;
             }
-            seen.push(b);
-            if !vars.contains(&v) {
+            if have.insert(v) {
                 vars.push(v);
             }
             stack.extend([lo, hi]);
@@ -462,7 +466,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_wide(program, &HashSet::new())
+    structure_wide(program, &HashSet::default())
 }
 
 /// [`structure`], with the branches that close the blocks of `wide` kept as the console has
@@ -474,7 +478,7 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// run as two host waves, which exchange that decision and can then meet (a group barrier)
 /// inside the branch.
 pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
-    structure_wide_host(program, wide, &HashSet::new())
+    structure_wide_host(program, wide, &HashSet::default())
 }
 
 /// [`structure_wide`], with the branches of `host` taken together too, but by each host wave
@@ -622,8 +626,8 @@ impl<'a> Lanes<'a> {
             incoming,
             defs,
             phis,
-            unresolved: HashSet::new(),
-            derived_phis: HashSet::new(),
+            unresolved: HashSet::default(),
+            derived_phis: HashSet::default(),
             b: Bools::new(),
             masks: Map::default(),
             other: Map::default(),
@@ -631,13 +635,13 @@ impl<'a> Lanes<'a> {
             scc_lane: Map::default(),
             joins: Vec::new(),
             phi_joins: Vec::new(),
-            phi_join_ids: HashSet::new(),
+            phi_join_ids: HashSet::default(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
-            active: HashSet::new(),
-            wide: HashSet::new(),
-            host: HashSet::new(),
-            scc_every: HashSet::new(),
+            active: HashSet::default(),
+            wide: HashSet::default(),
+            host: HashSet::default(),
+            scc_every: HashSet::default(),
             wave_any: vec![None; blocks.len()],
         })
     }
@@ -735,7 +739,7 @@ impl<'a> Lanes<'a> {
     fn check_joins(&mut self, cond: &[Bool]) -> (Vec<Value>, Vec<Value>) {
         let mut wrong = Vec::new();
         let mut new_derived = Vec::new();
-        let mut seen_derived = HashSet::new();
+        let mut seen_derived = HashSet::default();
         let mut j = 0;
         let mut p = 0;
         // Checking an argument can resolve another join; it is checked too.
@@ -793,7 +797,7 @@ impl<'a> Lanes<'a> {
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
         let phi_joins = std::mem::take(&mut self.phi_joins);
-        let mut phi_masks = HashMap::with_capacity(phi_joins.len());
+        let mut phi_masks = HashMap::with_capacity_and_hasher(phi_joins.len(), Default::default());
         for pj in phi_joins {
             let incoming: Vec<Bool> = pj
                 .args
@@ -862,7 +866,7 @@ impl<'a> Lanes<'a> {
         // lowering refuses what reads it instead of taking the other
         // pair's lanes 32-63. Not where the low dword holds a number: see
         // the shortcut in `mask`.
-        let (mut high, mut split) = (Map::default(), HashSet::new());
+        let (mut high, mut split) = (Map::default(), HashSet::default());
         let keys = self.masks.keys().chain(self.other.keys());
         for &(lo, hi) in keys.chain(&self.seen) {
             if *high.entry(lo).or_insert(hi) != hi {

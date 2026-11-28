@@ -276,7 +276,11 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     let stride = widths.len() * per;
     let mut records = vec![0u8; blocks * stride];
     let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+    if c_lanes() {
+        lanes_c(tables, widths, per, blocks, src, &mut records)?;
+    } else {
+        lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+    }
     let records = records.chunks_exact(stride);
     let out = dst.chunks_exact_mut(block);
     let t = tables;
@@ -427,12 +431,18 @@ fn lanes(
     let mut at = 0;
     while pos < blocks * per {
         let (mut taken, mut moved) = (0, false);
-        for (j, lane) in lanes.iter_mut().enumerate() {
-            let bit = 1 << j;
-            let before = taken;
+        // The lanes' steps first: each depends on its own lane alone, so the
+        // processor runs several lanes' decoding at once; the bytes, which go
+        // to the lanes in order, after. (One loop of both made every lane wait
+        // for the one before it: 1.35 times as long, measured.)
+        for lane in lanes.iter_mut() {
             if !lane.stalled {
                 lane.step(t)?;
             }
+        }
+        for (j, lane) in lanes.iter_mut().enumerate() {
+            let bit = 1 << j;
+            let before = taken;
             let waiting = lane.out.is_some() && done & bit != 0;
             if lane.need && !waiting && taken < ROUND_BYTES {
                 // Past the end nothing arrives; in a valid stream only finished lanes ask there.
@@ -467,6 +477,53 @@ fn lanes(
         }
     }
     Ok(())
+}
+
+unsafe extern "C" {
+    fn victory_bcpack_lanes(
+        freq: *const u32,
+        start: *const u32,
+        bucket: *const u8,
+        recip: *const u64,
+        widths: *const u8,
+        nl: usize,
+        per: usize,
+        blocks: usize,
+        src: *const u8,
+        srclen: usize,
+        records: *mut u8,
+    ) -> i32;
+}
+
+/// Whether [`lanes_c`] decodes the lanes (`VICTORY_BCPACK_C=0`: [`lanes`]).
+fn c_lanes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BCPACK_C").is_none_or(|v| v != "0"))
+}
+
+/// [`lanes`] in C (`csrc/bcpack_lanes.c`), the input taken from `src` in
+/// order: the same records. The C compiler's code for this loop ran ahead of
+/// rustc's (measured in the module's benchmark).
+fn lanes_c(t: &Tables, widths: &[u8], per: usize, blocks: usize, src: &[u8], records: &mut [u8]) -> Result<(), Error> {
+    assert!(widths.len() <= 16 && records.len() >= blocks * widths.len() * per);
+    // SAFETY: the tables are plain arrays of the sizes the C side reads; the
+    // records hold every symbol the lanes deliver (asserted).
+    let rc = unsafe {
+        victory_bcpack_lanes(
+            t.freq.as_ptr().cast(),
+            t.start.as_ptr().cast(),
+            t.bucket.as_ptr().cast(),
+            t.recip.as_ptr().cast(),
+            widths.as_ptr(),
+            widths.len(),
+            per,
+            blocks,
+            src.as_ptr(),
+            src.len(),
+            records.as_mut_ptr(),
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(Error("the stream ends early or is corrupt")) }
 }
 
 // Blocks.
@@ -660,11 +717,36 @@ fn bc5_pack(v: &Plain, out: &mut [u8]) {
     bc4_alpha(v.ep[2], v.ep[3], &v.ix[16..], &mut out[8..]);
 }
 
-/// A byte's even and odd bits as two zigzag-coded 4-bit residuals.
+/// A byte's even and odd bits as two zigzag-coded 4-bit residuals: from a
+/// table made at compile time (the bit loops ran 32 times a block).
+const NIBBLES: [[i16; 2]; 256] = {
+    let mut t = [[0i16; 2]; 256];
+    let mut b = 0;
+    while b < 256 {
+        let mut halves = [0u8; 2];
+        let mut h = 0;
+        while h < 2 {
+            let v = (b >> h) as u8;
+            let mut acc = 0u8;
+            let mut k = 0;
+            while k < 4 {
+                acc |= (v >> (2 * k) & 1) << k;
+                k += 1;
+            }
+            halves[h] = acc;
+            h += 1;
+        }
+        let z0 = (halves[0] >> 1) as i16 ^ -((halves[0] & 1) as i16);
+        let z1 = (halves[1] >> 1) as i16 ^ -((halves[1] & 1) as i16);
+        t[b] = [z0, z1];
+        b += 1;
+    }
+    t
+};
+
+#[inline]
 fn nibbles(b: u8, odd_first: bool) -> [i16; 2] {
-    let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> (2 * k) & 1) << k);
-    let z = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
-    let (even, odd) = (z(half(b)), z(half(b >> 1)));
+    let [even, odd] = NIBBLES[usize::from(b)];
     if odd_first { [odd, even] } else { [even, odd] }
 }
 
@@ -682,19 +764,39 @@ fn add_index(cur: i16, bits: u8, refv: i16, ref_bits: u8) -> i16 {
     if bits == 0 { 0 } else { sum >> (16 - bits) }
 }
 
-/// Little-endian bit writer for one 128-bit block.
+/// Little-endian bit writer for one 128-bit block, on two 64-bit words
+/// (shifts of a u128 by a variable amount took several instructions and a
+/// branch each).
 #[derive(Default)]
 struct Bits {
-    v: u128,
+    lo: u64,
+    hi: u64,
     at: u32,
 }
 
 impl Bits {
+    #[inline]
     fn put(&mut self, value: u64, n: u32) {
         if n > 0 && self.at < 128 {
-            self.v |= (u128::from(value) & ((1u128 << n) - 1)) << self.at;
+            let v = if n >= 64 { value } else { value & ((1u64 << n) - 1) };
+            let at = self.at;
+            if at < 64 {
+                self.lo |= v << at;
+                if at + n > 64 {
+                    self.hi |= v >> (64 - at);
+                }
+            } else {
+                self.hi |= v << (at - 64);
+            }
         }
         self.at += n;
+    }
+
+    fn bytes(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.lo.to_le_bytes());
+        out[8..].copy_from_slice(&self.hi.to_le_bytes());
+        out
     }
 }
 
@@ -895,15 +997,15 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
         m if pbits(m) => (0..ends).for_each(|e| w.put(field(e / 2, e % 2, prec[0]) & 1, 1)),
         _ => {}
     }
-    let anchors: &[u8] = match subsets {
-        2 => &[0, ANCHOR2[part]],
-        3 => &[0, ANCHOR3A[part], ANCHOR3B[part]],
-        _ => &[0],
+    let anchors: u16 = match subsets {
+        2 => 1 | 1 << ANCHOR2[part],
+        3 => 1 | 1 << ANCHOR3A[part] | 1 << ANCHOR3B[part],
+        _ => 1,
     };
     let mut indices = |set: usize| {
-        let bits = ix.bits[set];
+        let bits = u32::from(ix.bits[set]);
         for (p, &v) in ix.ix[set].iter().enumerate() {
-            let n = u32::from(bits) - u32::from(anchors.contains(&(p as u8)));
+            let n = bits - u32::from(anchors >> p & 1);
             w.put(u64::from(v as u16), n);
         }
     };
@@ -918,7 +1020,7 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
         }
         _ => indices(0),
     }
-    out.copy_from_slice(&w.v.to_le_bytes());
+    out.copy_from_slice(&w.bytes());
 }
 
 // BC6H.
@@ -1165,7 +1267,7 @@ fn bc6<'a>(
             let v = (v as u16).wrapping_add(1 << (bits - 1));
             w.put(v.into(), u32::from(bits) - u32::from(short));
         }
-        block.copy_from_slice(&w.v.to_le_bytes());
+        block.copy_from_slice(&w.bytes());
     }
     Ok(())
 }
@@ -1347,7 +1449,7 @@ mod tests {
         }
         w.put(1, 1);
         w.put(1, 1);
-        assert_eq!(dst, w.v.to_le_bytes());
+        assert_eq!(dst, w.bytes());
     }
 
     #[test]
@@ -1442,7 +1544,7 @@ mod tests {
             ] {
                 w.put(v, n);
             }
-            assert_eq!(dst, w.v.to_le_bytes(), "mode {mode} rot 1");
+            assert_eq!(dst, w.bytes(), "mode {mode} rot 1");
         }
     }
 
@@ -1636,6 +1738,10 @@ mod tests {
                 let mut next = src.iter().copied();
                 lanes(&t, widths, per, blocks, |_| next.next(), &mut got).unwrap();
                 assert_eq!(got, records.concat(), "{widths:?} x{per}, {blocks} blocks");
+                let mut from_c = vec![0u8; got.len()];
+                lanes_c(&t, widths, per, blocks, &src, &mut from_c).unwrap();
+                assert_eq!(from_c, got, "C: {widths:?} x{per}, {blocks} blocks");
+                assert!(lanes_c(&t, widths, per, blocks, &src[..src.len() / 2], &mut from_c).is_err());
             }
         }
     }

@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::HashMap;
+use crate::fxmap::HashMap;
 
 pub mod census;
 pub mod opt;

@@ -1458,45 +1458,19 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
+    // libdeflate's whole-buffer decompressor (C): 1.3-1.4 times zlib-rs's
+    // streaming one on these requests, which arrive whole. It stops at the
+    // stream's end (bytes after it are left alone, as before), checks the
+    // Adler-32, and fails when `out` is too small.
     thread_local! {
-        static INFLATE: std::cell::RefCell<zlib_rs::Inflate> =
-            std::cell::RefCell::new(zlib_rs::Inflate::new(true, 15));
+        static INFLATE: std::cell::RefCell<libdeflater::Decompressor> =
+            std::cell::RefCell::new(libdeflater::Decompressor::new());
     }
-    INFLATE.with_borrow_mut(|state| {
-        state.reset(true);
-        // `Inflate::decompress` cannot distinguish a valid empty stream from
-        // an insufficient buffer when `avail_out == 0`, so use a 1-byte scratch
-        // destination and verify `written <= out_len` afterward.
-        let out_len = out.len();
-        let mut scratch = [0u8; 1];
-        let dest = if out_len == 0 { &mut scratch[..] } else { out };
-        let (mut in_pos, mut out_pos) = (0usize, 0usize);
-        let status = loop {
-            match state.decompress(
-                &source[in_pos..],
-                &mut dest[out_pos..],
-                zlib_rs::InflateFlush::NoFlush,
-            ) {
-                Ok(zlib_rs::Status::StreamEnd) => break Ok(zlib_rs::Status::StreamEnd),
-                Ok(zlib_rs::Status::Ok) => {
-                    let next_in = state.total_in() as usize;
-                    let next_out = state.total_out() as usize;
-                    if next_in == in_pos && next_out == out_pos {
-                        break Ok(zlib_rs::Status::BufError);
-                    }
-                    in_pos = next_in;
-                    out_pos = next_out;
-                }
-                other => break other,
-            }
-        };
-        let written = state.total_out() as usize;
-        match status {
-            Ok(zlib_rs::Status::StreamEnd) if written <= out_len => Ok(written),
-            other => {
-                tracing::debug!(?other, "dstorage: zlib stream");
-                Err(INVALID_DATA)
-            }
+    INFLATE.with_borrow_mut(|state| match state.zlib_decompress(source, out) {
+        Ok(written) => Ok(written),
+        Err(error) => {
+            tracing::debug!(?error, "dstorage: zlib stream");
+            Err(INVALID_DATA)
         }
     })
 }

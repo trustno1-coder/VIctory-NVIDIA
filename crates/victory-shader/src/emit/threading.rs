@@ -4,7 +4,7 @@
 use crate::gfx10::{Fields, Operand, Valu};
 use crate::ir::{Exit, Program, Reg, Value};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
-use std::collections::HashMap;
+use crate::fxmap::HashMap;
 
 fn plain(v: &Valu) -> bool {
     v.abs == 0
@@ -25,7 +25,7 @@ fn immediate(op: Operand) -> Option<u32> {
 }
 
 pub(super) fn constant_edges(p: &Program, st: &Structured) -> Vec<(usize, usize, usize)> {
-    let mut constants = HashMap::new();
+    let mut constants = HashMap::default();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             if inst.name() == "v_mov_b32"

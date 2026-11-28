@@ -39,7 +39,7 @@
 //! skips left out, the branches around it taken wave-wide), where the halves do exchange.
 //! `VICTORY_WAVE_OWN_BITS=0` turns this off.
 
-use std::collections::{HashMap, HashSet};
+use crate::fxmap::{HashMap, HashSet};
 
 use super::wave::{self, Op, Shape};
 use crate::gfx10::{Fields, NULL, Operand};
@@ -179,9 +179,9 @@ fn effect(inst: &Inst) -> bool {
 
 impl Ctx<'_> {
     fn new<'a>(p: &'a Program, st: &'a Structured) -> Ctx<'a> {
-        let mut users: HashMap<Value, Vec<User>> = HashMap::new();
-        let mut def = HashMap::new();
-        let mut live: HashSet<Value> = HashSet::new();
+        let mut users: HashMap<Value, Vec<User>> = HashMap::default();
+        let mut def = HashMap::default();
+        let mut live: HashSet<Value> = HashSet::default();
         for (b, block) in p.blocks.iter().enumerate() {
             for (k, phi) in block.phis.iter().enumerate() {
                 for &a in &phi.args {
@@ -358,8 +358,8 @@ impl Ctx<'_> {
             return Err((here, MASK));
         }
         // ---- the bits still to visit, and the loop's own steps ----
-        let mut rem: HashSet<Value> = HashSet::from([t]);
-        let mut pattern: HashSet<(usize, usize)> = HashSet::new();
+        let mut rem: HashSet<Value> = [t].into_iter().collect::<HashSet<_>>();
+        let mut pattern: HashSet<(usize, usize)> = HashSet::default();
         let mut alike: Vec<Value> = Vec::new();
         // an unguarded copy
         let copy = |u: (usize, usize)| -> Option<Value> {
@@ -544,7 +544,7 @@ impl Ctx<'_> {
             }
         }
         // the loop goes on while bits remain and is left when none does
-        let mut leaves: HashSet<usize> = HashSet::new();
+        let mut leaves: HashSet<usize> = HashSet::default();
         for &(scc, set_while_more) in &more {
             if !self.joins(scc).is_empty() {
                 return Err((head, USED));
@@ -621,7 +621,7 @@ impl Ctx<'_> {
         if tests.is_empty() {
             return Err((head, TEST));
         }
-        let mut memo: Vec<HashMap<Bool, bool>> = vec![HashMap::new(); tests.len()];
+        let mut memo: Vec<HashMap<Bool, bool>> = vec![HashMap::default(); tests.len()];
         // what a lane only reaches with its own bit set, in the round of that test
         let mut body_block = vec![false; n];
         for b in (0..n).filter(|&b| lp[b]) {
@@ -707,7 +707,7 @@ impl Ctx<'_> {
                 }
             }
         }
-        let mut seen: HashMap<Bool, bool> = HashMap::new();
+        let mut seen: HashMap<Bool, bool> = HashMap::default();
         let mut tainted = |b: Bool| -> bool {
             *seen
                 .entry(b)
@@ -866,7 +866,7 @@ mod tests {
             .rfind(|i| i.name() == "v_readlane_b32")
             .and_then(|i| i.write(Reg::S(7)))
             .unwrap();
-        assert_eq!(own.totals, HashSet::from([total]));
+        assert_eq!(own.totals, [total].into_iter().collect::<HashSet<_>>());
         let first = insts().find(|i| i.name() == "v_readfirstlane_b32").unwrap();
         assert!(own.alike.contains(&first.read(Reg::V(3)).unwrap()));
     }

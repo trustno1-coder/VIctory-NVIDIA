@@ -340,7 +340,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         },
         ..Io::default()
     };
-    let defs: std::collections::HashMap<Value, Site> = p
+    let defs: crate::fxmap::HashMap<Value, Site> = p
         .blocks
         .iter()
         .enumerate()
@@ -352,7 +352,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .flat_map(move |(i, inst)| inst.writes.iter().map(move |w| (w.1, (b, i))))
         })
         .collect();
-    let phis: std::collections::HashMap<Value, (usize, usize)> = p
+    let phis: crate::fxmap::HashMap<Value, (usize, usize)> = p
         .blocks
         .iter()
         .enumerate()
@@ -470,12 +470,12 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
     // half need not be evaluated. A first half also read as data (or used
     // without a second half) must keep P0 + i * P10. Follow phi uses too,
     // without forcing ordinary pairs to read per-vertex attributes.
-    let folded: std::collections::HashSet<_> = io
+    let folded: crate::fxmap::HashSet<_> = io
         .interps
         .iter()
         .filter_map(|(s, i)| matches!(i, Interp::Interpolated { .. }).then_some(*s))
         .collect();
-    let mut used: std::collections::HashSet<_> = p
+    let mut used: crate::fxmap::HashSet<_> = p
         .blocks
         .iter()
         .enumerate()
@@ -568,8 +568,8 @@ fn push_pair(io: &mut Io, site: Site, pair: Pair, attribute: Attribute) {
 /// Finds the first halves of interpolations.
 struct Halves<'a> {
     p: &'a Program,
-    defs: &'a std::collections::HashMap<Value, Site>,
-    phis: &'a std::collections::HashMap<Value, (usize, usize)>,
+    defs: &'a crate::fxmap::HashMap<Value, Site>,
+    phis: &'a crate::fxmap::HashMap<Value, (usize, usize)>,
 }
 
 impl Halves<'_> {
