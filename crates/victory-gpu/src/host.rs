@@ -1398,6 +1398,38 @@ mod tests {
         );
     }
 
+    /// Bench (`--ignored --nocapture`): 256 buffers of 64 KiB, on the card
+    /// and in the PC's memory, made one at a time and sixteen at a time (as
+    /// the thread that makes buffers ahead makes them, `crate::ahead`),
+    /// beside [`beside_the_thread_that_makes_buffers`].
+    #[test]
+    #[ignore]
+    fn bench_buffers_made_one_at_a_time_or_together() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        const SIZE: u64 = 64 << 10;
+        for shared in [false, true] {
+            let mut lines = Vec::new();
+            let mut beside = 0;
+            for batch in [1usize, 16] {
+                beside = beside_the_thread_that_makes_buffers(host, || {
+                    let began = std::time::Instant::now();
+                    let mut made = 0;
+                    while made < 256 {
+                        made += if shared { host.shared_buffers_now(SIZE, batch).len() } else { host.uav_buffers(SIZE, batch).len() };
+                    }
+                    lines.push(format!("{batch} at a time {:.3} ms a buffer", began.elapsed().as_secs_f64() * 1e3 / 256.0));
+                });
+            }
+            eprintln!(
+                "256 {} buffers of 64 KiB beside a thread making buffers of {beside} KiB: {}",
+                if shared { "shared" } else { "card" },
+                lines.join(", ")
+            );
+        }
+    }
+
     /// Threads that make buffers on the card at once each wait for their
     /// own mapping copy (`super::mapped`, more of them than it has lists),
     /// and every buffer is then written by the card from an upload buffer
