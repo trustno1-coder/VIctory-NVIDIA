@@ -23,9 +23,11 @@
 
 #[cfg(windows)]
 mod console_insn;
+#[cfg(windows)]
 mod crash;
 pub mod frame_rate;
 pub mod prepare;
+#[cfg(any(windows, test))]
 pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
