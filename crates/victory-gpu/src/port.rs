@@ -37,11 +37,13 @@
 //!
 //! Why our own view: a heap opened from an address holds the pages it was
 //! opened on: the title could not unmap, decommit or protect them while it
-//! stands. Opened on our view, the title's own views stay free to change.
-//! When the title maps other pages at such an address, what is in place
-//! there is let go (`crate::inplace::title_memory_freeing`) and the region
-//! forgotten; the view of ours stays (shortcut: it is never unmapped, a
-//! few hundred MB of address space at most).
+//! stands. Opened on our view, the title's own views stay free to change: a
+//! section page's commit is shared by its views and survives unmapping one of
+//! them, and the test reprotects a title view and unmaps another under the
+//! heap while the placed buffer still reads the section's pages. When the
+//! title maps other pages at such an address, what is in place there is let go
+//! (`crate::inplace::title_memory_freeing`) and the region forgotten; our view
+//! itself goes when its last placed buffer and heap do (`SectionView`).
 //!
 //! What it assumes: the CPU steps of ours that read this memory at
 //! submission (fills of constant buffers, the title's buffer copies done on
@@ -384,7 +386,11 @@ mod tests {
             assert_eq!(second.bias, 0);
             // The title's own views may change under the heap: ours is a view of the section,
             // not of their placeholders. Protect one read-only and unmap the other; the placed
-            // buffer reads the section's committed pages all the same.
+            // buffer reads the section's committed pages all the same. What the placed buffer
+            // must still read is saved first: after the title's view is unmapped its address
+            // range is a placeholder, and reading it on the CPU (as a comparison against it
+            // would) faults - which is exactly what the placed buffer must not do.
+            let expected: Vec<u8> = std::slice::from_raw_parts(start as *const u8, len as usize).to_vec();
             let mut old = 0;
             assert_ne!(
                 mem::VirtualProtect(views[0].Value, 256, mem::PAGE_READONLY, &mut old),
@@ -398,14 +404,11 @@ mod tests {
                 "the title's view can be unmapped under the heap"
             );
             let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
-            assert!(
-                got == std::slice::from_raw_parts(start as *const u8, len as usize),
-                "the card still reads the section's pages after the title's view went"
-            );
+            assert!(got == expected, "the card still reads the section's pages after the title's view went");
             // The section going away does not take the placed buffer's own view with it.
             crate::port::section_gone(section as usize);
             let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
-            assert!(got == std::slice::from_raw_parts(start as *const u8, len as usize), "the placed buffer keeps its pages");
+            assert!(got == expected, "the placed buffer keeps its pages");
             drop((placed, second));
             forget(base as usize, 8 * K);
             assert!(mem::UnmapViewOfFile2(process, views[0], mem::MEM_PRESERVE_PLACEHOLDER) != 0, "the title's own view can be unmapped");

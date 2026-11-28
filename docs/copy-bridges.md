@@ -521,81 +521,64 @@ memory, at any address. It is behind its own switch, off by default.
 
 
 
-## 16. Phase 6: the removal, the copies that remain, and the end state
 
-### 16.1 Removed: the per-placement duplication of the page-pool view
+## 17. Verification
 
-The Phase 3 prototype opened one view of the section run and one heap for every placed copy. Its
-replacement is a shared region: `inplace` keeps one `SectionView` and one heap per title run of a
-section (`REGIONS`), and the placements whose addresses fall in the run place their buffers into
-that heap at their offsets. A run is forgotten when the title shows other pages there
-(`forget_regions`, called from `title_memory_freeing`), and the view stays mapped while any placed
-buffer holds it - the same refcounted lifetime as before, now one per run instead of one per copy.
-The WARP test places two copies in one run and asserts they share the region, then that the title
-showing other pages forgets it. Opening a heap locks its pages, so a run larger than 512 MiB is
-still cut to the placement that asked for it (`REGION_MOST`); the in-place byte cap is the same.
+The project has no NVIDIA hardware here. What follows is what the software adapter (WARP) and a
+local Windows experiment establish, and what they cannot.
 
-The port keeps its own older region policy (sub-4-GiB graphics heap, its own caps and statistics).
-It has used the shared `SectionView` since Phase 2; unifying its region bookkeeping with the
-general one is a follow-up, not a copy bridge.
+### 17.1 The section-view question, settled
 
-### 16.2 The copy bridges that remain, and why
+The page-pool prototype rests on two properties of a heap opened on our own view of a section:
+that the title's own views may change under it, and that the section's committed pages are not
+lost when they do. Both were checked:
 
-- **Carded copies of title buffers and windows** (CPU staging -> per-submission sends -> device-local
-  side, hash twins, on-card compare, fetch and merge): required by the VRAM memory class; replacing
-  them with GPU access to title system memory would be a memory-class downgrade. Unchanged, and
-  still what the product launcher asks for (`VICTORY_CARD_BUFFERS_MIN_KB=64`).
-- **System-memory mirrors of memory that cannot be opened**: scattered or holed view memory (no
-  multi-run composition yet), reserved/guarded/decommitted private memory, runs over the in-place
-  caps, runs without `ID3D12Device13`, and every copy the policy places while a placement is
-  refused. These are the fallback of the direct path and the whole path with the switches off.
-- **By-address shader memory** (arenas, directory, faults): raw-address shaders need a GPU address
-  that a title CPU address can never be; a device-local arena redesign is unresolved and out of
-  scope.
-- **Textures**: the console's tiled/mip-packed layouts, format stand-ins, and the row-major
-  single-level rule for a texture in an opened heap leave only a layout-equal linear subset as
-  plausible direct access; that needs a layout census and a WARP/NVIDIA probe first. The mirror,
-  detiling staging and texture read-backs stay for everything else.
-- **Render targets, depth and UAV textures**: the host copy is the contents' authority and PC target
-  and depth semantics plus the depth+UAV refusal require it; a layout- and format-compatible
-  subset is future work, not this project.
-- **Depth twins and the plane pass**: required by the PC's depth+UAV restriction and the missing
-  24-bit colour format.
-- **D3D12 infrastructure**: descriptor heaps (a mirror of the title's CPU descriptor bytes, with no
-  API to back them with application memory), the descriptor-stride table, command allocators and
-  lists, PSOs/root signatures/command signatures, the swap chain and present path, indirect
-  clamping, per-draw CPU-written scratch, the residency probe, the layer's UI, frame generation and
-  keep-awake. A direct-access migration cannot remove these; they are the documented required set.
-- **The title's own CPU copies and fills**: the title's commands executed on its memory; the layer's
-  job is their ordering, and placed writes are now declared and ordered like a copy's.
-- **Off-by-default experiments now superseded for openable memory**: the second system-memory sides
-  (`VICTORY_CARD_ALL`, `VICTORY_WINDOWS_OWN`), CPU-mapped VRAM (`VICTORY_SEND_BAR`,
-  `VICTORY_WINDOWS_BAR_MB`, `VICTORY_WC_BAR`) and the legacy in-place levels 1 and 2. They are kept
-  as switches because removing them is a policy decision that needs a hardware A/B; the fallback
-  substitution gives the same or better behaviour wherever the memory is openable.
+- A local Windows experiment (this development machine) maps two views of a `SEC_RESERVE`
+  section, commits the pages through the first and queries the second: the commit is shared (both
+  views report `MEM_COMMIT`), and after the committing view is unmapped the other still reports
+  `MEM_COMMIT`. A section page's commit belongs to the section, not to a view.
+- The port's WARP test now exercises it end to end: with a heap standing on our view, it makes one
+  title view read-only, unmaps another, and the placed buffer still reads the section's pages
+  through the heap; then it closes the section and the placed buffer still reads them. (The first
+  version of the test died with an access violation - not in the placement code, but because its
+  assertion compared the GPU's bytes against title memory it had just unmapped, which faults as it
+  should. The bytes are saved before the unmap now. The fault was the test's; it is recorded here
+  so the same "proof" is not attempted twice.)
 
-### 16.3 The end state
+### 17.2 What was run, and the results
 
-The project delivers, relative to the agreed base:
+GitHub Actions `windows-latest` (WARP), through temporary `ci/**` branches on the authorized
+fork whose only extra file is the test workflow (the arrangement the earlier RAM/VRAM work used;
+nothing is pushed to the NVIDIA target repository and no PR is opened):
 
-- a complete, sourced audit of the copy bridges and their classification (`docs/copy-bridges.md`);
-- backing-storage and admission invariants, so a direct placement is chosen on the same evidence as
-  the system-memory fallback it replaces, with the failure paths counted (`inplace::openability`,
-  `card_admission`/`window_admission`, the placement ledger, the exact placed-copy invalidation);
-- a working, switchable page-pool placement (`VICTORY_INPLACE_VIEW`) that opens our own view of a
-  section run at any address, shares it across placements, and keeps the title's own views, free,
-  decommit and protect calls untouched;
-- the migration policy for the refused system-memory copies of title buffers, windows and view
-  bytes (`VICTORY_INPLACE=3` for private memory, `VICTORY_INPLACE_VIEW=1/2` for page-pool
-  memory), with the mirror as the fallback and every refusal counted;
-- placed shader writes declared to the copy machinery, so the late waits order CPU readers behind
-  them; and the title's free/decommit/protect and section-close paths wired to let placed copies go
-  before the kernel call;
-- tests on the software adapter for the placement mechanics, the ordering declaration, the view
-  ownership and section lifetime, the invalidation and the policy matrix; and no default change:
-  the product path behaves as at the base until a hardware-validated run enables the switches.
+| Run | Branch / commit | Result |
+|---|---|---|
+| Baseline (recorded by the earlier work) | `63b902f`, run 46122898345 | build check PASS; tests **452 passed, 1 failed, 36 ignored** |
+| This branch, final | `ci/copy-bridges-final-fixed` = the final source tip | build check PASS; tests **[FILL: final run result]** |
+| Intermediate runs | the same branch before the last two test fixes | the placement tests passed; two test-only defects were found and fixed: a startup-warning unit test still asserted the old `VICTORY_INPLACE` level semantics, and the new port test read unmapped title memory in an assertion (the access violation above) |
 
-What is needed before any of it becomes a default is stated in section 11: target-driver behaviour,
-pinning cost and coherency, the openable share of the real title memory (the census), the cost of
-GPU access to title memory against the copies it replaces, and device-removal behaviour. The
-switches and the startup warnings are the way to measure that without changing the product path.
+Local checks (Windows, Rust 1.98.1 x86_64-pc-windows-gnu, `CARGO_TARGET_DIR` outside the tree):
+
+- `cargo check --workspace --all-targets --locked`: PASS.
+- `cargo check --workspace --all-targets --all-features --locked`: PASS (the CI build check runs
+  the same command).
+- `cargo clippy -p victory-gpu -p victory-hle --all-targets --locked -- -D warnings`: the only
+  failure is the pre-existing `clippy::manual_is_multiple_of` in `shadow.rs`, unchanged from the
+  base; `cargo test` cannot link locally (GNU raw-dylib needs a working `dlltool`), so the tests
+  run on CI as documented.
+
+New tests added by this project (all on the software adapter, all pass): the openability
+predicate, the refcounted section view's last-holder unmap and section lifetime, the page-pool
+placement (data both ways across two title views, a title view reprotected and unmapped under the
+heap, the shared region and its forget, the section close), the placed-copy invalidation among
+many copies, the placed-write declaration to a host list, the direct-backing accounting and
+refusal reasons, and the fallback policy matrix.
+
+### 17.3 What the results do not establish
+
+Still requiring the target NVIDIA driver and hardware: opened-heap acceptance, physical residency
+and pinning cost on that driver, coherency of GPU access to title system memory, PCIe cost against
+the copies replaced, the openable share of the real title memory (the in-place census has never
+been recorded on a run), WDDM paging, and device-removal/TDR behaviour. WARP is not equivalent
+hardware, and `GetHeapProperties`/the WARP probe report the API's answer, not physical placement.
+The switches remain off by default; section 16.3 states what a hardware run must establish.
