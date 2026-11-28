@@ -1567,18 +1567,23 @@ pub(crate) fn make_waiting() {
 /// counts them). So is one any of whose slots a draw's table showed after
 /// frame `cutoff` (the second result counts them): a texture drawn through
 /// a table every frame never asks for its host copy again, so its last use
-/// is old although it is on screen.
+/// is old although it is on screen. The fourth result: with
+/// `VICTORY_SAMPLED_MARKS=1`, the textures left out for the third reason
+/// that no shader marked since `cutoff` through any of their slots, and no
+/// table showed (`crate::sampled`): those eviction could take if it trusted
+/// the marks.
 #[cfg(windows)]
 #[allow(clippy::type_complexity)]
 pub(crate) fn evictable_slots(
     raws: &std::collections::HashMap<usize, usize>,
     frame: u64,
     cutoff: u64,
-) -> (std::collections::HashMap<usize, Vec<(usize, u32)>>, u64, u64) {
+) -> (std::collections::HashMap<usize, Vec<(usize, u32)>>, u64, u64, Vec<usize>) {
     let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
     let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32)>> = std::collections::HashMap::new();
     let mut blocked = std::collections::HashSet::new();
     let mut seen = std::collections::HashSet::new();
+    let mut sampled = std::collections::HashSet::new();
     {
         // (The heaps stay while the lock is held: `mirror`.)
         let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -1591,6 +1596,9 @@ pub(crate) fn evictable_slots(
                 if lately {
                     seen.insert(raw);
                 }
+                if crate::sampled::sampled_since(index, cutoff).unwrap_or(true) {
+                    sampled.insert(raw);
+                }
                 if ok {
                     by_texture.entry(raw).or_default().push((at, index));
                 } else {
@@ -1600,11 +1608,17 @@ pub(crate) fn evictable_slots(
         }
     }
     let kept = seen.iter().filter(|raw| !blocked.contains(raw)).count() as u64;
+    let cold = blocked
+        .iter()
+        .filter(|raw| !sampled.contains(raw) && !seen.contains(raw))
+        .filter_map(|raw| raws.get(raw).copied())
+        .collect();
     by_texture.retain(|raw, _| !blocked.contains(raw) && !seen.contains(raw));
     (
         by_texture.into_iter().filter_map(|(raw, slots)| Some((*raws.get(&raw)?, slots))).collect(),
         kept,
         blocked.len() as u64,
+        cold,
     )
 }
 

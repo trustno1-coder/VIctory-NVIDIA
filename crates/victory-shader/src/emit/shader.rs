@@ -61,6 +61,15 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// With `VICTORY_SAMPLED_MARKS=1`: the root UAV `u<SLOT_SAMPLED>` in
+/// [`ROOT_CBV_SPACE`], one bit per view heap slot ([`SAMPLED_MARKS`]
+/// dwords), set by every texture read or sample through a slot picked from
+/// the heap. The host reads from it which of the textures shaders pick by
+/// index they use.
+pub const SLOT_SAMPLED: u8 = 251;
+/// Dwords of the [`SLOT_SAMPLED`] buffer: a bit for each of 2^22 slots
+/// (the largest host view heap, raw twins included).
+pub const SAMPLED_MARKS: u32 = 1 << 17;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// In a directory entry's first dword: shaders do not store there by address

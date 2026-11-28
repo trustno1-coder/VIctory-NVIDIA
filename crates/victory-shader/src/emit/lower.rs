@@ -304,6 +304,12 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    /// The title's heap index of each texture handle made from the heap,
+    /// for [`Lower::mark_sampled`].
+    heap_indices: HashMap<V, V>,
+    /// Texture handles the image instruction being lowered read, marked
+    /// after it.
+    pending_marks: Vec<V>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
@@ -1439,6 +1445,24 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`sampled_marks_on`] for a test's thread alone.
+    pub(crate) static SAMPLED_MARKS_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_SAMPLED_MARKS=1` (off by default): texture reads and samples
+/// through a slot picked from the heap set that slot's bit in
+/// [`super::shader::SLOT_SAMPLED`].
+pub fn sampled_marks_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = SAMPLED_MARKS_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLED_MARKS").is_some_and(|v| v == "1"))
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -2048,6 +2072,8 @@ impl<'a> Lower<'a> {
                 m
             },
             handles: HashMap::new(),
+            heap_indices: HashMap::new(),
+            pending_marks: Vec::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -6201,7 +6227,15 @@ impl<'a> Lower<'a> {
                     .bvh(inst, b, i)
                     .map_err(|why| unsupported(offset, why));
             }
-            Fields::Image { .. } => self.image(inst, b, i),
+            Fields::Image { .. } => {
+                let done = self.image(inst, b, i);
+                // After the instruction: `image` emits into the block it
+                // began in, and a mark branches.
+                for h in std::mem::take(&mut self.pending_marks) {
+                    self.mark_sampled(h);
+                }
+                done
+            }
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
             Fields::Ds { .. } => self.ds(inst, b, i),
@@ -8006,6 +8040,56 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// [`super::shader::Shader::heap_handle_at`] in the current block; with
+    /// [`sampled_marks_on`], a texture's heap index is kept for
+    /// [`Lower::mark_sampled`].
+    fn heap_handle_noted(&mut self, index: V, sampler: bool, per_lane: bool, props: (u32, u32), bounded: bool) -> V {
+        let h = self.s.heap_handle_at(self.cur, index, sampler, per_lane, props, bounded);
+        // A texture (kinds 1 to 9) that is read, not written (no UAV bit).
+        let texture = matches!(props.0 & 0xff, 1..=9) && props.0 & 0x1000 == 0;
+        if !sampler && !bounded && texture && sampled_marks_on() {
+            self.heap_indices.insert(h, index);
+        }
+        h
+    }
+
+    /// With [`sampled_marks_on`]: sets the bit of the heap slot that texture
+    /// handle `h` was picked from in [`super::shader::SLOT_SAMPLED`]. The
+    /// dword is read first, and the atomic OR runs only for a bit not set
+    /// yet: every pixel of a draw reads the same slot, and an atomic on one
+    /// address from all of them would queue at the card's cache. A lane that
+    /// does not run marking a slot only keeps a texture longer.
+    fn mark_sampled(&mut self, h: V) {
+        use super::shader::{SAMPLED_MARKS, SLOT_SAMPLED};
+        let Some(&index) = self.heap_indices.get(&h) else {
+            return;
+        };
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let marks = self.s.root_uav_handle(SLOT_SAMPLED);
+        let c = self.cur;
+        let (k5, k31, k2, one) = (self.s.m.i32(5), self.s.m.i32(31), self.s.m.i32(2), self.s.m.i32(1));
+        let last = self.s.m.i32(SAMPLED_MARKS - 1);
+        let word = self.s.m.bin(c, Bin::LShr, index, k5);
+        let word = self.s.m.bin(c, Bin::And, word, last);
+        let byte = self.s.m.bin(c, Bin::Shl, word, k2);
+        let shift = self.s.m.bin(c, Bin::And, index, k31);
+        let bit = self.s.m.bin(c, Bin::Shl, one, shift);
+        let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(1), self.s.m.i32(4));
+        let r = self
+            .s
+            .op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[marks, byte, iu, mask, align]);
+        let was = self.s.m.extract(c, r, 0);
+        let was = self.as_int(was);
+        let has = self.s.m.bin(c, Bin::And, was, bit);
+        let zero = self.s.m.i32(0);
+        let missing = self.s.m.cmp(c, pred::EQ, has, zero);
+        let at = self.begin_guarded(Some(missing));
+        let or = self.s.m.i32(2);
+        self.s
+            .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[marks, or, byte, iu, iu, bit]);
+        self.end_guarded(at, &[]);
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -8025,9 +8109,7 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
-                let h = self
-                    .s
-                    .heap_handle_at(self.cur, index, sampler, per_lane, props, bounded);
+                let h = self.heap_handle_noted(index, sampler, per_lane, props, bounded);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -8075,7 +8157,7 @@ impl<'a> Lower<'a> {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
                 let (index, bounded) = self.raw_twin(src, phi, sampler, props);
-                Ok(self.s.heap_handle_at(self.cur, index, sampler, false, props, bounded))
+                Ok(self.heap_handle_noted(index, sampler, false, props, bounded))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -8094,7 +8176,7 @@ impl<'a> Lower<'a> {
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
-                Ok(self.s.heap_handle_at(self.cur, index, sampler, false, props, bounded))
+                Ok(self.heap_handle_noted(index, sampler, false, props, bounded))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
@@ -8102,7 +8184,7 @@ impl<'a> Lower<'a> {
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
-                Ok(self.s.heap_handle_at(self.cur, index, sampler, true, props, bounded))
+                Ok(self.heap_handle_noted(index, sampler, true, props, bounded))
             }
         }
     }
@@ -11870,6 +11952,9 @@ impl<'a> Lower<'a> {
             return Err("sampling a UAV");
         }
         let h = self.handle(site, src, false, props)?;
+        if !uav {
+            self.pending_marks.push(h);
+        }
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
         // A gather at a named level, done as four texel reads (below).

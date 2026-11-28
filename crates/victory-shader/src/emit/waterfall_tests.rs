@@ -176,6 +176,22 @@ fn lanes_sample_the_texture_their_if_else_arm_chose() {
     }
 }
 
+/// With `VICTORY_SAMPLED_MARKS=1` a sample through a slot picked from the
+/// heap marks the slot in our root UAV, and the shader still validates
+/// (`build`); without it there is no such view.
+#[test]
+fn a_picked_texture_marks_its_slot_with_sampled_marks() {
+    use super::shader::SLOT_SAMPLED;
+    use crate::resource::tests::WATERFALL_JOINED_MIXED_WAVE32;
+    let off = build(WATERFALL_JOINED_MIXED_WAVE32, false);
+    assert!(!off.root_uavs.contains(&SLOT_SAMPLED));
+    super::lower::SAMPLED_MARKS_HERE.set(Some(true));
+    let on = build(WATERFALL_JOINED_MIXED_WAVE32, false);
+    super::lower::SAMPLED_MARKS_HERE.set(None);
+    assert!(on.root_uavs.contains(&SLOT_SAMPLED));
+    assert_ne!(on.dxil, off.dxil);
+}
+
 #[test]
 fn lanes_sample_the_texture_their_arm_loaded_or_picked() {
     use crate::resource::tests::WATERFALL_JOINED_MIXED_WAVE32;

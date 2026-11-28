@@ -2628,10 +2628,17 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     if copies.is_empty() {
         return;
     }
-    let (slots, kept, blocked) = crate::descriptor::evictable_slots(&raws, frame, cutoff);
+    let (slots, kept, blocked, cold) = crate::descriptor::evictable_slots(&raws, frame, cutoff);
     SLOT_STATE[3].store(raws.len() as u64, Relaxed);
     SLOT_STATE[2].store(blocked, Relaxed);
     SLOT_STATE[1].store(kept, Relaxed);
+    {
+        let cold: std::collections::HashSet<usize> = cold.into_iter().collect();
+        let bytes: u64 = copies.iter().filter(|c| cold.contains(&c.0)).map(|c| c.2).sum();
+        crate::sampled::COLD[0].store(blocked, Relaxed);
+        crate::sampled::COLD[1].store(cold.len() as u64, Relaxed);
+        crate::sampled::COLD[2].store(bytes, Relaxed);
+    }
     copies.retain(|&(at, ..)| slots.contains_key(&at));
     let (mut n, mut bytes) = (0u64, 0u64);
     for at in oldest_covering(copies, need) {

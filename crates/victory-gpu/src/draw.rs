@@ -2139,6 +2139,21 @@ impl State {
                     }
                     continue;
                 }
+                if slot == victory_shader::emit::SLOT_SAMPLED {
+                    // Ours: where shaders mark the texture slots they read.
+                    if let Some(gpu) = crate::sampled::gpu() {
+                        // SAFETY: an open list; the buffer lives as long as
+                        // the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let address = match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::View(address)) => Some(address),
                     _ => {
