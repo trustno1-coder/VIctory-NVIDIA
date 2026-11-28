@@ -170,8 +170,9 @@ if (-not (Test-Path $victory)) {
     if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
-# Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
+# Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise),
+# the same names as KEPT in apps/victory/src/play.rs (#751).
+$paths = 'VICTORY_HOME', 'VICTORY_ADAPTER', 'VICTORY_LOG', 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
