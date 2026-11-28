@@ -81,6 +81,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(test)]
+mod census_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
