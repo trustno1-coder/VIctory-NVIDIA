@@ -2698,7 +2698,7 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
-    /// The pipelines [`HostList::bind_pipeline`] kept, by address.
+    /// The pipelines and root signatures [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
@@ -7565,7 +7565,7 @@ impl HostList {
 
     /// The list binds a pipeline: it and its root signature are kept until
     /// the list is reset, and its name noted, the first time only (a kept
-    /// pipeline's address names no other).
+    /// object's address names no other).
     pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
         {
             let mut deferred = self.deferred();
@@ -7573,9 +7573,16 @@ impl HostList {
                 return;
             }
             deferred.kept.push(pso.clone().into());
-            deferred.kept.push(root.clone().into());
+            if deferred.bound.insert(root.as_raw() as usize) {
+                deferred.kept.push(root.clone().into());
+            }
         }
         self.used_pipeline(name);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kept_len(&self) -> usize {
+        self.deferred().kept.len()
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
