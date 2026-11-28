@@ -1655,6 +1655,10 @@ impl State {
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
+        // The first part of a dispatch ([`dispatch_parts`]), or no dispatch.
+        if kind == victory_shader::emit::USER_GROUP_BASE {
+            return 0;
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
@@ -3767,8 +3771,28 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        if y > HOST_GROUPS || z > HOST_GROUPS {
+            once!(x, y, z, "a dispatch of more groups in y or z than the host runs");
+        }
+        // The console runs more groups in x than the host does at once: the
+        // host runs such a dispatch in parts, the program's group x starting
+        // at each part's first group (`USER_GROUP_BASE`, 0 as bound). A
+        // program that does not read its group x runs alike in every part.
+        let base = compute_word(p, victory_shader::emit::USER_GROUP_BASE);
+        for (first, count) in dispatch_parts(x) {
+            // SAFETY: an open list with everything set; the parameter and
+            // dword are the pipeline's.
+            unsafe {
+                if let Some((param, word)) = base.filter(|_| first > 0) {
+                    list.list.SetComputeRoot32BitConstant(param, first, word);
+                }
+                list.list.Dispatch(count, y, z);
+            }
+        }
+        if let Some((param, word)) = base.filter(|_| x > HOST_GROUPS) {
+            // SAFETY: as above; the next dispatch starts at group 0.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -5466,6 +5490,18 @@ fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
     std::array::from_fn(|i| threads[i].div_ceil(size[i]))
 }
 
+use victory_shader::emit::HOST_GROUPS;
+
+/// The parts a dispatch of `x` groups in x runs in on the host: each part's
+/// first group and its count, at most [`HOST_GROUPS`]; one empty part for
+/// none. (Marvisak/VIctory#3086.)
+fn dispatch_parts(x: u32) -> impl Iterator<Item = (u32, u32)> {
+    (0..x.div_ceil(HOST_GROUPS).max(1)).map(move |i| {
+        let first = i * HOST_GROUPS;
+        (first, (x - first).min(HOST_GROUPS))
+    })
+}
+
 /// Where a compute pipeline's user data has a word the host computes: the
 /// root parameter and the dword in it.
 fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
@@ -5478,6 +5514,23 @@ fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod thread_tests {
     use super::*;
+
+    /// A dispatch of more groups in x than the host runs at once is run in
+    /// parts of at most 65,535 that together cover each group once.
+    #[test]
+    fn large_dispatches_run_in_parts() {
+        let parts = |x| dispatch_parts(x).collect::<Vec<_>>();
+        assert_eq!(parts(0), [(0, 0)]);
+        assert_eq!(parts(100), [(0, 100)]);
+        assert_eq!(parts(65_535), [(0, 65_535)]);
+        assert_eq!(parts(65_536), [(0, 65_535), (65_535, 1)]);
+        assert_eq!(parts(115_200), [(0, 65_535), (65_535, 49_665)]);
+        let all = parts(u32::MAX);
+        assert!(all.iter().all(|&(_, n)| n <= HOST_GROUPS));
+        assert!(all.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0), "parts follow each other");
+        let last = all.last().unwrap();
+        assert_eq!(last.0 + last.1, u32::MAX);
+    }
 
     #[test]
     fn threads_are_counted_in_the_programs_groups() {

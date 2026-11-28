@@ -99,6 +99,16 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host sets at a dispatch:
+/// the first group (in x) of the part of the dispatch it runs, 0 as bound. A
+/// compute program's group x adds it: the console runs more than 65,535
+/// groups in x at once, the host at most [`HOST_GROUPS`], so the host runs
+/// a larger dispatch in parts. (Marvisak/VIctory#3086, after
+/// DexNom/VIctory 570a941.)
+pub const USER_GROUP_BASE: u32 = 0x107;
+/// The most groups in one dimension the host runs in one dispatch
+/// (`D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION`).
+pub const HOST_GROUPS: u32 = 65_535;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

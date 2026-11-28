@@ -780,6 +780,62 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
     }
 }
 
+/// A program's group x adds the first group of the part of a dispatch the
+/// host runs (`USER_GROUP_BASE`, a dword the host sets past the console's
+/// user data): two groups run with base 3 count as groups 3 and 4. The
+/// host runs at most 65,535 groups in x at once and a larger dispatch in
+/// parts (Marvisak/VIctory#3086).
+#[test]
+fn group_x_starts_at_the_dispatch_part() {
+    // Each of a group's 64 lanes adds 1 to counter[group x]. The group id is
+    // in s5 (after five user SGPRs), taken before the address's high half
+    // goes there.
+    let mut native = native_of(&[], false, 64);
+    let words = [
+        0x7E06_0205, // v_mov_b32 v3, s5: the group id
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+        125 << 25,   // s_load_dwordx4 s[8:11], s[4:5], 0
+        0x3402_0682, // v_lshlrev_b32 v1, 2, v3
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xE0C8_1000, 0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
+        S_ENDPGM,
+    ];
+    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    native.io = StageIo::Cs(ComputeIo { rsrc2: 5 << 1 | 1 << 7, threads: [64, 1, 1] });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let shader = lowered(&native, &p, &HashSet::new()).unwrap();
+    let base = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_GROUP_BASE))
+        .expect("a program that reads its group x reads the part's first group");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else { continue };
+        for first in [0u32, 3] {
+            let mut constants = vec![0; shader.user_data_dwords() as usize];
+            constants[base.index as usize] = first;
+            let result = host
+                .dispatch(&root, &pso, &Dispatch {
+                    roots: vec![(0, Root::Constants(constants))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [2, 1, 1],
+                })
+                .unwrap();
+            for (g, &word) in result[0].iter().enumerate().take(16) {
+                let want = if g as u32 == first || g as u32 == first + 1 { 64 } else { 0 };
+                assert_eq!(word, want, "warp {warp}, first group {first}, counter {g}");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no device ran the program");
+}
+
 /// The wave size a lowering of `native` at a host of 32-lane waves asks for, and the shader.
 fn lowered_with_wave(
     native: &NativeProgram,
