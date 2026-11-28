@@ -152,8 +152,25 @@ struct MouseCapture {
 static MOUSE_CAPTURE: std::sync::LazyLock<Mutex<MouseCapture>> =
     std::sync::LazyLock::new(|| Mutex::new(MouseCapture::default()));
 
+/// The mouse is captured for the mouse device (`VICTORY_MOUSE_CAPTURE=1`) or
+/// for the stand-in pad's right stick (`VICTORY_KBM_GTA=1`).
+fn capture_wanted() -> bool {
+    enabled("VICTORY_MOUSE_CAPTURE") || super::gameinput::kbm_gta()
+}
+
+/// The cursor goes back to the window's centre after each sample
+/// (`VICTORY_MOUSE_WARP=1`); with `VICTORY_KBM_GTA=1` unless `=0`, since a
+/// camera turned by the mouse stops at the edge of a clipped cursor.
+fn warp_wanted() -> bool {
+    match std::env::var_os("VICTORY_MOUSE_WARP") {
+        Some(v) if v == "1" => true,
+        Some(v) if v == "0" => false,
+        _ => super::gameinput::kbm_gta(),
+    }
+}
+
 fn capture_mouse(hwnd: HWND, active: bool) {
-    if !enabled("VICTORY_MOUSE_CAPTURE") { return; }
+    if !capture_wanted() { return; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: runs on the window thread; local geometry, balanced cursor count.
     unsafe {
@@ -186,7 +203,7 @@ fn capture_mouse(hwnd: HWND, active: bool) {
 }
 
 pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
-    if !enabled("VICTORY_MOUSE_CAPTURE") { return None; }
+    if !capture_wanted() { return None; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: sampling and warping serialize with capture/focus messages.
     unsafe {
@@ -194,8 +211,7 @@ pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
         let mut point = POINT::default();
         if wm::GetCursorPos(&mut point) == 0 { state.reference = None; return None; }
         let point = (point.x, point.y);
-        let warp = std::env::var_os("VICTORY_MOUSE_WARP").is_some_and(|v| v == "1");
-        let warped = (warp && wm::SetCursorPos(state.center.0, state.center.1) != 0)
+        let warped = (warp_wanted() &&wm::SetCursorPos(state.center.0, state.center.1) != 0)
             .then_some(state.center);
         Some(mouse_motion(&mut state.reference, point, warped))
     }
@@ -536,7 +552,7 @@ mod tests {
 
     #[test]
     fn mouse_reference_handles_focus_reset_and_warp() {
-        if !enabled("VICTORY_MOUSE_CAPTURE") { assert_eq!(captured_mouse_delta(), None); }
+        if !capture_wanted() { assert_eq!(captured_mouse_delta(), None); }
         let mut reference = None;
         assert_eq!(mouse_motion(&mut reference, (480, 390), None), (0, 0));
         assert_eq!(mouse_motion(&mut reference, (500, 400), None), (20, 10));

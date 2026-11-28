@@ -101,6 +101,14 @@
   it): DLSS, frame generation, frame rate cap and more.
 - **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
   memory numbers).
+- **GTA V keys and mouse**, off by default: **F1, GTA V KEYS AND MOUSE, ON**,
+  then restart (or `VICTORY_KBM_GTA=1`). The mouse turns the camera (it is
+  captured while the game is in front; Alt+Tab lets it go), left button fires,
+  right button aims, middle looks behind. W/A/S/D move, Shift sprints, Space
+  jumps, R reloads, F enters vehicles, Tab weapon wheel, Q cover, Ctrl crouch,
+  C look behind, E interact, V camera, Z minimap, M phone, Esc or P pause;
+  I/J/K/L still turn the camera. `VICTORY_MOUSE_SENS=2` turns faster,
+  `VICTORY_MOUSE_INVERT_Y=1` inverts.
 
 **Building it yourself instead**
 
