@@ -41,6 +41,10 @@ param(
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
     [ValidateRange(1, 1000)][int]$Fps = 1000,
+    # -Fps also gives the title its own frame rate (VICTORY_FRAME_INTERVAL_MS), so that its simulation steps by the
+    # time that passed: with only our clock faster, each frame still moved game time 1/30 s and above 30 fps the game
+    # ran fast. -FixedStep: our clock alone (VICTORY_FRAME_INTERVAL_US), as before.
+    [switch]$FixedStep,
     # Every shader and the loading pipelines made first (`victory preload`), then the game; the F1 menu's
     # PRELOAD SHADERS starts this again with it.
     [switch]$Preload,
@@ -97,6 +101,10 @@ $settings = @{
     VICTORY_LEAVE_OUT = '02384a60fda6f2d0,731a39171b568298'
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
     VICTORY_PIPELINE_BOOK = '1'
+    # Pipelines the library cannot hold are made again every start: 12 makers at normal priority and no slow limit
+    # finish them before the world (38-46 s, not 170 s). Intro cutscene 18.5 -> 26-27 FPS, no half-second stalls.
+    # The wait stays at 500 ms: at 50 ms a pass a face needs is dropped.
+    VICTORY_PIPELINE_LOWEST = '0'; VICTORY_PIPELINE_WORKERS = '12'; VICTORY_PIPELINE_SLOW = '0'
     # Memory stack (skornuta): unused texture slots given back, old allocators taken anew, small buffers packed
     VICTORY_SLOT_EVICT = '1'
     VICTORY_ALLOCATOR_TRIM = '1'
@@ -138,7 +146,13 @@ if ($FgType -ne 'dlss' -and ($FrameGen -or ($FrameGenReady -and -not $NoFrameGen
     if (-not $settings.VICTORY_FRAMEGEN_X) { $settings.VICTORY_FRAMEGEN_X = if ($FrameGen) { [string]$timesWanted } else { '0' } }
     if (-not $settings.VICTORY_TEXTURE_ROOM_PERCENT) { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }
 }
-if ($fpsWanted -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
+if ($FixedStep) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
+elseif ($fpsWanted -ge 1000) {
+    # No wait of ours, and the title told 59 (not its "no limit", which halves a per-frame scale of its own):
+    # real speed from 15 to 59 rendered frames a second, measured 0.985x at 30-36.
+    $settings.VICTORY_FRAME_INTERVAL_MS = '0'; $settings.VICTORY_TITLE_FPS = '59'
+}
+else { $settings.VICTORY_FRAME_INTERVAL_MS = ([math]::Round(1000 / $fpsWanted, 3)).ToString([Globalization.CultureInfo]::InvariantCulture) }
 foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
@@ -155,7 +169,7 @@ $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })$(if ($FixedStep) { ' -FixedStep' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
