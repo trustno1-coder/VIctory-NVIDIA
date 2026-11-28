@@ -713,7 +713,7 @@ pub(crate) extern "system" fn create_stream(
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
     let mut at = 0;
-    while at + 8 <= desc.size {
+    while desc.size.saturating_sub(at) >= 8 {
         // SAFETY: inside the stream the title passes.
         let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
         let Some((size, stage)) = subobject(kind) else {
@@ -724,10 +724,20 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if at.checked_add(size).is_none_or(|end| end > desc.size) {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                stream = desc.size,
+                "truncated pipeline subobject; the rest is ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8 (may be unaligned).
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -917,5 +927,83 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use crate::object::{S_OK, slot};
+
+    struct PipelineGuard(This);
+    impl PipelineGuard {
+        fn release_now(&mut self) -> u32 {
+            let ptr = std::mem::replace(&mut self.0, std::ptr::null());
+            if ptr.is_null() {
+                0
+            } else {
+                slot::<extern "system" fn(This) -> u32>(ptr, 0x10)(ptr)
+            }
+        }
+    }
+    impl Drop for PipelineGuard {
+        fn drop(&mut self) {
+            let _ = self.release_now();
+        }
+    }
+
+    fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
+        pipeline(p)
+            .shaders
+            .iter()
+            .map(|s| (s.stage, s.container.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn unaligned_stream_yields_its_shaders() {
+        let vs = [1u8, 2, 3, 4];
+        let mut backing = [0u64; 5];
+        // SAFETY: `backing` is 40 contiguous bytes; slicing at +1 leaves 39
+        // bytes and guarantees non-8-byte alignment.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), size_of_val(&backing))
+        };
+        let stream = &mut bytes[1..25];
+        assert_ne!(stream.as_ptr() as usize % 8, 0);
+        stream[0..4].copy_from_slice(&1u32.to_le_bytes());
+        stream[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
+        stream[16..24].copy_from_slice(&vs.len().to_le_bytes());
+
+        let desc = StreamDesc {
+            size: stream.len(),
+            stream: stream.as_ptr(),
+        };
+        let mut raw = std::ptr::null();
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut raw),
+            S_OK
+        );
+        let mut p = PipelineGuard(raw);
+        assert_eq!(shaders(p.0), [("vertex", vs.to_vec())]);
+        assert_eq!(p.release_now(), 0);
+    }
+
+    #[test]
+    fn truncated_shader_subobject_does_not_read_past_stream() {
+        let mut stream = [0u8; 16];
+        stream[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let desc = StreamDesc {
+            size: stream.len(),
+            stream: stream.as_ptr(),
+        };
+        let mut raw = std::ptr::null();
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut raw),
+            S_OK
+        );
+        let mut p = PipelineGuard(raw);
+        assert!(shaders(p.0).is_empty());
+        assert_eq!(p.release_now(), 0);
     }
 }

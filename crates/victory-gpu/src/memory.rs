@@ -1105,6 +1105,20 @@ pub(crate) fn ready(
     })
 }
 
+/// Drops the per-heap slot record when its host view heap is released.
+pub(crate) fn release_heap(key: usize) {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = guard.as_mut() {
+        m.heaps.remove(&key);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn has_heap(key: usize) -> bool {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().is_some_and(|m| m.heaps.contains_key(&key))
+}
+
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of
 /// one thread that stores a structure's compacted size) and when title memory
 /// has them, and the copies to a place of that size.
