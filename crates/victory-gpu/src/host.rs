@@ -455,6 +455,7 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        trim_spare_uploads();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -2413,6 +2414,225 @@ fn trim_spare_chunks() {
     drop(freed);
 }
 
+/// Whether the upload buffers of lists' copies ([`HostList::upload`]: the
+/// texels a title copy takes from a buffer, the zeros of a texture's new
+/// levels) are kept when their list is reset, for the next list that asks
+/// for one of their size, as the scratch chunks are ([`scratch_pool`])
+/// (`VICTORY_UPLOAD_POOL`, on; `0`: one made for each copy and let go at
+/// the reset, as before).
+///
+/// Each was memory of its own, made on the thread translating the list:
+/// made not resident, made resident ([`resident`]) and, with
+/// `VICTORY_CARD_STEPS=2` (memory the card may write, [`card_steps`]),
+/// waited for until mapped ([`mapped`], a copy queue's round trip). In an
+/// RTX 5070 Ti run (2026-11-28, with that switch) new memory was waited for
+/// 28,000 times, 22.7 s (the longest 1.8 s, the card's memory near its
+/// budget), and until mapped 25,000 times, 19.4 s; those lines do not say
+/// which memory, and these buffers are among the few made that often.
+/// A buffer kept is taken again only by a list recorded after its own was
+/// reset, which is after every submission of it finished
+/// ([`HostList::reset`]), and its bytes are written anew by whoever takes
+/// it.
+fn upload_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The size a list's upload buffer of `size` bytes is made at to be kept
+/// ([`upload_pool`]): a power of two from 64 KiB, so that the next of about
+/// that size finds it; `None` past 32 MiB (made at its size, not kept).
+fn upload_class(size: u64) -> Option<u64> {
+    const LEAST: u64 = 64 << 10;
+    const MOST: u64 = 32 << 20;
+    size.max(LEAST).checked_next_power_of_two().filter(|&class| class <= MOST)
+}
+
+/// The most bytes of upload buffers kept while no list holds them (the
+/// PC's memory), and the same with [`keep_freed`].
+const UPLOADS_MOST: u64 = 64 << 20;
+const UPLOADS_KEPT: u64 = 256 << 20;
+
+/// A list's upload buffer and its mapping.
+struct Upload {
+    buffer: ID3D12Resource,
+    data: usize,
+}
+
+// SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner at
+// a time.
+unsafe impl Send for Upload {}
+
+/// Upload buffers no list holds, of upload memory and of memory the card
+/// may write too ([`card_steps`]).
+static UPLOADS: [Mutex<Spare<Upload>>; 2] = [const { Mutex::new(Spare::new()) }; 2];
+
+/// Since the start: upload buffers of lists taken from those kept, and made
+/// to be kept.
+static UPLOADS_TAKEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A kept upload buffer of `class` bytes, or a new one; with `shared`,
+/// memory the card may write too.
+fn take_upload(host: &Host, class: u64, shared: bool) -> Option<Upload> {
+    let kept = UPLOADS[usize::from(shared)].lock().unwrap_or_else(|e| e.into_inner()).take(class);
+    let (upload, i) = match kept {
+        Some(upload) => (upload, 0),
+        None => {
+            let (buffer, data) = if shared { host.shared_buffer(class)? } else { host.upload_buffer(class)? };
+            name(&buffer, || format!("list upload {class:#x} (kept)"));
+            (Upload { buffer, data: data as usize }, 1)
+        }
+    };
+    let n = UPLOADS_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
+    if i == 0 && (n == 1 || n.is_multiple_of(10_000)) {
+        tracing::info!(
+            taken = n,
+            made = UPLOADS_TAKEN[1].load(Ordering::Relaxed),
+            "lists' upload buffers taken from those kept, since the start (VICTORY_UPLOAD_POOL=0: one made for each)"
+        );
+    }
+    Some(upload)
+}
+
+/// A list is done with `uploads` (size, whether shared): kept, or let go
+/// past the bytes kept.
+fn give_uploads(uploads: Vec<(Upload, u64, bool)>) {
+    if uploads.is_empty() {
+        return;
+    }
+    let limit = if keep_freed() && !crate::residency::limited_host_ram() { UPLOADS_KEPT } else { UPLOADS_MOST };
+    let mut freed = Vec::new();
+    for (upload, class, shared) in uploads {
+        let mut spare = UPLOADS[usize::from(shared)].lock().unwrap_or_else(|e| e.into_inner());
+        freed.extend(spare.give(upload, class, limit));
+    }
+    // Let go outside the locks.
+    drop(freed);
+}
+
+/// Drops the kept upload buffers when the PC's memory is pressured.
+fn trim_spare_uploads() {
+    for spare in &UPLOADS {
+        let freed = {
+            let mut spare = spare.lock().unwrap_or_else(|e| e.into_inner());
+            spare.bytes = 0;
+            spare.low = 0;
+            std::mem::take(&mut spare.kept)
+        };
+        drop(freed);
+    }
+}
+
+#[cfg(test)]
+mod upload_pool_tests {
+    use super::*;
+
+    /// Lists' upload buffers are kept at powers of two from 64 KiB, so the
+    /// next copy of about the same size finds one; the largest are not.
+    #[test]
+    fn kept_upload_buffers_come_in_powers_of_two() {
+        assert_eq!(upload_class(1), Some(64 << 10));
+        assert_eq!(upload_class(64 << 10), Some(64 << 10));
+        assert_eq!(upload_class((64 << 10) + 1), Some(128 << 10));
+        assert_eq!(upload_class(3 << 20), Some(4 << 20));
+        assert_eq!(upload_class(32 << 20), Some(32 << 20));
+        assert_eq!(upload_class((32 << 20) + 1), None);
+        assert_eq!(upload_class(u64::MAX), None);
+    }
+
+    /// A list that is done gives its upload buffers back, and the next
+    /// list that asks for one of that size gets one of them, mapped and
+    /// writable; one of another size is made.
+    #[test]
+    fn the_next_list_gets_the_upload_buffers_a_list_gave_back() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !upload_pool() {
+            return;
+        }
+        // A size no other test asks for: 16 MiB buffers.
+        let size = (8 << 20) + 1;
+        let first = host.new_list().unwrap();
+        let (buffer, data) = first.upload(host, size).unwrap();
+        // SAFETY: a mapped buffer of at least `size` bytes.
+        unsafe { std::ptr::write_bytes(data, 0xab, size as usize) };
+        let given = buffer.as_raw();
+        drop(buffer);
+        drop(first);
+        let second = host.new_list().unwrap();
+        let (again, data) = second.upload(host, size + 4096).unwrap();
+        assert_eq!(again.as_raw(), given, "the buffer the first list gave back");
+        // SAFETY: as above; the second list holds it.
+        unsafe { std::ptr::write_bytes(data, 0xcd, size as usize) };
+        let (other, _) = second.upload(host, size).unwrap();
+        assert_ne!(other.as_raw(), given, "one buffer, one list");
+    }
+
+    /// What a list's upload buffer costs the thread that records the copy:
+    /// made for it (upload memory, made resident; with
+    /// `VICTORY_CARD_STEPS=2` memory the card may write, made resident and
+    /// waited for until mapped), against one taken from those kept. With
+    /// `VICTORY_BENCH_BUSY=1` a thread beside it makes 64 MiB buffers all the
+    /// while, so the system pages as it does while a scene loads.
+    /// `cargo test --release -p victory-gpu --lib -- bench_list_upload_buffers --ignored --nocapture`
+    #[test]
+    #[ignore = "a bench: run it by hand"]
+    fn bench_list_upload_buffers() {
+        let Some(host) = host() else {
+            return;
+        };
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let busy = std::env::var_os("VICTORY_BENCH_BUSY").is_some_and(|v| v == "1");
+        std::thread::scope(|scope| {
+            if busy {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        drop(host.upload_buffer(64 << 20));
+                    }
+                });
+            }
+            const N: usize = 200;
+            let report = |what: &str, mut us: Vec<u64>| {
+                us.sort_unstable();
+                let mean = us.iter().sum::<u64>() as f64 / us.len() as f64;
+                println!(
+                    "{what:<44} mean {:>7.1} us  median {:>6} us  99th {:>6} us",
+                    mean,
+                    us[us.len() / 2],
+                    us[us.len() * 99 / 100]
+                );
+            };
+            for size in [64u64 << 10, 1 << 20, 8 << 20] {
+                for shared in [false, true] {
+                    let kind = if shared { "shared (CARD_STEPS=2)" } else { "upload" };
+                    let made: Vec<u64> = (0..N)
+                        .map(|_| {
+                            let began = std::time::Instant::now();
+                            let buffer = if shared { host.shared_buffer_now(size) } else { host.upload_buffer(size) };
+                            let us = began.elapsed().as_micros() as u64;
+                            drop(buffer.expect("a buffer"));
+                            us
+                        })
+                        .collect();
+                    report(&format!("{} KiB {kind}, made for each", size >> 10), made);
+                    let class = upload_class(size).unwrap();
+                    let kept: Vec<u64> = (0..N)
+                        .map(|_| {
+                            let began = std::time::Instant::now();
+                            let upload = take_upload(host, class, shared).expect("a buffer");
+                            let us = began.elapsed().as_micros() as u64;
+                            give_uploads(vec![(upload, class, shared)]);
+                            us
+                        })
+                        .collect();
+                    report(&format!("{} KiB {kind}, kept", size >> 10), kept);
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+}
+
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
@@ -2687,6 +2907,10 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Upload buffers kept for other lists once this one is reset
+    /// ([`upload_pool`]): the buffer, its size, whether it is memory the
+    /// card may write.
+    kept_uploads: Vec<(Upload, u64, bool)>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
     /// Title textures whose upload the list's prelude records if the check at
@@ -2745,6 +2969,14 @@ impl Deferred {
         self.uploads.push(buffer);
     }
 
+    /// As [`Deferred::hold_upload`], for a buffer kept after the reset.
+    fn hold_kept_upload(&mut self, upload: Upload, size: u64, shared: bool) {
+        ALIVE[6].fetch_add(1, Ordering::Relaxed);
+        ALIVE[7].fetch_add(size, Ordering::Relaxed);
+        self.upload_bytes += size;
+        self.kept_uploads.push((upload, size, shared));
+    }
+
     /// The steps recorded last write title memory: what was brought up to
     /// date before them is not any more.
     fn title_written(&mut self) {
@@ -2757,7 +2989,9 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        let kept = std::mem::take(&mut self.kept_uploads);
+        ALIVE[6].fetch_sub((self.uploads.len() + kept.len()) as u64, Ordering::Relaxed);
+        give_uploads(kept);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
 }
@@ -7533,6 +7767,7 @@ impl HostList {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
+                && deferred.kept_uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
@@ -7692,13 +7927,20 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// A mapped upload buffer of at least `size` bytes, alive until the
+    /// list is reset (and then kept for another list, [`upload_pool`]).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        let shared = card_steps::stage() > 1;
+        if upload_pool()
+            && let Some(class) = upload_class(size)
+        {
+            let upload = take_upload(host, class, shared)?;
+            let made = (upload.buffer.clone(), upload.data as *mut u8);
+            self.deferred().hold_kept_upload(upload, class, shared);
+            return Some(made);
+        }
+        let (buffer, data) = if shared { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
