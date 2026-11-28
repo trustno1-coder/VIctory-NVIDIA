@@ -25,9 +25,104 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        shell: bash
+        run: |
+          set -o pipefail
+          # One compilation job at a time: clippy-driver of the bigger crates
+          # runs the whole runner out of memory when they build in parallel,
+          # and the killed run's log just stops.
+          cargo clippy --workspace --all-targets --locked -j 1 -- -D warnings 2>&1 | tee /tmp/clippy.log || {
+            { echo '## Clippy (last 30000 bytes)'; echo '```'; tail -c 30000 /tmp/clippy.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            # The annotations carry the log base64-encoded: pure ASCII, so
+            # nothing in the compiler's output breaks them. Only every
+            # error's own line: at most ten annotations survive a step.
+            printf '::error title=clippy log bytes::%s\n' "$(wc -c < /tmp/clippy.log)"
+            b64=$(sed -e $'s/\x1b\\[[0-9;]*m//g' /tmp/clippy.log | grep -aA4 -E '^(error|warning)(\[|:)' | head -48 | base64 -w0)
+            len=${#b64}; i=0; n=1
+            while [ "$i" -lt "$len" ] && [ "$n" -le 9 ]; do
+              printf '::error title=clippy errors %d::%s\n' "$n" "${b64:i:600}"
+              i=$((i + 600)); n=$((n + 1))
+            done
+            exit 1
+          }
       - name: Clippy, diagnostics build
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --all-features --locked -j 1 -- -D warnings 2>&1 | tee /tmp/clippy.log || {
+            { echo '## Clippy, diagnostics (last 30000 bytes)'; echo '```'; tail -c 30000 /tmp/clippy.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            printf '::error title=clippy diagnostics log bytes::%s\n' "$(wc -c < /tmp/clippy.log)"
+            b64=$(sed -e $'s/\x1b\\[[0-9;]*m//g' /tmp/clippy.log | grep -aA4 -E '^(error|warning)(\[|:)' | head -48 | base64 -w0)
+            len=${#b64}; i=0; n=1
+            while [ "$i" -lt "$len" ] && [ "$n" -le 9 ]; do
+              printf '::error title=clippy diagnostics %d::%s\n' "$n" "${b64:i:600}"
+              i=$((i + 600)); n=$((n + 1))
+            done
+            exit 1
+          }
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked -j 1 2>&1 | tee /tmp/test.log || {
+            { echo '## Tests (last 20000 bytes)'; echo '```'; tail -c 20000 /tmp/test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            printf '::error title=tests log bytes::%s\n' "$(wc -c < /tmp/test.log)"
+            b64=$(sed -e $'s/\x1b\\[[0-9;]*m//g' /tmp/test.log | grep -aA6 -E '(^error(\[|:)|^---- |panicked at|test result: FAILED)' | head -60 | base64 -w0)
+            len=${#b64}; i=0; n=1
+            while [ "$i" -lt "$len" ] && [ "$n" -le 9 ]; do
+              printf '::error title=tests %d::%s\n' "$n" "${b64:i:600}"
+              i=$((i + 600)); n=$((n + 1))
+            done
+            exit 1
+          }
+
+  # Both routes of scripts/build-on-linux.sh (building the exe from Linux for
+  # a run under Wine): the MinGW one and the MSVC one through cargo-xwin,
+  # which is the only one with the D3D12 Agility exports.
+  linux-cross:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { toolchain: mingw, target: x86_64-pc-windows-gnu }
+          - { toolchain: xwin, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.target }}
+      - name: Install the cross compiler
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.toolchain == 'mingw' && 'mingw-w64' || 'clang llvm' }}
+      - name: Install cargo-xwin
+        if: matrix.toolchain == 'xwin'
+        run: cargo install cargo-xwin --locked
+      - name: Build
+        run: |
+          set -o pipefail
+          cargo ${{ matrix.toolchain == 'mingw' && 'build' || 'xwin build' }} --release --locked --target ${{ matrix.target }} -p victory 2>&1 | tee /tmp/build.log || {
+            { echo "## Build ${{ matrix.target }} (last 30000 bytes)"; echo '```'; tail -c 30000 /tmp/build.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            oneline=$(sed -z 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g' /tmp/build.log)
+            len=${#oneline}
+            # The error comes last in a build's output; at most ten
+            # annotations of a step survive, so take the last 8000 escaped
+            # characters and emit those, newest part first.
+            if [ "$len" -gt 8000 ]; then
+                oneline="${oneline:$((len - 8000))}"
+                len=8000
+            fi
+            i=$(( (len / 800) * 800 )); n=$(( len / 800 + 1 ))
+            if [ $(( len % 800 )) -eq 0 ] && [ "$len" -gt 0 ]; then n=$((n - 1)); fi
+            while [ "$i" -ge 0 ] && [ "$n" -ge 1 ]; do
+              printf '::error title=build ${{ matrix.target }} tail %d::%s\n' "$n" "${oneline:i:800}"
+              i=$((i - 800)); n=$((n - 1))
+            done
+            exit 1
+          }
+      - name: The exe exists
+        run: ls -l target/${{ matrix.target }}/release/victory.exe && sha256sum target/${{ matrix.target }}/release/victory.exe

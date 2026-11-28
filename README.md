@@ -117,6 +117,37 @@ powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\
 Put the path to **your** `game_scarlett_master.exe` in the last line. The
 first start builds the layer, which takes a few minutes.
 
+**On CachyOS (Linux): build it there, run it under Wine**
+
+The program stays Windows-only (it runs the title's own image inside its own
+process), but the exe can be built from Linux and started under Wine like any
+other. `scripts/build-on-linux.sh` does it, in a clone of this repository:
+
+```bash
+sudo pacman -S --needed rustup     # once
+./scripts/build-on-linux.sh        # MinGW build: what pacman has
+./scripts/build-on-linux.sh --msvc # MSVC build: needs clang and cargo-xwin (crates.io)
+```
+
+The exe lands in `target/<target>/release/victory.exe`; put it next to
+**your** `game_scarlett_master.exe` as above. One difference between the two:
+only the MSVC build carries the D3D12 Agility exports (a Visual Studio linker
+feature), so a MinGW-built exe runs Windows' own Direct3D 12 runtime; under
+Wine both run DXVK's anyway. Continuous integration builds both routes on
+Linux on every pull request, so the script stays working.
+
+NVIDIA's and AMD's fetchers (`victory get-dlss`, `victory get-fsr`) run
+Windows PowerShell, which Wine does not have. Fetch the files by hand
+instead: AMD's two FidelityFX DLLs from GPUOpen's FidelityFX SDK GitHub, and
+NVIDIA's Streamline from its GitHub releases. The start looks for them in a
+`fidelityfx` and an `nvidia-sdk/Streamline/bin/x64` folder beside the exe, or
+under the victory folder Wine keeps
+(`C:\users\<you>\AppData\Local\victory\amd-fidelityfx`,
+`...\nvidia-sdk\Streamline\bin\x64`, what `get-fsr` and `get-dlss` would
+have made). A card without DLSS needs the AMD files only.
+
+Not tested here: the CI job proves the build, not the run under Wine.
+
 Options, requirements in full and the details are under
 [How to run it](#how-to-run-it).
 
