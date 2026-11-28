@@ -26,7 +26,10 @@ use crate::{HleExport, HleModule};
 // PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy);
 // PS4 pads (DualShock 4) and rumble from FrancescoGelosoEterea/VIscosity (d8db7a0).
 #[cfg(any(windows, test))]
+mod bindings;
 mod playstation;
+
+use bindings::{Bindings, PadInput};
 
 /// Stops the motors of the PlayStation pads read over HID, before the
 /// process ends (XInput pads stop by themselves when it does).
@@ -79,6 +82,8 @@ const DEVICES: usize = PADS + 3;
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
+/// Polls between looks at the controls file.
+const CONTROLS_CHECK: u64 = 125;
 
 /// The keyboard's stand-in gamepad (key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. The letters are
@@ -101,18 +106,24 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'H', RIGHT_STICK),
 ];
 
-/// Where the stand-in pad's letters are on the keyboard: scan code (set 1)
-/// and the letter a US layout prints there.
-const LETTER_POSITIONS: [(u32, u8); 16] = [
+/// Where the letters are on the keyboard: scan code (set 1) and the letter a
+/// US layout prints there. All of them, as `victory-controls.txt` may bind any.
+const LETTER_POSITIONS: [(u32, u8); 26] = [
     (0x10, b'Q'),
     (0x11, b'W'),
     (0x12, b'E'),
+    (0x13, b'R'),
+    (0x14, b'T'),
     (0x15, b'Y'),
+    (0x16, b'U'),
     (0x17, b'I'),
+    (0x18, b'O'),
+    (0x19, b'P'),
     (0x1E, b'A'),
     (0x1F, b'S'),
     (0x20, b'D'),
     (0x21, b'F'),
+    (0x22, b'G'),
     (0x23, b'H'),
     (0x24, b'J'),
     (0x25, b'K'),
@@ -120,6 +131,10 @@ const LETTER_POSITIONS: [(u32, u8); 16] = [
     (0x2C, b'Z'),
     (0x2D, b'X'),
     (0x2E, b'C'),
+    (0x2F, b'V'),
+    (0x30, b'B'),
+    (0x31, b'N'),
+    (0x32, b'M'),
 ];
 
 /// The scan code of the stand-in pad's letter `vk` on a US layout.
@@ -184,6 +199,7 @@ const _: () = assert!(size_of::<MouseState>() == 40);
 fn apply_mouse_sample(
     mouse: &mut MouseState,
     (dx, dy): (i64, i64),
+    wheel: i64,
     buttons: u32,
     menu_open: bool,
 ) -> MouseState {
@@ -192,9 +208,182 @@ fn apply_mouse_sample(
     } else {
         mouse.position_x += dx;
         mouse.position_y += dy;
+        mouse.wheel_y += wheel;
         mouse.buttons = buttons;
     }
     *mouse
+}
+
+/// Mouse look: how far the captured mouse pushes the pad's right stick, for
+/// titles that take a pad and a keyboard and never ask for a mouse
+/// (`VICTORY_MOUSE_LOOK`: unset or 1 the default, another number scales it,
+/// 0 turns it off). Read once.
+pub(super) fn mouse_look() -> f32 {
+    static LOOK: LazyLock<f32> = LazyLock::new(|| {
+        std::env::var("VICTORY_MOUSE_LOOK")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|s| s.is_finite() && *s >= 0.0)
+            .unwrap_or(1.0)
+    });
+    *LOOK
+}
+
+/// Mouse motion in one poll that holds the stick fully over, at sensitivity 1.
+const LOOK_FULL: f32 = 12.0;
+/// The share of the way to the newest motion the stick moves each poll: the
+/// title samples the pad once a frame, several polls apart.
+const LOOK_SMOOTH: f32 = 0.25;
+/// Where the stick starts when the mouse moves at all: titles ignore less.
+const LOOK_DEAD_ZONE: f32 = 0.2;
+/// Below this the smoothed stick is at rest.
+const LOOK_REST: f32 = 0.01;
+
+/// Wheel motion of one notch.
+const NOTCH: i64 = 120;
+/// How long a wheel notch holds what it presses, and the rest before the next,
+/// in microseconds: the title samples the pad once a frame (25 to 60 a second).
+const NOTCH_HOLD: u64 = 70_000;
+const NOTCH_REST: u64 = 50_000;
+/// Notches waiting at most, so a fast spin does not scroll on for seconds.
+const NOTCH_QUEUE: i64 = 6;
+
+/// What the captured mouse drives ([`Bindings`] says how, in `victory-controls.txt`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum MouseMode {
+    /// The camera (by default motion on the right stick, the buttons the triggers).
+    #[default]
+    Play,
+    /// The title's menus (by default motion on the left stick, the buttons A and
+    /// B, the side buttons the shoulders, the wheel the D-pad's up and down).
+    Menu,
+}
+
+/// The captured mouse as a pad. The title has no mouse of its own (it asks for
+/// a pad and a keyboard only), so the mouse moves the pad's sticks and presses
+/// its buttons, as the controls file binds them.
+#[derive(Default)]
+struct MousePad {
+    mode: MouseMode,
+    /// The last reading while captured: the motion is measured from it.
+    last: Option<MouseState>,
+    /// The stick, smoothed.
+    x: f32,
+    y: f32,
+    /// A key of the pause (the pad's menu button) was held at the last poll.
+    pause: bool,
+    /// Wheel motion short of a notch, and notches still to press (up positive).
+    wheel_rest: i64,
+    notches: i64,
+    /// What a notch holds and until when; the rest after it ends.
+    pressing: Option<(PadInput, u64)>,
+    resting_until: u64,
+}
+
+impl MousePad {
+    /// What the corner of the picture says (`victory_gpu::MOUSE_MODE`).
+    fn shown(&self, captured: bool, speed: f32) -> u8 {
+        match self.mode {
+            _ if !captured || speed <= 0.0 => victory_gpu::MOUSE_OFF,
+            MouseMode::Play => victory_gpu::MOUSE_PLAY,
+            MouseMode::Menu => victory_gpu::MOUSE_MENU,
+        }
+    }
+
+    /// Everything but the mode, as when the mouse is let go.
+    fn release(&mut self) {
+        *self = MousePad { mode: self.mode, pause: self.pause, ..Default::default() };
+    }
+
+    /// One poll: `mouse` is the cumulative reading (`None` while not captured),
+    /// `keys` the keys held, `now` in microseconds, `speed` the mouse's speed.
+    fn step(&mut self, mouse: Option<&MouseState>, keys: &[KeyState], now: u64, b: &Bindings, speed: f32) -> PadState {
+        let pause = keys.iter().any(|k| b.is_pause_key(pad_key(k)));
+        let pause_pressed = pause && !self.pause;
+        self.pause = pause;
+        let Some(mouse) = mouse.filter(|_| speed > 0.0) else {
+            self.release();
+            return PadState::default();
+        };
+        // The first reading after a capture has no motion and no presses to compare with.
+        let last = self.last.replace(*mouse).unwrap_or(*mouse);
+        let pressed = mouse.buttons & !last.buttons;
+        if pause_pressed || pressed & b.switch != 0 {
+            let mode = match self.mode {
+                MouseMode::Play => MouseMode::Menu,
+                MouseMode::Menu => MouseMode::Play,
+            };
+            self.release();
+            self.mode = mode;
+            self.last = Some(*mouse);
+        }
+        let (bound, lift) = match self.mode {
+            MouseMode::Play => (&b.play, LOOK_DEAD_ZONE),
+            // No lift past the title's dead zone in the menus: a hand resting
+            // on the mouse must not move the selection.
+            MouseMode::Menu => (&b.menu, 0.0),
+        };
+        let mut pad = PadState::default();
+        let (dx, dy) = (mouse.position_x - last.position_x, mouse.position_y - last.position_y);
+        let (x, y) = self.stick(dx, dy, lift, speed);
+        match bound.moves {
+            Some(true) => (pad.right_x, pad.right_y) = (x, y),
+            Some(false) => (pad.left_x, pad.left_y) = (x, y),
+            None => (self.x, self.y) = (0.0, 0.0),
+        }
+        for &(input, pad_input) in &bound.buttons {
+            if matches!(input, bindings::MouseInput::Button(bit) if mouse.buttons & bit != 0) {
+                pad_input.press(&mut pad);
+            }
+        }
+        self.wheel_rest += mouse.wheel_y - last.wheel_y;
+        self.notches = (self.notches + self.wheel_rest / NOTCH).clamp(-NOTCH_QUEUE, NOTCH_QUEUE);
+        self.wheel_rest %= NOTCH;
+        if let Some(input) = self.wheel(now, bound) {
+            input.press(&mut pad);
+        }
+        pad
+    }
+
+    /// The motion `dx`, `dy` as a stick, smoothed; once it moves at all it
+    /// starts at `lift` (past the title's dead zone).
+    fn stick(&mut self, dx: i64, dy: i64, lift: f32, speed: f32) -> (f32, f32) {
+        let target = |d: i64| d as f32 * speed / LOOK_FULL;
+        // Screen y grows downward; the stick's y is up positive.
+        let (tx, ty) = (target(dx), target(-dy));
+        self.x += (tx - self.x) * LOOK_SMOOTH;
+        self.y += (ty - self.y) * LOOK_SMOOTH;
+        let size = self.x.hypot(self.y);
+        if size < LOOK_REST {
+            (self.x, self.y) = (0.0, 0.0);
+            return (0.0, 0.0);
+        }
+        let pushed = (lift + (1.0 - lift) * size).min(1.0) / size;
+        (self.x * pushed, self.y * pushed)
+    }
+
+    /// What the wheel holds now: each notch a press of what it is bound to, then a rest.
+    fn wheel(&mut self, now: u64, bound: &bindings::MouseMode) -> Option<PadInput> {
+        if let Some((input, until)) = self.pressing {
+            if now < until {
+                return Some(input);
+            }
+            self.pressing = None;
+            self.resting_until = until + NOTCH_REST;
+        }
+        if now < self.resting_until || self.notches == 0 {
+            return None;
+        }
+        let way = if self.notches > 0 { bindings::MouseInput::WheelUp } else { bindings::MouseInput::WheelDown };
+        self.notches -= self.notches.signum();
+        let Some(&(_, input)) = bound.buttons.iter().find(|&&(m, _)| m == way) else {
+            // Not bound in this mode: nothing waits to be pressed.
+            self.notches = 0;
+            return None;
+        };
+        self.pressing = Some((input, now + NOTCH_HOLD));
+        Some(input)
+    }
 }
 
 /// Host input, or a fake in tests.
@@ -208,26 +397,10 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| pad_key(k) == vk) {
-            1.0
-        } else {
-            0.0
-        }
-    };
-    PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
-    }
+/// The keyboard's stand-in pad, as the controls bind the keys held. A letter
+/// in the controls is the key where a US keyboard has it ([`pad_key`]).
+fn fallback(keys: &[KeyState], b: &Bindings) -> PadState {
+    b.pad(|vk| keys.iter().any(|k| pad_key(k) == vk))
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -447,6 +620,17 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// The captured mouse as a pad.
+    mouse_pad: MousePad,
+    /// The keyboard and mouse controls (`victory-controls.txt`).
+    bindings: Bindings,
+}
+
+impl State {
+    /// The mouse's speed: the controls file's, else `VICTORY_MOUSE_LOOK`.
+    fn speed(&self) -> f32 {
+        self.bindings.speed.unwrap_or_else(mouse_look)
+    }
 }
 
 pub struct Hub {
@@ -494,6 +678,8 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                mouse_pad: MousePad::default(),
+                bindings: Bindings::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -510,14 +696,38 @@ impl Hub {
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
         let hub = Hub::new(source, one_pad());
+        let path = bindings::file();
+        let mut saved = None;
+        hub.read_controls(path.as_deref(), &mut saved);
         hub.poll();
         std::thread::spawn(move || {
+            let mut polls = 0_u64;
             loop {
                 std::thread::sleep(POLL);
+                polls += 1;
+                // The controls file, read again when it was saved (about once a second).
+                if polls.is_multiple_of(CONTROLS_CHECK) {
+                    hub.read_controls(path.as_deref(), &mut saved);
+                }
                 hub.poll();
             }
         });
         hub
+    }
+
+    /// Reads the controls file if it was saved since `saved` (the first time,
+    /// writing the defaults if there is none), and shows them on the F2 page.
+    fn read_controls(&self, path: Option<&std::path::Path>, saved: &mut Option<Option<std::time::SystemTime>>) {
+        let modified = path.and_then(bindings::modified);
+        if saved.is_some_and(|s| s == modified) {
+            return;
+        }
+        let mut state = self.state();
+        if let Some(path) = path {
+            state.bindings = bindings::load(path, mouse_look());
+        }
+        *saved = Some(path.and_then(bindings::modified));
+        *lock(&victory_gpu::CONTROLS) = bindings::page(&state.bindings, state.speed());
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -581,18 +791,26 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        // The mouse also moves a pad: the one pad, else the first host pad,
+        // else the keyboard's stand-in.
+        let speed = self.speed();
+        let look = self.mouse_pad.step(mouse.as_ref(), &keys, now, &self.bindings, speed);
+        victory_gpu::MOUSE_MODE.store(self.mouse_pad.shown(mouse.is_some(), speed), Ordering::Relaxed);
+        let typed = fallback(&keys, &self.bindings);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(merged(typed, look), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
         let any_pad = pads.iter().any(Option::is_some);
+        let mut first = true;
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = pad.map(|pad| if std::mem::take(&mut first) { merged(pad, look) } else { pad });
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(merged(typed, look)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1308,6 +1526,8 @@ mod host {
 
     impl Source for Host {
         fn mouse(&mut self) -> Option<MouseState> {
+            // Taken first: wheel motion while not captured is dropped.
+            let wheel = crate::modules::lifecycle::take_wheel();
             let delta = crate::modules::lifecycle::captured_mouse_delta()?;
             let menu_open = victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed);
             let buttons = if menu_open {
@@ -1317,7 +1537,7 @@ mod host {
                     // SAFETY: virtual-key state query.
                     .fold(0, |bits, (i, vk)| bits | ((unsafe { GetAsyncKeyState(vk) } < 0) as u32) << i)
             };
-            Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
+            Some(super::apply_mouse_sample(&mut self.mouse, delta, wheel, buttons, menu_open))
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             // XInput first; HID PlayStation pads (PS4 and PS5) take the slots XInput leaves free
@@ -1758,18 +1978,168 @@ mod tests {
     }
 
     #[test]
+    fn mouse_look_pushes_the_right_stick_and_triggers() {
+        let at = |x, y, buttons| MouseState { position_x: x, position_y: y, buttons, ..Default::default() };
+        let b = Bindings::default();
+        let step = |pad: &mut MousePad, m: Option<MouseState>, speed: f32| pad.step(m.as_ref(), &[], 0, &b, speed);
+        let mut look = MousePad::default();
+        // Not captured, and the first reading of a capture: at rest.
+        assert_eq!(step(&mut look, None, 1.0), PadState::default());
+        assert_eq!(step(&mut look, Some(at(500, 500, 0)), 1.0), PadState::default());
+
+        // Steady motion right and up (screen y falls): the stick goes right and up, never past 1.
+        let pad = (1..=40)
+            .map(|i| step(&mut look, Some(at(500 + 30 * i, 500 - 30 * i, 0)), 1.0))
+            .inspect(|pad| assert!(pad.right_x.hypot(pad.right_y) <= 1.0001, "{pad:?}"))
+            .last()
+            .expect("forty polls");
+        assert!(pad.right_x > 0.6 && pad.right_y > 0.6, "{pad:?}");
+        assert_eq!((pad.left_x, pad.left_y, pad.buttons), (0.0, 0.0, 0));
+
+        // Slow motion still clears the title's dead zone; a higher speed pushes further.
+        let mut slow = MousePad::default();
+        step(&mut slow, Some(at(0, 0, 0)), 1.0);
+        let pad = step(&mut slow, Some(at(-1, 0, 0)), 1.0);
+        assert!(pad.right_x < -LOOK_DEAD_ZONE && pad.right_x > -0.3 && pad.right_y == 0.0, "{pad:?}");
+        let mut fast = MousePad::default();
+        step(&mut fast, Some(at(0, 0, 0)), 5.0);
+        assert!(step(&mut fast, Some(at(-1, 0, 0)), 5.0).right_x < pad.right_x);
+
+        // The mouse at rest lets the stick come back to the middle.
+        let pad = (0..60).map(|_| step(&mut look, Some(at(1700, -700, 0)), 1.0)).last().expect("sixty polls");
+        assert_eq!((pad.right_x, pad.right_y), (0.0, 0.0));
+
+        // Left button: right trigger; right button: left trigger.
+        let pad = step(&mut look, Some(at(1700, -700, 0b01)), 1.0);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (0.0, 1.0));
+        let pad = step(&mut look, Some(at(1700, -700, 0b10)), 1.0);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 0.0));
+
+        // Released and captured again: no jump from the old position.
+        step(&mut look, None, 1.0);
+        assert_eq!(step(&mut look, Some(at(-9000, 9000, 0)), 1.0), PadState::default());
+
+        // Speed 0: nothing.
+        let mut off = MousePad::default();
+        step(&mut off, Some(at(0, 0, 0)), 0.0);
+        assert_eq!(step(&mut off, Some(at(300, 300, 0b11)), 0.0), PadState::default());
+        assert_eq!(off.shown(true, 0.0), victory_gpu::MOUSE_OFF);
+    }
+
+    #[test]
+    fn the_mouse_drives_the_menus_after_esc_or_a_middle_click() {
+        use bindings::{MOUSE_BACK, MOUSE_FORWARD, MOUSE_LEFT, MOUSE_MIDDLE, MOUSE_RIGHT};
+        let at = |x, wheel, buttons| MouseState { position_x: x, wheel_y: wheel, buttons, ..Default::default() };
+        let b = Bindings::default();
+        let esc = [key(0x1B)];
+        let mut m = MousePad::default();
+        m.step(Some(&at(0, 0, 0)), &[], 0, &b, 1.0);
+        assert_eq!(m.shown(true, 1.0), victory_gpu::MOUSE_PLAY);
+
+        // Esc (the title's pause) switches to the menus once per press.
+        m.step(Some(&at(0, 0, 0)), &esc, 0, &b, 1.0);
+        m.step(Some(&at(0, 0, 0)), &esc, 0, &b, 1.0);
+        assert_eq!((m.mode, m.shown(true, 1.0), m.shown(false, 1.0)), (MouseMode::Menu, victory_gpu::MOUSE_MENU, victory_gpu::MOUSE_OFF));
+
+        // Buttons: left A, right B, side buttons the shoulders; no triggers.
+        let pad = m.step(Some(&at(0, 0, MOUSE_LEFT | MOUSE_BACK)), &[], 0, &b, 1.0);
+        assert_eq!((pad.buttons, pad.right_trigger), (A | LEFT_SHOULDER, 0.0));
+        let pad = m.step(Some(&at(0, 0, MOUSE_RIGHT | MOUSE_FORWARD)), &[], 0, &b, 1.0);
+        assert_eq!(pad.buttons, B | RIGHT_SHOULDER);
+
+        // Motion moves the left stick, and a hand resting on the mouse stays under the dead zone.
+        let pad = m.step(Some(&at(1, 0, 0)), &[], 0, &b, 1.0);
+        assert!(pad.left_x > 0.0 && pad.left_x < LOOK_DEAD_ZONE && pad.right_x == 0.0, "{pad:?}");
+        let pad = (2..=30).map(|i| m.step(Some(&at(30 * i, 0, 0)), &[], 0, &b, 1.0)).last().expect("polls");
+        assert!(pad.left_x > 0.9, "{pad:?}");
+        for _ in 0..60 {
+            m.step(Some(&at(900, 0, 0)), &[], 0, &b, 1.0);
+        }
+
+        // Two notches down: two presses of the D-pad, each held, then a rest, half notches kept.
+        let ms = 1_000;
+        let mut t = 0;
+        let mut presses = Vec::new();
+        let mut was = 0;
+        for _ in 0..60 {
+            let pad = m.step(Some(&at(900, -2 * NOTCH - NOTCH / 2, 0)), &[], t, &b, 1.0);
+            let dpad = pad.buttons & (UP | DOWN);
+            if dpad != 0 && was == 0 {
+                presses.push((dpad, t));
+            }
+            was = dpad;
+            t += 10 * ms;
+        }
+        assert_eq!(presses.iter().map(|p| p.0).collect::<Vec<_>>(), [DOWN, DOWN]);
+        assert!(presses[1].1 - presses[0].1 >= NOTCH_HOLD + NOTCH_REST, "{presses:?}");
+        let pad = m.step(Some(&at(900, -3 * NOTCH, 0)), &[], t, &b, 1.0);
+        assert_eq!(pad.buttons & DOWN, DOWN, "the half notches made a third");
+
+        // A middle click goes back to the camera; holding it does not switch again.
+        m.step(Some(&at(900, -3 * NOTCH, MOUSE_MIDDLE)), &[], t, &b, 1.0);
+        m.step(Some(&at(900, -3 * NOTCH, MOUSE_MIDDLE)), &[], t, &b, 1.0);
+        assert_eq!(m.mode, MouseMode::Play);
+        // The wheel is not bound in play: its notches are dropped, not kept for later.
+        let pad = m.step(Some(&at(900, -9 * NOTCH, MOUSE_LEFT)), &[], t + 500 * ms, &b, 1.0);
+        assert_eq!((pad.buttons, pad.right_trigger, m.notches), (0, 1.0, 0));
+    }
+
+    #[test]
+    fn the_controls_file_rebinds_the_keys_and_the_mouse() {
+        let b = bindings::parse(
+            "[KEYBOARD]\nA = SPACE\nLEFT STICK UP = UP\n\
+             [MOUSE PLAY]\nMOVE = LEFT STICK\nY = WHEEL UP\nX = BACK BUTTON\n\
+             [MOUSE]\nSWITCH MODE = FORWARD BUTTON\nPAUSE SWITCHES MODE = NO\n",
+        );
+        assert!(b.errors.is_empty(), "{:?}", b.errors);
+        let typed = fallback(&[key(0x20), key(0x26), key(0x0D)], &b);
+        assert_eq!((typed.buttons, typed.left_y), (A, 1.0), "Enter is no longer bound");
+
+        let at = |x, wheel, buttons| MouseState { position_x: x, wheel_y: wheel, buttons, ..Default::default() };
+        let mut m = MousePad::default();
+        m.step(Some(&at(0, 0, 0)), &[], 0, &b, 1.0);
+        let pad = m.step(Some(&at(40, NOTCH, bindings::MOUSE_BACK)), &[], 0, &b, 1.0);
+        assert!(pad.left_x > 0.0 && pad.right_x == 0.0, "{pad:?}");
+        assert_eq!(pad.buttons, X | Y);
+        // Esc no longer switches; the forward button does, and the middle does nothing.
+        m.step(Some(&at(40, NOTCH, bindings::MOUSE_MIDDLE)), &[key(0x1B)], 0, &b, 1.0);
+        assert_eq!(m.mode, MouseMode::Play);
+        m.step(Some(&at(40, NOTCH, bindings::MOUSE_FORWARD)), &[], 0, &b, 1.0);
+        assert_eq!(m.mode, MouseMode::Menu);
+        // Nothing is bound in the menus here.
+        let pad = m.step(Some(&at(400, 5 * NOTCH, bindings::MOUSE_LEFT)), &[], 0, &b, 1.0);
+        assert_eq!(pad, PadState::default());
+    }
+
+    #[test]
+    fn mouse_look_reaches_the_pad_the_title_reads() {
+        for one_pad in [false, true] {
+            let (hub, host) = fake_with(one_pad);
+            host.lock().unwrap().mouse = Some(MouseState::default());
+            hub.poll();
+            host.lock().unwrap().mouse = Some(MouseState { position_x: 40, buttons: 1, ..Default::default() });
+            hub.poll();
+            let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            let state = pad(r);
+            release(r);
+            assert!(state.right_x > LOOK_DEAD_ZONE && state.right_y == 0.0, "{state:?}");
+            assert_eq!((state.right_trigger, state.left_trigger), (1.0, 0.0));
+        }
+    }
+
+    #[test]
     fn mouse_motion_and_buttons_are_suppressed_while_settings_menu_is_open() {
         let mut mouse = MouseState::default();
-        let active = apply_mouse_sample(&mut mouse, (12, -5), 0b11, false);
-        assert_eq!(active, MouseState { position_x: 12, position_y: -5, buttons: 0b11, ..Default::default() });
+        let active = apply_mouse_sample(&mut mouse, (12, -5), 120, 0b11, false);
+        assert_eq!(active, MouseState { position_x: 12, position_y: -5, wheel_y: 120, buttons: 0b11, ..Default::default() });
 
-        // Opening the F1 menu drops motion deltas and clears buttons while keeping position.
-        let paused = apply_mouse_sample(&mut mouse, (40, 25), 0b01, true);
-        assert_eq!(paused, MouseState { position_x: 12, position_y: -5, buttons: 0, ..Default::default() });
+        // Opening the F1 menu drops motion and wheel deltas and clears buttons while keeping position.
+        let paused = apply_mouse_sample(&mut mouse, (40, 25), -240, 0b01, true);
+        assert_eq!(paused, MouseState { position_x: 12, position_y: -5, wheel_y: 120, buttons: 0, ..Default::default() });
 
         // Closing the F1 menu resumes cleanly from the preserved position with no jump.
-        let resumed = apply_mouse_sample(&mut mouse, (3, 4), 0b10, false);
-        assert_eq!(resumed, MouseState { position_x: 15, position_y: -1, buttons: 0b10, ..Default::default() });
+        let resumed = apply_mouse_sample(&mut mouse, (3, 4), 0, 0b10, false);
+        assert_eq!(resumed, MouseState { position_x: 15, position_y: -1, wheel_y: 120, buttons: 0b10, ..Default::default() });
     }
 
     #[test]
@@ -1873,17 +2243,24 @@ mod tests {
     fn the_stand_in_pad_reads_letters_by_their_place() {
         // An AZERTY keyboard: the key above S is marked Z, the one left of S is Q.
         let at = |scan_code, virtual_key| KeyState { scan_code, virtual_key, ..Default::default() };
-        let pad = fallback(&[at(0x11, b'Z'), at(0x1E, b'Q')]);
+        let b = Bindings::default();
+        let pad = fallback(&[at(0x11, b'Z'), at(0x1E, b'Q')], &b);
         assert_eq!((pad.left_x, pad.left_y, pad.left_trigger), (-1.0, 1.0, 0.0));
         // Its key marked W is in the bottom row, where the left trigger is; the one marked A is
         // the left shoulder's.
-        let pad = fallback(&[at(0x2C, b'W'), at(0x10, b'A')]);
+        let pad = fallback(&[at(0x2C, b'W'), at(0x10, b'A')], &b);
         assert_eq!((pad.left_x, pad.left_y, pad.left_trigger), (0.0, 0.0, 1.0));
         assert_eq!(pad.buttons, LEFT_SHOULDER);
-        // A letter in none of the pad's places presses nothing (Dvorak's S, right of L).
-        assert_eq!(fallback(&[at(0x27, b'S')]), PadState::default());
+        // A letter in no letter's place presses nothing (Dvorak's S, right of L).
+        assert_eq!(fallback(&[at(0x27, b'S')], &b), PadState::default());
         // Keys that are no letters are the same on every layout.
-        assert_eq!(fallback(&[at(0x1C, 0x0D)]).buttons, A);
+        assert_eq!(fallback(&[at(0x1C, 0x0D)], &b).buttons, A);
+        // A letter the controls file binds counts by its place too: G is AZERTY's G, but its
+        // M (right of L) is US ;, and its , is US M.
+        let g = bindings::parse("[KEYBOARD]\nY = G\nX = M");
+        assert_eq!(fallback(&[at(0x22, b'G')], &g).buttons, Y);
+        assert_eq!(fallback(&[at(0x27, b'M')], &g), PadState::default());
+        assert_eq!(fallback(&[at(0x32, 0xBC)], &g).buttons, X);
     }
 
     #[test]

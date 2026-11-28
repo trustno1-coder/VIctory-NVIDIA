@@ -185,6 +185,14 @@ fn capture_mouse(hwnd: HWND, active: bool) {
     }
 }
 
+/// Wheel motion the title's window was sent since the last [`take_wheel`].
+static WHEEL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The wheel's motion since the last call (120 a notch, up positive).
+pub(super) fn take_wheel() -> i64 {
+    i64::from(WHEEL.swap(0, Ordering::Relaxed))
+}
+
 pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
     if !enabled("VICTORY_MOUSE_CAPTURE") { return None; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
@@ -194,7 +202,10 @@ pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
         let mut point = POINT::default();
         if wm::GetCursorPos(&mut point) == 0 { state.reference = None; return None; }
         let point = (point.x, point.y);
-        let warp = std::env::var_os("VICTORY_MOUSE_WARP").is_some_and(|v| v == "1");
+        // Mouse look needs motion without end, so it warps unless told not to
+        // (`VICTORY_MOUSE_WARP=0`): the confined cursor stops at the window's edge.
+        let warp = std::env::var_os("VICTORY_MOUSE_WARP")
+            .map_or(super::gameinput::mouse_look() > 0.0, |v| v == "1");
         let warped = (warp && wm::SetCursorPos(state.center.0, state.center.1) != 0)
             .then_some(state.center);
         Some(mouse_motion(&mut state.reference, point, warped))
@@ -367,6 +378,10 @@ extern "system" fn window_proc(
         english_input();
     }
     match message {
+        // Wheel notches (120 each, up positive) for the input module's mouse.
+        wm::WM_MOUSEWHEEL => {
+            WHEEL.fetch_add(i32::from((wparam >> 16) as u16 as i16), Ordering::Relaxed);
+        }
         wm::WM_KILLFOCUS | wm::WM_NCDESTROY => capture_mouse(hwnd, false),
         wm::WM_ACTIVATE => capture_mouse(hwnd, wparam & 0xffff != wm::WA_INACTIVE as usize),
         wm::WM_SETFOCUS | wm::WM_MOVE | wm::WM_SIZE => capture_mouse(hwnd, true),

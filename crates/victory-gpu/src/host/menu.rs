@@ -28,7 +28,7 @@ use std::time::Duration;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -310,6 +310,35 @@ fn fps_line() -> Option<String> {
     })
 }
 
+/// The F2 page of keyboard and mouse controls is shown (it takes no keys from the title).
+static CONTROLS_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// The F2 page: the input module's lines ([`crate::CONTROLS`]) in the box.
+fn controls_lines() -> Vec<String> {
+    let mut out = vec!["CONTROLS: KEYBOARD AND MOUSE                     F2 CLOSES".to_owned(), String::new()];
+    let lines = crate::CONTROLS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if lines.is_empty() {
+        out.push("THE GAME HAS NOT ASKED FOR INPUT YET".to_owned());
+    }
+    out.extend(lines.into_iter().map(|l| l.chars().take(COLUMNS as usize).collect()));
+    out.truncate(LINES as usize);
+    out
+}
+
+/// The corner line while no page is shown: the frame-rate line, and the mouse's mode while it
+/// drives the title's menus. With the stats panel in that corner, it goes to the other one.
+fn corner_line() -> Option<(String, bool)> {
+    let menu = crate::MOUSE_MODE.load(Ordering::Relaxed) == crate::MOUSE_MENU;
+    let panel = super::panel::shown().load(Ordering::Relaxed);
+    let line = match (fps_line(), menu) {
+        (Some(fps), true) => format!("{fps}  MOUSE: MENU"),
+        (Some(fps), false) => fps,
+        (None, true) => "MOUSE: MENU".to_owned(),
+        (None, false) => return None,
+    };
+    Some((line, panel))
+}
+
 /// The index of `value` among the item's values (an unknown value: shown as
 /// itself, at the end).
 fn index_of(item: &Item, value: &str) -> Option<usize> {
@@ -333,7 +362,7 @@ fn keys() -> &'static Mutex<Vec<u16>> {
     static KEYS: OnceLock<Mutex<Vec<u16>>> = OnceLock::new();
     KEYS.get_or_init(|| {
         let _ = std::thread::Builder::new().name("settings menu keys".into()).spawn(|| {
-            const WATCHED: [u16; 7] = [VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE];
+            const WATCHED: [u16; 8] = [VK_F1, VK_F2, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE];
             let mut was = [false; WATCHED.len()];
             loop {
                 std::thread::sleep(Duration::from_millis(10));
@@ -465,6 +494,8 @@ pub(super) struct Menu {
     imports: Vec<String>,
     import_at: usize,
     picking: bool,
+    /// The buffer holds the controls page (F2) rather than the settings.
+    controls_painted: bool,
 }
 
 impl Menu {
@@ -476,7 +507,7 @@ impl Menu {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false }
+        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, controls_painted: false }
     }
 
     fn open() -> bool {
@@ -806,6 +837,20 @@ impl Menu {
         }
         let total = ITEMS.len() + ACTIONS.len();
         for vk in pressed {
+            // F2 shows and hides the controls page; F1 and F2 each close the other's page.
+            if vk == VK_F2 {
+                let show = !CONTROLS_OPEN.load(Ordering::Relaxed);
+                CONTROLS_OPEN.store(show, Ordering::Relaxed);
+                if show {
+                    crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed);
+                    self.picking = false;
+                }
+                self.changed = true;
+                continue;
+            }
+            if vk == VK_F1 {
+                CONTROLS_OPEN.store(false, Ordering::Relaxed);
+            }
             let open = Self::open();
             // Esc in the list of saves goes back to the settings.
             if open && self.picking && vk == VK_ESCAPE {
@@ -886,11 +931,19 @@ impl Menu {
         if self.failed {
             return;
         }
-        // Closed: the frame-rate line in the top left corner, if it is wanted and there is a rate.
-        let open = Self::open();
-        let line = if open { None } else { fps_line() };
+        // Closed: the corner line, if there is anything to say (`corner_line`).
+        let controls = CONTROLS_OPEN.load(Ordering::Relaxed);
+        let open = Self::open() || controls;
+        let (line, right) = match if open { None } else { corner_line() } {
+            Some((line, right)) => (Some(line), right),
+            None => (None, false),
+        };
         if !open && line.is_none() {
             return;
+        }
+        if controls != self.controls_painted {
+            self.controls_painted = controls;
+            self.changed = true;
         }
         // Our own copies are not part of a recorded frame (the recorder is in diagnostics builds).
         #[cfg(feature = "diagnostics")]
@@ -906,7 +959,8 @@ impl Menu {
             self.painted = line.clone();
             self.changed = true;
         }
-        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(), |l| vec![l.clone()])) } else { None };
+        let page = || if controls { controls_lines() } else { self.lines() };
+        let lines = if self.changed { Some(line.as_ref().map_or_else(page, |l| vec![l.clone()])) } else { None };
         let Some(buffers) = &mut self.buffers else { return };
         if let Some(lines) = lines {
             self.changed = false;
@@ -918,7 +972,11 @@ impl Menu {
             None => size(scale),
         };
         let (w, h) = (w.min(width), h.min(height));
-        let (x, y) = if line.is_some() { (0, 0) } else { ((width - w) / 2, (height - h) / 2) };
+        let (x, y) = match &line {
+            Some(_) if right => (width - w, 0),
+            Some(_) => (0, 0),
+            None => ((width - w) / 2, (height - h) / 2),
+        };
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
@@ -976,7 +1034,7 @@ mod tests {
             std::env::remove_var("VICTORY_MENU_FILE");
             std::env::set_var("VICTORY_HOME", &home);
         }
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, controls_painted: false };
         menu.started = menu.values.clone();
         let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
         menu.change_and_save(dlss, 1);
@@ -993,7 +1051,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, controls_painted: false };
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;
@@ -1008,7 +1066,7 @@ mod tests {
 
     #[test]
     fn the_link_is_always_right_under_the_note() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, controls_painted: false };
         menu.started = menu.values.clone();
         for note in ["", "SAVED"] {
             menu.note = note.to_owned();
@@ -1078,7 +1136,7 @@ mod tests {
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false, controls_painted: false };
         menu.started = menu.values.clone();
         let n = ITEMS[0].values.len();
         for _ in 0..n {
@@ -1092,7 +1150,7 @@ mod tests {
     #[test]
     fn a_shared_save_name_is_shown_in_letters_the_menu_has() {
         let names = vec!["save 2026-11-27 23-45-10.zip".to_owned(), "Jason's boat ~ 100% [\u{e9}] and a very long name that goes on and on.zip".to_owned()];
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true, controls_painted: false };
         menu.started = menu.values.clone();
         let check = |menu: &Menu| {
             let lines = menu.lines();

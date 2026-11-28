@@ -47,6 +47,17 @@ mod host;
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
 pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What the captured mouse drives, set by the input module and shown in the corner
+/// (`host/menu.rs`): [`MOUSE_OFF`], [`MOUSE_PLAY`] or [`MOUSE_MENU`].
+pub static MOUSE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(MOUSE_OFF);
+/// Not captured, or mouse look is off.
+pub const MOUSE_OFF: u8 = 0;
+/// The camera: the pad's right stick.
+pub const MOUSE_PLAY: u8 = 1;
+/// The title's menus: the left stick, A, B, the shoulders and the D-pad.
+pub const MOUSE_MENU: u8 = 2;
+/// The keyboard and mouse controls, a line each, set by the input module; F2 shows them.
+pub static CONTROLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
