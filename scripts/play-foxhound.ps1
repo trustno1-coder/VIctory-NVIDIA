@@ -50,8 +50,9 @@ $repo = Split-Path $PSScriptRoot -Parent
 # switches below are cleared).
 $preload = $Preload -or $env:VICTORY_PRELOAD -eq '1'
 # The F1 menu's "CLEAR SHADERS" restarts this with VICTORY_CLEAR_SHADERS=1, likewise read here before the
-# switches are cleared and handed to victory.exe below (its run removes the shader and pipeline caches
-# before it opens them, this start alone).
+# switches are cleared and handed to victory.exe below: `victory preload` (when there is one) removes the
+# shader and pipeline caches before it opens them and fills them again, else `victory run` does; either
+# way this start alone.
 $clearShaders = $env:VICTORY_CLEAR_SHADERS -eq '1'
 # What the F1 menu saved: its own choices (VICTORY_MENU_...) stand in for this script's options, and its
 # switches go over the settings below. An empty value unsets a switch.
@@ -193,6 +194,11 @@ try {
         $how = if ($LASTEXITCODE -eq 0) { 'done' } else { "ended with code $LASTEXITCODE" }
         $said = 'Preload {0} after {1:N1} min. Starting the game.' -f $how, ((Get-Date) - $began).TotalMinutes
         $writer.WriteLine("# $said"); Write-Host $said
+        # The preload above cleared the caches first when asked (`victory preload` reads
+        # VICTORY_CLEAR_SHADERS before it opens them); the ask stops here, so `victory run` below
+        # keeps what the preload made. Without a preload, `victory run` clears by itself, before
+        # it opens the caches.
+        Remove-Item Env:VICTORY_CLEAR_SHADERS -ErrorAction SilentlyContinue
     }
 }
 finally { Pop-Location }

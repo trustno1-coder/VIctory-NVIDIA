@@ -119,15 +119,18 @@ impl Config {
     }
 
     /// Removes the preloaded shader caches: `<cache>/shaders` (the
-    /// translated shaders) and its sibling `pipelines` folder (the host
+    /// translated shaders, with the record of the title's pipelines that
+    /// earlier runs made) and its sibling `pipelines` folder (the host
     /// pipelines made ahead) — what F1's CLEAR SHADERS asks a start for.
-    /// Nothing else under the victory home is touched, and a missing folder
-    /// is not an error. What went: the files and their bytes, for the log.
+    /// Nothing else under the victory home is touched, a missing folder is
+    /// not an error, and no folder is made: what is not there stays not
+    /// there. What went: the files and their bytes, for the log.
     pub fn clear_shader_caches(&self) -> Result<(u64, u64)> {
-        let shaders = self.cache_subdir("shaders")?;
+        let shaders = self.cache_dir.join("shaders");
         let pipelines = shaders.with_file_name("pipelines");
         let (mut files, mut bytes) = (0, 0);
         for dir in [&shaders, &pipelines] {
+            ensure_outside_repo(dir)?;
             let (f, b) = remove_folder(dir)?;
             files += f;
             bytes += b;
@@ -152,9 +155,17 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
 }
 
 /// Removes `dir` with everything in it, saying how much went: the files and
-/// their bytes. A folder that is not there is nothing removed, not an error.
+/// their bytes. A folder that is not there is nothing removed, not an error,
+/// and a link in its place (a symlink, a junction) goes without what it
+/// points at, counting nothing.
 fn remove_folder(dir: &Path) -> Result<(u64, u64)> {
-    if !dir.is_dir() {
+    // (symlink_metadata, not is_dir: a link in place of the folder is taken
+    // for the link it is, not the folder it points at.)
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return Ok((0, 0));
+    };
+    if meta.file_type().is_symlink() {
+        std::fs::remove_file(dir).with_context(|| format!("removing {}", dir.display()))?;
         return Ok((0, 0));
     }
     let (mut files, mut bytes) = (0, 0);
@@ -333,10 +344,62 @@ mod tests {
             data_dir: home.path().join("data"),
             ..Default::default()
         };
-        // Neither folder is there (the shaders one is made and taken away
-        // again): nothing removed, no error.
+        // Neither folder is there: nothing removed, no error.
         assert_eq!(cfg.clear_shader_caches().unwrap(), (0, 0));
         assert!(!cfg.cache_dir.join("shaders").exists());
         assert!(!cfg.cache_dir.join("pipelines").exists());
+    }
+
+    #[test]
+    fn clearing_without_the_folders_creates_none() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            cache_dir: home.path().join("cache"),
+            data_dir: home.path().join("data"),
+            ..Default::default()
+        };
+        // A missing cache is no error, and nothing is made for it: not the
+        // folders, not the cache's own.
+        assert_eq!(cfg.clear_shader_caches().unwrap(), (0, 0));
+        assert!(!cfg.cache_dir.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn clearing_removes_links_not_what_they_point_at() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            cache_dir: home.path().join("cache"),
+            data_dir: home.path().join("data"),
+            ..Default::default()
+        };
+        // A link in place of the shaders folder, pointing at a folder of its own.
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep.bin"), b"keep").unwrap();
+        std::fs::create_dir_all(&cfg.cache_dir).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, cfg.cache_dir.join("shaders")).unwrap();
+        std::fs::create_dir_all(cfg.cache_dir.join("pipelines")).unwrap();
+        std::fs::write(cfg.cache_dir.join("pipelines").join("one.bin"), vec![0u8; 10]).unwrap();
+
+        let (files, bytes) = cfg.clear_shader_caches().unwrap();
+        // The link goes and counts nothing; what it points at stays.
+        assert_eq!((files, bytes), (1, 10));
+        assert!(!cfg.cache_dir.join("shaders").exists());
+        assert!(elsewhere.join("keep.bin").is_file());
+    }
+
+    #[test]
+    fn clearing_a_cache_inside_a_source_tree_is_refused() {
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
+        let cfg = Config {
+            cache_dir: inside.clone(),
+            data_dir: inside.clone(),
+            ..Default::default()
+        };
+        assert!(cfg.clear_shader_caches().is_err());
+        // Refused without making anything.
+        assert!(!inside.join("shaders").exists());
+        assert!(!inside.join("pipelines").exists());
     }
 }

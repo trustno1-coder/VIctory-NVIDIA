@@ -414,7 +414,8 @@ fn main() -> Result<()> {
     if let Command::Play(options) = &cli.command {
         // (Read before `prepare` clears the `VICTORY_...` variables: the menu's restart sets it.)
         let preload = options.preload || std::env::var_os("VICTORY_PRELOAD").is_some_and(|v| v == "1");
-        let clear_shaders = std::env::var_os("VICTORY_CLEAR_SHADERS").is_some_and(|v| v == "1");
+        // (Likewise before `prepare`; the ask is taken back with the answer, for one start alone.)
+        let clear_shaders = play::asked_to_clear_shaders();
         let done = play::prepare(options).and_then(|ready| {
             victory_core::logging::init("info");
             // F1's CLEAR SHADERS, read above before `prepare` cleared the variable: the caches
@@ -482,6 +483,13 @@ fn main() -> Result<()> {
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         #[cfg(windows)]
         Command::Preload { paths } => {
+            // F1's CLEAR SHADERS, asked of this start (the script launcher asks a preload
+            // and a clear of the same start): the old caches go before the preload fills
+            // the folder again. The ask is taken back with the answer, and the script
+            // removes the variable before `victory run`, so the run keeps what is made.
+            if play::asked_to_clear_shaders() {
+                play::clear_shader_caches();
+            }
             play::explain_preload();
             translate::precompile(paths, None)?;
             warm::run(None, None, false, false, None)?;
