@@ -388,6 +388,7 @@ struct Container {
     name: String,
     dir: PathBuf,
 }
+#[derive(Clone)]
 struct Update {
     name: String,
     dir: PathBuf,
@@ -662,6 +663,23 @@ fn cstring(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap_or_default()
 }
 
+/// Calling an async API is time-critical-safe ("Asynchronous Programming
+/// Model"): the disk work of the `*Async` calls runs on a thread of ours,
+/// with what the title passed copied at the call, and the call completes
+/// with `work`'s result.
+fn later(
+    block: *mut AsyncBlock,
+    identity: *const c_void,
+    work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
+) -> HRESULT {
+    xasync::pending_with(block, identity, work)
+}
+
+/// An HRESULT as a result without data.
+fn outcome(hr: HRESULT) -> Result<Vec<u8>, HRESULT> {
+    if hr < 0 { Err(hr) } else { Ok(Vec::new()) }
+}
+
 static INIT: u8 = 0;
 static QUOTA_CALL: u8 = 0;
 static DELETE: u8 = 0;
@@ -676,12 +694,13 @@ extern "system" fn initialize_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     let saves = runtime::title().saves();
-    let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
-        Err(NO_ACCESS)
-    } else {
-        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
-    };
-    xasync::finished_with(block, (&raw const INIT).cast(), result)
+    if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return xasync::finished(block, (&raw const INIT).cast(), NO_ACCESS);
+    }
+    let config = text(config);
+    later(block, (&raw const INIT).cast(), move || {
+        Provider::open(&saves, config.as_deref()).map(|p| xasync::bytes(give(p)))
+    })
 }
 extern "system" fn initialize_result(
     _: This,
@@ -699,10 +718,12 @@ extern "system" fn quota_async(
     provider: *const Provider,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = get(provider)
-        .ok_or(E_INVALIDARG)
-        .map(|p| xasync::bytes(p.remaining() as i64));
-    xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
+    let Some(root) = get(provider).map(|p| p.root.clone()) else {
+        return xasync::finished(block, (&raw const QUOTA_CALL).cast(), E_INVALIDARG);
+    };
+    later(block, (&raw const QUOTA_CALL).cast(), move || {
+        Ok(xasync::bytes(Provider { root }.remaining() as i64))
+    })
 }
 extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
@@ -714,12 +735,12 @@ extern "system" fn delete_async(
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let hr = match (get(provider), text(name)) {
-        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
-        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
-        _ => E_INVALIDARG,
+    let (root, name) = match (get(provider), text(name)) {
+        (Some(p), Some(name)) if valid_container(&name) => (p.root.clone(), name),
+        (Some(_), Some(_)) => return xasync::finished(block, (&raw const DELETE).cast(), INVALID_CONTAINER_NAME),
+        _ => return xasync::finished(block, (&raw const DELETE).cast(), E_INVALIDARG),
     };
-    xasync::finished(block, (&raw const DELETE).cast(), hr)
+    later(block, (&raw const DELETE).cast(), move || outcome(delete(&root, &name)))
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
@@ -832,8 +853,9 @@ extern "system" fn read_blobs(
     put(count, blobs.len() as u32)
 }
 
-/// Read at once; the result holds the layout with pointers relative to the
-/// title's buffer, fixed up when the title takes it.
+/// Read on a thread of ours ([`later`]); the result holds the layout with
+/// pointers relative to the title's buffer, fixed up when the title takes
+/// it.
 extern "system" fn read_async(
     _: This,
     container: *const Container,
@@ -841,11 +863,17 @@ extern "system" fn read_async(
     count: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = match get(container) {
-        Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
-        None => Err(E_INVALIDARG),
+    let Some(c) = get(container) else {
+        return xasync::finished(block, (&raw const READ).cast(), E_INVALIDARG);
     };
-    xasync::finished_with(block, (&raw const READ).cast(), result)
+    let container = Container {
+        name: c.name.clone(),
+        dir: c.dir.clone(),
+    };
+    let names = names(blob_names, count);
+    later(block, (&raw const READ).cast(), move || {
+        read(&container, names).map(|blobs| layout(&blobs, 0))
+    })
 }
 extern "system" fn read_result(
     _: This,
@@ -944,9 +972,13 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
     }
 }
 
+/// The update as it is at the call (its blobs copied), written on a thread
+/// of ours ([`later`]).
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
-    let hr = get(update).map_or(E_INVALIDARG, Update::submit);
-    xasync::finished(block, (&raw const SUBMIT).cast(), hr)
+    let Some(update) = get(update).cloned() else {
+        return xasync::finished(block, (&raw const SUBMIT).cast(), E_INVALIDARG);
+    };
+    later(block, (&raw const SUBMIT).cast(), move || outcome(update.submit()))
 }
 extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
@@ -1461,6 +1493,7 @@ mod tests {
         // Quota counts the blobs; deleting the container frees it.
         let mut b = block();
         assert_eq!(quota_async(this, provider, &mut b), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         let mut left = 0i64;
         assert_eq!(quota_result(this, &mut b, &mut left), S_OK);
         assert!(left as u64 <= QUOTA - 7);
@@ -1469,6 +1502,7 @@ mod tests {
             delete_async(this, provider, c"Slot_1".as_ptr(), &mut b),
             S_OK
         );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         assert_eq!(delete_result(this, &mut b), S_OK);
         found.clear();
         let context = (&raw mut found).cast();
@@ -1547,5 +1581,63 @@ mod tests {
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
         assert!(slot.join("v1").join("0").is_file());
         assert!(!slot.join("v2").exists());
+    }
+
+    /// The async calls return before their disk work is done: a submit,
+    /// read, quota or delete started while another save holds the disk
+    /// (here: the lock every save takes) does not wait for it, and
+    /// completes once it is free.
+    #[test]
+    fn async_calls_do_not_wait_for_the_disk() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("async")).unwrap());
+        let container = give(Provider { root: get(provider).unwrap().root.clone() }.container("Slot"));
+        let mut update = give(Update {
+            name: "Slot".into(),
+            dir: get(container).unwrap().dir.clone(),
+            display: None,
+            changes: vec![("a".into(), Some(b"async".to_vec()))],
+        });
+
+        let (held, hold) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _saves = saves_lock();
+            held.send(()).unwrap();
+            // Let go after a second whatever happens, so that calls that
+            // wait for it fail the test rather than hang it.
+            let _ = released.recv_timeout(std::time::Duration::from_secs(1));
+        });
+        hold.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        let mut blocks = [block(), block(), block(), block()];
+        let [submit, read, quota, delete] = &mut blocks;
+        type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
+        assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, submit), S_OK);
+        // The title may change or close its update once the call is made.
+        close_update(this, std::mem::replace(&mut update, std::ptr::null_mut()));
+        assert_eq!(read_async(this, container, std::ptr::null(), 0, read), S_OK);
+        assert_eq!(quota_async(this, provider, quota), S_OK);
+        assert_eq!(delete_async(this, provider, c"Other".as_ptr(), delete), S_OK);
+        let begun = started.elapsed();
+        for b in blocks.iter_mut() {
+            assert_eq!(xasync::XAsyncGetStatus(b, false), xasync::E_PENDING);
+        }
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(begun < std::time::Duration::from_millis(500), "the calls waited {begun:?}");
+
+        let [submit, read, quota, delete] = &mut blocks;
+        assert_eq!(xasync::XAsyncGetStatus(submit, true), S_OK);
+        // Read after the submit, or before it (no container yet).
+        let read_hr = xasync::XAsyncGetStatus(read, true);
+        assert!(read_hr == S_OK || read_hr == BLOB_NOT_FOUND, "{read_hr:#x}");
+        assert_eq!(xasync::XAsyncGetStatus(quota, true), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(delete, true), S_OK);
+        assert_eq!(state(&get(provider).unwrap().root), Some((String::new(), vec![("a".into(), "async".into())])));
+        close_container(this, container);
+        close_provider(this, provider);
     }
 }
