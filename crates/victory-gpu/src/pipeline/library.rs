@@ -627,25 +627,70 @@ pub(crate) fn pipeline(
         )
     });
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
+    match library.saving.try_read() {
+        Ok(_stores) => store(library, &wide, &pso),
+        // A save is writing the library out: stored after it ([`store_later`]).
+        Err(std::sync::TryLockError::WouldBlock) if store_later() => {
+            LATER.lock().unwrap_or_else(|e| e.into_inner()).push((wide, Later(pso.clone())));
+        }
+        Err(_) => {
+            let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+            store(library, &wide, &pso);
+        }
     }
     Ok(pso)
+}
+
+/// Stores `pso` as `name`; the caller holds `library.saving` for reading.
+fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) {
+    let _call = call("store", &name.to_string());
+    // SAFETY: a live pipeline; a name already stored (a description that
+    // differs) is refused, which leaves the library as it was.
+    if unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
+        library.added.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether a pipeline made while a save writes the library out is stored
+/// after the save, and handed to the draws that wait for it at once (on by
+/// default; `VICTORY_LIBRARY_STORE_LATER=0`: its worker waits for the save,
+/// as before). A save of a library of 4.78 GB (an RTX run of 2026-11-28)
+/// takes seconds, and every pipeline made meanwhile, one a frame waits for
+/// among them, waited for it before it was used.
+fn store_later() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_STORE_LATER").is_none_or(|v| v != "0"))
+}
+
+/// A pipeline made during a save, for [`LATER`].
+struct Later(ID3D12PipelineState);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Later {}
+
+/// Pipelines made while a save wrote the library out, stored after it.
+static LATER: Mutex<Vec<(HSTRING, Later)>> = Mutex::new(Vec::new());
+
+/// Stores the pipelines made during a save ([`LATER`]).
+fn store_waiting(library: &Library) {
+    let waiting = std::mem::take(&mut *LATER.lock().unwrap_or_else(|e| e.into_inner()));
+    if waiting.is_empty() {
+        return;
+    }
+    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    for (name, Later(pso)) in &waiting {
+        store(library, name, pso);
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        let every = save_every(SAVED.load(Ordering::Relaxed).max(BLOB.load(Ordering::Relaxed)));
+        if !now && last.is_some_and(|t| t.elapsed() < every) {
             return;
         }
         *last = Some(std::time::Instant::now());
@@ -654,6 +699,8 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+    // Those made during the last save go into this one.
+    store_waiting(library);
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
@@ -686,6 +733,7 @@ pub(crate) fn save(now: bool) {
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
+    store_waiting(library);
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -716,6 +764,27 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+}
+
+/// How long a save waits after the last one while a run goes on, for a
+/// library of `bytes`: 20 s up to 256 MB, and as much longer as it is
+/// larger (6 min at 4.78 GB), so that saves write at most about 13 MB a
+/// second on average. A save writes the whole library again, however few
+/// pipelines were added: at 4.78 GB (an RTX run of 2026-11-28) that was
+/// 4.78 GB of the file cache dirtied every 20 s while new pipelines came
+/// in, beside the title's own streaming. The save at the end of a run is
+/// not held back. `VICTORY_LIBRARY_SAVE_S=<seconds>`: that long whatever the size
+/// (20: as before).
+fn save_every(bytes: u64) -> std::time::Duration {
+    static ASKED: OnceLock<Option<u64>> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| std::env::var("VICTORY_LIBRARY_SAVE_S").ok().and_then(|v| v.trim().parse().ok()));
+    save_every_for(bytes, asked)
+}
+
+fn save_every_for(bytes: u64, asked: Option<u64>) -> std::time::Duration {
+    const BASE_S: u64 = 20;
+    const BASE_BYTES: u64 = 256 << 20;
+    std::time::Duration::from_secs(asked.unwrap_or_else(|| (BASE_S * bytes / BASE_BYTES).max(BASE_S)))
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
@@ -851,6 +920,16 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saves_of_large_libraries_wait_longer() {
+        let s = |bytes, asked| save_every_for(bytes, asked).as_secs();
+        assert_eq!(s(0, None), 20);
+        assert_eq!(s(256 << 20, None), 20);
+        assert_eq!(s(1 << 30, None), 80);
+        assert_eq!(s(4_781_301_298, None), 356);
+        assert_eq!(s(4_781_301_298, Some(20)), 20);
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
