@@ -2,6 +2,7 @@
 use super::*;
 mod io;
 pub mod fg;
+mod combined;
 use io::{readback, upload};
 use std::time::Instant;
 use windows::Win32::Graphics::Dxgi::Common::*;

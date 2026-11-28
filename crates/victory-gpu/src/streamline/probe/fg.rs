@@ -7,13 +7,22 @@ const WARMUP: u32 = 10;
 const PERIOD: u32 = 256;
 
 pub fn framegen_check(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait_s: u32) -> Result<Vec<String>, String> {
-    if size.iter().any(|&n| !(128..=4096).contains(&n)) || !(30..=600).contains(&frames) {
-        return Err("FG validation requires dimensions 128..4096 and 30..600 frames".into());
+    check(size, frames, lifecycle, focus_wait_s, false)
+}
+
+pub fn combined_check(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait_s: u32) -> Result<Vec<String>, String> {
+    check(size, frames, lifecycle, focus_wait_s, true)
+}
+
+fn check(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait_s: u32, combined: bool) -> Result<Vec<String>, String> {
+    let limit = if combined { 18000 } else { 600 };
+    if size.iter().any(|&n| !(128..=4096).contains(&n)) || !(30..=limit).contains(&frames) {
+        return Err(format!("validation requires dimensions 128..4096 and 30..{limit} frames"));
     }
     // Production singleton SDK/device state is deliberately not reinitialized in-process.
     // Repeat complete processes for init/shutdown coverage.
     let mut lines = Vec::new();
-    let result = run(size, frames, lifecycle, std::time::Duration::from_secs(focus_wait_s.into()), &mut lines);
+    let result = run(size, frames, lifecycle, std::time::Duration::from_secs(focus_wait_s.into()), combined, &mut lines);
     let shutdown = shut_down();
     CHECKING.store(false, Relaxed);
     lines.push(format!("Shutdown: {shutdown:?}"));
@@ -24,12 +33,12 @@ pub fn framegen_check(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait_s
     }
 }
 
-fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Duration, lines: &mut Vec<String>) -> Result<(), String> {
+fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Duration, combined: bool, lines: &mut Vec<String>) -> Result<(), String> {
     if std::env::var("VICTORY_FRAMEGEN_CYCLE").is_ok_and(|v| v != "0") {
         return Err("unset VICTORY_FRAMEGEN_CYCLE: the probe owns phase transitions".into());
     }
     let mut asked = Asked::from_env()?;
-    asked.dlss = false;
+    asked.dlss = combined;
     asked.framegen = true;
     asked.fsr_framegen = false;
     asked.present_hook = false;
@@ -39,6 +48,8 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
     CHECK_DEVICE.store(true, Relaxed);
     CHECKING.store(true, Relaxed);
     if !FG_READY.load(Acquire) { return Err("FG device not ready".into()); }
+    if combined && !DLSS_READY.load(Acquire) { return Err("combined SR device not ready".into()); }
+    if combined { lines.push("Combined SR -> FP16 HUD-less colour -> RGBA8 composition -> FG; static reference; first/final SR readback, no generated-image oracle".into()); }
     let get_state = FUNCTIONS.get().and_then(|f| f.dlssg_get_state).ok_or("no FG state query")?;
     let mut caps = abi::DlssgState::default();
     // SAFETY: initialized SDK, live device, valid output. Before any presents; does not drain live counts.
@@ -64,7 +75,8 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
             host.drop_presenter();
         }
         set_framegen(mode);
-        let fixture = Fixture::new(host, output)?;
+        let fixture = if combined { None } else { Some(Fixture::new(host, output)?) };
+        let mut sr = if combined { Some(super::combined::Combined::new(host, output, &asked)?) } else { None };
         let before = host.video_memory();
         let mut times = Vec::new();
         let mut shown = 0u64;
@@ -94,8 +106,16 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
         while measuring_from.is_none_or(|m| round - m < wanted) {
             frame += 1;
             let start = Instant::now();
-            fixture.advance(host, round % PERIOD)?;
+            if let Some(s) = &mut sr { s.advance(host, round)?; }
+            if let Some(f) = &fixture { f.advance(host, round % PERIOD)?; }
             let advanced = Instant::now();
+            if let Some(s) = &sr {
+                *lock(&SUBMITTED) = Some(Noted { id:NEXT_ID.fetch_add(1,Relaxed)+1,
+                    depth:Source::Fixed(s.depth.clone(),SHADER_READ),
+                    motion:Source::Fixed(s.motion.clone(),SHADER_READ),camera:s.camera,frame_ms:16.7 });
+                host.present_planes(&s.out, SHADER_READ, Some((&s.overlay, SHADER_READ)), frame)
+                    .ok_or("combined present/resize failed")?;
+            } else if let Some(fixture) = &fixture {
             let camera = plan::Camera { jitter:[0.0;2], motion_scale:[1.0;2], render:output, output,
                 near:0.15, far:10_000.0, fov_y:1.0, reset:round==0, flags:plan::FFX_DEPTH_INVERTED };
             *lock(&SUBMITTED) = Some(Noted { id:NEXT_ID.fetch_add(1,Relaxed)+1,
@@ -103,6 +123,7 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
                 motion:Source::Fixed(fixture.motion.clone(),SHADER_READ),camera,frame_ms:16.7 });
             lock(&HUD_SUBMITTED).push(Copied { id:frame,target:fixture.base.as_raw() as usize,texture:fixture.hud.clone() });
             host.present_planes(&fixture.base, SHADER_READ, None, frame).ok_or("present/resize failed")?;
+            }
             let presented = Instant::now();
             crate::host::settle_for_fence();
             let settled = Instant::now();
@@ -153,6 +174,7 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
         let pct=|p:f64|at(&times,p);
         lines.push(format!("Phase {name}: size={output:?} requested={mode}x presents={round} warmup={warm} measured={measured} enabled={on} SDK_shown={shown} status={status:#x} focused={focused} pause={} proxy={} PASS={}; synchronized_host_ms p50={:.3} p95={:.3}; memory_before={before:?} memory_after={:?}; dxgi_present_delta={:?} dxgi_stats_delta={:?}; split_ms p50 advance={:.3} present={:.3} settle={:.3}; present_ms p95={:.3}; interval_ms p50={:.3} p95={:.3} max={:.3}",verdict.as_deref().unwrap_or("-"),SWAP_CHAIN_PROXIED.load(Relaxed),verdict.is_ok(),pct(0.5),pct(0.95),host.video_memory(),native.0,native.1,at(&adv,0.5),at(&pres,0.5),at(&settle,0.5),at(&pres,0.95),at(&interval,0.5),at(&interval,0.95),interval.last().copied().unwrap_or(f64::NAN)));
         if let Err(e)=verdict { failed.push(format!("{name}: {e}")); }
+        if let Some(s) = &sr { lines.push(s.check(host)?); }
         // Disable and drop SDK references before the fixture's resources are released.
         resizing();
         *lock(&SUBMITTED)=None;

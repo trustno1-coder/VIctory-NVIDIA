@@ -142,7 +142,26 @@ pub(super) fn readback(
     host: &crate::host::Host,
     t: &ID3D12Resource,
 ) -> Result<Vec<u8>, String> {
+    readback_from(d, host, t, UNORDERED)
+}
+
+/// Copy a completed FP16 output and restore its actual entry state in one submission.
+pub(super) fn readback_from(
+    d: &ID3D12Device,
+    host: &crate::host::Host,
+    t: &ID3D12Resource,
+    state: u32,
+) -> Result<Vec<u8>, String> {
     let (f, size) = layout(d, t);
+    if f.Footprint.Format != DXGI_FORMAT_R16G16B16A16_FLOAT {
+        return Err("readback requires FP16 RGBA output".into());
+    }
+    let row_bytes = (f.Footprint.Width as usize).checked_mul(8).ok_or("row size overflow")?;
+    let packed_size = row_bytes.checked_mul(f.Footprint.Height as usize).ok_or("readback size overflow")?;
+    // Reserve before mapping. Row-wise Vec growth otherwise overallocates and copies
+    // already-packed rows, producing a transient host-memory spike at final validation.
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(packed_size).map_err(|e| format!("readback allocation: {e}"))?;
     let b = buffer(
         d,
         size,
@@ -153,7 +172,7 @@ pub(super) fn readback(
     transition(
         &l.list,
         t,
-        UNORDERED,
+        state,
         D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
     );
     let (from, to) = locations(t, &b, f);
@@ -165,12 +184,11 @@ pub(super) fn readback(
         &l.list,
         t,
         D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
-        UNORDERED,
+        state,
     );
     l.close();
     host.execute_sync_internal(&l);
     let mut data = std::ptr::null_mut();
-    let mut pixels = Vec::new();
     // SAFETY: completed copy, exact footprint bounds; discard row padding.
     unsafe {
         b.Map(
@@ -185,7 +203,7 @@ pub(super) fn readback(
         let bytes = std::slice::from_raw_parts(data.cast::<u8>(), size as usize);
         for y in 0..f.Footprint.Height as usize {
             let at = f.Offset as usize + y * f.Footprint.RowPitch as usize;
-            pixels.extend_from_slice(&bytes[at..at + f.Footprint.Width as usize * 8]);
+            pixels.extend_from_slice(&bytes[at..at + row_bytes]);
         }
         b.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
     }
