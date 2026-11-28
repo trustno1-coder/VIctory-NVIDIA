@@ -38,6 +38,7 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
         return Err("unset VICTORY_FRAMEGEN_CYCLE: the probe owns phase transitions".into());
     }
     let mut asked = Asked::from_env()?;
+    let degrade = combined && std::env::var("VICTORY_CHECK_DEGRADE").as_deref() == Ok("1");
     asked.dlss = combined;
     asked.framegen = true;
     asked.fsr_framegen = false;
@@ -48,7 +49,7 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
     CHECK_DEVICE.store(true, Relaxed);
     CHECKING.store(true, Relaxed);
     if !FG_READY.load(Acquire) { return Err("FG device not ready".into()); }
-    if combined && !DLSS_READY.load(Acquire) { return Err("combined SR device not ready".into()); }
+    if combined && !DLSS_READY.load(Acquire) && !degrade { return Err("combined SR device not ready".into()); }
     let split = combined && super::combined::split_token();
     if combined {
         lines.push("Combined SR -> FP16 HUD-less colour -> RGBA8 composition -> FG; static reference; first/final SR readback, no generated-image oracle".into());
@@ -62,8 +63,14 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
     let code = unsafe { get_state(&abi::ViewportHandle::new(VIEWPORT_FG), &mut caps, std::ptr::null()) };
     if code != 0 { return Err(format!("FG capabilities query: {code}")); }
     let max = caps.num_frames_to_generate_max.saturating_add(1);
-    let requested = framegen_wanted();
-    if requested > max { return Err(format!("requested {requested}x exceeds SDK maximum {max}x")); }
+    // Probe-only negative control: restrict the observed capability, never expand it.
+    let max = if std::env::var("VICTORY_CHECK_FG_CAP_2").as_deref() == Ok("1") { max.min(2) } else { max };
+    let mut requested = framegen_wanted();
+    if requested > max {
+        if !degrade { return Err(format!("requested {requested}x exceeds SDK maximum {max}x")); }
+        lines.push(format!("Degraded: FG request {requested}x exceeds maximum {max}x; continuing SR with FG disabled"));
+        requested = 0;
+    }
     if size.iter().any(|&n| n < caps.min_width_or_height) { return Err(format!("below SDK minimum {}", caps.min_width_or_height)); }
     lines.push(format!("FG capabilities: maximum={max}x minimum={} requested={requested}x; original scrolling pattern, depth 0.5, pixel motion+1x; SDK counts only", caps.min_width_or_height));
     let smaller = size.map(|n| (n * 3 / 4).max(caps.min_width_or_height).max(128));
@@ -81,8 +88,22 @@ fn run(size: [u32; 2], frames: u32, lifecycle: bool, focus_wait: std::time::Dura
             host.drop_presenter();
         }
         set_framegen(mode);
-        let fixture = if combined { None } else { Some(Fixture::new(host, output)?) };
-        let mut sr = if combined { Some(super::combined::Combined::new(host, output, &asked)?) } else { None };
+        let mut sr = if combined {
+            let init = if std::env::var("VICTORY_CHECK_SR_INIT_FAIL").as_deref() == Ok("1") {
+                Err("injected SR initialization failure (probe control)".into())
+            } else if !DLSS_READY.load(Acquire) {
+                Err("SR device unavailable".into())
+            } else { super::combined::Combined::new(host, output, &asked) };
+            match init {
+                Ok(sr) => Some(sr),
+                Err(e) if degrade => {
+                    lines.push(format!("Degraded: SR initialization failed ({e}); continuing initialized native-resolution FG fixture"));
+                    None
+                }
+                Err(e) => return Err(e),
+            }
+        } else { None };
+        let fixture = if sr.is_none() { Some(Fixture::new(host, output)?) } else { None };
         let before = host.video_memory();
         let mut times = Vec::new();
         let mut shown = 0u64;
