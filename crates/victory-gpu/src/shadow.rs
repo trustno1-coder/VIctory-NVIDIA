@@ -2363,6 +2363,199 @@ fn is_write_combined(start: u64, len: u64) -> bool {
         .any(|&(from, to)| from <= start && start + len <= to)
 }
 
+/// Title memory the title asked for with read-only GPU page protection
+/// (`PAGE_GRAPHICS_READONLY` / `PAGE_GRAPHICS_EXECUTE` /
+/// `PAGE_GRAPHICS_EXECUTE_READ`, without `PAGE_GRAPHICS_READWRITE` or
+/// `PAGE_GRAPHICS_EXECUTE_READWRITE`). Kept sorted and merged as disjoint
+/// `[start, end)` intervals.
+///
+/// On console hardware the GPU MMU forbids shader stores to these pages.
+/// A title may still place one large buffer across adjacent regions of
+/// different GPU protections (for example a CPU-written constant ring with
+/// `PAGE_GRAPHICS_EXECUTE_READ` followed by GPU-written skinning pools with
+/// `PAGE_GRAPHICS_READWRITE`) and bind one raw UAV over the whole buffer.
+/// Subtracting these read-only intervals from shader UAV write declarations
+/// avoids false read-after-write waits on CPU constant fills and skips
+/// hashing/comparing pages shaders cannot write.
+static GPU_READONLY: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
+
+/// Lowest start and highest end across `GPU_READONLY` (both 0 when empty), for
+/// a lock-free fast path on hot shader write declarations.
+static GPU_READONLY_BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn update_gpu_ro_bounds(all: &[(u64, u64)]) {
+    let (lo, hi) = match (all.first(), all.last()) {
+        (Some(&(first, _)), Some(&(_, last))) => (first, last),
+        _ => (0, 0),
+    };
+    GPU_READONLY_BOUNDS[0].store(lo, Ordering::Relaxed);
+    GPU_READONLY_BOUNDS[1].store(hi, Ordering::Relaxed);
+}
+
+/// Whether shader UAV write declarations exclude GPU-read-only sub-ranges
+/// (`VICTORY_GPU_RO_SKIP=0` disables it; `VICTORY_GPU_RO_CHECK=1` also leaves
+/// full ranges declared so the compare pass can verify zero GPU writes hit
+/// them). On by default.
+pub(crate) fn gpu_ro_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !gpu_ro_check() && std::env::var_os("VICTORY_GPU_RO_SKIP").is_none_or(|v| v != "0")
+    })
+}
+
+/// Verification mode (`VICTORY_GPU_RO_CHECK=1`, off by default): keeps full
+/// UAV ranges declared and warns if any GPU compare pass ever sees a changed
+/// 64 KiB piece inside a GPU-read-only region.
+pub(crate) fn gpu_ro_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_RO_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// Bytes of shader UAV write declarations clipped away as GPU-read-only since
+/// the last frame-rate line.
+pub(crate) static GPU_RO_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// Records `[at, at + len)` as GPU-read-only title memory.
+pub fn title_memory_gpu_readonly(at: usize, len: usize) {
+    let Some(end) = (at as u64).checked_add(len as u64) else {
+        return;
+    };
+    let start = at as u64;
+    if len == 0 {
+        return;
+    }
+    let mut all = GPU_READONLY.write().unwrap_or_else(|e| e.into_inner());
+    let mut merged = Vec::with_capacity(all.len() + 1);
+    let mut inserted = false;
+    let (mut cur_s, mut cur_e) = (start, end);
+    for &(a, b) in all.iter() {
+        if b < cur_s {
+            merged.push((a, b));
+        } else if a > cur_e {
+            if !inserted {
+                merged.push((cur_s, cur_e));
+                inserted = true;
+            }
+            merged.push((a, b));
+        } else {
+            cur_s = cur_s.min(a);
+            cur_e = cur_e.max(b);
+        }
+    }
+    if !inserted {
+        merged.push((cur_s, cur_e));
+    }
+    *all = merged;
+    update_gpu_ro_bounds(&all);
+    drop(all);
+    tracing::info!(
+        start = format_args!("{start:#x}"),
+        len = format_args!("{len:#x}"),
+        "GPU-read-only title memory noted (VICTORY_GPU_RO_SKIP={})",
+        u8::from(gpu_ro_skip())
+    );
+}
+
+/// Removes `[at, at + len)` from GPU-read-only tracking (splitting any larger
+/// interval that contains it).
+pub fn title_memory_gpu_writable(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let start = at as u64;
+    let end = start.saturating_add(len as u64);
+    let hi = GPU_READONLY_BOUNDS[1].load(Ordering::Relaxed);
+    if hi <= start || GPU_READONLY_BOUNDS[0].load(Ordering::Relaxed) >= end {
+        return;
+    }
+    let mut all = GPU_READONLY.write().unwrap_or_else(|e| e.into_inner());
+    let mut next = Vec::with_capacity(all.len() + 1);
+    for &(a, b) in all.iter() {
+        if b <= start || a >= end {
+            next.push((a, b));
+        } else {
+            if a < start {
+                next.push((a, start));
+            }
+            if b > end {
+                next.push((end, b));
+            }
+        }
+    }
+    *all = next;
+    update_gpu_ro_bounds(&all);
+}
+
+/// The title let go of `[at, at + len)` (`len` 0: the whole allocation at
+/// `at`): GPU-read-only intervals in it are forgotten.
+pub(crate) fn gpu_readonly_freed(at: usize, len: usize) {
+    let start = at as u64;
+    if GPU_READONLY_BOUNDS[1].load(Ordering::Relaxed) <= start {
+        return;
+    }
+    if len != 0 {
+        title_memory_gpu_writable(at, len);
+        return;
+    }
+    let mut all = GPU_READONLY.write().unwrap_or_else(|e| e.into_inner());
+    let before = all.len();
+    all.retain(|&(a, _)| a != start);
+    if all.len() != before {
+        update_gpu_ro_bounds(&all);
+    }
+}
+
+/// Whether `[start, start + len)` overlaps any GPU-read-only region.
+pub(crate) fn overlaps_gpu_readonly(start: u64, len: u64) -> bool {
+    let end = start.saturating_add(len);
+    if len == 0
+        || GPU_READONLY_BOUNDS[1].load(Ordering::Relaxed) <= start
+        || GPU_READONLY_BOUNDS[0].load(Ordering::Relaxed) >= end
+    {
+        return false;
+    }
+    let all = GPU_READONLY.read().unwrap_or_else(|e| e.into_inner());
+    let i = all.partition_point(|&(_, b)| b <= start);
+    all.get(i).is_some_and(|&(a, _)| a < end)
+}
+
+/// Subtracts GPU-read-only regions from `[start, start + len)`.
+/// Returns `None` when nothing overlaps (fast path, zero allocation), or
+/// `Some(remaining)` with the GPU-writable sub-ranges inside `[start, end)`.
+fn writable_subranges(start: u64, len: u64) -> Option<Vec<(u64, u64)>> {
+    let end = start.saturating_add(len);
+    if len == 0
+        || GPU_READONLY_BOUNDS[1].load(Ordering::Relaxed) <= start
+        || GPU_READONLY_BOUNDS[0].load(Ordering::Relaxed) >= end
+    {
+        return None;
+    }
+    let all = GPU_READONLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut i = all.partition_point(|&(_, b)| b <= start);
+    if all.get(i).is_none_or(|&(a, _)| a >= end) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut cursor = start;
+    while let Some(&(a, b)) = all.get(i) {
+        if a >= end {
+            break;
+        }
+        if a > cursor {
+            out.push((cursor, a));
+        }
+        cursor = cursor.max(b.min(end));
+        if cursor >= end {
+            break;
+        }
+        i += 1;
+    }
+    if cursor < end {
+        out.push((cursor, end));
+    }
+    Some(out)
+}
+
 /// Whether what shaders write into copies in the card's memory of
 /// write-combined title memory stays on the card and is not compared,
 /// fetched and merged into title memory (`VICTORY_WC_NO_BACK=1`; off by
@@ -3466,6 +3659,63 @@ impl Shadow {
         }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
+        list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Shaders of `list` may write `[address, address + len)` through an
+    /// unordered-access view. Unlike [`Shadow::gpu_writes`] (which also serves
+    /// explicit host-recorded `CopyBufferRegion` destinations), this subtracts
+    /// sub-ranges whose title page protection forbids GPU writes
+    /// ([`title_memory_gpu_readonly`]) when `VICTORY_GPU_RO_SKIP` is enabled.
+    pub(crate) fn shader_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, pipeline: usize) {
+        let _ = pipeline;
+        if self.place.is_some() {
+            return;
+        }
+        if (self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() || self.mapped && !self.window)
+            && self.write_combined()
+        {
+            self.written.store(true, Ordering::Relaxed);
+            WC_LEFT.fetch_add(len.min(self.left(address)), Ordering::Relaxed);
+            return;
+        }
+        let len = len.min(self.left(address));
+        if len == 0 {
+            return;
+        }
+        if gpu_ro_skip()
+            && let Some(ranges) = writable_subranges(address, len)
+        {
+            let kept: u64 = ranges.iter().map(|&(a, b)| b - a).sum();
+            let clipped = len - kept;
+            GPU_RO_LEFT.fetch_add(clipped, Ordering::Relaxed);
+            {
+                static LOGGED: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
+                let mut seen = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+                let set = seen.get_or_insert_with(Default::default);
+                if set.len() < 64 && set.insert((address, len)) {
+                    let kept_desc: Vec<String> = ranges.iter().map(|&(a, b)| format!("{a:#x}..{b:#x}")).collect();
+                    tracing::info!(
+                        declared = format_args!("{address:#x}..{:#x}", address + len),
+                        clipped_mb = format_args!("{:.1}", clipped as f64 / 1e6),
+                        kept = kept_desc.join(", "),
+                        "shader UAV write clipped GPU-read-only prefix/sub-range (VICTORY_GPU_RO_SKIP=0 disables)"
+                    );
+                }
+            }
+            if !ranges.is_empty() {
+                self.written.store(true, Ordering::Relaxed);
+                for (a, b) in ranges {
+                    #[cfg(feature = "diagnostics")]
+                    crate::host::wide_write(a, b - a, pipeline);
+                    list.defer_gpu_write(self, a as usize, (b - a) as usize);
+                }
+            }
+            return;
+        }
+        self.written.store(true, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::host::wide_write(address, len, pipeline);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -5957,6 +6207,100 @@ mod write_combined_tests {
             !is_write_combined(other as u64, 0x1000),
             "the allocation released"
         );
+    }
+}
+
+#[cfg(test)]
+mod gpu_readonly_tests {
+    use super::{
+        gpu_readonly_freed, overlaps_gpu_readonly, title_memory_gpu_readonly, title_memory_gpu_writable,
+        writable_subranges,
+    };
+
+    /// Simulates a single placed buffer spanning a GPU-read-only CPU constant
+    /// ring followed by GPU-read-write pools: subtracting GPU-read-only pages
+    /// keeps only the writable suffix.
+    #[test]
+    fn clips_gpu_readonly_prefix_and_keeps_writable_suffix() {
+        let base = 0x7e10_0000_0000usize;
+        let ro_len = 0x0100_0000usize; // 16 MiB GPU-read-only constant ring
+        let rw_len = 0x09e0_0000usize; // ~158 MiB GPU-writable pools
+        let total = (ro_len + rw_len) as u64;
+
+        title_memory_gpu_readonly(base, ro_len);
+        title_memory_gpu_writable(base + ro_len, rw_len);
+
+        assert_eq!(
+            writable_subranges(base as u64, total),
+            Some(vec![((base + ro_len) as u64, base as u64 + total)])
+        );
+        assert!(overlaps_gpu_readonly(base as u64, 0x1000));
+        assert!(overlaps_gpu_readonly((base + ro_len - 0x1000) as u64, 0x2000));
+        assert!(!overlaps_gpu_readonly((base + ro_len) as u64, 0x1000));
+        assert_eq!(writable_subranges((base + ro_len) as u64, rw_len as u64), None);
+
+        gpu_readonly_freed(base, ro_len + rw_len);
+        assert_eq!(writable_subranges(base as u64, total), None);
+    }
+
+    /// Middle holes split into two writable ranges, wholly read-only ranges
+    /// return an empty list, and disjoint ranges take the fast `None` path.
+    #[test]
+    fn splits_middle_hole_suffix_and_whole_ro() {
+        let base = 0x7e20_0000_0000usize;
+        title_memory_gpu_readonly(base + 0x2_0000, 0x3_0000);
+
+        // Wholly inside RO.
+        assert_eq!(writable_subranges((base + 0x2_0000) as u64, 0x3_0000), Some(vec![]));
+        assert_eq!(writable_subranges((base + 0x3_0000) as u64, 0x1_0000), Some(vec![]));
+
+        // Middle RO hole splits into two writable halves.
+        assert_eq!(
+            writable_subranges(base as u64, 0x8_0000),
+            Some(vec![
+                (base as u64, (base + 0x2_0000) as u64),
+                ((base + 0x5_0000) as u64, (base + 0x8_0000) as u64),
+            ])
+        );
+
+        // Suffix RO leaves prefix only.
+        assert_eq!(
+            writable_subranges(base as u64, 0x4_0000),
+            Some(vec![(base as u64, (base + 0x2_0000) as u64)])
+        );
+
+        // Disjoint ranges before and after take the fast None path.
+        assert_eq!(writable_subranges(base as u64, 0x2_0000), None);
+        assert_eq!(writable_subranges((base + 0x5_0000) as u64, 0x3_0000), None);
+
+        gpu_readonly_freed(base + 0x2_0000, 0);
+        assert!(!overlaps_gpu_readonly((base + 0x2_0000) as u64, 0x3_0000));
+    }
+
+    /// Adjacent/overlapping read-only intervals merge, and marking a sub-range
+    /// writable splits or clears them cleanly.
+    #[test]
+    fn merges_and_splits_gpu_readonly_intervals() {
+        let base = 0x7e30_0000_0000usize;
+        title_memory_gpu_readonly(base, 0x2_0000);
+        title_memory_gpu_readonly(base + 0x2_0000, 0x2_0000); // adjacent
+        title_memory_gpu_readonly(base + 0x3_0000, 0x3_0000); // overlapping -> [0..0x6_0000)
+
+        assert_eq!(writable_subranges(base as u64, 0x6_0000), Some(vec![]));
+
+        // Carve out [0x2_0000..0x4_0000) as writable.
+        title_memory_gpu_writable(base + 0x2_0000, 0x2_0000);
+        assert_eq!(
+            writable_subranges(base as u64, 0x6_0000),
+            Some(vec![((base + 0x2_0000) as u64, (base + 0x4_0000) as u64)])
+        );
+        assert!(overlaps_gpu_readonly(base as u64, 0x1_0000));
+        assert!(!overlaps_gpu_readonly((base + 0x2_0000) as u64, 0x2_0000));
+        assert!(overlaps_gpu_readonly((base + 0x5_0000) as u64, 0x1_0000));
+
+        // Clean up both halves.
+        gpu_readonly_freed(base, 0x6_0000);
+        assert!(!overlaps_gpu_readonly(base as u64, 0x6_0000));
     }
 }
 

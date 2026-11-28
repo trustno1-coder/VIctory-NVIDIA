@@ -260,3 +260,70 @@ used a stale size, or the trace does not tie them to their ask, is not settled b
 198 containers without a vertex, pixel, compute or mesh program, 22 wave64 programs with no
 wave32 lowering, 5 with a descriptor read only as data. Two of the 22 were created in these
 runs (`6b82bc7d22016cb5`, `a10179ab7eda0dc3`, both compute).
+
+# Clipping GPU-read-only sub-ranges from shader UAV writes (2026-11-28)
+
+## Cause of the 174 MB heap read-after-write waits
+
+On the console, a title can reserve one virtual placeholder (`MEM_RESERVE_PLACEHOLDER`),
+split it with `VirtualFree(..., MEM_PRESERVE_PLACEHOLDER)`, replace each sub-range with
+`XMemVirtualAlloc(..., MEM_REPLACE_PLACEHOLDER, protect)` carrying distinct Xbox GDK
+`PAGE_GRAPHICS_*` protection bits, and then place a single large buffer and raw UAV across
+adjacent regions of mixed GPU protection.
+
+In particular, the 174 MiB (`0xae00000`) heap noted above spans a 27 MiB (`0x1b00000`)
+prefix allocated with `PAGE_GRAPHICS_EXECUTE_READ` (a CPU-written constant/upload ring)
+followed by 147 MiB (`0x9300000`) allocated with `PAGE_GRAPHICS_READWRITE`. Previously,
+`XMemVirtualAlloc` returned early on `MEM_REPLACE_PLACEHOLDER` without recording GPU
+protection bits, so binding a raw UAV over all 174 MiB declared the read-only 27 MiB prefix
+as shader-writable. Every CPU upload-buffer fill reading from that prefix then either
+stalled waiting for in-flight submissions or was diverted into `card_steps` (~4,000-7,500
+fills/frame).
+
+Tracking `PAGE_GRAPHICS_READONLY`, `PAGE_GRAPHICS_EXECUTE`, and
+`PAGE_GRAPHICS_EXECUTE_READ` (without `PAGE_GRAPHICS_READWRITE` /
+`PAGE_GRAPHICS_EXECUTE_READWRITE`, and excluding `PAGE_GRAPHICS_NOACCESS`, which is passed
+on empty placeholder reservations) in `xmem.rs` and subtracting those intervals in
+`Shadow::shader_writes` (`VICTORY_GPU_RO_SKIP`, on by default; `VICTORY_GPU_RO_SKIP=0`
+disables) clips only the 27 MiB read-only prefix while leaving the 147 MiB writable suffix
+and explicit `CopyBufferRegion` destinations (`Shadow::gpu_writes`) untouched.
+
+## Verification and RTX 3080 A/B measurements
+
+One PC: Windows 11, NVIDIA GeForce RTX 3080 10 GB (driver 621.14), Series X profile,
+2560x1440 output, release build, warm shader/pipeline cache (`0` pipelines compiling),
+frame generation off, identical scripted startup/cutscene/world sequence (115-120 s per
+run).
+
+- **Verification (`VICTORY_GPU_RO_CHECK=1`, diagnostics build):** leaves full UAV ranges
+  declared and checks every flagged 64 KiB piece in `CardPlan::check_gpu_ro` against
+  recorded GPU-read-only ranges. **0 warnings** across boot, menu, cutscene, and gameplay
+  (~320 compare passes/frame).
+
+### DLSS Performance (2560x1440 output, 1280x720 internal — CPU/submission-bound)
+
+| Metric (3D world & cutscene) | `VICTORY_GPU_RO_SKIP=0` | `VICTORY_GPU_RO_SKIP=1` | Change |
+|---|---:|---:|---:|
+| Median FPS | 20.80 | 24.15 | +16.1 % |
+| Median frame time | 48.00 ms | 41.45 ms | -6.55 ms |
+| Steady gameplay (~5,050 draws/frame) | 21.7 fps (46.0 ms) | 24.6-25.2 fps (39.8-40.6 ms) | +15-16 % |
+| Total DLSS frames rendered (115 s) | 1,547 | 1,828 | +18.2 % |
+| Submit-thread `preparing` (median / late) | 44.30 / 49.0 ms | 40.00 / 35.5 ms | -4.3 to -13.5 ms |
+| `waiting for flights` (median / gameplay) | 2.90 / 8.6 ms | 0.90 / 0.4-0.6 ms | -69 % to -94 % |
+| `planning card_steps` (median) | 3.10 ms | 1.60 ms | -48.4 % |
+| `card_steps` fills/frame (median) | 3,986 | 1,023 | -74.3 % |
+| `merge_under_writes` (median) | 2.30 ms | 1.50 ms | -34.8 % |
+| Card upload ranges/frame (median) | 16,383 | 4,855 | -70.4 % |
+| Card pieces compared/frame (median) | 6,421 | 5,555 | -13.5 % |
+| GPU-read-only UAV bytes clipped (median) | 0.0 MB/frame | 206.4 MB/frame | — |
+
+### Native 2560x1440 (`--dlss off` — heavily GPU-bound in 5,000-draw scenes)
+
+| Metric (3D world & cutscene) | `VICTORY_GPU_RO_SKIP=0` | `VICTORY_GPU_RO_SKIP=1` | Change |
+|---|---:|---:|---:|
+| Median FPS | 13.70 | 14.50 | +5.8 % |
+| Submit-thread `preparing` (median) | 75.60 ms | 65.00 ms | -10.60 ms (-14.0 %) |
+| `waiting for flights` (median) | 35.70 ms | 20.50 ms | -15.20 ms (-42.6 %) |
+| `planning card_steps` (median) | 4.50 ms | 2.40 ms | -46.7 % |
+| `card_steps` fills/frame (median) | 6,499 | 1,510 | -76.8 % |
+| Card upload ranges/frame (median) | 3,462 | 656 | -81.0 % |
