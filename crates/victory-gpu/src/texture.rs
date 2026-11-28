@@ -1513,6 +1513,30 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
+        static LOCKLESS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_REFRESH_LOCKLESS").is_some_and(|v| v == "1")
+        });
+        if *LOCKLESS {
+            let epoch = crate::watch::changes();
+            if epoch.is_multiple_of(2) && with_read(size, |bytes| {
+                if !crate::host::read_into(self.memory, bytes) || epoch != crate::watch::changes() {
+                    return false;
+                }
+                let hash = digest(bytes);
+                if last.hash != Some(hash) {
+                    // Streamed mip selection still needs the mapping guard.
+                    if self.on_demand {
+                        return false;
+                    }
+                    last.hash = Some(hash);
+                    found_blind(last);
+                    self.detile(bytes);
+                }
+                true
+            }) {
+                return size;
+            }
+        }
         let _mapped = if no_wait() && !exact {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
