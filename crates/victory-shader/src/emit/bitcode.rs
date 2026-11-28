@@ -549,6 +549,28 @@ impl Module {
         live
     }
 
+    #[cfg(test)]
+    pub(crate) fn cmp_preds(&self) -> Vec<u8> {
+        self.insts
+            .iter()
+            .filter_map(|i| {
+                if let Op::Cmp(p, ..) = &i.op {
+                    Some(*p)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_count(&self) -> usize {
+        self.insts
+            .iter()
+            .filter(|i| matches!(i.op, Op::Select(..)))
+            .count()
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");

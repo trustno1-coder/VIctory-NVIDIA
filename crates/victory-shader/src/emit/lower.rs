@@ -68,6 +68,12 @@ pub(crate) struct Lowered {
     /// Whether the program declares D3D12's early depth-stencil test.
     #[cfg(test)]
     pub early_depth: bool,
+    /// Comparisons and selects in the emitted module, for tests of guarded
+    /// accesses.
+    #[cfg(test)]
+    pub cmp_preds: Vec<u8>,
+    #[cfg(test)]
+    pub selects: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2228,7 +2234,7 @@ impl<'a> Lower<'a> {
             if let Some(bias) = self.root_bias(a.param) {
                 off = self.s.m.bin(c, Bin::Add, off, bias);
             }
-            match self.root_memory(&src, off, guard, false) {
+            match self.root_memory(&src, off, guard, false, None) {
                 Some((h, byte)) => {
                     off = byte;
                     Some(h)
@@ -2850,6 +2856,10 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             early_depth: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
+            #[cfg(test)]
+            cmp_preds: self.s.m.cmp_preds(),
+            #[cfg(test)]
+            selects: self.s.m.select_count(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3613,10 +3623,19 @@ impl<'a> Lower<'a> {
     /// and the byte in it of the view's byte `off` (signed: an offset below
     /// the address stays below it). [`Lower::handle`] gives the same view for
     /// the rest of the instruction. None for any other source. Goes on in
-    /// another block.
+    /// another block. Lanes where `inside` is false touch nothing: their
+    /// loads read zeros and their stores are dropped, as the console's
+    /// range check does.
     /// shortcut: an access of several dwords is taken not to cross the end
     /// of a host copy (the builder's records lie on their size).
-    fn root_memory(&mut self, src: &Source, off: V, guard: Option<V>, store: bool) -> Option<(V, V)> {
+    fn root_memory(
+        &mut self,
+        src: &Source,
+        off: V,
+        guard: Option<V>,
+        store: bool,
+        inside: Option<V>,
+    ) -> Option<(V, V)> {
         let (lo, hi) = self.root_address(src)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -3628,6 +3647,18 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::Add, hi, carry);
         let mut hi = self.s.m.bin(c, Bin::Add, hi, sign);
         let mut sum = sum;
+        let mut guard = guard;
+        if let Some(inside) = inside {
+            // Address 0 is a page without a copy: it reads zeros and drops
+            // writes, and no shader fault is noted for it.
+            let zero = self.s.m.i32(0);
+            sum = self.s.m.select(c, inside, sum, zero);
+            hi = self.s.m.select(c, inside, hi, zero);
+            guard = Some(match guard {
+                Some(g) => self.s.m.bin(c, Bin::And, g, inside),
+                None => inside,
+            });
+        }
         if super::builder_bounds() {
             // No structure is near 64 MiB (the greatest seen has 14). One
             // whose memory was written over says it has gigabytes, and the
@@ -7067,7 +7098,7 @@ impl<'a> Lower<'a> {
                 && matches!(soffset, Operand::Scalar { code: NULL, .. })
                 && super::builder_bounds();
             let mut root = false;
-            let h = match self.root_memory(src, addr, None, false) {
+            let h = match self.root_memory(src, addr, None, false, None) {
                 Some((h, byte)) => {
                     addr = byte;
                     root = true;
@@ -12568,6 +12599,9 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        // The element the console's range check sees, before the host's
+        // byte offset is made from it.
+        let asked = index;
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -12639,7 +12673,19 @@ impl<'a> Lower<'a> {
                 off = self.s.m.bin(c, Bin::Add, element, off);
                 index = None;
             }
-            if let Some((_, byte)) = self.root_memory(src, off, guard, store || atomic.is_some()) {
+            // RDNA2 range checking with dword 3's OOB_SELECT 1 (structured,
+            // element only): an element at or past num_records touches
+            // nothing. Other modes go unchecked, as before; check them once
+            // their offsets and strides are known exactly.
+            let inside = match (&src, asked) {
+                (Source::Built { words, .. }, Some(element)) if (words[1] >> 28) & 3 == 1 => {
+                    let n = self.s.m.i32(words[0]);
+                    Some(self.s.m.cmp(c, pred::IULT, element, n))
+                }
+                _ => None,
+            };
+            let written = store || atomic.is_some();
+            if let Some((_, byte)) = self.root_memory(src, off, guard, written, inside) {
                 off = byte;
             }
         }
@@ -13653,11 +13699,12 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::bitcode::pred;
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
-    use crate::{io, ir, resource, structure};
+    use crate::{io, ir, resource, spill, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -13863,6 +13910,97 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    /// Lowers a compute program that reads a root UAV descriptor from the
+    /// spilled user-data table and indexes it with the lane's v0. The
+    /// descriptor's dword 2 is `records`, dword 3 is `word3`; `idxen` selects
+    /// the index-only form rather than an offset-only one.
+    fn lower_spilled_root_buffer(
+        records: u32,
+        word3: u32,
+        idxen: bool,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let words = vec![
+            0x8703_FF01,
+            0x0000_00FF, // s_and_b32 s3, s1, 0xff
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xF404_0001,
+            0xFA00_0000, // s_load_dwordx2 s[0:1], s[2:3], 0
+            0xBE80_03FF | 18 << 16,
+            records, // s_mov_b32 s18, records
+            0xBE80_03FF | 19 << 16,
+            word3, // s_mov_b32 s19, word3
+            if idxen { 0xE030_2000 } else { 0xE030_1000 },
+            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], idxen or offen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![RootParam {
+                sgprs: 2,
+                ..root(RootType::Descriptor, 16, 0)
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 16,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1 | 1 << 7,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = spill::build(&native)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
+    fn iult_count(l: &Lowered) -> usize {
+        l.cmp_preds.iter().filter(|&&p| p == pred::IULT).count()
+    }
+
+    #[test]
+    fn oob_select_one_checks_only_indexed_elements_past_num_records() {
+        let oob_select_one = 1 << 28;
+        let checked = lower_spilled_root_buffer(4, oob_select_one, true).unwrap();
+        let other_mode = lower_spilled_root_buffer(4, 0, true).unwrap();
+        let offset_only = lower_spilled_root_buffer(4, oob_select_one, false).unwrap();
+        assert_eq!(
+            iult_count(&checked),
+            iult_count(&other_mode) + 1,
+            "OOB_SELECT 1 idxen adds the element check"
+        );
+        assert_eq!(
+            iult_count(&checked),
+            iult_count(&offset_only) + 1,
+            "an offset-only access has no element to check"
+        );
+        // The out-of-range address and its high half are replaced with zero.
+        assert_eq!(checked.selects, other_mode.selects + 2);
+        assert_eq!(checked.selects, offset_only.selects + 2);
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
