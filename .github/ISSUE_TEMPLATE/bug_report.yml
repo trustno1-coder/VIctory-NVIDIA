@@ -1,0 +1,64 @@
+name: Something went wrong
+description: A crash, a black screen, missing pictures, a launcher that stops. Attach both logs.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please attach **both** logs from the run that went wrong. Without them we can only guess. Paste `%LOCALAPPDATA%` into the address bar of File Explorer to get there.
+
+        1. **The play log**, in `%LOCALAPPDATA%\victory\logs\`: the newest `victory-nvidia-play-<date>-<time>-<number>.log` (from `victory.exe`) or `victory-nvidia-<date>-<time>.log` (from the script launcher). The window shows its path at the start, on the line `Log: ...`.
+        2. **The crash log**: `%LOCALAPPDATA%\VIctory\data\7952987A\crashes.log`, and, if there is one from that run, the newest `victory-<date>-<time>-<number>.crash.log` in `%LOCALAPPDATA%\VIctory\data\7952987A\temp\`.
+
+        Search the open issues first: if yours is there, add your logs to it instead.
+  - type: input
+    id: release
+    attributes:
+      label: Release
+      description: The release or commit you ran.
+      placeholder: v2026.11.28.01, or a commit such as 63b902f
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      placeholder: RTX 4060 8 GB, driver 591.44
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: CPU and RAM
+      placeholder: Ryzen 7 9800X3D, 32 GB
+    validations:
+      required: true
+  - type: dropdown
+    id: windows
+    attributes:
+      label: System
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux (Proton)
+    validations:
+      required: true
+  - type: input
+    id: settings
+    attributes:
+      label: Settings
+      description: From the F1 menu, or the launcher you used.
+      placeholder: CONSOLE Series S, DLSS Quality, frame generation 2x
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you saw, and when in the run (title screen, loading, in the world after N minutes).
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Drag both log files here.
+    validations:
+      required: true
