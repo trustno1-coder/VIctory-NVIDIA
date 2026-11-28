@@ -126,8 +126,31 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    // The title's bvh_skinning programs pose every animated mesh once more,
+    // only for the ray-tracing structures: with every ray a miss
+    // (`VICTORY_RT_MISS=1`) and the builder off nothing reads what they
+    // write, and they were the largest share of the card's time in a
+    // cutscene. `VICTORY_RT_SKIN=1` runs them anyway. After edsuuu's
+    // VI-BR-PORT (ab4571d, 1556de8): Series S, opening cutscene, 6.8 -> 10.2
+    // fps median.
+    static SKIP_RT_SKIN: OnceLock<bool> = OnceLock::new();
+    let skip_skin = *SKIP_RT_SKIN.get_or_init(|| {
+        victory_shader::emit::rt_miss()
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+            && std::env::var_os("VICTORY_RT_SKIN").is_none_or(|v| v != "1")
+    });
+    if skip_skin && named(shaders, RAY_SKINNING) {
+        return Some("skins meshes only for rays, which all miss (VICTORY_RT_MISS=1), left out");
+    }
     None
 }
+
+/// The entry points of the title's `bvh_skinning` programs: a container holds
+/// its entry point's name, not the effect's, and all 30 named so in the
+/// title's shader file are that effect's. The picture's own skinning is
+/// `CS_PedStandardSkinning*`, `CS_PosOnlyLodSkinning*` and the cloth's
+/// `computeclothSkinning`.
+const RAY_SKINNING: &[u8] = b"CSComputeSkinning";
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
 /// launch so cutscene lighting, tiling, and bakes never miss their first frame.
@@ -667,6 +690,28 @@ mod tests {
             missing(&p).as_deref(),
             Some("left out on purpose: shades ray-tracing hits without BVH, left out")
         );
+    }
+
+    /// The passes that only serve rays are known by their entry point's name;
+    /// the picture's own skinning is named otherwise (VI-BR-PORT 1556de8,
+    /// f1e5e45).
+    #[test]
+    fn ray_programs_are_known_by_name() {
+        let of = |stage, bytes: &'static [u8]| [super::super::shader(stage, bytes)];
+        let skin = b"..\0CSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0..";
+        assert!(named(&of("compute", skin), RAY_SKINNING));
+        let ped = b"..\0CS_PedStandardSkinning_3_00aa11bb_Wrapped\0..";
+        assert!(!named(&of("compute", ped), RAY_SKINNING));
+        let cloth = b"computeclothSkinning";
+        assert!(!named(&of("compute", cloth), RAY_SKINNING));
+        let resolve = b"..\0CS_RaytracingResolve_Opaque_12345678_Wrapped\0..";
+        assert!(named(&of("compute", resolve), b"CS_RaytracingResolve"));
+        let activate = b"..\0CS_ScreenProbes_ActivateRays_0_Wrapped\0..";
+        assert!(named(&of("compute", activate), b"CS_ScreenProbes_ActivateRays"));
+        // Only compute programs. Bytes of their own: `shader` keeps one
+        // container per content, with the stage it was first given.
+        let pixel = b"..\0CSComputeSkinningRigidVelocity_ps_0_Wrapped\0..";
+        assert!(!named(&of("pixel", pixel), RAY_SKINNING));
     }
 
     #[test]

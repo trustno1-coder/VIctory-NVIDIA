@@ -97,6 +97,8 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
+| `VICTORY_RT_MISS=1` | every ray-tracing node test hits nothing: lamps cast no shadows, reflection and probe rays reach the sky; with the builder off the `CSComputeSkinning*` passes are left out too |
+| `VICTORY_RT_SKIN=1` | with `VICTORY_RT_MISS=1`, the `CSComputeSkinning*` passes run anyway |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
