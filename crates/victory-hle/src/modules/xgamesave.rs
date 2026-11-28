@@ -953,26 +953,82 @@ extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast())
 }
 
+// The blocking calls, which the GDK's samples use as much as the async ones.
+
+extern "system" fn initialize(
+    _: This,
+    _user: *const c_void,
+    config: *const c_char,
+    _sync_on_demand: bool,
+    out: *mut *mut Provider,
+) -> HRESULT {
+    let saves = runtime::title().saves();
+    if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return NO_ACCESS;
+    }
+    match Provider::open(&saves, text(config).as_deref()) {
+        Ok(p) => put(out, give(p)),
+        Err(hr) => hr,
+    }
+}
+extern "system" fn quota(_: This, provider: *const Provider, out: *mut i64) -> HRESULT {
+    get(provider).map_or(E_INVALIDARG, |p| put(out, p.remaining() as i64))
+}
+extern "system" fn delete_container(_: This, provider: *const Provider, name: *const c_char) -> HRESULT {
+    match (get(provider), text(name)) {
+        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
+        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
+        _ => E_INVALIDARG,
+    }
+}
+/// The containers whose names start with `prefix`.
+extern "system" fn containers_by_name(
+    _: This,
+    provider: *const Provider,
+    prefix: *const c_char,
+    context: *mut c_void,
+    callback: Option<ContainerCallback>,
+) -> HRESULT {
+    let (Some(p), Some(callback)) = (get(provider), callback) else {
+        return E_INVALIDARG;
+    };
+    let prefix = text(prefix).unwrap_or_default();
+    report(&p.root, |n| n.starts_with(&prefix), context, callback);
+    S_OK
+}
+/// Every blob of the container.
+extern "system" fn all_blobs(
+    this: This,
+    container: *const Container,
+    context: *mut c_void,
+    callback: Option<BlobCallback>,
+) -> HRESULT {
+    enumerate_blobs(this, container, std::ptr::null(), context, callback)
+}
+extern "system" fn submit(_: This, update: *const Update) -> HRESULT {
+    get(update).map_or(E_INVALIDARG, Update::submit)
+}
+
 static VTABLE: Methods<30> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),         // 0x18 initialize (blocking)
+    initialize as *const (),           // 0x18
     initialize_async as *const (),     // 0x20
     initialize_result as *const (),    // 0x28
     close_provider as *const (),       // 0x30
-    missing::<7> as *const (),         // 0x38 remaining quota (blocking)
+    quota as *const (),                // 0x38
     quota_async as *const (),          // 0x40
     quota_result as *const (),         // 0x48
-    missing::<10> as *const (),        // 0x50 delete (blocking)
+    delete_container as *const (),     // 0x50
     delete_async as *const (),         // 0x58
     delete_result as *const (),        // 0x60
     container_info as *const (),       // 0x68
     enumerate_containers as *const (), // 0x70
-    missing::<15> as *const (),        // 0x78 by name prefix
+    containers_by_name as *const (),   // 0x78 by name prefix
     create_container as *const (),     // 0x80
     close_container as *const (),      // 0x88
-    missing::<18> as *const (),        // 0x90 all blob info
+    all_blobs as *const (),            // 0x90 all blob info
     enumerate_blobs as *const (),      // 0x98 by name prefix
     read_blobs as *const (),           // 0xa0
     read_async as *const (),           // 0xa8
@@ -981,7 +1037,7 @@ static VTABLE: Methods<30> = Methods([
     close_update as *const (),         // 0xc0
     write_blob as *const (),           // 0xc8
     delete_blob as *const (),          // 0xd0
-    missing::<27> as *const (),        // 0xd8 submit (blocking)
+    submit as *const (),               // 0xd8
     submit_async as *const (),         // 0xe0
     submit_result as *const (),        // 0xe8
 ]);
@@ -1294,6 +1350,67 @@ mod tests {
         let other = Provider::open(saves.path(), Some("other")).unwrap();
         assert_eq!(state(&other.root), None);
         assert_eq!(state(&scid.root), kept);
+    }
+
+    /// The blocking calls: initialize, quota, submit, enumerate by name
+    /// prefix and all blobs, delete.
+    #[test]
+    fn the_blocking_calls_save_and_enumerate() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("sync")).unwrap());
+        type Quota = extern "system" fn(This, *const Provider, *mut i64) -> HRESULT;
+        let mut left = 0i64;
+        assert_eq!(method::<Quota>(&OBJECT, 0x38)(this, provider, &mut left), S_OK);
+        assert!(left > 0 && left as u64 <= QUOTA, "{left}");
+
+        type Submit = extern "system" fn(This, *const Update) -> HRESULT;
+        for name in ["Slot_1", "Slot_2", "Other"] {
+            let update = give(Update {
+                name: name.into(),
+                dir: container_dir(&get(provider).unwrap().root, name),
+                display: None,
+                changes: vec![("a".into(), Some(b"aa".to_vec())), ("b".into(), Some(b"b".to_vec()))],
+            });
+            assert_eq!(method::<Submit>(&OBJECT, 0xd8)(this, update), S_OK);
+            close_update(this, update);
+        }
+
+        extern "system" fn container(info: *const ContainerInfo, context: *mut c_void) -> bool {
+            // SAFETY: valid during the callback; the context is the test's vector.
+            let (info, out) = unsafe { (&*info, &mut *context.cast::<Vec<String>>()) };
+            out.push(text(info.name).unwrap());
+            true
+        }
+        type ByName = extern "system" fn(This, *const Provider, *const c_char, *mut c_void, Option<ContainerCallback>) -> HRESULT;
+        let mut found: Vec<String> = Vec::new();
+        let by_name = method::<ByName>(&OBJECT, 0x78);
+        assert_eq!(by_name(this, provider, c"Slot".as_ptr(), (&raw mut found).cast(), Some(container)), S_OK);
+        found.sort();
+        assert_eq!(found, ["Slot_1", "Slot_2"]);
+
+        extern "system" fn blob(info: *const BlobInfo, context: *mut c_void) -> bool {
+            // SAFETY: as above.
+            let (info, out) = unsafe { (&*info, &mut *context.cast::<Vec<(String, u32)>>()) };
+            out.push((text(info.name).unwrap(), info.size));
+            true
+        }
+        type AllBlobs = extern "system" fn(This, *const Container, *mut c_void, Option<BlobCallback>) -> HRESULT;
+        let slot = give(get(provider).unwrap().container("Slot_1"));
+        let mut blobs: Vec<(String, u32)> = Vec::new();
+        assert_eq!(method::<AllBlobs>(&OBJECT, 0x90)(this, slot, (&raw mut blobs).cast(), Some(blob)), S_OK);
+        assert_eq!(blobs, [("a".into(), 2), ("b".into(), 1)]);
+        close_container(this, slot);
+
+        type Delete = extern "system" fn(This, *const Provider, *const c_char) -> HRESULT;
+        let delete = method::<Delete>(&OBJECT, 0x50);
+        assert_eq!(delete(this, provider, c"bad name".as_ptr()), INVALID_CONTAINER_NAME);
+        assert_eq!(delete(this, provider, c"Slot_2".as_ptr()), S_OK);
+        found.clear();
+        assert_eq!(by_name(this, provider, c"".as_ptr(), (&raw mut found).cast(), Some(container)), S_OK);
+        found.sort();
+        assert_eq!(found, ["Other", "Slot_1"]);
+        close_provider(this, provider);
     }
 
     #[test]

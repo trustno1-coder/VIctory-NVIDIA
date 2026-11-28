@@ -1,8 +1,9 @@
 //! XStore as an offline console answers it: the game's own licence is
-//! local and active (a full, owned game); the user owns no add-ons; what
-//! needs the store service (catalog, consumables, purchase and update
-//! pages, collection ids, update checks) fails with the documented store
-//! network error.
+//! local and active (a full, owned game); the user owns no add-ons and no
+//! add-on licences; what needs the store service (catalog and product
+//! queries, licence checks for what is not installed, consumables, purchase
+//! and update pages, collection ids, update checks and downloads) fails
+//! with the documented store network error.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -64,6 +65,7 @@ static FAILED: u8 = 0;
 static QUERY_CALL: u8 = 0;
 static LICENSE_CALL: u8 = 0;
 static GAME_LICENSE: u8 = 0;
+static ADDON_LICENSES: u8 = 0;
 
 fn offline(block: *mut AsyncBlock, what: &str) -> HRESULT {
     tracing::info!(what, "store call: offline");
@@ -206,6 +208,58 @@ extern "system" fn game_license_result(
     xasync::result(block, (&raw const GAME_LICENSE).cast(), out)
 }
 
+/// `XStoreQueryProductsAsync`: the catalog needs the service.
+#[allow(clippy::too_many_arguments)] // the public API's
+extern "system" fn products_async(
+    _: This,
+    _: Handle,
+    _kinds: u32,
+    _store_ids: *const *const c_char,
+    _store_id_count: usize,
+    _action_filters: *const *const c_char,
+    _action_filter_count: usize,
+    block: *mut AsyncBlock,
+) -> HRESULT {
+    offline(block, "products")
+}
+extern "system" fn product_for_game_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+    offline(block, "product for the game")
+}
+extern "system" fn product_for_package_async(
+    _: This,
+    _: Handle,
+    _kinds: u32,
+    _package: *const c_char,
+    block: *mut AsyncBlock,
+) -> HRESULT {
+    offline(block, "product for a package")
+}
+/// Store ids and packages alike: whether a licence could be acquired.
+extern "system" fn can_acquire_async(_: This, _: Handle, _id: *const c_char, block: *mut AsyncBlock) -> HRESULT {
+    offline(block, "licence acquisition check")
+}
+extern "system" fn struct_status(_: This, block: *mut AsyncBlock, _out: *mut c_void) -> HRESULT {
+    xasync::XAsyncGetStatus(block, false)
+}
+
+/// The user owns no add-ons, so none has a licence: an empty list.
+extern "system" fn addon_licenses_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+    xasync::finished(block, (&raw const ADDON_LICENSES).cast(), S_OK)
+}
+extern "system" fn addon_license_count(_: This, block: *mut AsyncBlock, out: *mut u32) -> HRESULT {
+    match xasync::XAsyncGetStatus(block, false) {
+        S_OK => put(out, 0),
+        hr => hr,
+    }
+}
+extern "system" fn addon_licenses(_: This, block: *mut AsyncBlock, count: u32, _out: *mut c_void) -> HRESULT {
+    match xasync::XAsyncGetStatus(block, false) {
+        S_OK if count == 0 => S_OK,
+        S_OK => E_INVALIDARG,
+        hr => hr,
+    }
+}
+
 extern "system" fn consumable_balance_async(
     _: This,
     _: Handle,
@@ -341,14 +395,14 @@ static VTABLE: Methods<77> = Methods([
     close as *const (),                      // 0x20
     associated_products_async as *const (),  // 0x28
     query_result as *const (),               // 0x30
-    missing::<7> as *const (),               // 0x38 products by id
-    missing::<8> as *const (),               // 0x40
+    products_async as *const (),             // 0x38 products by id
+    query_result as *const (),               // 0x40
     entitled_products_async as *const (),    // 0x48
     query_result as *const (),               // 0x50
-    missing::<11> as *const (),              // 0x58 product for the game
-    missing::<12> as *const (),              // 0x60
-    missing::<13> as *const (),              // 0x68 product for a package
-    missing::<14> as *const (),              // 0x70
+    product_for_game_async as *const (),     // 0x58 product for the game
+    query_result as *const (),               // 0x60
+    product_for_package_async as *const (),  // 0x68 product for a package
+    query_result as *const (),               // 0x70
     enumerate_products as *const (),         // 0x78
     has_more_pages as *const (),             // 0x80
     next_page_async as *const (),            // 0x88
@@ -358,15 +412,15 @@ static VTABLE: Methods<77> = Methods([
     license_result as *const (),             // 0xa8
     is_license_valid as *const (),           // 0xb0
     close as *const (),                      // 0xb8 a licence
-    missing::<24> as *const (),              // 0xc0 can acquire for store id
-    missing::<25> as *const (),              // 0xc8
-    missing::<26> as *const (),              // 0xd0 can acquire for package
-    missing::<27> as *const (),              // 0xd8
+    can_acquire_async as *const (),          // 0xc0 can acquire for store id
+    struct_status as *const (),              // 0xc8
+    can_acquire_async as *const (),          // 0xd0 can acquire for package
+    struct_status as *const (),              // 0xd8
     game_license_async as *const (),         // 0xe0
     game_license_result as *const (),        // 0xe8
-    missing::<30> as *const (),              // 0xf0 add-on licences
-    missing::<31> as *const (),              // 0xf8
-    missing::<32> as *const (),              // 0x100
+    addon_licenses_async as *const (),       // 0xf0 add-on licences
+    addon_license_count as *const (),        // 0xf8
+    addon_licenses as *const (),             // 0x100
     consumable_balance_async as *const (),   // 0x108
     count_status as *const (),               // 0x110
     report_fulfillment_async as *const (),   // 0x118
@@ -392,8 +446,8 @@ static VTABLE: Methods<77> = Methods([
     updates_async as *const (),              // 0x1b8
     count_status as *const (),               // 0x1c0
     array_status as *const (),               // 0x1c8
-    missing::<58> as *const (),              // 0x1d0 download updates
-    missing::<59> as *const (),              // 0x1d8
+    install_async as *const (),              // 0x1d0 download updates
+    status as *const (),                     // 0x1d8
     install_async as *const (),              // 0x1e0 updates
     status as *const (),                     // 0x1e8
     install_async as *const (),              // 0x1f0 packages by store id
@@ -425,6 +479,56 @@ mod tests {
             callback: None,
             internal: [0; 4],
         }
+    }
+
+    /// The product queries, licence checks and update downloads that need
+    /// the service fail with the store's network error through the block;
+    /// add-on licences are an empty list.
+    #[test]
+    fn product_licence_and_download_calls_answer_through_the_block() {
+        let this: This = &OBJECT;
+        let context = handle(&CONTEXT);
+        let mut blocks: Vec<AsyncBlock> = (0..6).map(|_| block()).collect();
+        type Products = extern "system" fn(
+            This, Handle, u32, *const *const c_char, usize, *const *const c_char, usize, *mut AsyncBlock,
+        ) -> HRESULT;
+        type ForGame = extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
+        type ForPackage = extern "system" fn(This, Handle, u32, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type ById = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type Download = extern "system" fn(This, Handle, *const *const c_char, usize, *mut AsyncBlock) -> HRESULT;
+        let ids = [c"9DUMMY".as_ptr()];
+        let [a, b, c, d, e, f] = &mut blocks[..] else { unreachable!() };
+        let none = std::ptr::null();
+        assert_eq!(method::<Products>(&OBJECT, 0x38)(this, context, 0x10, ids.as_ptr(), 1, none, 0, a), S_OK);
+        assert_eq!(method::<ForGame>(&OBJECT, 0x58)(this, context, b), S_OK);
+        assert_eq!(method::<ForPackage>(&OBJECT, 0x68)(this, context, 0x10, c"pkg".as_ptr(), c), S_OK);
+        assert_eq!(method::<ById>(&OBJECT, 0xc0)(this, context, c"9DUMMY".as_ptr(), d), S_OK);
+        assert_eq!(method::<ById>(&OBJECT, 0xd0)(this, context, c"pkg".as_ptr(), e), S_OK);
+        assert_eq!(method::<Download>(&OBJECT, 0x1d0)(this, context, ids.as_ptr(), 1, f), S_OK);
+        type QueryResult = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        type StructResult = extern "system" fn(This, *mut AsyncBlock, *mut [u8; 16]) -> HRESULT;
+        type StatusResult = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        for (b, slot) in [(&mut *a, 0x40), (&mut *b, 0x60), (&mut *c, 0x70)] {
+            assert_eq!(xasync::XAsyncGetStatus(b, true), NETWORK_ERROR);
+            let mut query = std::ptr::null();
+            assert_eq!(method::<QueryResult>(&OBJECT, slot)(this, b, &mut query), NETWORK_ERROR);
+        }
+        for (b, slot) in [(&mut *d, 0xc8), (&mut *e, 0xd8)] {
+            assert_eq!(xasync::XAsyncGetStatus(b, true), NETWORK_ERROR);
+            assert_eq!(method::<StructResult>(&OBJECT, slot)(this, b, &mut [0; 16]), NETWORK_ERROR);
+        }
+        assert_eq!(xasync::XAsyncGetStatus(f, true), NETWORK_ERROR);
+        assert_eq!(method::<StatusResult>(&OBJECT, 0x1d8)(this, f), NETWORK_ERROR);
+
+        type Count = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        type Licenses = extern "system" fn(This, *mut AsyncBlock, u32, *mut c_void) -> HRESULT;
+        let mut b = block();
+        assert_eq!(method::<ForGame>(&OBJECT, 0xf0)(this, context, &mut b), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        let mut count = 7;
+        assert_eq!(method::<Count>(&OBJECT, 0xf8)(this, &mut b, &mut count), S_OK);
+        assert_eq!(count, 0);
+        assert_eq!(method::<Licenses>(&OBJECT, 0x100)(this, &mut b, 0, std::ptr::null_mut()), S_OK);
     }
 
     #[test]
