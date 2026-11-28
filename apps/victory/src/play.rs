@@ -216,6 +216,50 @@ pub(crate) fn preload(exe: &Path) {
     }
 }
 
+/// F1's CLEAR SHADERS (`VICTORY_CLEAR_SHADERS=1`, set for that one start by
+/// the menu's restart): whether this start was asked to remove the preloaded
+/// shader and pipeline caches. The ask is taken back with the answer, so it
+/// cannot reach a later start (a restart from the menu inherits this
+/// process's environment).
+pub(crate) fn asked_to_clear_shaders() -> bool {
+    let asked = std::env::var_os("VICTORY_CLEAR_SHADERS").is_some_and(|v| v == "1");
+    if asked {
+        // SAFETY: the variable is read with std::env::var_os at each use; Windows'
+        // environment block is locked by the process heap's routines, and std holds
+        // its own lock (the menu changes variables the same way while the game runs).
+        unsafe { std::env::remove_var("VICTORY_CLEAR_SHADERS") };
+    }
+    asked
+}
+
+/// F1's CLEAR SHADERS (`VICTORY_CLEAR_SHADERS=1`, set for that one start by
+/// the menu's restart): removes the preloaded shader and pipeline caches
+/// before the run opens them. Nothing else under the victory home is
+/// touched, and a missing folder is nothing removed. What went is said here
+/// and put in the start's log.
+pub(crate) fn clear_shader_caches() {
+    let cleared = victory_core::Config::load().and_then(|cfg| cfg.clear_shader_caches());
+    let said = match cleared {
+        Ok((files, bytes)) => {
+            println!("Shaders cleared: {files} files, {bytes} bytes of shader and pipeline caches removed.");
+            println!("The game makes them again as it needs them; F1, PRELOAD SHADERS makes them ahead.");
+            format!("# shaders cleared: {files} files, {bytes} bytes of shader and pipeline caches removed")
+        }
+        Err(e) => {
+            println!("The shader caches were not cleared ({e:#}); the game goes on with what is there.");
+            format!("# shaders not cleared: {e:#}")
+        }
+    };
+    // The start's log (`victory play` names it; the script launcher keeps its
+    // own, with our lines above in it).
+    if let Some(log) = std::env::var_os("VICTORY_LOG_FILE").filter(|v| !v.is_empty())
+        && let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&log)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{said}");
+    }
+}
+
 /// `%LOCALAPPDATA%\victory`, or the folder `VICTORY_HOME` names.
 fn home() -> Result<PathBuf> {
     if let Some(home) = victory_core::config::home_override() {
@@ -358,6 +402,12 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     for (k, v) in o.more.iter().filter_map(|m| m.split_once('=')) {
         s.insert(k.trim().to_owned(), v.trim().to_owned());
     }
+    // A clear or a preload is asked of one start alone (`VICTORY_CLEAR_SHADERS=1`,
+    // `VICTORY_PRELOAD=1`, set by the F1 menu's restart for that start; `--set` and
+    // the settings file are not ways to ask), so neither is kept as a setting: it
+    // must not reach the run's environment, nor a restart from the menu.
+    s.remove("VICTORY_CLEAR_SHADERS");
+    s.remove("VICTORY_PRELOAD");
     // For the menu: what it shows as the current choices.
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     set("VICTORY_MENU_CONSOLE", if series_s { "series-s" } else { "series-x" });
@@ -938,6 +988,10 @@ fn restart_args(o: &Play, exe: &Path) -> String {
     }
     args.extend(["--fg-type".to_owned(), quoted(&o.fg_type), "--fps".to_owned(), o.fps.to_string()]);
     for more in &o.more {
+        // A clear or a preload is asked of one start alone: never part of a restart.
+        if more.split_once('=').is_some_and(|(k, _)| matches!(k.trim(), "VICTORY_CLEAR_SHADERS" | "VICTORY_PRELOAD")) {
+            continue;
+        }
         args.extend(["--set".to_owned(), quoted(more)]);
     }
     args.join(" ")
@@ -971,6 +1025,27 @@ mod tests {
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    #[test]
+    fn a_clear_or_a_preload_is_not_a_setting() {
+        let mut o = options();
+        o.more = vec![
+            "VICTORY_CLEAR_SHADERS=1".to_owned(),
+            "VICTORY_PRELOAD=1".to_owned(),
+            "VICTORY_X=2".to_owned(),
+        ];
+        // However it is given (--set here, the settings file below), a clear or a
+        // preload is asked of one start alone: never a setting, never part of a restart.
+        let menu = parse_menu("VICTORY_CLEAR_SHADERS=1\r\n");
+        let (s, _) = settings(&o, &menu, None);
+        assert!(!s.contains_key("VICTORY_CLEAR_SHADERS"));
+        assert!(!s.contains_key("VICTORY_PRELOAD"));
+        assert_eq!(s.get("VICTORY_X").map(String::as_str), Some("2"));
+        let exe = Path::new(r"C:\game_scarlett_master.exe");
+        let args = restart_args(&o, exe);
+        assert!(!args.contains("VICTORY_CLEAR_SHADERS") && !args.contains("VICTORY_PRELOAD"));
+        assert!(args.contains("--set 'VICTORY_X=2'"));
     }
 
     #[test]

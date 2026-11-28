@@ -98,7 +98,14 @@
 **In the game**
 
 - **F1** brings up the settings menu (arrow keys pick and change, Enter does
-  it): DLSS, frame generation, frame rate cap and more.
+  it): DLSS, frame generation, frame rate cap and more. **CLEAR SHADERS**
+  (after a second Enter, like PRELOAD SHADERS) closes the game, removes the
+  preloaded shader and pipeline caches for a fresh start — settings, saves
+  and logs are kept — and restarts (`VICTORY_CLEAR_SHADERS=1` asks a start
+  for it). The record of the title's pipelines that earlier runs made
+  (`known-pipelines.bin` and `known-shaders.bin`, in the shaders cache) goes
+  with them: a preload right after it only translates the shaders, and the
+  record is made again while you play.
 - **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
   memory numbers).
 
@@ -207,6 +214,10 @@ speed, in the picture and in simply being able to play it:
   cap, console profile, picture size, the light estimates and the main speed
   switches, saved to `victory-settings.txt` and applied at the next start
   ("SAVE AND RESTART NOW" does that for you; lines marked LIVE change at once).
+  **CLEAR SHADERS** removes the preloaded shader and pipeline caches and the
+  record of the title's pipelines that earlier runs made — a fresh start: a
+  preload right after it only translates the shaders, until play records
+  the pipelines again.
 - **The F3 stats panel**, in every build: frame rate and frame time, frames
   shown with frame generation, draws, how busy the GPU and the submitting
   thread are, copies, RAM and VRAM. The menu switches it too.

@@ -120,6 +120,13 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // `VICTORY_CLEAR_SHADERS=1` (set for that one start by the F1 menu's CLEAR SHADERS; the
+    // script launcher hands it to this command, `victory play` reads it before its settings
+    // are made): the preloaded shader and pipeline caches are removed before this run opens
+    // them, and the ask is taken back with the answer so no later start clears again.
+    if crate::play::asked_to_clear_shaders() {
+        crate::play::clear_shader_caches();
+    }
     // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): Streamline
     // is loaded before anything of the title or the host GPU, and fails soft;
     // only if it offers one of them does the title render through its
