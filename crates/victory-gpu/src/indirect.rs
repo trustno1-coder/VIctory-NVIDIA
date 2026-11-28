@@ -647,11 +647,11 @@ void main() {
 }
 "#;
 
-    struct WarpHarness {
-        device: ID3D12Device,
+    pub(crate) struct WarpHarness {
+        pub(crate) device: ID3D12Device,
         queue: ID3D12CommandQueue,
         allocator: ID3D12CommandAllocator,
-        list: ID3D12GraphicsCommandList,
+        pub(crate) list: ID3D12GraphicsCommandList,
         fence: ID3D12Fence,
         submitted: u64,
         event: HANDLE,
@@ -678,7 +678,7 @@ void main() {
         }
 
         /// On the software adapter, or the first one (for measurements).
-        fn on(software: bool) -> Option<Self> {
+        pub(crate) fn on(software: bool) -> Option<Self> {
             let turn = warp_turn();
             // SAFETY: plain DXGI query and D3D12 test harness setup.
             unsafe {
@@ -771,7 +771,7 @@ void main() {
         }
 
         /// Device-local `DEFAULT`-heap UAV scratch buffer.
-        fn default_uav(&self, size: u64) -> ID3D12Resource {
+        pub(crate) fn default_uav(&self, size: u64) -> ID3D12Resource {
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_DEFAULT,
                 ..Default::default()
@@ -828,7 +828,7 @@ void main() {
             sig.unwrap()
         }
 
-        fn submit_and_wait(&mut self) {
+        pub(crate) fn submit_and_wait(&mut self) {
             self.submitted += 1;
             // SAFETY: closing, executing, waiting on fence, and resetting our list.
             unsafe {

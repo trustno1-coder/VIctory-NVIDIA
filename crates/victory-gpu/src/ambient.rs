@@ -191,6 +191,20 @@ fn air() -> f32 {
     })
 }
 
+/// Opt-in chromatic probe-garbage scrub (`VICTORY_AMBIENT_CHROMA_SCRUB=1`; off
+/// by default): drops acid-green and electric-cyan spikes left by unbuilt or
+/// stale screen probes on thin foliage edges while preserving neutral daylight,
+/// blue sky, coastal/deep water tones, warm lighting, and natural foliage
+/// bounce.
+fn chroma_scrub() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| chroma_scrub_for(std::env::var_os("VICTORY_AMBIENT_CHROMA_SCRUB").as_deref()))
+}
+
+fn chroma_scrub_for(env: Option<&std::ffi::OsStr>) -> bool {
+    env.is_some_and(|v| v == "1")
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -207,7 +221,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -217,6 +231,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float once;
+    uint chroma_scrub;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -470,6 +485,15 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // a faint violet by the line above. The sky's light keeps green above
     // 0.4x blue, sunsets keep blue low, so neither is touched.
     if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
+    if (chroma_scrub != 0) {
+        // Opt-in chromatic probe-garbage scrub (`VICTORY_AMBIENT_CHROMA_SCRUB=1`):
+        // acid-green (> 2.5x max(r, b)) and electric-cyan (r < 0.35 * min(g, b))
+        // spikes left by unbuilt/stale screen probes on thin foliage edges.
+        // Daylight, blue sky, coastal/deep water tones, warm sunset/lamp light,
+        // and natural foliage bounce stay within these channel ratios.
+        if (was.g > 2.5 * max(was.r, was.b) && was.g > 0.02) was = 0.0;
+        if (was.r < 0.35 * min(was.g, was.b) && max(was.g, was.b) > 0.02) was = 0.0;
+    }
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
@@ -715,7 +739,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 13];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -725,6 +749,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
     words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
+    words[12] = u32::from(chroma_scrub());
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -732,7 +757,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -857,5 +882,416 @@ mod tests {
             return;
         };
         make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+    }
+
+    fn pack_rgb9e5(c: [f32; 3]) -> u32 {
+        let c = c.map(|v| v.clamp(0.0, 65408.0));
+        let top = c[0].max(c[1]).max(c[2]);
+        let mut e = (top.max(1e-9).log2().floor() as i32 + 16).clamp(0, 31);
+        let mut scale = ((24 - e) as f32).exp2();
+        if top * scale >= 511.5 {
+            e = (e + 1).min(31);
+            scale = ((24 - e) as f32).exp2();
+        }
+        let m = c.map(|v| ((v * scale + 0.5) as u32).min(511));
+        m[0] | (m[1] << 9) | (m[2] << 18) | ((e as u32) << 27)
+    }
+
+    fn unpack_rgb9e5(v: u32) -> [f32; 3] {
+        let scale = (((v >> 27) as f32) - 24.0).exp2();
+        [
+            (v & 511) as f32 * scale,
+            ((v >> 9) & 511) as f32 * scale,
+            ((v >> 18) & 511) as f32 * scale,
+        ]
+    }
+
+    #[test]
+    fn chroma_scrub_is_opt_in() {
+        use std::ffi::OsStr;
+        let s = OsStr::new;
+        assert!(!chroma_scrub_for(None));
+        assert!(!chroma_scrub_for(Some(s(""))));
+        assert!(!chroma_scrub_for(Some(s("0"))));
+        assert!(!chroma_scrub_for(Some(s("off"))));
+        assert!(chroma_scrub_for(Some(s("1"))));
+    }
+
+    /// Runs the compiled `RAISE` compute shader on D3D12 hardware and WARP in
+    /// both default (scrub off) and opt-in (`VICTORY_AMBIENT_CHROMA_SCRUB=1`)
+    /// modes, proving:
+    /// - default mode keeps existing magenta/violet probe filtering verbatim
+    ///   while leaving acid-green/electric-cyan untouched;
+    /// - opt-in mode additionally scrubs acid-green and electric-cyan spikes;
+    /// - neutral daylight, blue sky, coastal/deep water tones, warm sunset/lamp
+    ///   lighting, and natural/deep foliage bounce are preserved in both modes.
+    #[test]
+    fn raise_opt_in_chroma_scrub_filters_spikes_and_preserves_scene_tones_on_hardware_and_warp() {
+        use crate::host::transition;
+        use crate::indirect::tests::WarpHarness;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC,
+        };
+        use windows::core::Interface;
+
+        let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
+        if debug {
+            let _ = host();
+        }
+
+        // Spatial estimate `found` is uniform (0.2, 0.2, 0.2), `most = 4.0`,
+        // so `top = 0.8`. Every input below has luminance < 0.75 so the
+        // luminance cap alone would NOT reject any of them.
+        // Columns: (name, input rgb, scrubbed_when_off, scrubbed_when_on).
+        let inputs: [(&str, [f32; 3], bool, bool); 12] = [
+            ("magenta_garbage", [0.70, 0.05, 0.70], true, true),
+            ("violet_garbage", [0.10, 0.10, 0.80], true, true),
+            ("acid_green_garbage", [0.05, 0.70, 0.05], false, true),
+            ("electric_cyan_garbage", [0.02, 0.60, 0.70], false, true),
+            ("neutral_daylight", [0.55, 0.54, 0.52], false, false),
+            ("blue_sky", [0.25, 0.42, 0.75], false, false),
+            ("coastal_water", [0.22, 0.48, 0.56], false, false),
+            ("deep_water", [0.16, 0.36, 0.58], false, false),
+            ("warm_sunset", [0.75, 0.45, 0.22], false, false),
+            ("warm_lamp", [0.78, 0.52, 0.28], false, false),
+            ("natural_foliage_bounce", [0.28, 0.52, 0.24], false, false),
+            ("deep_foliage_bounce", [0.24, 0.56, 0.22], false, false),
+        ];
+
+        let mut ran = 0;
+        for (label, software) in [("hardware", false), ("warp", true)] {
+            let Some(mut harness) = WarpHarness::on(software) else {
+                eprintln!("no {label} D3D12 device; skipped");
+                continue;
+            };
+            let pass = make(&harness.device, |bytes| Some(harness.default_uav(bytes)))
+                .expect("ambient passes build");
+
+            // SAFETY: plain D3D12 resource/descriptor creation and mapped buffers.
+            unsafe {
+                if let Ok(queue) = harness.device.cast::<ID3D12InfoQueue>() {
+                    queue.ClearStoredMessages();
+                }
+                let make_buf = |heap_type, width, state| -> ID3D12Resource {
+                    let mut res: Option<ID3D12Resource> = None;
+                    harness
+                        .device
+                        .CreateCommittedResource(
+                            &D3D12_HEAP_PROPERTIES {
+                                Type: heap_type,
+                                ..Default::default()
+                            },
+                            D3D12_HEAP_FLAG_NONE,
+                            &D3D12_RESOURCE_DESC {
+                                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                                Width: width,
+                                Height: 1,
+                                DepthOrArraySize: 1,
+                                MipLevels: 1,
+                                SampleDesc: DXGI_SAMPLE_DESC {
+                                    Count: 1,
+                                    Quality: 0,
+                                },
+                                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                                ..Default::default()
+                            },
+                            state,
+                            None,
+                            &mut res,
+                        )
+                        .unwrap();
+                    res.unwrap()
+                };
+                let make_tex = |format, flags| -> ID3D12Resource {
+                    let mut res: Option<ID3D12Resource> = None;
+                    harness
+                        .device
+                        .CreateCommittedResource(
+                            &D3D12_HEAP_PROPERTIES {
+                                Type: D3D12_HEAP_TYPE_DEFAULT,
+                                ..Default::default()
+                            },
+                            D3D12_HEAP_FLAG_NONE,
+                            &D3D12_RESOURCE_DESC {
+                                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                                Width: 12,
+                                Height: 1,
+                                DepthOrArraySize: 1,
+                                MipLevels: 1,
+                                Format: format,
+                                SampleDesc: DXGI_SAMPLE_DESC {
+                                    Count: 1,
+                                    Quality: 0,
+                                },
+                                Flags: flags,
+                                ..Default::default()
+                            },
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            None,
+                            &mut res,
+                        )
+                        .unwrap();
+                    res.unwrap()
+                };
+
+                let light = make_tex(
+                    DXGI_FORMAT_R32_UINT,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                );
+                let depth = make_tex(DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+                let up_light = make_buf(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    256,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                );
+                let up_depth = make_buf(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    256,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                );
+                let up_cells = make_buf(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    CELL_BYTES,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                );
+                let up_points = make_buf(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    POINT_BYTES,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                );
+                let readback = make_buf(
+                    D3D12_HEAP_TYPE_READBACK,
+                    256,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+
+                let mut ptr = std::ptr::null_mut();
+                up_light.Map(0, None, Some(&mut ptr)).unwrap();
+                for (i, &(_, rgb, _, _)) in inputs.iter().enumerate() {
+                    ptr.cast::<u32>().add(i).write(pack_rgb9e5(rgb));
+                }
+                up_light.Unmap(0, None);
+
+                up_depth.Map(0, None, Some(&mut ptr)).unwrap();
+                for i in 0..12usize {
+                    ptr.cast::<f32>().add(i).write(0.1);
+                }
+                up_depth.Unmap(0, None);
+
+                up_cells.Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::write_bytes(ptr.cast::<u8>(), 0, CELL_BYTES as usize);
+                let mean_at = ptr.cast::<f32>().add((CELLS as usize) * 4);
+                std::ptr::copy_nonoverlapping([0.2f32, 0.2, 0.2, 1.0].as_ptr(), mean_at, 4);
+                up_cells.Unmap(0, None);
+
+                up_points.Map(0, None, Some(&mut ptr)).unwrap();
+                let floats = ptr.cast::<f32>();
+                let count = (POINT_BYTES / 16) as usize;
+                for i in 0..count {
+                    std::ptr::copy_nonoverlapping(
+                        [0.0f32, 0.0, 0.0, 0.2].as_ptr(),
+                        floats.add(i * 4),
+                        4,
+                    );
+                }
+                up_points.Unmap(0, None);
+
+                let heap: ID3D12DescriptorHeap = harness
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 2,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let step = harness
+                    .device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    as usize;
+                let cpu0 = heap.GetCPUDescriptorHandleForHeapStart();
+                let cpu1 = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: cpu0.ptr + step,
+                };
+                harness.device.CreateShaderResourceView(&depth, None, cpu0);
+                harness.device.CreateUnorderedAccessView(
+                    &light,
+                    None::<&ID3D12Resource>,
+                    None,
+                    cpu1,
+                );
+                let gpu0 = heap.GetGPUDescriptorHandleForHeapStart();
+                let gpu1 = D3D12_GPU_DESCRIPTOR_HANDLE {
+                    ptr: gpu0.ptr + step as u64,
+                };
+
+                let placed = |resource: &ID3D12Resource, format| D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(resource),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: format,
+                                Width: 12,
+                                Height: 1,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                let sub = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(resource),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+
+                // Upload depth, cells, and points once.
+                harness.list.CopyTextureRegion(
+                    &sub(&depth),
+                    0,
+                    0,
+                    0,
+                    &placed(&up_depth, DXGI_FORMAT_R32_FLOAT),
+                    None,
+                );
+                harness.list.CopyBufferRegion(&pass.cells, 0, &up_cells, 0, CELL_BYTES);
+                harness.list.CopyBufferRegion(&pass.points, 0, &up_points, 0, POINT_BYTES);
+                harness.list.ResourceBarrier(&[
+                    transition(
+                        &depth,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    ),
+                    transition(
+                        &pass.cells,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                    transition(
+                        &pass.points,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                ]);
+                harness.submit_and_wait();
+
+                for scrub_on in [false, true] {
+                    let list = &harness.list;
+                    list.CopyTextureRegion(
+                        &sub(&light),
+                        0,
+                        0,
+                        0,
+                        &placed(&up_light, DXGI_FORMAT_R32_UINT),
+                        None,
+                    );
+                    list.ResourceBarrier(&[transition(
+                        &light,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+
+                    // RS: RootConstants(13, b0), SRV(t0)=depth, UAV(u0)=light, UAV(u1)=cells, UAV(u2)=points.
+                    let mut words = [0u32; 13];
+                    words[0] = 1.0f32.to_bits(); // level
+                    words[1] = 0.0f32.to_bits(); // constant
+                    words[2] = 0.0f32.to_bits(); // strength
+                    words[3] = 0.6f32.to_bits(); // radius
+                    words[4] = 0.1f32.to_bits(); // near
+                    words[5] = 0.45f32.to_bits(); // tan_y
+                    words[6] = 12; // width
+                    words[7] = 1; // height
+                    words[8] = 0.04f32.to_bits(); // follow
+                    words[9] = 4.0f32.to_bits(); // most
+                    words[10] = 0.0f32.to_bits(); // air
+                    words[11] = 0.0f32.to_bits(); // once
+                    words[12] = u32::from(scrub_on); // chroma_scrub
+
+                    list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                    list.SetComputeRootSignature(&pass.root);
+                    list.SetPipelineState(&pass.raise);
+                    list.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
+                    list.SetComputeRootDescriptorTable(1, gpu0);
+                    list.SetComputeRootDescriptorTable(2, gpu1);
+                    list.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+                    list.Dispatch(2, 1, 1);
+
+                    list.ResourceBarrier(&[transition(
+                        &light,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    list.CopyTextureRegion(
+                        &placed(&readback, DXGI_FORMAT_R32_UINT),
+                        0,
+                        0,
+                        0,
+                        &sub(&light),
+                        None,
+                    );
+                    list.ResourceBarrier(&[transition(
+                        &light,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    harness.submit_and_wait();
+
+                    readback.Map(0, None, Some(&mut ptr)).unwrap();
+                    let got = std::slice::from_raw_parts(ptr.cast::<u32>(), 12);
+                    for (i, &(name, input_rgb, scrub_off, scrub_when_on)) in
+                        inputs.iter().enumerate()
+                    {
+                        let out_rgb = unpack_rgb9e5(got[i]);
+                        let should_scrub = if scrub_on { scrub_when_on } else { scrub_off };
+                        let want = if should_scrub {
+                            [0.2, 0.2, 0.2]
+                        } else {
+                            input_rgb.map(|c| c.max(0.2))
+                        };
+                        for ch in 0..3 {
+                            assert!(
+                                (out_rgb[ch] - want[ch]).abs() < 0.015,
+                                "{label} scrub={scrub_on} pixel {i} ({name}) ch {ch}: got {out_rgb:?}, want {want:?}"
+                            );
+                        }
+                    }
+                    readback.Unmap(0, None);
+                }
+
+                if let Ok(queue) = harness.device.cast::<ID3D12InfoQueue>() {
+                    let mut severities = [
+                        D3D12_MESSAGE_SEVERITY_CORRUPTION,
+                        D3D12_MESSAGE_SEVERITY_ERROR,
+                    ];
+                    let filter = D3D12_INFO_QUEUE_FILTER {
+                        AllowList: D3D12_INFO_QUEUE_FILTER_DESC {
+                            NumSeverities: severities.len() as u32,
+                            pSeverityList: severities.as_mut_ptr(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    queue.PushRetrievalFilter(&filter).unwrap();
+                    assert_eq!(
+                        queue.GetNumStoredMessagesAllowedByRetrievalFilter(),
+                        0,
+                        "{label}: D3D12 debug layer errors"
+                    );
+                    queue.PopRetrievalFilter();
+                } else {
+                    assert!(
+                        !debug,
+                        "{label}: expected D3D12 info queue under VICTORY_D3D12_DEBUG=1"
+                    );
+                }
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "no D3D12 device available for ambient chroma test");
     }
 }

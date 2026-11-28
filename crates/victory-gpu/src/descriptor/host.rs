@@ -1958,28 +1958,87 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
-/// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
-/// (0: none): up to four times as many where the host heap has the room (a
-/// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
-/// sets the most). 2^18 ran out in the title's bigger places (session
-/// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
-/// refused, with 2,639 indirect draws and dispatches).
-fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+/// Maximum dynamic slots permitted on a host view heap capped at
+/// [`PORTABLE_VIEWS`] (`1_000_000`, e.g. NVIDIA where `null == 999_999`):
+/// `524_288`, leaving at least `475_711` title descriptor slots and ensuring
+/// `null - extra` can never underflow.
+const PORTABLE_DYNAMIC_CAP: u32 = DYNAMIC << 1;
+
+fn dynamic_slots_override() -> Option<u32> {
+    static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
-    });
-    if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+    })
+}
+
+/// Pure dynamic-slot sizing for a heap of `count` title slots whose null
+/// sentinel is `null` (`0`: unprobed) and optional explicit
+/// `VICTORY_DYNAMIC_SLOTS` override (`requested`).
+///
+/// Returns `(extra, clamped_override)` where `clamped_override` is true if an
+/// explicit override exceeded the safe cap within [`PORTABLE_VIEWS`].
+fn dynamic_slots_for(count: u32, null: u32, requested: Option<u32>) -> (u32, bool) {
+    if null == 0 {
+        let extra = requested.map_or(DYNAMIC, |req| req.clamp(DYNAMIC, DYNAMIC << 2));
+        return (extra, false);
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    if null < PORTABLE_VIEWS {
+        // On NVIDIA (`probe_view_limit` -> `PORTABLE_VIEWS = 1_000_000`),
+        // `null == PORTABLE_VIEWS - 1 == 999_999 < PORTABLE_VIEWS`. Honoring
+        // explicit `VICTORY_DYNAMIC_SLOTS` within `PORTABLE_DYNAMIC_CAP`
+        // avoids hard-capping dynamic slots at 262,144.
+        let ceiling = PORTABLE_DYNAMIC_CAP.min(null.saturating_sub(1));
+        let floor = DYNAMIC.min(ceiling);
+        return match requested {
+            Some(req) => (req.clamp(floor, ceiling), req > ceiling),
+            None => {
+                // Without an explicit override, never shrink title slots below
+                // `count`, while still granting unused headroom up to `ceiling`
+                // (even count so dynamic pairs stay aligned).
+                let spare = (null.saturating_sub(count) & !1).min(ceiling);
+                (spare.max(floor), false)
+            }
+        };
+    }
+    let most = requested.unwrap_or(DYNAMIC << 2);
+    let ceiling = null.saturating_sub(1);
+    let extra = null.saturating_sub(count).min(most).max(DYNAMIC).min(ceiling);
+    (extra, false)
+}
+
+/// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
+/// (0: none): up to four times as many on uncapped hosts, and up to
+/// [`PORTABLE_DYNAMIC_CAP`] on [`PORTABLE_VIEWS`]-capped hosts when requested
+/// via `VICTORY_DYNAMIC_SLOTS` or when `count` leaves headroom.
+fn dynamic_slots(count: u32, null: u32, requested: Option<u32>) -> u32 {
+    let (extra, clamped) = dynamic_slots_for(count, null, requested);
+    if clamped {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                requested = requested.unwrap_or(0),
+                capped = extra,
+                null,
+                "VICTORY_DYNAMIC_SLOTS capped within PORTABLE_VIEWS to preserve title descriptor slots"
+            );
+        });
+    }
+    extra
 }
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        Self::new_with(sampler, count, None, dynamic_slots_override())
+    }
+
+    fn new_with(
+        sampler: bool,
+        count: u32,
+        null_override: Option<u32>,
+        requested_dynamic: Option<u32>,
+    ) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -2001,16 +2060,24 @@ impl HostHeap {
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
-        if !sampler {
+        if !sampler && null_override.is_none() {
             probe_view_limit();
         }
         let null = if sampler {
             0
         } else {
-            victory_shader::emit::view_heap_limit()
+            null_override.unwrap_or_else(victory_shader::emit::view_heap_limit)
         };
-        let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
-        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        let raw = if sampler || null_override.is_some() {
+            0
+        } else {
+            victory_shader::emit::raw_views()
+        };
+        let extra = if sampler {
+            0
+        } else {
+            dynamic_slots(count, null, requested_dynamic)
+        };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -2026,8 +2093,14 @@ impl HostHeap {
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
+                let fitted = null - extra;
+                tracing::warn!(
+                    count,
+                    fitted,
+                    dynamic = extra,
+                    "host view heap capped at {size} ({fitted} title + {extra} dynamic slots); views past {fitted} read a null slot"
+                );
+                fitted
             };
             match make(size) {
                 Ok(heap) => (heap, fitted, size),
@@ -6934,6 +7007,506 @@ mod tests {
         assert_eq!(read_stride(s0 + 3), 0);
         assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
+    }
+
+    /// Regression test for the `null < PORTABLE_VIEWS` off-by-one bug: on
+    /// NVIDIA `probe_view_limit` sets `null = PORTABLE_VIEWS - 1 = 999_999`.
+    #[test]
+    fn dynamic_slots_for_portable_and_uncapped_hosts() {
+        let nvidia_null = PORTABLE_VIEWS - 1;
+        assert_eq!(dynamic_slots_for(1_000_000, nvidia_null, None), (DYNAMIC, false));
+        assert_eq!(dynamic_slots_for(1_048_576, nvidia_null, None), (DYNAMIC, false));
+        assert_eq!(dynamic_slots_for(1_000_000, nvidia_null, Some(393_216)), (393_216, false));
+        assert_eq!(dynamic_slots_for(1_000_000, nvidia_null, Some(524_288)), (524_288, false));
+        assert_eq!(
+            dynamic_slots_for(1_000_000, nvidia_null, Some(900_000)),
+            (PORTABLE_DYNAMIC_CAP, true)
+        );
+        assert_eq!(dynamic_slots_for(600_000, nvidia_null, None), (399_998, false));
+        assert_eq!(dynamic_slots_for(4, nvidia_null, None), (PORTABLE_DYNAMIC_CAP, false));
+
+        let amd_null = UNCAPPED_VIEWS - 1;
+        assert_eq!(dynamic_slots_for(1_000_000, amd_null, None), (DYNAMIC << 2, false));
+        assert_eq!(dynamic_slots_for(1_000_000, amd_null, Some(524_288)), (524_288, false));
+
+        assert_eq!(dynamic_slots_for(4, 0, None), (DYNAMIC, false));
+        assert_eq!(dynamic_slots_for(4, 0, Some(393_216)), (393_216, false));
+    }
+
+    /// End-to-end `HostHeap` creation regression test under the NVIDIA
+    /// `PORTABLE_VIEWS` cap (`null == 999_999`).
+    #[test]
+    fn host_heap_honors_dynamic_slots_within_portable_views_cap() {
+        let nvidia_null = PORTABLE_VIEWS - 1;
+        let Some(default_heap) = HostHeap::new_with(false, 1_000_000, Some(nvidia_null), None)
+        else {
+            return;
+        };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { default_heap.heap.GetDesc().NumDescriptors }, PORTABLE_VIEWS);
+        assert_eq!(default_heap.dynamic, DYNAMIC);
+        assert_eq!(default_heap.count, nvidia_null - DYNAMIC);
+
+        let raised = HostHeap::new_with(false, 1_000_000, Some(nvidia_null), Some(393_216))
+            .expect("PORTABLE_VIEWS heap with 393,216 dynamic slots");
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { raised.heap.GetDesc().NumDescriptors }, PORTABLE_VIEWS);
+        assert_eq!(raised.dynamic, 393_216);
+        assert_eq!(raised.count, nvidia_null - 393_216);
+        assert_eq!(raised.dynamic(393_216), Some(raised.count));
+        assert_eq!(raised.dynamic(1), None);
+
+        let capped = HostHeap::new_with(false, 1_000_000, Some(nvidia_null), Some(900_000))
+            .expect("PORTABLE_VIEWS heap with capped dynamic slots");
+        assert_eq!(capped.dynamic, PORTABLE_DYNAMIC_CAP);
+        assert_eq!(capped.count, nvidia_null - PORTABLE_DYNAMIC_CAP);
+        assert_eq!(capped.dynamic(PORTABLE_DYNAMIC_CAP), Some(capped.count));
+    }
+
+    /// Subprocess regression test running real `HostHeap::new(false, 1_000_000)`
+    /// with `VICTORY_DYNAMIC_SLOTS=393216` in the environment.
+    #[test]
+    fn host_heap_new_honors_env_dynamic_slots_on_host_device() {
+        const CHILD: &str = "VICTORY_TEST_DYNAMIC_SLOTS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            if let Some(heap) = HostHeap::new(false, 1_000_000) {
+                println!("\nheap-dynamic={} heap-count={}", heap.dynamic, heap.count);
+            } else {
+                println!("\nheap-none");
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "host_heap_new_honors_env_dynamic_slots_on_host_device",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("VICTORY_DYNAMIC_SLOTS", "393216")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if stdout.contains("heap-none") {
+            return;
+        }
+        let stats = stdout
+            .split_once("heap-dynamic=")
+            .map(|(_, rest)| rest.lines().next().unwrap_or(rest))
+            .unwrap_or_else(|| panic!("child output missing heap stats: {stdout}"));
+        assert!(
+            stats.starts_with("393216 "),
+            "HostHeap::new ignored VICTORY_DYNAMIC_SLOTS=393216: heap-dynamic={stats}"
+        );
+    }
+
+    /// D3D12 hardware + WARP OOB raw-view clamp test exercising `raw_view_range`
+    /// and `HostHeap::{raw_at, raw_uav_at}` with zero D3D12 debug layer errors.
+    #[test]
+    fn raw_view_clamp_bounds_srv_and_uav_on_hardware_and_warp() {
+        use crate::host::transition;
+        use crate::indirect::tests::WarpHarness;
+        use windows::core::{Interface, s};
+
+        const SHADER: &str = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0), UAV(u1))"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+RWByteAddressBuffer out_buf : register(u1);
+[RootSignature(RS)]
+[numthreads(4, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    uint i = tid.x;
+    out_buf.Store(i * 4, src.Load(i * 4));
+    dst.Store(i * 4, 0x11111111u * (i + 1));
+}
+"#;
+        let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
+        if debug {
+            let _ = host();
+        }
+        let code = crate::host::compile(SHADER, s!("main"), s!("cs_5_1"))
+            .expect("raw clamp test shader compiles");
+
+        let mut ran = 0;
+        for (label, software) in [("hardware", false), ("warp", true)] {
+            let Some(mut harness) = WarpHarness::on(software) else {
+                eprintln!("no {label} D3D12 device; skipped");
+                continue;
+            };
+            // SAFETY: plain D3D12 test resource, descriptor, and dispatch setup.
+            unsafe {
+                if let Ok(queue) = harness.device.cast::<ID3D12InfoQueue>() {
+                    queue.ClearStoredMessages();
+                }
+                let root: ID3D12RootSignature =
+                    harness.device.CreateRootSignature(0, &code).unwrap();
+                let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&Some(root.clone())),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                };
+                let pso: ID3D12PipelineState =
+                    harness.device.CreateComputePipelineState(&pso_desc).unwrap();
+
+                let make_buf = |heap_type, width, flags, state| -> ID3D12Resource {
+                    let mut res: Option<ID3D12Resource> = None;
+                    harness
+                        .device
+                        .CreateCommittedResource(
+                            &D3D12_HEAP_PROPERTIES {
+                                Type: heap_type,
+                                ..Default::default()
+                            },
+                            D3D12_HEAP_FLAG_NONE,
+                            &D3D12_RESOURCE_DESC {
+                                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                                Width: width,
+                                Height: 1,
+                                DepthOrArraySize: 1,
+                                MipLevels: 1,
+                                SampleDesc: DXGI_SAMPLE_DESC {
+                                    Count: 1,
+                                    Quality: 0,
+                                },
+                                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                                Flags: flags,
+                                ..Default::default()
+                            },
+                            state,
+                            None,
+                            &mut res,
+                        )
+                        .unwrap();
+                    res.unwrap()
+                };
+
+                let src_buf = make_buf(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    100,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+                let dst_buf = make_buf(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    100,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+                let out_buf = make_buf(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    64,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                );
+                let upload_src = make_buf(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    256,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                );
+                let upload_dst = make_buf(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    256,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                );
+                let readback = make_buf(
+                    D3D12_HEAP_TYPE_READBACK,
+                    256,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+
+                let mut up_src_ptr = std::ptr::null_mut();
+                upload_src.Map(0, None, Some(&mut up_src_ptr)).unwrap();
+                let mut up_dst_ptr = std::ptr::null_mut();
+                upload_dst.Map(0, None, Some(&mut up_dst_ptr)).unwrap();
+                for i in 0..25u32 {
+                    up_src_ptr.cast::<u32>().add(i as usize).write(0xAAAA_0000 + i);
+                    up_dst_ptr.cast::<u32>().add(i as usize).write(0x5555_0000 + i);
+                }
+
+                let heap: ID3D12DescriptorHeap = harness
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 3,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+                    .unwrap();
+                let step = harness
+                    .device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    as usize;
+                let cpu0 = heap.GetCPUDescriptorHandleForHeapStart();
+                let cpu_at = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: cpu0.ptr + i * step,
+                };
+
+                harness.list.CopyBufferRegion(&src_buf, 0, &upload_src, 0, 100);
+                harness.list.ResourceBarrier(&[transition(
+                    &src_buf,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+                harness.submit_and_wait();
+
+                let out_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 0,
+                            NumElements: 16,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                };
+                harness.device.CreateUnorderedAccessView(
+                    &out_buf,
+                    None::<&ID3D12Resource>,
+                    Some(&out_uav),
+                    cpu_at(2),
+                );
+
+                let cases: &[(&str, u64, u64, [u32; 4], &[(usize, u32)])] = &[
+                    (
+                        "shortened_tail",
+                        96,
+                        16,
+                        [0xAAAA_0018, 0, 0, 0],
+                        &[(24, 0x1111_1111)],
+                    ),
+                    ("past_end", 112, 16, [0, 0, 0, 0], &[]),
+                    ("unaligned", 4, 16, [0, 0, 0, 0], &[]),
+                    (
+                        "in_bounds",
+                        16,
+                        16,
+                        [0xAAAA_0004, 0xAAAA_0005, 0xAAAA_0006, 0xAAAA_0007],
+                        &[
+                            (4, 0x1111_1111),
+                            (5, 0x2222_2222),
+                            (6, 0x3333_3333),
+                            (7, 0x4444_4444),
+                        ],
+                    ),
+                ];
+
+                let local_srv_counts = [const { AtomicU64::new(0) }; 4];
+                let local_uav_counts = [const { AtomicU64::new(0) }; 4];
+
+                for &(case_name, offset, len, want_read, want_writes) in cases {
+                    match raw_view_range(&src_buf, offset, len, &local_srv_counts) {
+                        Some(r) => {
+                            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_SRV {
+                                        FirstElement: r.first,
+                                        NumElements: r.elements,
+                                        StructureByteStride: 0,
+                                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                    },
+                                },
+                            };
+                            harness
+                                .device
+                                .CreateShaderResourceView(&src_buf, Some(&desc), cpu_at(0));
+                        }
+                        None => {
+                            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_SRV {
+                                        NumElements: 1,
+                                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                        ..Default::default()
+                                    },
+                                },
+                            };
+                            harness.device.CreateShaderResourceView(
+                                None::<&ID3D12Resource>,
+                                Some(&desc),
+                                cpu_at(0),
+                            );
+                        }
+                    }
+                    match raw_view_range(&dst_buf, offset, len, &local_uav_counts) {
+                        Some(r) => {
+                            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_UAV {
+                                        FirstElement: r.first,
+                                        NumElements: r.elements,
+                                        StructureByteStride: 0,
+                                        CounterOffsetInBytes: 0,
+                                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                    },
+                                },
+                            };
+                            harness.device.CreateUnorderedAccessView(
+                                &dst_buf,
+                                None::<&ID3D12Resource>,
+                                Some(&desc),
+                                cpu_at(1),
+                            );
+                        }
+                        None => {
+                            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_UAV {
+                                        NumElements: 1,
+                                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                        ..Default::default()
+                                    },
+                                },
+                            };
+                            harness.device.CreateUnorderedAccessView(
+                                None::<&ID3D12Resource>,
+                                None::<&ID3D12Resource>,
+                                Some(&desc),
+                                cpu_at(1),
+                            );
+                        }
+                    }
+
+                    harness.list.CopyBufferRegion(&dst_buf, 0, &upload_dst, 0, 100);
+                    harness.list.ResourceBarrier(&[transition(
+                        &dst_buf,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+
+                    harness.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                    harness.list.SetComputeRootSignature(&root);
+                    harness.list.SetPipelineState(&pso);
+                    harness.list.SetComputeRootDescriptorTable(
+                        0,
+                        heap.GetGPUDescriptorHandleForHeapStart(),
+                    );
+                    harness.list.Dispatch(1, 1, 1);
+
+                    harness.list.ResourceBarrier(&[
+                        transition(
+                            &out_buf,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        ),
+                        transition(
+                            &dst_buf,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        ),
+                    ]);
+                    harness.list.CopyBufferRegion(&readback, 0, &out_buf, 0, 16);
+                    harness.list.CopyBufferRegion(&readback, 16, &dst_buf, 0, 100);
+                    harness.list.ResourceBarrier(&[
+                        transition(
+                            &out_buf,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        ),
+                        transition(
+                            &dst_buf,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        ),
+                    ]);
+                    harness.submit_and_wait();
+
+                    let mut rb_ptr = std::ptr::null_mut();
+                    readback.Map(0, None, Some(&mut rb_ptr)).unwrap();
+                    let got_read = std::slice::from_raw_parts(rb_ptr.cast::<u32>(), 4);
+                    assert_eq!(got_read, want_read, "{label} {case_name}: SRV read mismatch");
+                    let got_dst = std::slice::from_raw_parts(rb_ptr.cast::<u32>().add(4), 25);
+                    for (idx, &val) in got_dst.iter().enumerate() {
+                        let expected = want_writes
+                            .iter()
+                            .find(|&&(w_idx, _)| w_idx == idx)
+                            .map_or(0x5555_0000 + idx as u32, |&(_, w_val)| w_val);
+                        assert_eq!(val, expected, "{label} {case_name}: dst dword {idx} mismatch");
+                    }
+                    readback.Unmap(0, None);
+                }
+
+                assert_eq!(
+                    local_srv_counts.each_ref().map(|c| c.load(Ordering::Relaxed)),
+                    [1, 1, 0, 1],
+                    "{label}: SRV clamp counts"
+                );
+                assert_eq!(
+                    local_uav_counts.each_ref().map(|c| c.load(Ordering::Relaxed)),
+                    [1, 1, 0, 1],
+                    "{label}: UAV clamp counts"
+                );
+
+                if let Ok(queue) = harness.device.cast::<ID3D12InfoQueue>() {
+                    let mut severities = [
+                        D3D12_MESSAGE_SEVERITY_CORRUPTION,
+                        D3D12_MESSAGE_SEVERITY_ERROR,
+                    ];
+                    let filter = D3D12_INFO_QUEUE_FILTER {
+                        AllowList: D3D12_INFO_QUEUE_FILTER_DESC {
+                            NumSeverities: severities.len() as u32,
+                            pSeverityList: severities.as_mut_ptr(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    queue.PushRetrievalFilter(&filter).unwrap();
+                    assert_eq!(
+                        queue.GetNumStoredMessagesAllowedByRetrievalFilter(),
+                        0,
+                        "{label}: D3D12 debug layer errors"
+                    );
+                    queue.PopRetrievalFilter();
+                } else {
+                    assert!(
+                        !debug,
+                        "{label}: expected D3D12 info queue under VICTORY_D3D12_DEBUG=1"
+                    );
+                }
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "no D3D12 device available for raw view clamp test");
+
+        if let (Some(h), Some(host_dev)) = (HostHeap::new(false, 4), host())
+            && let Some(buf) = host_dev.uav_buffer(100)
+        {
+            let before = raw_view_counts();
+            let slot = h.dynamic(2).expect("two dynamic slots");
+            for (off, len) in [(112, 16), (96, 16), (0, 1), (4, 16)] {
+                h.raw_at(slot, &buf, off, len);
+                h.raw_uav_at(slot + 1, &buf, off, len);
+            }
+            let after = raw_view_counts();
+            for kind in 0..2 {
+                for cut in 0..4 {
+                    assert!(
+                        after[kind][cut] > before[kind][cut],
+                        "raw_view_counts()[{kind}][{cut}] did not increment: before={before:?} after={after:?}"
+                    );
+                }
+            }
+            h.release(h.id(), slot, 2);
+        }
     }
 }
 
