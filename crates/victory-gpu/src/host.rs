@@ -236,10 +236,125 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
 
+/// Whether upload buffers are made resident and waited for as the card's
+/// memory is (`VICTORY_WAIT_RESIDENT_UPLOADS=1`; off by default). They lie
+/// in the PC's memory, the CPU writes them through its own mapping (which
+/// needs no residency), and the card reads them only by address in lists
+/// recorded after they were made, which the system holds until the memory
+/// is there: no slot of a heap shows them to lists sent before. Waited for,
+/// each one stood its thread still until the system had paged it in
+/// (`MakeResident` is synchronous), behind whatever paging was queued.
+fn wait_resident_uploads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT_UPLOADS").is_some_and(|v| v == "1"))
+}
+
+/// What new memory [`resident`] and [`mapped`] waited for, as the log
+/// tells them apart.
+#[derive(Clone, Copy)]
+pub(crate) enum Made {
+    /// A buffer in the PC's memory the CPU writes ([`Host::upload_buffer`]).
+    Upload,
+    /// A buffer in the PC's memory the card reads and writes ([`Host::shared_buffer`]).
+    Shared,
+    /// A buffer in the card's memory the CPU maps ([`Host::mapped_card_buffer`]).
+    CardMapped,
+    /// A buffer in the card's memory ([`Host::uav_buffer`]).
+    Card,
+    /// A texture with memory of its own (`crate::resource`).
+    Texture,
+    /// A block that textures are cut from (`crate::pool`).
+    Block,
+    /// A depth texture's twin (`crate::resource`).
+    Twin,
+}
+
+const MADE_KINDS: usize = 7;
+const MADE_NAMES: [&str; MADE_KINDS] = [
+    "upload buffers",
+    "shared buffers",
+    "card buffers the CPU maps",
+    "card buffers",
+    "textures of their own",
+    "texture blocks",
+    "depth twins",
+];
+
+/// Per kind ([`Made`]), per thread (0: any but the one that makes buffers
+/// ahead, 1: that one, `crate::ahead`), per step (0: `MakeResident`, 1:
+/// [`mapped`], 2: of that, waiting for its lock): times, microseconds, the
+/// longest. Since the last [`log_waits`].
+static WAITED: [std::sync::atomic::AtomicU64; MADE_KINDS * 2 * 3 * 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MADE_KINDS * 2 * 3 * 3];
+
+/// [`WAITED`]'s three numbers of a kind, thread and step.
+fn waited(kind: usize, thread: usize, step: usize) -> &'static [std::sync::atomic::AtomicU64] {
+    let at = ((kind * 2 + thread) * 3 + step) * 3;
+    &WAITED[at..at + 3]
+}
+
+/// Whether this is the thread that makes buffers ahead (`crate::ahead`):
+/// what it waits for, no frame waits for.
+fn ahead_thread() -> bool {
+    thread_local! {
+        static AHEAD: bool = std::thread::current().name() == Some("victory-ahead");
+    }
+    AHEAD.with(|a| *a)
+}
+
+fn note_wait(kind: Made, step: usize, us: u64) {
+    let w = waited(kind as usize, usize::from(ahead_thread()), step);
+    w[0].fetch_add(1, Ordering::Relaxed);
+    w[1].fetch_add(us, Ordering::Relaxed);
+    w[2].fetch_max(us, Ordering::Relaxed);
+}
+
+/// Logs what new memory was waited for since the last call, by kind and by
+/// thread (with the 5-second lines).
+pub(crate) fn log_waits() {
+    let take = |kind: usize, thread: usize, step: usize| -> [u64; 3] {
+        let w = waited(kind, thread, step);
+        [0, 1, 2].map(|i| w[i].swap(0, Ordering::Relaxed))
+    };
+    let mut parts = Vec::new();
+    let mut frame_ms = 0.0;
+    let mut ahead_ms = 0.0;
+    for (kind, name) in MADE_NAMES.iter().enumerate() {
+        for thread in 0..2 {
+            let [made, mapped, locked] = [0, 1, 2].map(|step| take(kind, thread, step));
+            if made[0] + mapped[0] == 0 {
+                continue;
+            }
+            let ms = (made[1] + mapped[1]) as f64 / 1e3;
+            if thread == 0 { frame_ms += ms } else { ahead_ms += ms }
+            parts.push(format!(
+                "{name}{} {}x: {:.1} ms resident (longest {:.1}) + {:.1} ms mapped (longest {:.1}, {:.1} ms of it waiting for another thread's)",
+                if thread == 1 { " ahead" } else { "" },
+                made[0].max(mapped[0]),
+                made[1] as f64 / 1e3,
+                made[2] as f64 / 1e3,
+                mapped[1] as f64 / 1e3,
+                mapped[2] as f64 / 1e3,
+                locked[1] as f64 / 1e3,
+            ));
+        }
+    }
+    if !parts.is_empty() {
+        tracing::info!(
+            "new memory waited for in the last 5 seconds (VICTORY_WAIT_RESIDENT=0: none): {frame_ms:.1} ms by the title's threads and ours, \
+             {ahead_ms:.1} ms by the thread that makes buffers ahead (\"ahead\", which no frame waits for); {}",
+            parts.join("; ")
+        );
+    }
+}
+
 /// A queue of its own that new memory is waited for with ([`mapped`]).
 struct Aside {
     queue: ID3D12CommandQueue,
-    list: ID3D12CommandList,
+    /// The same copy recorded [`ASIDE_LISTS`] times, and the fence value of
+    /// each one's last run: a list may be sent again only once the card is
+    /// done reading it.
+    lists: Vec<(ID3D12CommandList, u64)>,
     fence: ID3D12Fence,
     event: windows::Win32::Foundation::HANDLE,
     value: u64,
@@ -249,20 +364,37 @@ struct Aside {
 // thread at a time (the lock).
 unsafe impl Send for Aside {}
 
+/// Copies [`mapped`] may have on the card at once.
+const ASIDE_LISTS: usize = 8;
+
+/// Whether threads that wait in [`mapped`] wait together, each for its own
+/// copy, the lock held only while one is sent (`VICTORY_MAPPED_TOGETHER=0`:
+/// one at a time, the lock held until its copy has run, as before). One at
+/// a time, a frame's thread that made a texture or a buffer on the card
+/// stood behind every other thread's wait, and the thread that makes
+/// buffers ahead (`crate::ahead`, of low priority, making thousands) is
+/// nearly always in one: while the system pages in a scene, each of those
+/// waits is as long as the paging queued before it.
+fn mapped_together() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_TOGETHER").is_none_or(|v| v != "0"))
+}
+
 /// New memory of the card is mapped into its address space when this
 /// returns: a copy of a few bytes is sent to a queue of ours after the
 /// memory was made, which the system starts only when all mappings asked
 /// for so far are done, and waited for. (`MakeResident` came back before
 /// that: run n11 was lost as n08 was with it alone.) Best done off a hot
 /// path: a tenth of a millisecond to some.
-pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
+pub(crate) fn mapped(device: &ID3D12Device, kind: Made) -> windows::core::Result<()> {
     static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
     if !wait_resident() {
         return Ok(());
     }
     let started = std::time::Instant::now();
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: plain object creation; the objects the list names are kept.
+    note_wait(kind, 2, started.elapsed().as_micros() as u64);
+    // SAFETY: plain object creation; the objects the lists name are kept.
     unsafe {
         if aside.is_none() {
             let buffer = |kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| -> windows::core::Result<ID3D12Resource> {
@@ -293,12 +425,18 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
                 ..Default::default()
             })?;
             let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
-            let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
-            list.CopyBufferRegion(&to, 0, &from, 0, 16);
-            list.Close()?;
+            let mut lists = Vec::with_capacity(ASIDE_LISTS);
+            for _ in 0..if mapped_together() { ASIDE_LISTS } else { 1 } {
+                // (Recorded one after another from the same allocator,
+                // which is never reset.)
+                let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                list.CopyBufferRegion(&to, 0, &from, 0, 16);
+                list.Close()?;
+                lists.push((list.cast()?, 0));
+            }
             *aside = Some(Aside {
                 queue,
-                list: list.cast()?,
+                lists,
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 event: CreateEventW(None, false, false, None)?,
                 value: 0,
@@ -306,15 +444,39 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             });
         }
         let Some(a) = aside.as_mut() else { return Ok(()) };
-        a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
+        // A list the card is done with; else the one sent longest ago,
+        // waited for here (it is no one's wait but the lock's).
+        let done = a.fence.GetCompletedValue();
+        let pick = a.lists.iter().position(|l| l.1 <= done).unwrap_or_else(|| {
+            a.lists.iter().enumerate().min_by_key(|(_, l)| l.1).map_or(0, |(i, _)| i)
+        });
+        let before = a.lists[pick].1;
+        if before > done {
+            a.fence.SetEventOnCompletion(before, a.event)?;
+            WaitForSingleObject(a.event, INFINITE);
+        }
+        a.queue.ExecuteCommandLists(&[Some(a.lists[pick].0.clone())]);
         a.value += 1;
         a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
-            a.fence.SetEventOnCompletion(a.value, a.event)?;
+        a.lists[pick].1 = a.value;
+        let mine = a.value;
+        if mapped_together() {
+            let fence = a.fence.clone();
+            drop(aside);
+            if fence.GetCompletedValue() < mine {
+                // A null event: this returns once the fence is there.
+                fence.SetEventOnCompletion(mine, HANDLE::default())?;
+            }
+        } else if a.fence.GetCompletedValue() < mine {
+            a.fence.SetEventOnCompletion(mine, a.event)?;
             WaitForSingleObject(a.event, INFINITE);
+            drop(aside);
+        } else {
+            drop(aside);
         }
     }
     let us = started.elapsed().as_micros() as u64;
+    note_wait(kind, 1, us);
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
     MAPPED[2].fetch_max(us, Ordering::Relaxed);
@@ -333,7 +495,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// New memory (made with [`not_resident`]) is resident when this returns.
-pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface, kind: Made) -> windows::core::Result<()> {
     if !wait_resident() {
         return Ok(());
     }
@@ -342,6 +504,7 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     // SAFETY: a live heap or resource of the device's.
     let made = unsafe { device.MakeResident(&[Some(object)]) };
     let us = started.elapsed().as_micros() as u64;
+    note_wait(kind, 0, us);
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
     RESIDENT[2].fetch_max(us, Ordering::Relaxed);
@@ -1091,6 +1254,84 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Threads that make buffers on the card at once each wait for their
+    /// own mapping copy (`super::mapped`, more of them than it has lists),
+    /// and every buffer is then written by the card from an upload buffer
+    /// made without waiting for it and read back whole.
+    #[test]
+    fn buffers_made_at_once_are_mapped_and_hold_what_is_copied_in() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return;
+        };
+        const THREADS: usize = 12;
+        const EACH: usize = 6;
+        const SIZE: u64 = 64 << 10;
+        let made: Vec<Vec<(ID3D12Resource, ID3D12Resource, *mut u8)>> = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    s.spawn(move || {
+                        (0..EACH)
+                            .map(|i| {
+                                let card = host.uav_buffer(SIZE).expect("a card buffer");
+                                let (upload, data) = host.upload_buffer(SIZE).expect("an upload buffer");
+                                // SAFETY: the upload buffer's whole mapping.
+                                unsafe { std::ptr::write_bytes(data, (t * EACH + i) as u8 ^ 0x5a, SIZE as usize) };
+                                (card, upload, data as usize)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap().into_iter().map(|(c, u, d)| (c, u, d as *mut u8)).collect()).collect()
+        });
+        let all: Vec<_> = made.into_iter().flatten().collect();
+        let (back, seen) = host.shared_buffer(SIZE * all.len() as u64).expect("a buffer to read back");
+        // SAFETY: a queue, list and fence of the test's own; the buffers are
+        // alive and nothing is read before the copies have run.
+        unsafe {
+            let device = &host.device;
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            for (n, (card, upload, _)) in all.iter().enumerate() {
+                list.CopyBufferRegion(card, 0, upload, 0, SIZE);
+                // (Promoted from common to a copy's destination by the copy
+                // in; from there to its source only by a barrier.)
+                let barrier = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::transmute_copy(card),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                            StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        }),
+                    },
+                    ..Default::default()
+                };
+                list.ResourceBarrier(&[barrier]);
+                list.CopyBufferRegion(&back, SIZE * n as u64, card, 0, SIZE);
+            }
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            for n in 0..all.len() {
+                let bytes = std::slice::from_raw_parts(seen.add(SIZE as usize * n), SIZE as usize);
+                let want = n as u8 ^ 0x5a;
+                assert!(bytes.iter().all(|&b| b == want), "buffer {n} read back other bytes");
+            }
+        }
+        // (With `VICTORY_D3D12_DEBUG=1` in a diagnostics build: a list of the
+        // mapping copies sent again while the card still read it is an error.)
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -9525,7 +9766,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    if wait_resident_uploads() { not_resident() } else { D3D12_HEAP_FLAG_NONE },
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -9533,7 +9774,9 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    if wait_resident_uploads() {
+                        resident(&self.device, b, Made::Upload)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9759,6 +10002,7 @@ impl Meter {
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
             crate::tiles::status();
+            log_waits();
             {
                 let [queued, due, away, partly, oldest, again] =
                     [0, 1, 2, 3, 4, 5].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
@@ -10680,8 +10924,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    resident(&self.device, b, Made::Shared)?;
+                    mapped(&self.device, Made::Shared)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10769,8 +11013,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    resident(&self.device, b, Made::CardMapped)?;
+                    mapped(&self.device, Made::CardMapped)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10822,7 +11066,9 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made
+            .and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b, Made::Card)))
+            .and_then(|()| mapped(&self.device, Made::Card));
         match made {
             Ok(()) => buffer,
             Err(e) => {

@@ -94,6 +94,21 @@ in that order of size:
    `VICTORY_INDIRECT_REST=0` is the experiment.
 5. Memory, 40-46 GB private: lists' allocators 9 GB, windows 7, uploads 4
    (`VICTORY_MEMORY_MAP=1` lists it).
+6. Waits for new memory. A 9-minute play log (2026-11-27, 16 GB card, budget 15.2 GB at the
+   start, 13.9-14.3 GB once frame generation ran) had 52,000 `MakeResident` waits for 27.3 s,
+   the longest 1,128 ms while a scene loaded with the card at 10 GB (not near its budget), and
+   48,000 mapping copies waited for, 7.2 s. Both counts took in the thread that makes buffers
+   ahead (`crate::ahead`, 8,000 of them in the first 6 s), whose waits no frame stands for, and
+   `mapped` held one lock for its whole round trip, so a frame's thread waited behind that
+   low-priority thread too. Now: the 5-second lines say which kind of memory and which thread
+   waited (`new memory waited for in the last 5 seconds`); `mapped` holds its lock only while it
+   sends its copy (`VICTORY_MAPPED_TOGETHER=0`: as before); upload buffers are no longer made
+   resident and waited for (`VICTORY_WAIT_RESIDENT_UPLOADS=1`: as before). The next log says
+   whether textures of their own or card buffers are the frames' waits; the next steps follow
+   from that (show-new-later for textures of their own, as pooled ones have it, in place of
+   the wait; card buffers placed in blocks). In play the card stood at 93-95 % of its budget,
+   and the system moved the budget by 300 MB about three times a second from the moment its use
+   came within 600 MB of it.
 
 ## The other repositories, compared
 

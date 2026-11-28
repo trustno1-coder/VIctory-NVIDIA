@@ -512,7 +512,7 @@ fn twin_texture(
         TWINS[1].fetch_add(1, Relaxed);
         return None;
     };
-    let _ = crate::host::resident(&host.device, &texture);
+    let _ = crate::host::resident(&host.device, &texture, crate::host::Made::Twin);
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -573,7 +573,7 @@ fn twin_texture(
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
         texture.map(|texture| {
-            let _ = crate::host::resident(&host.device, &texture);
+            let _ = crate::host::resident(&host.device, &texture, crate::host::Made::Twin);
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -3039,7 +3039,8 @@ fn host_texture_as(
     if !reserved
         && made.is_ok()
         && let Some(t) = &texture
-        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
+        && let Err(e) = crate::host::resident(&host.device, t, crate::host::Made::Texture)
+            .and_then(|()| crate::host::mapped(&host.device, crate::host::Made::Texture))
     {
         tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
         texture = None;
