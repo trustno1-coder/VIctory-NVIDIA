@@ -410,6 +410,140 @@ pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
     argv().list.get()
 }
 
+/// The title's command line, from the same list as [`TitleArgv`]: the host's
+/// own is ours (`victory run <exe> ...`), which a title that parses
+/// `GetCommandLineW` (Rust's `std::env::args`, for one) or takes `WinMain`'s
+/// line would read instead of its arguments. Quoted so that the C
+/// runtime's parse of it gives the list back. The narrow form is UTF-8, as
+/// `argv` is.
+struct TitleCommandLine {
+    wide: Box<[u16]>,
+    narrow: Box<[u8]>,
+    /// Where the arguments start (after the program and its separator):
+    /// `WinMain`'s command line.
+    wide_args: usize,
+    narrow_args: usize,
+    /// What `__p__wcmdln` and `__p__acmdln` point to.
+    wide_ptr: std::cell::UnsafeCell<*mut u16>,
+    narrow_ptr: std::cell::UnsafeCell<*mut c_char>,
+}
+
+// SAFETY: as for `TitleArgv`: never written after it was made.
+unsafe impl Send for TitleCommandLine {}
+// SAFETY: as above.
+unsafe impl Sync for TitleCommandLine {}
+
+/// One argument as the MSVC runtime parses it back: quotes around anything
+/// with whitespace or a quote, backslashes doubled only before a quote.
+fn quote_arg(arg: &str, out: &mut String) {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\x0b', '"']) {
+        out.push_str(arg);
+        return;
+    }
+    out.push('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+}
+
+/// The line and the byte offset where the arguments start. The program
+/// name is parsed without escapes, so it is only quoted.
+fn command_line_text(program: &str, args: &[String]) -> (String, usize) {
+    let mut line = String::new();
+    if program.is_empty() || program.contains([' ', '\t']) {
+        line.push('"');
+        line.push_str(program);
+        line.push('"');
+    } else {
+        line.push_str(program);
+    }
+    if args.is_empty() {
+        let end = line.len();
+        return (line, end);
+    }
+    line.push(' ');
+    let start = line.len();
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            line.push(' ');
+        }
+        quote_arg(a, &mut line);
+    }
+    (line, start)
+}
+
+fn title_command_line(program: &str, args: &[String]) -> TitleCommandLine {
+    let (text, start) = command_line_text(program, args);
+    let wide_args = text[..start].encode_utf16().count();
+    let mut wide: Box<[u16]> = text.encode_utf16().chain(Some(0)).collect();
+    let mut narrow: Box<[u8]> = text.bytes().chain(Some(0)).collect();
+    let (wide_ptr, narrow_ptr) = (wide.as_mut_ptr(), narrow.as_mut_ptr().cast::<c_char>());
+    TitleCommandLine {
+        wide,
+        narrow,
+        wide_args,
+        narrow_args: start,
+        wide_ptr: wide_ptr.into(),
+        narrow_ptr: narrow_ptr.into(),
+    }
+}
+
+fn command_line() -> &'static TitleCommandLine {
+    static LINE: std::sync::OnceLock<TitleCommandLine> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| {
+        // The program as `argv` has it.
+        let program = std::env::args_os().next().unwrap_or_default();
+        title_command_line(&program.to_string_lossy(), runtime::title_args())
+    })
+}
+
+/// See [`TitleCommandLine`].
+pub extern "system" fn GetCommandLineW() -> *const u16 {
+    command_line().wide.as_ptr()
+}
+
+/// See [`TitleCommandLine`].
+pub extern "system" fn GetCommandLineA() -> *const c_char {
+    command_line().narrow.as_ptr().cast()
+}
+
+/// The C runtime's `WinMain` line: the arguments, without the program.
+pub extern "C" fn _get_wide_winmain_command_line() -> *const u16 {
+    let line = command_line();
+    line.wide[line.wide_args..].as_ptr()
+}
+
+/// See [`_get_wide_winmain_command_line`].
+pub extern "C" fn _get_narrow_winmain_command_line() -> *const c_char {
+    let line = command_line();
+    line.narrow[line.narrow_args..].as_ptr().cast()
+}
+
+/// The C runtime's `_wcmdln`.
+pub extern "C" fn __p__wcmdln() -> *mut *mut u16 {
+    command_line().wide_ptr.get()
+}
+
+/// The C runtime's `_acmdln`.
+pub extern "C" fn __p__acmdln() -> *mut *mut c_char {
+    command_line().narrow_ptr.get()
+}
+
 /// The title's thread priorities, but for the lowest two, which become
 /// "below normal". Six of the title's threads run at "idle", the streaming
 /// pager's among them; on the console they have what the rest of the title
@@ -448,11 +582,18 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
+            "api-ms-win-core-processenvironment-*",
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
             hle_export!(__p___argc),
             hle_export!(__p___argv),
+            hle_export!(GetCommandLineW),
+            hle_export!(GetCommandLineA),
+            hle_export!(_get_wide_winmain_command_line),
+            hle_export!(_get_narrow_winmain_command_line),
+            hle_export!(__p__wcmdln),
+            hle_export!(__p__acmdln),
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
             hle_export!(GetModuleFileNameW),
@@ -773,6 +914,104 @@ mod tests {
         assert_eq!(__p___argc(), __p___argc());
         // SAFETY: as above.
         unsafe { assert_eq!((*__p___argc(), (**__p___argv()).is_null()), (1, false)) };
+    }
+
+    /// The MSVC runtime's argument parsing (VS 2008 on), to check that our
+    /// command line reads back as the title's list.
+    fn parse_msvc(line: &str) -> Vec<String> {
+        let c: Vec<char> = line.chars().collect();
+        let blank = |c: char| c == ' ' || c == '\t';
+        let mut i = 0;
+        let mut out = Vec::new();
+        // The program: up to whitespace, or between quotes; no escapes.
+        let mut program = String::new();
+        let mut quoted = false;
+        while i < c.len() && (quoted || !blank(c[i])) {
+            if c[i] == '"' {
+                quoted = !quoted;
+            } else {
+                program.push(c[i]);
+            }
+            i += 1;
+        }
+        out.push(program);
+        loop {
+            while i < c.len() && blank(c[i]) {
+                i += 1;
+            }
+            if i >= c.len() {
+                return out;
+            }
+            let mut arg = String::new();
+            let mut quoted = false;
+            while i < c.len() && (quoted || !blank(c[i])) {
+                let mut slashes = 0;
+                while i < c.len() && c[i] == '\\' {
+                    slashes += 1;
+                    i += 1;
+                }
+                if i < c.len() && c[i] == '"' {
+                    arg.extend(std::iter::repeat_n('\\', slashes / 2));
+                    if slashes % 2 == 1 {
+                        arg.push('"');
+                    } else if quoted && c.get(i + 1) == Some(&'"') {
+                        arg.push('"');
+                        i += 1;
+                    } else {
+                        quoted = !quoted;
+                    }
+                    i += 1;
+                } else {
+                    arg.extend(std::iter::repeat_n('\\', slashes));
+                    if i < c.len() && (quoted || !blank(c[i])) {
+                        arg.push(c[i]);
+                        i += 1;
+                    }
+                }
+            }
+            out.push(arg);
+        }
+    }
+
+    /// `GetCommandLineW` gives the title's arguments, quoted so that they
+    /// parse back exactly; `WinMain`'s line is what follows the program.
+    #[test]
+    fn the_title_gets_its_own_command_line() {
+        let args: Vec<String> = [
+            "-skipToIIS",
+            "two words",
+            "",
+            r#"say "hi""#,
+            r"C:\dir\",
+            r#"a\"b"#,
+            "tab\there",
+        ]
+        .map(String::from)
+        .to_vec();
+        for program in [r"C:\games\victory.exe", r"C:\Program Files\v\victory.exe"] {
+            let made = title_command_line(program, &args);
+            let text = String::from_utf16(&made.wide[..made.wide.len() - 1]).unwrap();
+            let mut want = vec![program.to_owned()];
+            want.extend(args.iter().cloned());
+            assert_eq!(parse_msvc(&text), want, "{text}");
+            assert_eq!(&made.narrow[..made.narrow.len() - 1], text.as_bytes());
+            let winmain =
+                String::from_utf16(&made.wide[made.wide_args..made.wide.len() - 1]).unwrap();
+            assert!(
+                winmain.starts_with(r#"-skipToIIS "two words""#),
+                "{winmain}"
+            );
+            assert_eq!(&text[made.narrow_args..], winmain);
+        }
+        // No arguments: WinMain's line is empty.
+        let bare = title_command_line("victory.exe", &[]);
+        assert_eq!(bare.wide[bare.wide_args], 0);
+        assert_eq!(bare.narrow[bare.narrow_args], 0);
+        // What the title is given: the same line every time, and `_wcmdln`
+        // is it.
+        assert_eq!(GetCommandLineW(), GetCommandLineW());
+        // SAFETY: `__p__wcmdln` points at the line's own pointer.
+        unsafe { assert_eq!((*__p__wcmdln()).cast_const(), GetCommandLineW()) };
     }
 
     fn w(text: &str) -> Vec<u16> {
