@@ -237,19 +237,6 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
 
-/// Whether upload buffers are made resident and waited for as the card's
-/// memory is (`VICTORY_WAIT_RESIDENT_UPLOADS=1`; off by default). They lie
-/// in the PC's memory, the CPU writes them through its own mapping (which
-/// needs no residency), and the card reads them only by address in lists
-/// recorded after they were made, which the system holds until the memory
-/// is there: no slot of a heap shows them to lists sent before. Waited for,
-/// each one stood its thread still until the system had paged it in
-/// (`MakeResident` is synchronous), behind whatever paging was queued.
-fn wait_resident_uploads() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT_UPLOADS").is_some_and(|v| v == "1"))
-}
-
 /// What new memory [`resident`] and [`mapped`] waited for, as the log
 /// tells them apart.
 #[derive(Clone, Copy)]
@@ -1267,6 +1254,132 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Milliseconds a call took, summed up: mean, median, 99th percentile,
+    /// longest.
+    fn spread(mut ms: Vec<f64>) -> String {
+        ms.sort_by(f64::total_cmp);
+        let at = |q: f64| ms[((ms.len() - 1) as f64 * q).round() as usize];
+        format!(
+            "{} calls: mean {:.3} ms, median {:.3}, 99th {:.3}, longest {:.3}",
+            ms.len(),
+            ms.iter().sum::<f64>() / ms.len() as f64,
+            at(0.5),
+            at(0.99),
+            ms[ms.len() - 1]
+        )
+    }
+
+    /// The thread that makes buffers ahead is told apart by its name, and
+    /// a wait is counted under its kind and thread once, then taken by the
+    /// 5-second lines.
+    #[test]
+    fn waits_are_counted_by_kind_and_thread() {
+        use std::sync::atomic::Ordering::Relaxed;
+        assert!(!super::ahead_thread());
+        let ahead = std::thread::Builder::new()
+            .name("victory-ahead".into())
+            .spawn(|| {
+                super::note_waits(super::Made::Twin, 0, 1234, 3);
+                super::ahead_thread()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(ahead);
+        // (Depth twins: no other test makes one.)
+        let w = super::waited(super::Made::Twin as usize, 1, 0);
+        assert_eq!([w[0].load(Relaxed), w[1].load(Relaxed), w[2].load(Relaxed)], [3, 1234, 1234]);
+        assert_eq!(super::waited(super::Made::Twin as usize, 0, 0)[0].load(Relaxed), 0);
+        super::log_waits();
+        assert_eq!(w[0].load(Relaxed), 0, "taken by the lines");
+    }
+
+    /// A thread like the one that makes buffers ahead (its name, its low
+    /// priority) making card buffers of `VICTORY_BENCH_AHEAD_KB` all the
+    /// time while `f` runs (none without it; 65536 keeps the system paging,
+    /// as while a scene loads). The size, in KiB.
+    fn beside_the_thread_that_makes_buffers(host: &'static super::Host, f: impl FnOnce()) -> u64 {
+        let Some(size) = std::env::var("VICTORY_BENCH_AHEAD_KB").ok().and_then(|v| v.parse::<u64>().ok()) else {
+            f();
+            return 0;
+        };
+        let size = size << 10;
+        let most = ((32usize << 20) / size as usize).max(8);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .name("victory-ahead".into())
+                .spawn_scoped(s, || {
+                    // SAFETY: this thread's own priority.
+                    unsafe {
+                        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    }
+                    let mut made = Vec::new();
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        made.extend(host.uav_buffer(size));
+                        if made.len() > most {
+                            made.clear();
+                        }
+                    }
+                })
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            f();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        size >> 10
+    }
+
+    /// Bench (`--ignored --nocapture`): upload buffers of 64 KiB and 8 MiB
+    /// made beside [`beside_the_thread_that_makes_buffers`]. (Waited for
+    /// or not, `MakeResident` and all, they took the same: 0.97 ms and 3.7
+    /// ms, beside buffers of 64 MiB, on an RTX card.)
+    #[test]
+    #[ignore]
+    fn bench_upload_buffers() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        for (size, n) in [(64u64 << 10, 400), (8 << 20, 40)] {
+            let mut ms = Vec::new();
+            let mut keep = Vec::new();
+            let beside = beside_the_thread_that_makes_buffers(host, || {
+                for _ in 0..n {
+                    let began = std::time::Instant::now();
+                    keep.push(host.upload_buffer(size).expect("an upload buffer"));
+                    ms.push(began.elapsed().as_secs_f64() * 1e3);
+                }
+            });
+            eprintln!("upload buffers of {} KiB beside a thread making buffers of {beside} KiB: {}", size >> 10, spread(ms));
+        }
+    }
+
+    /// Bench (`--ignored --nocapture`): a thread makes card buffers of 64
+    /// KiB one after another beside [`beside_the_thread_that_makes_buffers`],
+    /// as `VICTORY_MAPPED_TOGETHER` says (run once with `=0`, once without).
+    #[test]
+    #[ignore]
+    fn bench_card_buffers_beside_the_thread_that_makes_them_ahead() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let mut ms = Vec::new();
+        let mut keep = Vec::new();
+        let beside = beside_the_thread_that_makes_buffers(host, || {
+            for _ in 0..400 {
+                let began = std::time::Instant::now();
+                keep.push(host.uav_buffer(64 << 10).expect("a card buffer"));
+                ms.push(began.elapsed().as_secs_f64() * 1e3);
+            }
+        });
+        eprintln!(
+            "card buffers beside a thread making buffers of {beside} KiB (waiting together: {}): {}",
+            super::mapped_together(),
+            spread(ms)
+        );
+    }
+
     /// Threads that make buffers on the card at once each wait for their
     /// own mapping copy (`super::mapped`, more of them than it has lists),
     /// and every buffer is then written by the card from an upload buffer
@@ -9817,7 +9930,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    if wait_resident_uploads() { not_resident() } else { D3D12_HEAP_FLAG_NONE },
+                    not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -9825,9 +9938,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    if wait_resident_uploads() {
-                        resident(&self.device, b, Made::Upload)?;
-                    }
+                    resident(&self.device, b, Made::Upload)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };

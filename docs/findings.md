@@ -102,8 +102,10 @@ in that order of size:
    `mapped` held one lock for its whole round trip, so a frame's thread waited behind that
    low-priority thread too. Now: the 5-second lines say which kind of memory and which thread
    waited (`new memory waited for in the last 5 seconds`); `mapped` holds its lock only while it
-   sends its copy (`VICTORY_MAPPED_TOGETHER=0`: as before); upload buffers are no longer made
-   resident and waited for (`VICTORY_WAIT_RESIDENT_UPLOADS=1`: as before). The next log says
+   sends its copy (`VICTORY_MAPPED_TOGETHER=0`: as before). Beside a thread that keeps the
+   system paging (buffers of 64 MiB), a card buffer of 64 KiB took 0.70 ms on average in place
+   of 0.89 (median 0.64 in place of 1.06). Upload buffers not waited for took the same as
+   waited for (0.97 ms of 64 KiB, 3.7 of 8 MiB), so they are waited for still. The next log says
    whether textures of their own or card buffers are the frames' waits; the next steps follow
    from that (show-new-later for textures of their own, as pooled ones have it, in place of
    the wait; card buffers placed in blocks). In play the card stood at 93-95 % of its budget,
