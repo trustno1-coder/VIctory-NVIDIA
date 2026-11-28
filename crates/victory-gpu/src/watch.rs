@@ -97,6 +97,80 @@ fn next_asking() -> u64 {
     ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// Page ranges `(first, last)` of memory of ours that only its owner writes,
+/// and whose owner tells every write ([`owner_wrote`]): the kernel is not
+/// asked about them, the journal alone answers.
+///
+/// The arenas of title memory by address (`crate::memory`) are such memory:
+/// 64 MiB each, 18-21 of them with the title's ray tracing on, and every
+/// list that reaches them refreshes all of them whole. Asked of the kernel
+/// that was 5-9 GB of page tables walked a frame, 6.5-11 ms of the
+/// submitting thread (i7-13700K, the office and the boat of the opening;
+/// the time follows the megabytes, not the number of askings), to find the
+/// few pages `crate::memory` itself had just written.
+static OWNED: RwLock<Vec<(usize, usize)>> = RwLock::new(Vec::new());
+
+/// Whether memory of ours is taken out of the kernel's askings when its
+/// owner tells its writes (`VICTORY_MEMORY_OWNED=0`: asked of the kernel, as
+/// before).
+fn owned_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_OWNED").is_none_or(|v| v != "0"))
+}
+
+/// `[start, start + len)` (whole pages) is written by its owner alone from
+/// here on, and every write of it is told with [`owner_wrote`], after the
+/// bytes are in. Whether it was taken: if not, the kernel goes on answering.
+pub(crate) fn own(start: usize, len: usize) -> bool {
+    if !owned_on() || len == 0 || !start.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) {
+        return false;
+    }
+    let mut owned = OWNED.write().unwrap_or_else(|e| e.into_inner());
+    owned.push((start / PAGE, (start + len) / PAGE));
+    true
+}
+
+/// [`own`] undone: the memory is given back.
+pub(crate) fn disown(start: usize) {
+    let mut owned = OWNED.write().unwrap_or_else(|e| e.into_inner());
+    owned.retain(|r| r.0 != start / PAGE);
+}
+
+/// Whether the pages `[first, last)` lie in one range that is [`own`]ed.
+fn owned(first: usize, last: usize) -> bool {
+    let owned = OWNED.read().unwrap_or_else(|e| e.into_inner());
+    owned.iter().any(|&(a, b)| a <= first && last <= b)
+}
+
+/// The owner of memory wrote `[at, at + len)` of it: noted as a write found
+/// by an asking of its own, so the refreshes that follow copy it. For memory
+/// that is not [`own`]ed this is [`wrote`].
+///
+/// Called after the bytes are in. A copy that began before them took its
+/// asking's number before this one was counted, so it finds the pages
+/// written since and takes them again; one that began after has the bytes.
+pub(crate) fn owner_wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / PAGE, (at + len).div_ceil(PAGE));
+    if !owned(first, last) {
+        return wrote(at, len);
+    }
+    let mut j = journal_mut();
+    let now = next_asking();
+    // As in `wrote`: what is copied from now on is copied after this write.
+    if j.kept {
+        j.ahead_asked = now;
+    }
+    for page in first..last {
+        let (from, to) = (at.max(page * PAGE) - page * PAGE, (at + len).min((page + 1) * PAGE) - page * PAGE);
+        let (a, b) = (from / KERNEL_PAGE, to.div_ceil(KERNEL_PAGE));
+        let parts = if b - a >= PARTS { WHOLE } else { (((1u32 << (b - a)) - 1) << a) as u16 };
+        j.note(page, parts, now);
+    }
+}
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
@@ -332,6 +406,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         // asking (and, asked together with others, theirs).
         .filter(|r| r.0 < r.1 && !published(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        // Nor memory whose owner tells its writes.
+        .filter(|&(first, last)| !owned(first, last))
         .collect();
     if pieces.len() < 2 {
         return;
@@ -569,6 +645,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
         if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+            && !owned(first, last)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
@@ -660,10 +737,12 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    let of = |j: &Journal| j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        return Some((j.ahead_asked, of(&j)));
+    }
+    // Its owner tells its writes: an asking of its own, with nothing asked.
+    owned(first, last).then(|| (next_asking(), of(&j)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -684,6 +763,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
+    }
+    // Memory of ours whose owner tells its writes: the journal has them.
+    if owned(first, last) {
+        let j = journal();
+        return Some((next_asking(), of(&j)));
     }
     // Read-only since an asking noted it: the bits first, then the journal.
     if guarded && published(start, end) {
@@ -764,6 +848,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     if known {
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
+    let known = known || owned(first, last);
     let j = journal();
     if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return false;
@@ -4396,6 +4481,40 @@ mod tests {
 
     /// Of a page taken before, what is taken again is the kernel's pages
     /// written since; where they are not known, all of it.
+    #[test]
+    fn memory_its_owner_tells_of_is_answered_without_the_kernel() {
+        // No memory is there: nothing may ask the kernel or read it.
+        let start = 0x7e00_0000_0000usize;
+        let len = 4 * PAGE;
+        assert!(own(start, len));
+        let (first, pages) = writes(start, start + len, false).expect("answered from the journal");
+        assert!(pages.is_empty());
+        assert!(asked(start + PAGE, start + 2 * PAGE).is_some());
+        // A copy that took its pages at `first` holds all of it.
+        assert!(nothing_new(start, start + len, start / PAGE, &[first; 4], 0));
+
+        // Bytes 0x1100..0x2100 of the second page: its parts 1 and 2.
+        owner_wrote(start + PAGE + 0x1100, 0x1000);
+        let (second, pages) = writes(start, start + len, false).expect("answered from the journal");
+        assert_eq!(pages.len(), 1);
+        let (page, write) = pages[0];
+        assert_eq!(page, start / PAGE + 1);
+        assert!(first < write && write < second);
+        assert_eq!(parts_written(&[(page, first)]), [0b110]);
+        assert!(!nothing_new(start, start + len, start / PAGE, &[first; 4], 0));
+        assert!(nothing_new(start, start + len, start / PAGE, &[second; 4], 0));
+
+        // A write across two pages is told of both; a range that is only
+        // partly owned is not owned.
+        owner_wrote(start + 3 * PAGE - 4, 8);
+        let (_, pages) = writes(start, start + len, false).expect("answered from the journal");
+        assert_eq!(pages.iter().map(|p| p.0 - start / PAGE).collect::<Vec<_>>(), [1, 2, 3]);
+        assert!(!owned(start / PAGE + 3, start / PAGE + 5));
+
+        disown(start);
+        assert!(!owned(start / PAGE, start / PAGE + 1));
+    }
+
     #[test]
     fn what_is_taken_again_is_what_was_written() {
         // SAFETY: a fresh write-watched allocation, freed at the end.

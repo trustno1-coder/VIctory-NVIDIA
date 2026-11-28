@@ -98,6 +98,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
+| `VICTORY_MEMORY_OWNED=0` | the kernel is asked what was written in the arenas and the directory, as before (on: `memory.rs` tells its own writes) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
 
