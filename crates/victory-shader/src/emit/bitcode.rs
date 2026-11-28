@@ -108,6 +108,9 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    /// 32- to 64-bit float: a plain double operation, unlike the integer conversions to
+    /// doubles (which need the double extensions flag).
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -226,6 +229,10 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Float results that must be the console's bit for bit (the ordered paired FP32
+    /// reductions, fxceless e3307c77). This line writes no fast-math flags, so it only marks
+    /// such a program.
+    pub exact_floats: bool,
 }
 
 impl Module {

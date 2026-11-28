@@ -112,6 +112,7 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+mod water_tile_slots;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -382,6 +383,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(u8::from(wave_pairs_on()));
     out
 }
 
@@ -483,13 +485,24 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
+/// Brings a console program into the form this host translates, where one differs from the
+/// program as the title has it: on a host of 32-lane waves the water light's tile lists take
+/// a slot a lane ([`water_tile_slots`]). [`translate`] does this itself; a caller that parses
+/// the container and calls [`emit`] calls this first. Returns whether the program changed.
+pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
+    lower::host_max_wave() == 32
+        && c.digest == water_tile_slots::CONTAINER
+        && water_tile_slots::on()
+        && water_tile_slots::rewrite(native)
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -501,6 +514,9 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    // The water light's tile lists on a host of 32-lane waves: a slot a lane
+    // ([`water_tile_slots`]), so no tile is lost between the two host waves of a group.
+    host_form(&c, &mut native);
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -511,6 +527,79 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// [`with_wave_pairs`]'s choice, for this thread's translations.
+    static WAVE_PAIRS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Exact surface water lighting consumers. GenerateTiles uses the per-lane
+// allocator above, with its original dispatch contract.
+const WATER_PAIRED_PROGRAMS: [([u8; 16], &str); 2] = [
+    (
+        [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90],
+        "5dc3b25986622949",
+    ),
+    (
+        [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6],
+        "6f225b641c5b0708",
+    ),
+];
+
+fn water_pair_name(
+    digest: [u8; 16],
+    host_wave: u32,
+    water_light: bool,
+    allow_pairs: bool,
+) -> Option<&'static str> {
+    if host_wave != 32 || !water_light || !allow_pairs {
+        return None;
+    }
+    WATER_PAIRED_PROGRAMS
+        .iter()
+        .find_map(|(known, name)| (*known == digest).then_some(*name))
+}
+
+#[cfg(test)]
+#[test]
+fn paired_water_selection_matches_only_enabled_wave32_consumers() {
+    for (digest, name) in WATER_PAIRED_PROGRAMS {
+        assert_eq!(water_pair_name(digest, 32, true, true), Some(name));
+        assert_eq!(water_pair_name(digest, 64, true, true), None);
+        assert_eq!(water_pair_name(digest, 32, false, true), None);
+        assert_eq!(water_pair_name(digest, 32, true, false), None);
+    }
+    assert_eq!(water_pair_name(water_tile_slots::CONTAINER, 32, true, true), None);
+    assert_eq!(water_pair_name([0; 16], 32, true, true), None);
+}
+
+fn water_pair(c: &Container) -> Option<&'static str> {
+    water_pair_name(
+        c.digest,
+        lower::host_max_wave(),
+        std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|value| value == "1"),
+        std::env::var_os("VICTORY_WATER_WAVE_PAIRS").is_none_or(|value| value != "0"),
+    )
+}
+
+thread_local! {
+    static PAIRED_BY_DEFAULT_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn paired_by_default_here() -> bool {
+    PAIRED_BY_DEFAULT_HERE.get()
+}
+
+#[cfg(all(test, windows))]
+fn with_wave_pairs<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAVE_PAIRS_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(WAVE_PAIRS_HERE.replace(on));
+    f()
+}
 /// Emits a program whose earlier stages already ran ([`emit_once`]). A wave64 compute program
 /// that does not translate with the branches that close or leave its loops taken by each host
 /// wave together ([`loops_wave`]) is tried once more without them, as before that step: the
@@ -558,6 +647,25 @@ fn emit_once(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    let wave32_compute =
+        native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
+    let water = if wave32_compute { water_pair(c) } else { None };
+    let selected = water.is_some() || (cfg!(test) && WAVE_PAIRS_HERE.get());
+    if selected && wave32_compute {
+        let old = PAIRED_BY_DEFAULT_HERE.replace(water.is_some());
+        let tried = paired(c, native, p);
+        PAIRED_BY_DEFAULT_HERE.set(old);
+        let name = water.unwrap_or("test");
+        match tried {
+            Ok((shader, Some(32))) => {
+                eprintln!("WAVE64-PAIRED {name}: translated as two guest lanes per host lane");
+                return Ok(shader);
+            }
+            Ok((_, wave)) => eprintln!("WAVE64-PAIRED {name}: unexpected wave {wave:?}; using existing lowering"),
+            Err(e) => eprintln!("WAVE64-PAIRED {name}: {e}; using existing lowering"),
+        }
+        lower::take_needs();
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
@@ -569,10 +677,29 @@ fn emit_once(
         Err(ShaderError::Unsupported { what, .. }) => lower::needs_every_lane(what),
         Err(_) => false,
     };
+    let pairs_on = wave_pairs_on() && !selected;
+    if wave32_compute
+        && pairs_on
+        && !stuck
+        && (matches!(native.io, crate::native::StageIo::Cs(cs) if cs.lds_bytes() > 0)
+            || lower::crosses_halves(p, st)
+                && (original.is_err() || lower::wave_local(p, st).is_err()))
+    {
+        let again = paired(c, native, p);
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            match &again {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY paired Wave64: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-RETRY paired Wave64: {e}"),
+            }
+        }
+        if let Ok((shader, Some(32))) = again {
+            return Ok(shader);
+        }
+    }
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+    if stuck && wave32_compute {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -695,6 +822,13 @@ fn emit_once(
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
             if !exact {
+                if pairs_on {
+                    let again = paired(c, native, p);
+                    report("paired Wave64", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 // Before anything approximate, the exact forms that cost group barriers.
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
@@ -930,6 +1064,91 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+fn wave_pairs_on() -> bool {
+    cfg!(test) && std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1")
+}
+
+// Paired Wave64 port from Geckomacabre and TaynanGT (Vice-Tay #208).
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes outside compute",
+        });
+    };
+    if crate::spill::is_spilled(native) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 for spilled DispatchX programs is not validated",
+        });
+    }
+    let threads = cs.threads.iter().product::<u32>();
+    if threads == 0 || threads > 1024 || threads % 64 != 0 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes in a thread group that does not fill its console waves",
+        });
+    }
+    if p.blocks.first().is_some_and(|b| !b.preds.is_empty()) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 requires a single-entry wave prologue",
+        });
+    }
+    let lds = cs.lds_bytes();
+    if lds + 4 * u32::from(threads > 64) > 32 * 1024 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 exceeds the compute group shared-memory limit",
+        });
+    }
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let accesses_lds = insts().any(lower::accesses_lds);
+    if accesses_lds
+        && (lds == 0 || insts().filter(|i| lower::accesses_lds(i)).any(|i| {
+            !lower::supports_paired_lds(i.name())
+        }))
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "an LDS operation not supported by paired Wave64",
+        });
+    }
+    let waits = accesses_lds || insts().any(|i| i.name() == "s_barrier");
+    // Independently progressing waves cannot rendezvous after a divergent exit.
+    if (threads > 64 && p.blocks.len() > 1 && waits)
+        || (group_sync() == 0 && (threads > 64 || waits))
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 would require an unavailable group rendezvous",
+        });
+    }
+    // every per-lane branch the wave's; again while that leaves another branch per lane
+    let mut wide = std::collections::HashSet::new();
+    let st = loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let lanes: Vec<usize> = (0..st.exits.len())
+            .filter(|b| !wide.contains(b))
+            .filter(|&b| {
+                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
+            })
+            .collect();
+        if lanes.is_empty() {
+            break st;
+        }
+        wide.extend(lanes);
+    };
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res))
 }
 
 /// The translated program, and the wave size it requires of the host.
