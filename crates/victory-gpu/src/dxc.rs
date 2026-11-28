@@ -80,7 +80,34 @@ pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core:
 /// Whether the container holds the root signature the shader asked for: both
 /// compilers store it as the chunk `RTS0`.
 fn carries_root_signature(bytes: &[u8]) -> bool {
-    bytes.windows(4).any(|chunk| chunk == b"RTS0")
+    // Structural DXBC container parse: RTS0 must be the FourCC of a real
+    // chunk, not a byte sequence hidden inside another chunk.
+    if bytes.len() < 28 || &bytes[0..4] != b"DXBC" {
+        return false;
+    }
+    let chunk_count =
+        u32::from_le_bytes(bytes[24..28].try_into().unwrap_or([0; 4])) as usize;
+    let table_end = 28usize.saturating_add(chunk_count.saturating_mul(4));
+    if chunk_count == 0 || table_end > bytes.len() {
+        return false;
+    }
+    for i in 0..chunk_count {
+        let off = u32::from_le_bytes(
+            bytes[28 + i * 4..32 + i * 4].try_into().unwrap_or([0; 4]),
+        ) as usize;
+        if off + 8 > bytes.len() {
+            return false;
+        }
+        let fourcc = &bytes[off..off + 4];
+        let size = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap_or([0; 4])) as usize;
+        if off + 8 + size > bytes.len() {
+            return false;
+        }
+        if fourcc == b"RTS0" {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether the declaration of `entry` asks for a root signature. A source can
