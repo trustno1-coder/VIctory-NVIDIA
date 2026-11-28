@@ -13,6 +13,8 @@ use crate::keymap;
 const TABS: [&str; 3] = ["ON FOOT", "VEHICLE", "MOUSE AND OPTIONS"];
 /// Where the columns begin: the action, key 1, key 2 (or an option's value).
 const ACTION: usize = 2;
+/// The pad button an action is on (in the title's Standard controller layout).
+const PAD: usize = 25;
 const KEY1: usize = 31;
 const KEY2: usize = 46;
 const WIDTH: usize = 14;
@@ -138,6 +140,7 @@ impl KeyPage {
         let mut names = String::new();
         if self.tab < 2 {
             put(&mut names, ACTION, "ACTION");
+            put(&mut names, PAD, "PAD");
             put(&mut names, KEY1, "KEY 1");
             put(&mut names, KEY2, "KEY 2");
         } else {
@@ -163,6 +166,7 @@ impl KeyPage {
                 Row::Blank => {}
                 Row::Bind(control, name) => {
                     put(&mut line, ACTION, name);
+                    put(&mut line, PAD, keymap::PAD_NAMES[control]);
                     for (slot, column) in [KEY1, KEY2].into_iter().enumerate() {
                         let vk = keymap::keys(self.tab, control)[slot];
                         let text = if picked && self.capture && slot == self.slot { "PRESS A KEY".to_owned() } else { keymap::name(vk) };
@@ -233,7 +237,8 @@ impl KeyPage {
                 self.note.clear();
                 return Done::Stay;
             }
-            let vk = vk as u8;
+            // A letter by its place, as the key map holds it (`keymap::by_place`).
+            let vk = keymap::captured(vk as u8);
             match row {
                 Row::SwitchKey => {
                     keymap::set_switch_key(vk);
@@ -329,6 +334,13 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
+        // An action's name leaves a blank before the pad column, the pad's name one before key 1's mark.
+        for page in keymap::PAGES {
+            for (_, actions) in page {
+                assert!(actions.iter().all(|(_, name)| ACTION + name.len() < PAD), "{actions:?}");
+            }
+        }
+        assert!(keymap::PAD_NAMES.iter().all(|n| PAD + n.len() < KEY1 - 1));
         for tab in 0..TABS.len() {
             for at in 0..rows(tab).len() {
                 for capture in [false, true] {

@@ -84,6 +84,14 @@ pub const CONTROLS: [(Control, &str, &str, &str); 24] = [
     (Control::LookRight, "LOOK_RIGHT", "LOOK RIGHT", "LOOK RIGHT"),
 ];
 
+/// Each control's pad button as the menu shows it next to the action, in
+/// [`CONTROLS`] order: the actions are those of the title's Standard
+/// controller layout, and another layout moves them to other buttons.
+pub const PAD_NAMES: [&str; 24] = [
+    "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "L3", "R3", "VIEW", "MENU", "D-UP", "D-DN", "D-LT", "D-RT", "LS-U",
+    "LS-D", "LS-L", "LS-R", "RS-U", "RS-D", "RS-L", "RS-R",
+];
+
 /// The settings page of each profile: groups of actions, each the pad control
 /// it presses and its name there. Every control is on each page once.
 pub const PAGES: [&[(&str, &[(Control, &str)])]; 2] = [
@@ -106,7 +114,7 @@ pub const PAGES: [&[(&str, &[(Control, &str)])]; 2] = [
             (Control::Right, "DETONATE"),
         ]),
         ("ACTIONS", &[
-            (Control::Y, "INTERACT / ENTER VEHICLE"),
+            (Control::Y, "INTERACT / GET IN"),
             (Control::Up, "PHONE"),
             (Control::Left, "RADIO"),
             (Control::Down, "OBJECTIVE / MINIMAP"),
@@ -129,7 +137,7 @@ pub const PAGES: [&[(&str, &[(Control, &str)])]; 2] = [
             (Control::MoveRight, "STEER RIGHT"),
             (Control::A, "HANDBRAKE"),
             (Control::LeftStick, "HORN / NITRO"),
-            (Control::MoveUp, "LEAN FORWARD / NOSE DOWN"),
+            (Control::MoveUp, "LEAN FWD / NOSE DOWN"),
             (Control::MoveDown, "LEAN BACK / NOSE UP"),
         ]),
         ("VEHICLE", &[
@@ -400,6 +408,50 @@ pub fn set_auto_switch(on: bool) {
     AUTO.store(on, Ordering::Relaxed);
 }
 
+/// The letter keys by place: scan code (set 1) and the letter a US layout
+/// prints there. Letters in the key map are places, so the defaults are the
+/// same keys under the fingers on every layout (Z/Q/S/D on AZERTY).
+const LETTERS: [(u32, u8); 26] = [
+    (0x10, b'Q'), (0x11, b'W'), (0x12, b'E'), (0x13, b'R'), (0x14, b'T'), (0x15, b'Y'), (0x16, b'U'),
+    (0x17, b'I'), (0x18, b'O'), (0x19, b'P'), (0x1E, b'A'), (0x1F, b'S'), (0x20, b'D'), (0x21, b'F'),
+    (0x22, b'G'), (0x23, b'H'), (0x24, b'J'), (0x25, b'K'), (0x26, b'L'), (0x2C, b'Z'), (0x2D, b'X'),
+    (0x2E, b'C'), (0x2F, b'V'), (0x30, b'B'), (0x31, b'N'), (0x32, b'M'),
+];
+
+/// A key held, as the key map names it: a letter key by its place (the US
+/// letter there), any other by its virtual key.
+/// 0: a letter key where a US layout has none (Dvorak's S, right of L).
+// shortcut: such a key cannot be bound; give the key map US punctuation places if a layout needs it.
+pub fn by_place(vk: u8, scan_code: u32) -> u8 {
+    match LETTERS.iter().find(|(scan, _)| *scan == scan_code) {
+        Some(&(_, letter)) => letter,
+        None if vk.is_ascii_uppercase() => 0,
+        None => vk,
+    }
+}
+
+/// A key the menu captured (a virtual key on this layout), as the key map names it.
+pub fn captured(vk: u8) -> u8 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+    if !vk.is_ascii_uppercase() {
+        return vk;
+    }
+    // SAFETY: a plain query.
+    match by_place(vk, unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) }) {
+        0 => vk,
+        letter => letter,
+    }
+}
+
+/// The letter this layout prints at the place of US letter `letter`.
+fn shown_letter(letter: u8) -> u8 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VSC_TO_VK, MapVirtualKeyW};
+    let Some(&(scan, _)) = LETTERS.iter().find(|(_, l)| *l == letter) else { return letter };
+    // SAFETY: a plain query.
+    let vk = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK) };
+    u8::try_from(vk).ok().filter(u8::is_ascii_uppercase).unwrap_or(letter)
+}
+
 /// A key's name in the menu.
 pub fn name(vk: u8) -> String {
     match vk {
@@ -425,7 +477,8 @@ pub fn name(vk: u8) -> String {
         0x27 => "RIGHT ARROW".into(),
         0x28 => "DOWN ARROW".into(),
         0x2E => "DELETE".into(),
-        b'0'..=b'9' | b'A'..=b'Z' => char::from(vk).to_string(),
+        b'0'..=b'9' => char::from(vk).to_string(),
+        b'A'..=b'Z' => char::from(shown_letter(vk)).to_string(),
         0x60..=0x69 => format!("NUM {}", vk - 0x60),
         0x70..=0x87 => format!("F{}", vk - 0x6F),
         0xBA => "SEMICOLON".into(),
@@ -466,6 +519,7 @@ pub fn pressed(profile: usize, keys: &[u8], mouse_buttons: u32) -> [bool; CONTRO
 /// long: getting in takes a few seconds, and a second press in the meantime
 /// (in game, 0.2-0.3 s after the first) switched straight back.
 const AUTO_QUIET_MS: u64 = 2000;
+const DRIVING_MS: u64 = 1500;
 
 /// What the stand-in pad presses this poll, in the profile in use; switches the
 /// profile on a fresh press of the profile key, or of the interact control
@@ -490,6 +544,14 @@ fn stand_in_at(keys: &[u8], mouse_buttons: u32, ms: u64) -> [bool; CONTROLS.len(
         fresh
     };
     let on = pressed(profile(), keys, mouse_buttons);
+    // Driving (accelerate, brake or steer held in the vehicle profile): no key
+    // switches to on foot by itself until 1.5 s after (Shift pressed in a boat
+    // took the boat's controls away).
+    static DRIVING_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let driving = [Control::RightTrigger, Control::LeftTrigger, Control::MoveLeft, Control::MoveRight];
+    if profile() == 1 && driving.iter().any(|&c| on[c as usize]) {
+        DRIVING_UNTIL.store(ms + DRIVING_MS, Ordering::Relaxed);
+    }
     let switch = held(switch_key(), keys, mouse_buttons);
     let interact = on[3];
     let last = LAST.swap(u8::from(interact) | u8::from(switch) << 1, Ordering::Relaxed);
@@ -502,7 +564,11 @@ fn stand_in_at(keys: &[u8], mouse_buttons: u32, ms: u64) -> [bool; CONTROLS.len(
         } else {
             tracing::info!("keyboard profile: interact pressed again within 2 s, not switched");
         }
-    } else if auto_switch() && ms >= QUIET_UNTIL.load(Ordering::Relaxed) && other_profile_key(&fresh) {
+    } else if auto_switch()
+        && ms >= QUIET_UNTIL.load(Ordering::Relaxed)
+        && ms >= DRIVING_UNTIL.load(Ordering::Relaxed)
+        && other_profile_key(&fresh)
+    {
         // A key that does nothing here and something in the other profile:
         // Shift (sprint) in the vehicle one means on foot, H (headlights) on foot a vehicle.
         toggle_profile();
@@ -572,7 +638,7 @@ mod tests {
     fn a_second_interact_press_soon_after_does_not_switch_back() {
         let start = profile();
         let tap = |ms: u64| {
-            stand_in_at(&[b'F'], 0, ms);
+            stand_in_at(b"F", 0, ms);
             stand_in_at(&[], 0, ms + 100);
         };
         tap(10_000);
@@ -590,7 +656,7 @@ mod tests {
             stand_in_at(&[], 0, 20_100);
         }
         // W is in both: it switches nothing.
-        stand_in_at(&[b'W'], 0, 20_200);
+        stand_in_at(b"W", 0, 20_200);
         assert_eq!(profile(), 0);
         // Sprinting to a car (Shift held) and pressing F: in the vehicle it stays.
         stand_in_at(&[0xA0], 0, 30_000);
@@ -606,5 +672,17 @@ mod tests {
         stand_in_at(&[0xA0], 0, 33_100);
         assert_eq!(profile(), 0);
         stand_in_at(&[], 0, 33_200);
+        // Driving a boat (W held) and pressing Shift: the vehicle profile stays,
+        // and Shift works on foot again 1.5 s after the last driving key.
+        stand_in_at(b"F", 0, 40_000);
+        stand_in_at(&[], 0, 40_100);
+        assert_eq!(profile(), 1);
+        stand_in_at(b"W", 0, 42_100);
+        stand_in_at(&[b'W', 0xA0], 0, 42_200);
+        assert_eq!(profile(), 1, "Shift while driving switched to on foot");
+        stand_in_at(&[], 0, 42_300);
+        stand_in_at(&[0xA0], 0, 43_700);
+        assert_eq!(profile(), 0);
+        stand_in_at(&[], 0, 43_800);
     }
 }

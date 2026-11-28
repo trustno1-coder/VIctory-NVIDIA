@@ -8,7 +8,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use anyhow::Context;
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -867,14 +868,14 @@ pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
-            tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
+            tracing::warn!(error = %format_args!("{e:#}"), "no host D3D12 device; command lists will not run");
             None
         }
     })
     .as_ref()
 }
 
-fn create() -> windows::core::Result<Host> {
+fn create() -> anyhow::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -928,25 +929,31 @@ fn create() -> windows::core::Result<Host> {
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
         if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
-            let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let adapter = warp_adapter().context("selecting the WARP adapter")?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                .context("D3D12CreateDevice(WARP, FL 12_0, ID3D12Device)")?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            // The card with the most memory of its own (or the one
+            // The card the monitor is on, else the one with the most memory (or the one
             // VICTORY_ADAPTER names), not Windows' first adapter, which is
             // often an integrated GPU.
             if let Some((adapter, name, own)) = victory_shader::emit::host::hardware_adapter()
-                && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                    .inspect_err(|e| tracing::warn!(adapter = %name, error = %e, "D3D12CreateDevice(selected adapter, FL 12_0, ID3D12Device) failed"))
+                    .is_ok()
             {
-                tracing::info!(adapter = %name, own_memory_mb = own >> 20, "host device on the card with the most memory of its own (VICTORY_ADAPTER names another)");
+                tracing::info!(adapter = %name, own_memory_mb = own >> 20, "host device on the card the monitor is on, else the one with the most memory of its own (VICTORY_ADAPTER names another)");
             }
             if device.is_none() {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+                    .context("D3D12CreateDevice(default adapter, FL 12_0, ID3D12Device)")?;
             }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+        let device = device
+            .ok_or_else(windows::core::Error::empty)
+            .context("D3D12CreateDevice returned an empty device")?;
         require_direct_heaps(&device);
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
@@ -1011,26 +1018,32 @@ fn create() -> windows::core::Result<Host> {
         // its device proxy.
         let queue: ID3D12CommandQueue = match crate::streamline::device_made(&device) {
             Some(queue) => queue,
-            None => device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
-            })?,
+            None => device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .context("CreateCommandQueue(DIRECT)")?,
         };
-        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+        let fence: ID3D12Fence = device
+            .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+            .context("CreateFence")?;
+        let event = CreateEventW(None, false, false, None).context("CreateEventW")?;
+        let rtvs: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                 NumDescriptors: RTV_RING,
                 ..Default::default()
-            })?;
+            })
+            .context("CreateDescriptorHeap(RTV)")?;
         let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+        let dsvs: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
                 NumDescriptors: RTV_RING,
                 ..Default::default()
-            })?;
+            })
+            .context("CreateDescriptorHeap(DSV)")?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
@@ -3082,6 +3095,9 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+// A flight is far larger than the other variants; boxing it would add an
+// allocation per flight on the submission path, so it stays inline.
+#[allow(clippy::large_enum_variant)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -3308,7 +3324,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -3722,6 +3738,49 @@ fn land() {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn host_fence_completion_rejects_removed_device() {
+    assert!(!fence_reached(u64::MAX, 1));
+    assert!(!fence_reached(6, 7));
+    assert!(fence_reached(7, 7));
+    assert!(fence_reached(8, 7));
+}
+
+/// Whether a fence's completed value shows `target` run. `u64::MAX` is not
+/// a value the card reaches: it is what `GetCompletedValue` answers when the
+/// device is gone.
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// Waits for `target` on `fence` and reports what went wrong instead of
+/// carrying on: a failed wait used to fall through to the landing step with
+/// nothing run, settling flights off an unsent fence value, and a lost
+/// device (a completed value of `u64::MAX`) made every wait pass at once.
+///
+/// # Safety
+///
+/// `event` is the calling thread's own, never closed while it waits.
+unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) {
+    // SAFETY: the caller's fence and event, alive for the whole wait.
+    if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
+        fail(format_args!(
+            "{context}: SetEventOnCompletion({target}) failed: {e}"
+        ));
+    }
+    let status = unsafe { WaitForSingleObject(event, INFINITE) };
+    if status != WAIT_OBJECT_0 {
+        fail(format_args!("{context}: fence wait failed: {status:?}"));
+    }
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!(
+            "{context}: fence {completed} did not reach {target}"
+        ));
+    }
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3761,14 +3820,10 @@ fn late_helper() {
         };
         // The card first, without the submission lock: the submitting
         // thread prepares and sends meanwhile.
+        #[cfg(feature = "diagnostics")]
+        let _card = crate::timeline::card_wait(Some(target));
         // SAFETY: our fence and event.
-        unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
-            }
-        }
+        unsafe { wait_host_fence(&host.fence, target, event, "late helper") };
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
             // Something newer went up meanwhile: the card is waited for
@@ -3926,14 +3981,7 @@ fn relay_worker() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                unsafe { wait_host_fence(&host.fence, target, event, "relay") };
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -4148,6 +4196,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+#[cfg(feature = "diagnostics")]
 pub(crate) mod indirects;
 mod font;
 mod menu;
@@ -6217,7 +6266,7 @@ impl Host {
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
-            if let Some([front, behind]) = self.span_lists() {
+            if let Some([front, behind]) = self.span_lists(*submitted) {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
@@ -8593,7 +8642,9 @@ enum Touch {
     Refresh(usize, usize, usize),
     /// The copy is given to shaders.
     Write(usize),
-    /// Title memory is written.
+    /// Title memory is written. The callers stop their walk there instead
+    /// (`refresh_ahead`); the tests of [`written_spans`] use it.
+    #[cfg_attr(not(test), allow(dead_code))]
     Title,
     Nothing,
     /// Another part of the submission begins.
@@ -9587,6 +9638,41 @@ struct Presenter {
     notice: panel::Notice,
     /// The F1 settings menu.
     menu: menu::Menu,
+    /// The swap chain lets a frame be shown at once ([`tearing`]): its flags, kept for
+    /// ResizeBuffers, which may not change them.
+    tearing: bool,
+    /// Presents ask for that; off for the rest of the run once one such present is refused.
+    presents_tearing: bool,
+    /// A refused present was logged.
+    present_refused: bool,
+}
+
+/// Whether the swap chain lets a frame be shown as soon as it is presented, not at the screen's
+/// next refresh (`DXGI_FEATURE_PRESENT_ALLOW_TEARING`; `VICTORY_TEARING=0`: not). Without it a
+/// window in front, which Windows then shows without its compositor ("independent flip"), had
+/// each frame wait for a refresh with two buffers: frame times rounded up to whole refreshes,
+/// about 2 fps fewer than the same window behind another (2026-11-28). On a G-SYNC or FreeSync
+/// screen nothing tears; on others a frame may.
+fn tearing(factory: &IDXGIFactory2) -> bool {
+    if std::env::var("VICTORY_TEARING").is_ok_and(|v| v.trim() == "0") {
+        return false;
+    }
+    let Ok(factory) = factory.cast::<IDXGIFactory5>() else { return false };
+    let mut allowed = windows::core::BOOL(0);
+    // SAFETY: a BOOL-sized answer for this feature.
+    let asked = unsafe {
+        factory.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut allowed).cast(),
+            size_of_val(&allowed) as u32,
+        )
+    };
+    asked.is_ok() && allowed.as_bool()
+}
+
+/// The swap chain's flags for [`tearing`].
+fn chain_flags(tearing: bool) -> DXGI_SWAP_CHAIN_FLAG {
+    if tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING } else { DXGI_SWAP_CHAIN_FLAG(0) }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9595,6 +9681,31 @@ struct Presenter {
 /// line at the top of the picture (`menu.rs`).
 pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Logs how even the frames since the last line were: the median, the 95th
+/// and 99th percentile and the longest interval between presents, and how
+/// many took over 50 and over 100 ms (a frame rate of 30 with every frame
+/// at 33 ms plays smoothly; one with frames of 20 and 80 ms stutters).
+fn frame_times_line(intervals: &mut Vec<f32>) {
+    if intervals.is_empty() {
+        return;
+    }
+    intervals.sort_unstable_by(f32::total_cmp);
+    let at = |q: f32| intervals[((intervals.len() - 1) as f32 * q).round() as usize];
+    let over = |ms: f32| intervals.iter().filter(|&&t| t > ms).count();
+    tracing::info!(
+        target: "victory_gpu::frame_times",
+        "frame times: {} frames, median {:.1} ms, p95 {:.1}, p99 {:.1}, longest {:.1}; {} over 50 ms, {} over 100 ms",
+        intervals.len(),
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        intervals[intervals.len() - 1],
+        over(50.0),
+        over(100.0)
+    );
+    intervals.clear();
+}
+
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -9602,6 +9713,10 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// The last present counted, and the intervals between presents since
+    /// the last frame-rate line, in ms: what the average hides (stutter).
+    last: std::time::Instant,
+    intervals: Vec<f32>,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -9616,6 +9731,8 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            last: now,
+            intervals: Vec::with_capacity(512),
             caption: None,
         }
     }
@@ -9636,10 +9753,14 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        let now = std::time::Instant::now();
+        self.intervals.push((now - self.last).as_secs_f32() * 1000.0);
+        self.last = now;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        frame_times_line(&mut self.intervals);
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
@@ -10154,7 +10275,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, width, height, format, chain_flags(p.tearing))
             };
             match resized {
                 Ok(()) => {
@@ -10392,7 +10513,17 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let shown = p.swap_chain.Present(0, if p.presents_tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) });
+            if shown.is_err() && p.presents_tearing {
+                // A white window on an RTX 5070 at 1440p (2026-11-28): presents that may tear
+                // were not shown. The rest of the run presents at the next refresh.
+                tracing::warn!(code = %shown, frame, "a present shown at once was refused; presenting at the next refresh for the rest of the run");
+                p.presents_tearing = false;
+                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            } else if shown.is_err() && !p.present_refused {
+                p.present_refused = true;
+                tracing::warn!(code = %shown, frame, "a present was refused (logged once)");
+            }
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
@@ -10429,6 +10560,8 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let tearing = tearing(&factory);
+            tracing::info!(tearing, "swap chain: frames shown as soon as presented (VICTORY_TEARING=0: at the next refresh)");
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -10440,6 +10573,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: chain_flags(tearing).0 as u32,
                 ..Default::default()
             };
             // FSR 3 frame generation (where DLSS Frame Generation does not
@@ -10490,13 +10624,44 @@ impl Host {
                 panel: panel::Panel::new(),
                 notice: panel::Notice::new(),
                 menu: menu::Menu::new(),
+                tearing,
+                presents_tearing: tearing,
+                present_refused: false,
             })
         }
     }
 }
 
+/// The property our hook of the title's window procedure puts on the
+/// windows the title makes (`TITLE_PROC` in `victory_hle::modules::lifecycle`).
+const TITLE_HOOK: PCWSTR = w!("victory.wndproc");
+
+/// A visible top-level window of this process, as [`title_window`] finds it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Candidate {
+    hwnd: usize,
+    /// Carries [`TITLE_HOOK`]: a window the title made.
+    hooked: bool,
+    /// Its client area is not empty.
+    sized: bool,
+}
+
+/// Which of `candidates` (in z-order, topmost first) is the title's: the
+/// one our hook marked, else the first with a client area. Pure, for testing.
+fn pick_title_window(candidates: &[Candidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .find(|c| c.hooked)
+        .or_else(|| candidates.iter().find(|c| c.sized))
+        .map(|c| c.hwnd)
+}
+
 /// A visible top-level window of this process: the one the title made, if
-/// it made one.
+/// it made one. Not simply the first visible one: started under a
+/// pseudoconsole (from Windows Terminal, or by a process that has one), this
+/// process also owns a visible `PseudoConsoleWindow` of 0x0 pixels. When
+/// that one was above the title's window in z-order, the swap chain was made
+/// for it, and the title's window stayed white with no frame ever shown.
 fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
@@ -10506,16 +10671,59 @@ fn title_window() -> Option<HWND> {
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
             {
-                *(found.0 as *mut Option<HWND>) = Some(hwnd);
-                return false.into();
+                let mut area = RECT::default();
+                let sized = GetClientRect(hwnd, &mut area).is_ok() && area.right > area.left && area.bottom > area.top;
+                let hooked = !GetPropW(hwnd, TITLE_HOOK).0.is_null();
+                (*(found.0 as *mut Vec<Candidate>)).push(Candidate { hwnd: hwnd.0 as usize, hooked, sized });
             }
         }
         true.into()
     }
-    let mut found: Option<HWND> = None;
-    // SAFETY: the callback only writes `found`, which outlives the call.
+    let mut found: Vec<Candidate> = Vec::new();
+    // SAFETY: the callback only adds to `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
-    found
+    let picked = pick_title_window(&found);
+    if !found.iter().any(|c| c.hooked) {
+        tracing::info!(
+            windows = found.len(),
+            "no window of the title's among ours: presenting to the first with a client area, if any"
+        );
+    }
+    picked.map(|hwnd| HWND(hwnd as *mut _))
+}
+
+#[cfg(test)]
+mod title_window_tests {
+    use super::{Candidate, pick_title_window};
+
+    fn window(hwnd: usize, hooked: bool, sized: bool) -> Candidate {
+        Candidate { hwnd, hooked, sized }
+    }
+
+    /// A pseudoconsole's 0x0 window above the title's in z-order.
+    #[test]
+    fn the_titles_window_wins_over_a_pseudo_console_above_it() {
+        let found = [window(1, false, false), window(2, true, true)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn the_titles_window_counts_even_while_its_client_area_is_empty() {
+        let found = [window(1, false, true), window(2, true, false)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn without_one_of_the_titles_the_first_with_a_client_area() {
+        let found = [window(1, false, false), window(2, false, true), window(3, false, true)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn a_pseudo_console_alone_is_no_window_to_present_to() {
+        assert_eq!(pick_title_window(&[window(1, false, false)]), None);
+        assert_eq!(pick_title_window(&[]), None);
+    }
 }
 
 /// `state` without the bits the host texture's flags forbid: the console
