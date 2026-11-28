@@ -1,10 +1,13 @@
 # Pipelines the title hands over in loose parts (device methods 0x1c8 and 0x218)
 
 The title calls two console device methods as `(this, description, iid, out)` and
-asks for an `ID3D12PipelineState`. Until these were read, VIctory answered
-`E_NOTIMPL` and the title went without those pipelines, silently: the draws and
-dispatches of every one of them were dropped (the "dropped N without a host
-pipeline" figure of the frame line). `VICTORY_DUMP_PSO=<dir>` saves the first 600
+asks for an `ID3D12PipelineState`. VIctory answers `E_NOTIMPL` to both. For 0x218
+that is not the end of it: the title then makes the same compute pipeline from a
+container through method 0x1f0, and those translate (see below). For 0x1c8 nothing
+was seen to take its place, and a share of the draws is dropped for want of a host
+pipeline (the "dropped N without a host pipeline" figure of the frame line; 3 % to
+29 % in the sessions looked at, which of it is 0x1c8 not counted).
+`VICTORY_DUMP_PSO=<dir>` saves the first 600
 calls of each method as `<slot>-<call>.bin` (the description's 128 bytes, then for
 every (address, size) pair its address, size and bytes), and the log of an
 unimplemented call shows the first bytes of each part (`pairs=`).
@@ -18,7 +21,16 @@ Five pairs: registers (0x1c bytes), hash (0x14), GFX10 code, program metadata, t
 the registers again. They are the entries of an `FSPX` part, kinds 0, 1, 6 and 7
 (`victory_shader::native::fspx_program` documents them), so `create_loose_compute`
 puts them into one, in a container with one `ACCC` part, and the pipeline goes on
-as any other. `VICTORY_LOOSE_COMPUTE=0` goes back to answering `E_NOTIMPL`.
+as any other. **It is off by default** (`VICTORY_LOOSE_COMPUTE=1` turns it on): the
+title does not go without a pipeline when 0x218 answers `E_NOTIMPL`, it makes the same
+compute pipeline from a container through method 0x1f0, and those containers translate
+far better than these parts do. A play session with the fallback (`=0`): 765 compute
+programs translated, 1 not, 3 % of the draws dropped for want of a host pipeline; with
+this on (`=1`): 225 translated, 893 not, 29 % of the draws dropped. A 0x218 that succeeds
+makes the title skip the fallback, so this is only worth turning on when a loose program
+that translates is the only way to get that pipeline (answering `S_OK` for those alone,
+and `E_NOTIMPL` for the rest, is the way to do that; it needs the translation in the
+call).
 
 Seen in 600 dumps: every one reads. Their metadata has root constants (resource
 type 2, root type 0, 4 dwords at `b500`...) which `fspx_program` had no place for;

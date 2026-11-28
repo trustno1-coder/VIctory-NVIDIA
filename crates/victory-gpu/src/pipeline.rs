@@ -723,9 +723,14 @@ pub(crate) extern "system" fn create_loose_compute(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // `VICTORY_LOOSE_COMPUTE=0`: as before, the title goes without these pipelines.
+    // Off unless `VICTORY_LOOSE_COMPUTE=1`. Answering `E_NOTIMPL` is not going without the
+    // pipeline: the title then makes it from a container through method 0x1f0
+    // ([`create_compute_x`]), and those containers translate far better than the loose
+    // parts do (a play session: 765 compute programs translated with the fallback, 225
+    // with this, and 3 % of the draws dropped for want of a host pipeline against 29 %).
+    // A 0x218 that succeeds makes the title skip the fallback.
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_LOOSE_COMPUTE").is_none_or(|v| v != "0")) {
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_LOOSE_COMPUTE").is_some_and(|v| v == "1")) {
         return E_NOTIMPL;
     }
     // SAFETY: the title passes a description (null is tolerated); its pairs
