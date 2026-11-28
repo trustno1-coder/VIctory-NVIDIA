@@ -729,17 +729,17 @@ pub fn device_shader_model(device: &ID3D12Device) -> Option<(u32, u32)> {
 /// Direct3D 12 stops at 6.5; Microsoft's newer runtime (`D3D12\D3D12Core.dll`
 /// beside the program, which victory.exe asks for) runs 6.6. Made in a process of
 /// its own (`victory shader-model`), since a process keeps the first runtime it loads.
-pub fn highest_shader_model() -> Option<(u32, u32)> {
+pub fn highest_shader_model() -> windows::core::Result<Option<(u32, u32)>> {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     // SAFETY: plain DXGI and D3D12 calls with owned results.
     let device = unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let adapter = factory.EnumAdapters1(0).ok()?;
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+        let adapter = factory.EnumAdapters1(0)?;
         let mut device: Option<ID3D12Device> = None;
-        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
-        device?
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device)?;
+        device
     };
-    device_shader_model(&device)
+    Ok(device.as_ref().and_then(device_shader_model))
 }
 
 /// The file of the Direct3D 12 runtime this process loaded (`D3D12Core.dll`:

@@ -498,8 +498,12 @@ fn main() -> Result<()> {
                 println!("runtime {}", core.display());
             }
             match model {
-                Some((major, minor)) => println!("{major}.{minor}"),
-                None => println!("none"),
+                Ok(Some((major, minor))) => println!("{major}.{minor}"),
+                // D3D12_ERROR_INVALID_REDIST: the loader could not use the requested SDK.
+                Err(error) if error.code().0 as u32 == 0x887e0003 => {
+                    println!("{}", play::INVALID_D3D12_SDK_PROBE);
+                }
+                _ => println!("none"),
             }
             Ok(())
         }

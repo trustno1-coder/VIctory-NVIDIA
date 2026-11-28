@@ -635,10 +635,31 @@ fn d3d12_dir() -> Result<PathBuf> {
     Ok(program.parent().map(Path::to_path_buf).unwrap_or_default().join("D3D12"))
 }
 
+pub(crate) const INVALID_D3D12_SDK_PROBE: &str = "invalid-d3d12-sdk";
+
+enum ShaderModelProbe {
+    Model(u32, u32),
+    InvalidSdk,
+}
+
+impl ShaderModelProbe {
+    fn from_output(text: &str) -> Option<Self> {
+        if text.lines().last()?.trim() == INVALID_D3D12_SDK_PROBE {
+            return Some(Self::InvalidSdk);
+        }
+        let (major, minor) = text.lines().rev().find_map(|l| l.trim().split_once('.'))?;
+        Some(Self::Model(major.parse().ok()?, minor.parse().ok()?))
+    }
+
+    fn needs_download_confirmation(&self) -> bool {
+        matches!(self, Self::Model(..))
+    }
+}
+
 /// The highest shader model the default GPU runs, asked by a process of our
 /// own (`victory shader-model`: a process keeps the first Direct3D 12 runtime
 /// it loads, and this one is yet to choose). `None`: no answer.
-fn shader_model() -> Option<(u32, u32)> {
+fn shader_model() -> Option<ShaderModelProbe> {
     let program = std::env::current_exe().ok()?;
     let out = std::process::Command::new(program)
         .arg("shader-model")
@@ -647,9 +668,7 @@ fn shader_model() -> Option<(u32, u32)> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (major, minor) = text.lines().rev().find_map(|l| l.trim().split_once('.'))?;
-    Some((major.parse().ok()?, minor.parse().ok()?))
+    ShaderModelProbe::from_output(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Runs the fetcher: Microsoft's D3D12Core.dll from nuget.org into `to`.
@@ -677,80 +696,98 @@ pub(crate) fn get_d3d12() -> Result<()> {
     fetch_d3d12(&d3d12_dir()?)
 }
 
+fn confirm_d3d12_download() -> bool {
+    if !std::io::stdin().is_terminal() {
+        return true;
+    }
+    print!("Download it now? [Y/n] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    let _ = std::io::stdin().read_line(&mut answer);
+    !answer.trim().to_ascii_lowercase().starts_with('n')
+}
+
 /// Makes sure the GPU runs the translated shaders' model (6.6) before the
-/// title starts: where Windows' own Direct3D 12 does not (Windows 10),
-/// Microsoft's newer runtime is fetched beside this program, after asking.
-/// Below 6.6 every pipeline is refused and the title closes within seconds,
-/// so a start that still cannot run it stops here, saying why.
+/// title starts. If the missing local SDK prevents the loader from running,
+/// fetch it beside the program without prompting.
 ///
-/// On Windows 10 the runtime is fetched even where its own reports 6.6 or
-/// more (an up-to-date driver says 6.8): Windows 10's own Direct3D 12
-/// refuses the root signatures the translated shaders need (descriptor
-/// heaps indexed directly), and the title closed a second after its first
-/// frame (2026-11-27, Windows 10 21H2 LTSC with an RTX 4060, issue #290;
-/// #123 and discussion #186 found the same refusal).
+/// On Windows 10, offer the SDK even if the Windows runtime reports 6.6 or
+/// more: it refuses the directly indexed descriptor heaps the game needs
+/// (issue #290). If the download is declined or fails, warn before starting.
 fn check_shader_model() -> Result<()> {
     let needed = victory_hle::streamline::SHADER_MODEL_NEEDED;
-    let Some(found) = shader_model() else { return Ok(()) };
+    let Some(probe) = shader_model() else { return Ok(()) };
+    let found = match probe {
+        ShaderModelProbe::Model(major, minor) => Some((major, minor)),
+        ShaderModelProbe::InvalidSdk => None,
+    };
     let to = d3d12_dir()?;
-    let had = to.join("D3D12Core.dll").is_file();
+    let core = to.join("D3D12Core.dll");
+    let had = core.is_file();
     let windows_10 = !had && crate::windows_build().is_some_and(|build| build < 22000);
-    if found >= needed && !windows_10 {
+    let meets_shader_model = found.is_some_and(|model| model >= needed);
+    if meets_shader_model && !windows_10 {
         return Ok(());
     }
     if !had {
-        if found < needed {
-            println!("This PC's Direct3D 12 runs shader model {}.{}, and the game's translated shaders need 6.6.", found.0, found.1);
-            println!("Windows 10's own Direct3D 12 stops at 6.5; Microsoft's newer runtime (the D3D12 Agility SDK)");
-            println!("runs 6.6.");
-        } else {
-            println!("This is Windows 10: its own Direct3D 12 refuses root signatures the game's translated shaders");
-            println!("need, and the game would close at the start. Microsoft's newer runtime (the D3D12 Agility SDK)");
-            println!("takes them.");
+        match found {
+            Some((major, minor)) if !meets_shader_model => {
+                println!("This PC's Direct3D 12 runs shader model {major}.{minor}, and the game's translated shaders need 6.6.");
+                println!("Windows 10's own Direct3D 12 stops at 6.5; Microsoft's newer runtime (the D3D12 Agility SDK)");
+                println!("runs 6.6.");
+            }
+            Some(_) => {
+                println!("This is Windows 10: its own Direct3D 12 refuses root signatures the game's translated shaders");
+                println!("need, and the game would close at the start. Microsoft's newer runtime (the D3D12 Agility SDK)");
+                println!("takes them.");
+            }
+            None => {
+                println!("Direct3D 12 could not load the requested Agility SDK (0x887E0003). {} is missing.", core.display());
+            }
         }
         println!("It is Microsoft's own, under Microsoft's licence, from nuget.org (about 22 MB, once),");
         println!("and goes into {}.", to.display());
-        let yes = if std::io::stdin().is_terminal() {
-            print!("Download it now? [Y/n] ");
-            let _ = std::io::stdout().flush();
-            let mut answer = String::new();
-            let _ = std::io::stdin().read_line(&mut answer);
-            !answer.trim().to_ascii_lowercase().starts_with('n')
-        } else {
-            true
-        };
-        if yes {
+        if !probe.needs_download_confirmation() || confirm_d3d12_download() {
             match fetch_d3d12(&to) {
                 Ok(()) => match {
                     // This process is yet to load Direct3D 12: it asks for the file now there.
                     crate::match_d3d12_core();
                     shader_model()
                 } {
-                    Some(now) if now >= needed => {
-                        println!("Shader model {}.{} with Microsoft's runtime. Starting the game.", now.0, now.1);
+                    Some(ShaderModelProbe::Model(major, minor)) if (major, minor) >= needed => {
+                        println!("Shader model {major}.{minor} with Microsoft's runtime. Starting the game.");
                         return Ok(());
                     }
-                    now => {
-                        let now = now.unwrap_or(found);
-                        println!("With Microsoft's runtime the GPU still runs shader model {}.{}.", now.0, now.1);
+                    Some(ShaderModelProbe::Model(major, minor)) => {
+                        println!("With Microsoft's runtime the GPU still runs shader model {major}.{minor}.");
                     }
+                    _ => {}
                 },
                 Err(e) => println!("{e:#}"),
             }
         }
     }
-    if found >= needed {
+    if meets_shader_model {
         println!("Starting with Windows 10's own Direct3D 12: the game may close at the start.");
         println!("`victory get-d3d12` fetches Microsoft's newer runtime later.");
         return Ok(());
     }
-    let now = shader_model().unwrap_or(found);
+    let now = match shader_model() {
+        Some(ShaderModelProbe::Model(major, minor)) => Some((major, minor)),
+        _ => found,
+    };
+    let Some(now) = now else {
+        anyhow::bail!(
+            "Direct3D 12 could not use the requested Agility SDK (0x887E0003). Run `victory get-d3d12` to install the verified runtime at {}.",
+            core.display()
+        );
+    };
     anyhow::bail!(
         "this PC's Direct3D 12 runs shader model {}.{}, and the game needs 6.6: every shader would be \
          refused and the game would close at once. {}",
         now.0,
         now.1,
-        if to.join("D3D12Core.dll").is_file() {
+        if core.is_file() {
             "Microsoft's newer runtime is in place (D3D12 beside victory.exe), so it is the graphics \
              driver: update it, or use Windows 11"
         } else {
@@ -952,6 +989,23 @@ mod tests {
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    #[test]
+    fn invalid_d3d12_sdk_probe_downloads_without_prompt() {
+        let probe = ShaderModelProbe::from_output("invalid-d3d12-sdk\r\n").unwrap();
+        assert!(matches!(probe, ShaderModelProbe::InvalidSdk));
+        assert!(!probe.needs_download_confirmation());
+    }
+
+    #[test]
+    fn shader_model_probe_distinguishes_a_working_runtime_and_no_answer() {
+        assert!(matches!(
+            ShaderModelProbe::from_output("runtime C:\\Victory\\D3D12\\D3D12Core.dll\r\n6.8\r\n"),
+            Some(ShaderModelProbe::Model(6, 8))
+        ));
+        assert!(ShaderModelProbe::from_output("none\r\n").is_none());
+        assert!(ShaderModelProbe::from_output("6.5\r\n").unwrap().needs_download_confirmation());
     }
 
     #[test]
