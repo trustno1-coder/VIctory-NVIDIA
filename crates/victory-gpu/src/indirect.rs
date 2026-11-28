@@ -532,6 +532,9 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // `VICTORY_INDIRECT_ONE_WAIT=1`: the wait after the clamp is left out
+    // ([`one_wait`]); the move of `dst` to indirect arguments stays.
+    let after = if one_wait() { 1 } else { skip };
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -545,9 +548,31 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[after..]);
     }
     true
+}
+
+/// Whether the clamp of one indirect command is followed by its move of
+/// the scratch buffer to indirect arguments alone, without a wait for every
+/// earlier shader write (`VICTORY_INDIRECT_ONE_WAIT=1`; off by default).
+///
+/// What the clamp writes is the scratch buffer, whose move out of unordered
+/// access already has the card finish those writes before the execution
+/// reads them, and the list's budget, which only clamps change, each with
+/// atomic adds. The wait before the clamp (the title's argument passes
+/// first) stays. On an RTX 3070 Ti 169 commands a frame were clamped this
+/// way, each between two such waits (2026-11-28, timing run), in frames of
+/// 9,000 commands where the card ran at half its power.
+fn one_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_INDIRECT_ONE_WAIT").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("indirect commands clamped one at a time: no wait after the clamp (VICTORY_INDIRECT_ONE_WAIT=1)");
+        }
+        on
+    })
 }
 
 /// The batched clamp's pipeline ([`batch`]).
