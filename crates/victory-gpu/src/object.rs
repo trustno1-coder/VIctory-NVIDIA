@@ -83,8 +83,28 @@ pub(crate) fn add_ref_alive(this: This) -> bool {
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
-    let _ = refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
-    refs.load(Ordering::Relaxed)
+    match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
+        Ok(1) => {
+            // The last reference to an object that is never destroyed (the
+            // device and its kin): its private data goes, as it would on
+            // destruction, instead of accumulating for the whole run.
+            clear_private_data(this as usize);
+            0
+        }
+        Ok(n) => n - 1,
+        Err(_) => 0,
+    }
+}
+
+/// Drops every private-data entry of the object at `address`.
+fn clear_private_data(address: usize) {
+    let keys = (address, [u8::MIN; 16])..=(address, [u8::MAX; 16]);
+    let mut data = private_data();
+    // An object's IDs are contiguous in key order. Seek directly to them so
+    // releases don't visit private data held by other objects.
+    while let Some((&key, _)) = data.range(keys.clone()).next() {
+        data.remove(&key);
+    }
 }
 
 /// Answers an interface query (or any call handing out an object): a new
@@ -145,16 +165,7 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
-            let address = this as usize;
-            let keys = (address, [u8::MIN; 16])..=(address, [u8::MAX; 16]);
-            {
-                let mut data = private_data();
-                // An object's IDs are contiguous in key order. Seek directly to
-                // them so releases don't visit private data held by other objects.
-                while let Some((&key, _)) = data.range(keys.clone()).next() {
-                    data.remove(&key);
-                }
-            }
+            clear_private_data(this as usize);
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
             0
@@ -525,6 +536,19 @@ mod tests {
             assert_eq!(set_private_data(this, &id, 1, b"a".as_ptr()), S_OK);
         }
         assert_eq!(release_boxed::<OwnedObject>(this), 0);
+    }
+
+    #[test]
+    fn final_plain_release_clears_private_data() {
+        static TABLE: Table<7> = Table(d3d12_object(missing_table::<DEVICE, 7>()));
+        let this: This = Box::into_raw(Box::new(Object::new(&TABLE))).cast();
+        assert_eq!(add_ref(this), 1);
+        assert_eq!(set_private_data(this, &TAG, 1, b"a".as_ptr()), S_OK);
+        assert_eq!(release(this), 0);
+        let mut size = 1;
+        assert_eq!(get_private_data(this, &TAG, &mut size, std::ptr::null_mut()), NOT_FOUND);
+        // SAFETY: the test's own box, never handed out.
+        drop(unsafe { Box::from_raw(this.cast_mut()) });
     }
 
     #[test]

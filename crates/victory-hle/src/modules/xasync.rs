@@ -149,15 +149,21 @@ impl Port {
 
 /// The thread pool behind thread-pool ports: idle workers are reused, and a
 /// new one starts whenever more tasks wait than workers idle, so a callback
-/// that blocks on another never starves it. Workers stay for reuse.
+/// that blocks on another never starves it. Workers stay for reuse, up to
+/// [`POOL_MOST`]; idle ones past [`POOL_KEPT`] leave after [`POOL_IDLE`], so
+/// a burst of blocking callbacks does not leave its threads behind for good.
 struct Pool {
-    /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
+    /// Queued tasks, the number of idle workers, and of workers in all.
+    state: Mutex<(VecDeque<Task>, usize, usize)>,
     ready: Condvar,
 }
 
+const POOL_MOST: usize = 256;
+const POOL_KEPT: usize = 4;
+const POOL_IDLE: Duration = Duration::from_millis(if cfg!(test) { 50 } else { 30_000 });
+
 static POOL: Pool = Pool {
-    state: Mutex::new((VecDeque::new(), 0)),
+    state: Mutex::new((VecDeque::new(), 0, 0)),
     ready: Condvar::new(),
 };
 
@@ -165,27 +171,39 @@ impl Pool {
     fn submit(&'static self, task: Task) {
         let mut state = lock(&self.state);
         state.0.push_back(task);
-        if state.0.len() > state.1 {
-            std::thread::spawn(move || self.work());
+        if state.0.len() > state.1 && state.2 < POOL_MOST {
+            state.2 += 1;
+            if std::thread::Builder::new().spawn(move || self.work()).is_err() {
+                state.2 -= 1;
+                self.ready.notify_one();
+            }
         } else {
             self.ready.notify_one();
         }
     }
 
     fn work(&self) {
-        let mut state = lock(&self.state);
         loop {
-            while state.0.is_empty() {
-                state.1 += 1;
-                state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
-                state.1 -= 1;
-            }
-            let task = state.0.pop_front();
-            drop(state);
-            if let Some(task) = task {
-                task.run(false);
-            }
-            state = lock(&self.state);
+            let task = {
+                let mut state = lock(&self.state);
+                loop {
+                    if let Some(task) = state.0.pop_front() {
+                        break task;
+                    }
+                    state.1 += 1;
+                    let (back, over) = self
+                        .ready
+                        .wait_timeout_while(state, POOL_IDLE, |s| s.0.is_empty())
+                        .unwrap_or_else(|e| e.into_inner());
+                    state = back;
+                    state.1 -= 1;
+                    if over.timed_out() && state.0.is_empty() && state.2 > POOL_KEPT {
+                        state.2 -= 1;
+                        return;
+                    }
+                }
+            };
+            task.run(false);
         }
     }
 }

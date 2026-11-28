@@ -71,6 +71,24 @@ fn set_event(event: usize) {
     let _ = event;
 }
 
+impl Drop for Fence {
+    fn drop(&mut self) {
+        // A fence let go of with events still waiting for it: set them, or
+        // whoever waits on them waits for good.
+        let waiters = self.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        for &(_, event) in waiters.iter() {
+            set_event(event);
+        }
+        drop(waiters);
+        #[cfg(windows)]
+        // SAFETY: wake any guest thread blocking via WaitOnAddress on the
+        // fence's value before it goes.
+        unsafe {
+            windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const self.value).cast());
+        }
+    }
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(
         FENCE,
@@ -148,7 +166,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    if !waiters.contains(&(value, event as usize)) {
+        waiters.push((value, event as usize));
+    }
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -157,7 +177,8 @@ pub(crate) fn set(this: This, value: u64) {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("a fence set", this as usize, value);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    fence.value.store(value, Ordering::Release);
+    // A fence's value never goes back: a signal below it changes nothing.
+    let value = fence.value.fetch_max(value, Ordering::AcqRel).max(value);
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {
@@ -239,6 +260,39 @@ mod tests {
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn releasing_a_fence_sets_its_waiting_events() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        // SAFETY: plain auto-reset event.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        assert!(!event.is_null());
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        assert_eq!(wait(f, 9, event), S_OK);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+        // SAFETY: a valid event.
+        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        // SAFETY: ours.
+        unsafe { CloseHandle(event) };
+    }
+
+    #[test]
+    fn a_fence_value_never_goes_backwards() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 5, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        let completed = slot::<extern "system" fn(This) -> u64>(f, 0x40);
+        assert_eq!(signal(f, 3), S_OK);
+        assert_eq!(completed(f), 5);
+        assert_eq!(signal(f, 7), S_OK);
+        assert_eq!(completed(f), 7);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 

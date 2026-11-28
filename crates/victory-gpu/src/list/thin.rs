@@ -83,6 +83,7 @@ impl Front {
         {
             recording.abandoned.store(true, Release);
         }
+        reclaim_untranslated(&self.words);
         self.words.clear();
     }
 
@@ -265,7 +266,11 @@ impl Recording {
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
-        give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
+        let untranslated: Vec<Vec<u64>> = inner.chunks.drain(..).collect();
+        for chunk in &untranslated {
+            reclaim_untranslated(chunk);
+        }
+        give_back(untranslated.into_iter().chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {
             if !inner.closed {
                 // Left in the middle.
@@ -274,6 +279,26 @@ impl Drop for Recording {
             }
             held(&BACKS).push(inner.back);
         }
+    }
+}
+
+/// Drops the boxed work a stream that was never translated still names
+/// (`UPLOAD` blocks and `EXTERNAL` work), so letting a recording go does
+/// not leak them. Translated streams must not go through here: their boxes
+/// were already taken out by [`translate`].
+fn reclaim_untranslated(words: &[u64]) {
+    let mut i = 0;
+    while i < words.len() {
+        let (op, len) = (words[i] & 0xffff, (words[i] >> 16) as usize);
+        let Some(args) = words.get(i + 1..i + 1 + len) else { break };
+        if op == UPLOAD && !args.is_empty() {
+            // SAFETY: made by `allocate_upload`, named once, never translated.
+            drop(unsafe { Box::from_raw(args[0] as *mut Upload) });
+        } else if op == EXTERNAL && !args.is_empty() {
+            // SAFETY: made by `put_external`, named once, never translated.
+            drop(unsafe { Box::from_raw(args[0] as *mut super::External) });
+        }
+        i += 1 + len;
     }
 }
 
@@ -962,6 +987,31 @@ mod tests {
         assert_eq!(translate(std::ptr::null(), &s, || false), (1, false));
         assert_eq!((ran.load(Relaxed), dropped.load(Relaxed)), (0, 3));
         f.recording = None;
+    }
+
+    /// Work written down but never handed over is dropped when the
+    /// recording is let go of, not leaked with the words.
+    #[test]
+    fn letting_a_recording_go_drops_its_untranslated_work() {
+        use std::sync::atomic::AtomicUsize;
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let guard = Counted(dropped.clone());
+        let work: super::super::External = Box::new(move |_| {
+            let _kept = &guard;
+            true
+        });
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(EXTERNAL, &[Box::into_raw(Box::new(work)) as u64]);
+        f.leave();
+        assert_eq!(dropped.load(Relaxed), 1);
+        assert!(f.words.is_empty());
     }
 
     /// A view's record is the one at the call, also if its slot is written

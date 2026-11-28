@@ -72,6 +72,17 @@ impl Journal {
         before
     }
 
+    /// Pages `[first, last)` are no longer the memory they were (freed or
+    /// remapped): what was noted of them goes, instead of accumulating for
+    /// every page ever written.
+    fn forget(&mut self, first: usize, last: usize) {
+        let pages: Vec<usize> = self.written.range(first..last).map(|(&p, _)| p).collect();
+        for page in pages {
+            self.written.remove(&page);
+            self.parts.remove(&page);
+        }
+    }
+
     /// The parts of `page` written by an asking after `taken`.
     fn parts_since(&self, page: usize, taken: u64) -> u16 {
         match self.parts.get(&page) {
@@ -2853,6 +2864,9 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
     crate::shadow::write_combined_freed(at, len);
+    if len != 0 {
+        journal_mut().forget(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    }
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -2866,6 +2880,11 @@ pub fn title_memory_freed(at: usize, len: usize) {
     };
     if noted >= end {
         return;
+    }
+    if len == 0 {
+        drop(g);
+        journal_mut().forget(first, end);
+        g = guards();
     }
     let absent: Vec<usize> = g.absent.range(first..end).collect();
     for block in absent {
@@ -2913,8 +2932,9 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    journal_mut().forget(range.start, range.end);
+    let mut g = guards();
     // Nothing of the range is known any more: told as written at the next
     // asking anyway. (A bit left would keep a hole mapped there from being
     // known by its bits.)

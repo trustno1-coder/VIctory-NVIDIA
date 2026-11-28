@@ -657,7 +657,9 @@ impl Recorder {
                 .and_then(|o| o.SetPrivateDataInterface(&KEY, &notice));
             if set.is_err() {
                 self.problem("an object's end cannot be followed");
-                std::mem::forget(notice);
+                // Dropping the notice runs `gone` now: the object's entries
+                // are cleaned up instead of staying (with the notice) for
+                // good.
             }
         }
     }
