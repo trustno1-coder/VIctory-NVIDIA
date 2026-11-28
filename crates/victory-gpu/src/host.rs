@@ -11453,12 +11453,22 @@ mod refresh_tests {
         }
     }
 
+    /// One submission's asking at a time in this test process, as in the
+    /// layer (one thread prepares them): taken by [`submission`] and by the
+    /// tests that ask as a submission does themselves. (Without it, one
+    /// test's asking ended another's while a third thread of that one was
+    /// refreshing: 4 of 40 runs of these tests with `watch::`'s left a copy
+    /// behind, with every hold of pages, 1 of 40 holding all memory; none
+    /// in 60 of the test alone.)
+    fn one_submission() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Prepares as a submission does: one asking for all the ranges, the
     /// refreshes in several flushes, the asking's end.
     fn submission(ranges: &[(Arc<Shadow>, usize, usize)], flushes: usize) {
-        // One at a time, as submissions are.
-        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = one_submission();
         let asked: Vec<(usize, usize)> = ranges.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.1 + r.2)).collect();
         crate::watch::ask_once(&asked);
         let mut batch = Batch::default();
@@ -11533,6 +11543,100 @@ mod refresh_tests {
                 assert!(same, "round {round}: {at:#x}+{n:#x} of a copy at {start:#x}; first byte {}", byte(*at));
             }
         }
+    }
+
+    /// A submission's asking beside other threads' askings, as the heaps'
+    /// thread and the helpers' texture refreshes ask while one is prepared:
+    /// copies of the same title memory refreshed by a submission on one
+    /// thread and one range at a time on another, while a third asks about
+    /// other memory without end. Whatever was written before a round, every
+    /// copy holds what title memory holds after it (an asking that forgot
+    /// pages another had not yet noted would leave one of them behind).
+    #[test]
+    fn askings_of_other_threads_beside_a_submission() {
+        const LEN: usize = 32 * PAGE;
+        let mut random = Random(0x2468_1357_ACE0_BDF9);
+        let regions = [title(LEN, false), title(LEN, true)];
+        let elsewhere = title(LEN, false);
+        // SAFETY: the test's own memory.
+        unsafe {
+            for r in regions.into_iter().chain([elsewhere]) {
+                std::ptr::write_bytes(r as *mut u8, 1, LEN);
+            }
+        }
+        // The submission's copies, and the other thread's over the same
+        // memory, cut elsewhere.
+        let cut = |spans: &[(usize, usize)]| -> Vec<(Arc<Shadow>, *mut u8, usize, usize)> {
+            regions
+                .iter()
+                .flat_map(|&region| {
+                    spans.iter().map(move |&(from, to)| {
+                        let data = memory(to - from);
+                        (Shadow::unbacked((region + from) as u64, data, (to - from) as u64, false), data, region + from, to - from)
+                    })
+                })
+                .collect()
+        };
+        let ours = cut(&(0..8).map(|i| (i * 4 * PAGE, (i + 1) * 4 * PAGE)).collect::<Vec<_>>());
+        let theirs = cut(&[(100, 6 * PAGE + 9), (6 * PAGE + 9, 19 * PAGE), (19 * PAGE, LEN - 3), (3 * PAGE, 4 * PAGE + 1)]);
+        let ranges: Vec<(Arc<Shadow>, usize, usize)> = ours.iter().map(|c| (c.0.clone(), c.2, c.3)).collect();
+        let same = |c: &(Arc<Shadow>, *mut u8, usize, usize)| unsafe {
+            std::slice::from_raw_parts(c.2 as *const u8, c.3) == std::slice::from_raw_parts(c.1, c.3)
+        };
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        // Told to stop however the rounds end (a failed one too: the scope
+        // would wait for it without end).
+        struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        const ROUNDS: usize = 300;
+        // (Raw pointers are the test's own memory, used by one thread at a time.)
+        struct Sent<T>(T);
+        unsafe impl<T> Send for Sent<T> {}
+        unsafe impl<T> Sync for Sent<T> {}
+        let theirs = Sent(theirs);
+        std::thread::scope(|s| {
+            // Without end, about memory no copy here holds.
+            s.spawn(|| {
+                let mut n = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let at = elsewhere + (n * 7 % 31) * PAGE;
+                    // SAFETY: the test's own memory.
+                    unsafe { (at as *mut u8).write_volatile(n as u8) };
+                    let _ = crate::watch::writes(at, at + PAGE, false);
+                    n += 1;
+                }
+            });
+            let _stop = Stop(&stop);
+            for round in 0..ROUNDS {
+                for _ in 0..1 + random.below(8) {
+                    let at = regions[random.below(2)] + random.below(LEN - 64);
+                    for i in 0..1 + random.below(60) {
+                        // SAFETY: the test's own memory.
+                        unsafe { ((at + i) as *mut u8).write_volatile(random.below(256) as u8) };
+                    }
+                }
+                // One range at a time on another thread, beside the submission.
+                std::thread::scope(|s| {
+                    let theirs = &theirs;
+                    s.spawn(move || {
+                        for c in &theirs.0 {
+                            c.0.update(c.2, c.3);
+                        }
+                    });
+                    submission(&ranges, 1 + random.below(3));
+                });
+                for c in &ours {
+                    assert!(same(c), "round {round}: a copy the submission refreshed at {:#x}+{:#x} differs", c.2, c.3);
+                }
+                for c in &theirs.0 {
+                    assert!(same(c), "round {round}: a copy refreshed beside it at {:#x}+{:#x} differs", c.2, c.3);
+                }
+            }
+        });
     }
 
     /// A copy in the card's memory, with the card's side and the sends to it
@@ -11835,6 +11939,7 @@ mod refresh_tests {
             // Ends in the middle of pages.
             let (at, len) = (region + 500, 5 * PAGE);
             let look = |expected: bool, what: &str| {
+                let _one = one_submission();
                 // The submission's one asking, which takes two ranges. (Again
                 // if a submission of another test ended it.)
                 let mut known = false;
