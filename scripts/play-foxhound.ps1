@@ -170,6 +170,25 @@ if (-not (Test-Path $victory)) {
     if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
+# The optional ReShade host has its own application directory. DXGI and its
+# add-ons are discovered next to that executable, including at process start.
+# For an RTX 40, install the full add-on edition of ReShade and the optional
+# mavismmg/MFGAdaUnlock-RenoDx add-on in target/<build>/ada-mfg. In a new
+# PowerShell session set $env:GTA6_ADA_MFG='1' and $env:GTA6_FRAMEGEN_X='4',
+# then run .\PLAY_FRAMEGEN.cmd 3. The multiplier override accepts 2 through 6.
+if ($env:GTA6_ADA_MFG -eq '1') {
+    $hostDir = Join-Path $repo "target\$Build\ada-mfg"
+    foreach ($file in 'dxgi.dll', 'renodx-mfgunlock.addon64') {
+        if (-not (Test-Path -LiteralPath (Join-Path $hostDir $file) -PathType Leaf)) {
+            throw "The optional Ada MFG host is missing $file in $hostDir"
+        }
+    }
+    $hostExe = Join-Path $hostDir 'victory.exe'
+    if (-not (Test-Path -LiteralPath $hostExe) -or (Get-FileHash $victory).Hash -ne (Get-FileHash $hostExe).Hash) {
+        Copy-Item -LiteralPath $victory -Destination $hostExe -Force -ErrorAction Stop
+    }
+    $victory = $hostExe
+}
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
