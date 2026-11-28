@@ -307,9 +307,34 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.graphics.is_none() && compute_waits() {
+            // Made here, or waited for while a worker makes it.
+            p.make();
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once, when a scene changes
+/// (a buffer reset or cleared), and what they leave is read for as long as
+/// the scene lasts. In the prison corridor a compute program met for the
+/// first time took 4.4 s to make on a 16 GB machine; its one dispatch was
+/// dropped after the half second of budget, and the windows of the room
+/// before stayed blended over the whole picture for minutes (run 195).
+/// A wait of seconds once (the pipeline library has it on the next run)
+/// against a picture wrong until the scene ends.
+/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as
+/// before.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
