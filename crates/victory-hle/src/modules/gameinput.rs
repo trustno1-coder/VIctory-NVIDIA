@@ -1,6 +1,8 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3) and, in the slots XInput leaves empty, from HID
-//! ([`playstation`]: DualShock 4, DualSense, DualSense Edge); while none is
+//! (host slots 0-3) and, while XInput lists none (or, with
+//! `VICTORY_DUALSENSE=1`, in the slots it leaves empty), from HID
+//! ([`playstation`]: DualShock 4, DualSense, DualSense Edge; [`generic`]:
+//! any other HID joystick or gamepad); while none is
 //! connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
@@ -27,6 +29,34 @@ use crate::{HleExport, HleModule};
 // PS4 pads (DualShock 4) and rumble from FrancescoGelosoEterea/VIscosity (d8db7a0).
 #[cfg(any(windows, test))]
 mod playstation;
+// Any other HID pad (no-name USB pads and the like), after VIscosity (d8db7a0).
+#[cfg(any(windows, test))]
+mod generic;
+
+/// `victory pads`: the pads XInput lists, then what each generic HID pad
+/// sends for `seconds` (its button numbers, for `VICTORY_PAD_BUTTONS`).
+#[cfg(windows)]
+pub fn monitor_pads(seconds: u64) {
+    use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
+    let xinput: Vec<String> = (0..PADS as u32)
+        .filter(|&slot| {
+            let mut state = XINPUT_STATE::default();
+            // SAFETY: room for the state.
+            unsafe { XInputGetState(slot, &mut state) == 0 }
+        })
+        .map(|slot| slot.to_string())
+        .collect();
+    if xinput.is_empty() {
+        println!("XInput pads: none.");
+    } else {
+        println!("XInput pads (read first) in slots {}.", xinput.join(", "));
+    }
+    if !generic::enabled() {
+        println!("Generic HID pads: off (VICTORY_GENERIC_PADS=0).");
+        return;
+    }
+    generic::monitor(seconds);
+}
 
 /// Stops the motors of the PlayStation pads read over HID, before the
 /// process ends (XInput pads stop by themselves when it does).
@@ -1279,16 +1309,24 @@ mod host {
             Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            // XInput first; HID PlayStation pads (PS4 and PS5) take the slots XInput leaves free
-            // (`VICTORY_DUALSENSE`: 0 off, 1 both).
+            // XInput first; HID pads take the slots XInput leaves free: PlayStation pads (PS4
+            // and PS5; `VICTORY_DUALSENSE`: 0 off, 1 both) and generic ones (no-name USB pads
+            // and the like; `VICTORY_GENERIC_PADS=0` off), which follow `VICTORY_DUALSENSE`'s
+            // 1 too.
             if slot == 0 {
+                use super::playstation::Mode;
                 let xinput = std::array::from_fn(|slot| self.xinput(slot));
-                self.pads = super::playstation::slots(
-                    super::playstation::mode(),
-                    xinput,
-                    &mut self.hid_slots,
-                    super::playstation::pads,
-                );
+                let sony = super::playstation::mode();
+                let generic = super::generic::enabled();
+                let mode = if sony == Mode::Off && generic { Mode::Auto } else { sony };
+                self.pads = super::playstation::slots(mode, xinput, &mut self.hid_slots, || {
+                    let mut pads =
+                        if sony == Mode::Off { Vec::new() } else { super::playstation::pads() };
+                    if generic {
+                        pads.extend(super::generic::pads());
+                    }
+                    pads
+                });
             }
             #[allow(unused_mut)]
             let mut pad = self.pads[slot]?;
@@ -1335,9 +1373,11 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            // A slot a HID pad has is one XInput left empty.
+            // A slot a HID pad has is one XInput left empty. Generic pads do not rumble.
             if let Some(id) = self.hid_slots[slot] {
-                super::playstation::rumble(id, low, high);
+                if id & super::generic::ID == 0 {
+                    super::playstation::rumble(id, low, high);
+                }
                 return;
             }
             let speeds = XINPUT_VIBRATION {

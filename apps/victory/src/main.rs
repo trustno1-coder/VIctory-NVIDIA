@@ -328,6 +328,16 @@ enum Command {
     /// it by itself then.
     #[cfg(windows)]
     GetMfg,
+    /// Show the pads the game would read and, live, what each generic HID
+    /// pad (a no-name USB pad and the like) sends: its button numbers, for
+    /// `VICTORY_PAD_BUTTONS` in `victory-settings.txt`, its sticks and hat,
+    /// and the console pad's buttons they make.
+    #[cfg(windows)]
+    Pads {
+        /// How long to watch, in seconds.
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
+    },
     /// Print the highest shader model the default GPU runs here (`play`
     /// asks it in a process of its own).
     #[cfg(windows)]
@@ -491,6 +501,12 @@ fn main() -> Result<()> {
         Command::GetD3d12 => play::get_d3d12(),
         #[cfg(windows)]
         Command::GetMfg => play::get_mfg(),
+        #[cfg(windows)]
+        Command::Pads { seconds } => {
+            play::pad_settings();
+            victory_hle::modules::gameinput::monitor_pads(seconds);
+            Ok(())
+        }
         #[cfg(windows)]
         Command::ShaderModel => {
             let model = victory_hle::streamline::highest_shader_model();

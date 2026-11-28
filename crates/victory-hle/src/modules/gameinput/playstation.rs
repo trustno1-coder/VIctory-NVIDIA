@@ -11,8 +11,8 @@
 //! that Bluetooth output reports carry) are ported from
 //! FrancescoGelosoEterea/VIscosity, commit d8db7a0 (`gameinput/hid.rs`, by
 //! marquezini), GPL-3.0 like this crate. Its report layouts are the ones
-//! Linux's `hid-playstation` and `hid-sony` drivers read and write. Its
-//! generic HID pads are not ported: this reader opens Sony's pads only.
+//! Linux's `hid-playstation` and `hid-sony` drivers read and write. This
+//! reader opens Sony's pads only; other HID pads are [`super::generic`]'s.
 
 use super::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
@@ -253,7 +253,7 @@ pub(super) fn rumble_report(
 }
 
 #[cfg(windows)]
-pub(super) use host::{pads, rumble, stop_rumble};
+pub(super) use host::{hid_paths, pads, rumble, stop_rumble};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
@@ -801,8 +801,9 @@ mod host {
         None
     }
 
-    /// The device paths of the HID devices present, without terminators.
-    fn hid_paths() -> Vec<Vec<u16>> {
+    /// The device paths of the HID devices present, without terminators
+    /// (also [`super::super::generic`]'s scan).
+    pub(in super::super) fn hid_paths() -> Vec<Vec<u16>> {
         let mut paths = Vec::new();
         // SAFETY: plain queries into buffers we own; the list is destroyed
         // before returning.
