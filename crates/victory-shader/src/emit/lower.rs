@@ -1870,8 +1870,10 @@ impl<'a> Lower<'a> {
                                 // (local waves never exchange across halves)
                                 let slot = if LOCAL_WAVES.get() { u32::MAX } else { s.lds_dwords };
                                 exchange = Some((slot, group <= 32, all));
-                                if !LOCAL_WAVES.get() {
-                                    s.lds_dwords += 2 * group.div_ceil(64);
+                                // (local waves keep the old layout unless the program's LDS is full)
+                                let n = 2 * group.div_ceil(64);
+                                if !LOCAL_WAVES.get() || s.lds_dwords + n < HOST_LDS_DWORDS {
+                                    s.lds_dwords += n;
                                 }
                             }
                         }
