@@ -254,7 +254,7 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
 
 fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     match (a, b) {
-        (Sym::K(k), x) | (x, Sym::K(k)) if op.identity(k) => x,
+        (Sym::K(k), x) | (x, Sym::K(k)) if op.identity(k) && !matches!(x, Sym::Red64F { .. }) => x,
         (
             Sym::Red {
                 op: oa,
@@ -364,6 +364,19 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                 };
                 uni.insert(w, sym);
             }
+            // both dwords of a 64-bit sum moved at once
+            if name == "s_mov_b64"
+                && inst.reads.len() == inst.writes.len()
+                && inst
+                    .reads
+                    .iter()
+                    .all(|r| matches!(r.0, Reg::S(_)) && matches!(uni.get(&r.1), Some(Sym::Red64F { .. })))
+            {
+                for (w, r) in inst.writes.iter().zip(&inst.reads) {
+                    let s = uni[&r.1];
+                    uni.insert(w.1, s);
+                }
+            }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
             }
@@ -445,6 +458,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                             &uni,
                         ),
                     )),
+                    Operand::Const(128) => Some((
+                        vec![Sym::K(0); wave as usize],
+                        vec![Sym::K(0); wave as usize],
+                    )),
                     _ => None,
                 }
             };
@@ -464,8 +481,14 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                 &vec,
                 &uni,
             );
-            let f64_term = |lo_s: Sym, hi_s: Sym| -> Option<(Value, Value, Value, u64)> {
+            #[derive(Clone, Copy)]
+            enum F64Pair {
+                Zero,
+                Sum(Value, Value, Value, u64),
+            }
+            let f64_term = |lo_s: Sym, hi_s: Sym| -> Option<F64Pair> {
                 match (lo_s, hi_s) {
+                    (Sym::K(0), Sym::K(0)) => Some(F64Pair::Zero),
                     (
                         Sym::Red {
                             op: None,
@@ -481,7 +504,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                             ident: 0,
                             lanes: lh,
                         },
-                    ) if ml == mh && ll == lh => Some((lo, hi, ml, ll)),
+                    ) if ml == mh && ll == lh => Some(F64Pair::Sum(lo, hi, ml, ll)),
                     (
                         Sym::Red64F {
                             lo: lo1,
@@ -497,7 +520,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                             lanes: l2,
                             high: true,
                         },
-                    ) if (lo1, hi1, m1, l1) == (lo2, hi2, m2, l2) => Some((lo1, hi1, m1, l1)),
+                    ) if (lo1, hi1, m1, l1) == (lo2, hi2, m2, l2) => {
+                        Some(F64Pair::Sum(lo1, hi1, m1, l1))
+                    }
                     _ => None,
                 }
             };
@@ -507,28 +532,35 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                 (pair_lanes(v.src.first()), pair_lanes(v.src.get(1)))
             {
                 for l in 0..wave as usize {
-                    let (rl, rh) = match (f64_term(alo[l], ahi[l]), f64_term(blo[l], bhi[l])) {
-                        (Some((lo1, hi1, m1, la)), Some((lo2, hi2, m2, lb)))
-                            if (lo1, hi1, m1) == (lo2, hi2, m2) && la & lb == 0 =>
-                        {
-                            (
-                                Sym::Red64F {
-                                    lo: lo1,
-                                    hi: hi1,
-                                    mask: m1,
-                                    lanes: la | lb,
-                                    high: false,
-                                },
-                                Sym::Red64F {
-                                    lo: lo1,
-                                    hi: hi1,
-                                    mask: m1,
-                                    lanes: la | lb,
-                                    high: true,
-                                },
-                            )
+                    let sum = match (f64_term(alo[l], ahi[l]), f64_term(blo[l], bhi[l])) {
+                        (Some(F64Pair::Zero), Some(x)) | (Some(x), Some(F64Pair::Zero)) => Some(x),
+                        (
+                            Some(F64Pair::Sum(lo1, hi1, m1, la)),
+                            Some(F64Pair::Sum(lo2, hi2, m2, lb)),
+                        ) if (lo1, hi1, m1) == (lo2, hi2, m2) && la & lb == 0 => {
+                            Some(F64Pair::Sum(lo1, hi1, m1, la | lb))
                         }
-                        _ => (Sym::Unknown, Sym::Unknown),
+                        _ => None,
+                    };
+                    let (rl, rh) = match sum {
+                        Some(F64Pair::Zero) => (Sym::K(0), Sym::K(0)),
+                        Some(F64Pair::Sum(lo, hi, mask, lanes)) => (
+                            Sym::Red64F {
+                                lo,
+                                hi,
+                                mask,
+                                lanes,
+                                high: false,
+                            },
+                            Sym::Red64F {
+                                lo,
+                                hi,
+                                mask,
+                                lanes,
+                                high: true,
+                            },
+                        ),
+                        None => (Sym::Unknown, Sym::Unknown),
                     };
                     out_lo[l] = if exec >> l & 1 != 0 { rl } else { old_lo[l] };
                     out_hi[l] = if exec >> l & 1 != 0 { rh } else { old_hi[l] };

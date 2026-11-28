@@ -534,7 +534,7 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     // ... and the lowering names the block, around which that branch is the one to widen
     let needs = lower::take_needs();
     let st = structure::structure(&p).expect("structure");
-    assert_eq!(lower::branches_around(&st, &needs), Some(vec![branch]));
+    assert_eq!(lower::branches_around_with_loop_exits(&st, &needs, true), Some(vec![branch]));
     // (taken, past the body, when every lane's bit is clear)
     assert_eq!(st.wave_any[branch], Some(false));
     // wave-wide, every lane runs the reduction (EXEC stays a guard on what it does there)
@@ -739,6 +739,9 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+#[path = "wave64_after_loop.rs"]
+mod after_loop;
 
 /// A dispatch counted in threads: of the last group only the lanes below the
 /// count store (after DexNom/VIctory bc3cd4b0).
@@ -1052,4 +1055,196 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
         eprintln!("the old rounding on this device: {written} of 64 dwords written");
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
+}
+
+/// [`native_of`] with `lds` bytes of LDS (512-byte granules).
+fn native_with(body: &[u32], wave64: bool, threads: u32, lds: u32) -> NativeProgram {
+    let mut n = native_of(body, wave64, threads);
+    if let StageIo::Cs(cs) = &mut n.io {
+        cs.rsrc2 |= lds.div_ceil(512) << 15;
+    }
+    n
+}
+
+const fn ds(op: u32, vdst: u32, addr: u32, data: u32, offset: u32) -> [u32; 2] {
+    [0xD800_0000 | op << 18 | offset, vdst << 24 | data << 8 | addr]
+}
+
+fn paired(native: &NativeProgram) -> HostShader {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let prev = super::TEST_PAIRS.replace(Some(false));
+    let others = super::emit(&c, native, &p, &st, &io, &res);
+    super::TEST_PAIRS.set(Some(true));
+    let chosen = super::emit(&c, native, &p, &st, &io, &res);
+    super::TEST_PAIRS.set(prev);
+    let shader = super::paired(&c, native, &p);
+    lower::TEST_HOST_WAVE.set(was);
+    let (shader, wave) = shader.expect("the paired form");
+    assert_eq!(wave, Some(32));
+    if others.is_err() {
+        assert_eq!(chosen.expect("emit").dxil, shader.dxil, "emit's choice");
+    }
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    shader
+}
+
+fn run_paired(shader: &HostShader, constants: [u32; 4], dwords: u32) -> Option<Vec<u32>> {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return None;
+        }
+    };
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, d @ 0..=3) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = constants[d as usize];
+        }
+    }
+    let mut out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(dwords)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out.swap_remove(0))
+}
+
+fn same_as_console(got: &[u32], want: &[u32]) {
+    assert_eq!(got.len(), want.len());
+    if let Some(n) = (0..want.len()).find(|&n| got[n] != want[n]) {
+        panic!("thread {}, dword {}: {:#x}, the console's {:#x}", n / 4, n % 4, got[n], want[n]);
+    }
+}
+
+/// Two console waves of 64 in a group of 128 (two host waves of 32, 512 bytes of LDS). In
+/// each, lane 0 zeroes the wave's dword of LDS; every lane loops (lane & 3) + 1 + wave times,
+/// adding its lane number to its sum and 1 to the wave's dword each round (`ds_add_u32`; the
+/// loop's branch is the wave's: it goes round while some lane is left); after the loop each
+/// lane reads the wave's total, with no barrier; lanes 40-63 read their first lane's sum
+/// (`v_readfirstlane_b32`: lane 40, an upper lane), then lanes 20-63 (lane 20, a lower one,
+/// though upper lanes have one too); past the barrier, each lane reads the other wave's total.
+#[test]
+fn paired_lanes_loop_apart_and_meet_the_other_wave_at_the_barrier() {
+    use after_loop::{EXEC, k, sop1, sop2, sopp, stores, v, vop1, vop2, vopc};
+    const VCC: u32 = 106;
+    let mut w = vec![
+        vop2(0x16, 1, k(6), 0),  // v_lshrrev_b32 v1, 6, v0: the console wave
+        vop2(0x1B, 2, k(63), 0), // v_and_b32 v2, 63, v0: the lane in it
+        vop2(0x1A, 11, k(2), 1), // v_lshlrev_b32 v11, 2, v1: the wave's dword
+        vop1(0x01, 12, k(0)),    // v_mov_b32 v12, 0
+        sop1(0x04, 22, EXEC),    // s_mov_b64 s[22:23], exec
+        vopc(0xD2, k(0), 2),     // v_cmpx_eq_u32 exec, 0, v2: lane 0
+    ];
+    w.extend(ds(0x0D, 0, 11, 12, 0)); // ds_write_b32 v11, v12
+    w.extend([
+        sop1(0x04, EXEC, 22),   // s_mov_b64 exec, s[22:23]
+        vop2(0x1B, 3, k(3), 2), // v_and_b32 v3, 3, v2
+        vop2(0x25, 3, k(1), 3), // v_add_nc_u32 v3, 1, v3
+        vop2(0x25, 3, v(1), 3), // v_add_nc_u32 v3, v1, v3: the rounds
+        vop1(0x01, 4, k(0)),    // v_mov_b32 v4, 0
+        vop1(0x01, 13, k(1)),   // v_mov_b32 v13, 1
+        sop1(0x04, 20, EXEC),   // s_mov_b64 s[20:21], exec
+        vop2(0x25, 4, v(2), 4), // loop: v_add_nc_u32 v4, v2, v4
+    ]);
+    w.extend(ds(0x00, 0, 11, 13, 0)); // ds_add_u32 v11, v13
+    w.extend([
+        vop2(0x25, 3, 193, 3),       // v_add_nc_u32 v3, -1, v3
+        vopc(0xC5, k(0), 3),         // v_cmp_ne_u32 vcc, 0, v3
+        sop2(0x0F, EXEC, EXEC, VCC), // s_and_b64 exec, exec, vcc
+        sopp(0x09, -7),              // s_cbranch_execnz loop
+        sop1(0x04, EXEC, 20),        // s_mov_b64 exec, s[20:21]
+    ]);
+    w.extend(ds(0x36, 5, 11, 0, 0)); // ds_read_b32 v5, v11: the wave's total
+    w.extend([
+        sop1(0x04, 24, EXEC), // s_mov_b64 s[24:25], exec
+        vopc(0xD1, k(39), 2), // v_cmpx_lt_u32 exec, 39, v2: lanes 40-63
+        vop1(0x02, 6, v(4)),  // v_readfirstlane_b32 s6, v4
+        sop1(0x04, EXEC, 24), // s_mov_b64 exec, s[24:25]
+        vopc(0xD1, k(19), 2), // v_cmpx_lt_u32 exec, 19, v2: lanes 20-63
+        vop1(0x02, 7, v(4)),  // v_readfirstlane_b32 s7, v4
+        sop1(0x04, EXEC, 24), // s_mov_b64 exec, s[24:25]
+        vop1(0x01, 6, 6),     // v_mov_b32 v6, s6
+        vop1(0x01, 9, 7),     // v_mov_b32 v9, s7
+        0xD400_0000 | 0x346 << 16 | 6, // v_lshl_add_u32 v6, v9, 16, v6
+        v(9) | k(16) << 9 | v(6) << 18,
+        sopp(0x0A, 0),            // s_barrier
+        vop2(0x1D, 14, k(4), 11), // v_xor_b32 v14, 4, v11: the other wave's dword
+    ]);
+    w.extend(ds(0x36, 7, 14, 0, 0)); // ds_read_b32 v7, v14
+    w.extend(stores([4, 5, 6, 7]));
+    let shader = paired(&native_with(&w, true, 128, 512));
+    let rounds = |wave: u32, lane: u32| (lane & 3) + 1 + wave;
+    let total = |wave: u32| (0..64).map(|lane| rounds(wave, lane)).sum::<u32>();
+    let first = |wave: u32, lane: u32| lane * rounds(wave, lane);
+    let want: Vec<u32> = (0..128)
+        .flat_map(|t| {
+            let (wave, lane) = (t / 64, t % 64);
+            [first(wave, lane), total(wave), first(wave, 20) << 16 | first(wave, 40), total(1 - wave)]
+        })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 512) else { return };
+    same_as_console(&got, &want);
+    eprintln!("ran on the hardware device: two console waves, their loops and LDS as on the console");
+}
+
+/// One console wave: `ds_bpermute_b32` (within each 32-lane half per GFX10 ISA); a DPP row shift
+/// whose row mask leaves rows 0 and 3 alone (rows 2 and 3 are lanes 32-63: rows are counted in
+/// console lanes); a `ds_swizzle_b32` swapping the two 16-lane rows of each 32 lanes;
+/// `v_writelane_b32` of s0 into lane 45.
+#[test]
+fn paired_lanes_permute_shift_and_write_lanes_of_both_halves() {
+    use after_loop::{LIT, k, stores, v, vop1, vop2, vop3};
+    let mut w = vop3(0x169, 1, v(0), k(3)).to_vec(); // v_mul_lo_u32 v1, v0, 3
+    w.extend([
+        vop2(0x25, 1, k(1), 1),  // v_add_nc_u32 v1, 1, v1
+        vop2(0x26, 2, k(63), 0), // v_sub_nc_u32 v2, 63, v0
+        vop2(0x1A, 2, k(2), 2),  // v_lshlrev_b32 v2, 2, v2: the mirror lane's address
+    ]);
+    w.extend(ds(0xB3, 3, 2, 1, 0)); // ds_bpermute_b32 v3, v2, v1
+    w.extend([
+        vop1(0x01, 4, LIT), // v_mov_b32 v4, 1000
+        1000,
+        vop1(0x01, 4, 0xFA), // v_mov_b32 v4, v1 row_shr:1 row_mask:0x6 bank_mask:0xf
+        0x6 << 28 | 0xF << 24 | 0x111 << 8 | 1,
+    ]);
+    w.extend(ds(0x35, 5, 1, 0, 0x401F)); // ds_swizzle_b32 v5, v1 offset:swizzle(BITMASK_PERM, xor 16)
+    w.push(vop1(0x01, 6, v(0))); // v_mov_b32 v6, v0
+    w.extend(vop3(0x361, 6, 0, k(45))); // v_writelane_b32 v6, s0, 45
+    w.extend(stores([3, 4, 5, 6]));
+    let shader = paired(&native_with(&w, true, 64, 0));
+    let s0 = 0xABCD_1234;
+    let x = |n: u32| 3 * n + 1;
+    let want: Vec<u32> = (0..64)
+        .flat_map(|n| {
+            let shifted = if matches!(n >> 4, 1 | 2) && n & 15 != 0 { x(n - 1) } else { 1000 };
+            let swizzled = x(n & 32 | (n & 31) ^ 16);
+            [x((n & 32) | ((63 - n) & 31)), shifted, swizzled, if n == 45 { s0 } else { n }]
+        })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [s0, 0, 0, 0], 256) else { return };
+    same_as_console(&got, &want);
+    eprintln!("ran on the hardware device: permutes, row masks, swizzles and lane writes as on the console");
 }
