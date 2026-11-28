@@ -60,7 +60,7 @@ fn publish_with(
 
 /// The folder name for `bytes`: 128 bits of their BLAKE3, in hexadecimal.
 fn key(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex()[..KEY_LEN].to_owned()
+    crate::hash::hash(bytes).to_hex()[..KEY_LEN].to_owned()
 }
 
 const KEY_LEN: usize = 32;

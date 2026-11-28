@@ -25,6 +25,7 @@
 mod console_insn;
 mod crash;
 pub mod frame_rate;
+mod hash;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;

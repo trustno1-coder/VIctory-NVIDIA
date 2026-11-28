@@ -49,7 +49,7 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 /// prepared (the title's 115 MB, no second copy of them).
 pub fn prepare_owned(original: Vec<u8>) -> Result<PreparedImage, PrepareError> {
     let info = ImageInfo::parse(&original)?;
-    let original_hash = blake3::hash(&original);
+    let original_hash = crate::hash::hash(&original);
     let mut bytes = original;
 
     let fh = layout::file_header_offset(&bytes).ok_or(PrepareError::Patch("no file header"))?;
