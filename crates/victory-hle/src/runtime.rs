@@ -269,6 +269,7 @@ pub fn use_console_timers() {
         timeBeginPeriod(1);
     }
     ahead_of_other_programs();
+    victory_gpu::place_process();
 }
 
 /// The title's streaming thread runs below normal priority (on the console

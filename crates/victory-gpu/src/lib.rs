@@ -127,6 +127,32 @@ pub fn frame_phase() -> u32 {
     copystat::phase()
 }
 
+/// For a run of the title, not for the tools: the process on the cores with the larger
+/// last-level cache, where a processor has them on one half (`VICTORY_CACHE_CORES`).
+#[cfg(windows)]
+pub fn place_process() {
+    cores::place_process();
+}
+
+/// For a thread of another crate below the frame's in priority (DirectStorage's): on the
+/// half the process was not placed on ([`place_process`]); nothing where it was not.
+#[cfg(windows)]
+pub fn keep_off_the_frames_cores(what: &str) {
+    cores::keep_off_the_frames_cores(what);
+}
+
+/// The logical processors [`keep_off_the_frames_cores`] leaves a thread on.
+pub fn off_the_frames_cores() -> usize {
+    #[cfg(windows)]
+    {
+        cores::off_the_frames_cores()
+    }
+    #[cfg(not(windows))]
+    {
+        std::thread::available_parallelism().map_or(4, |n| n.get())
+    }
+}
+
 /// Frames the title has begun (its frame waits that ended), for logs.
 pub fn frames_begun() -> u64 {
     frame::current()

@@ -629,7 +629,8 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        // As many workers as processors (`VICTORY_DSTORAGE_WORKERS=<n>`: that many), below
+        // As many workers as processors, those of the half that is not the frame's where the
+        // process was placed (`VICTORY_DSTORAGE_WORKERS=<n>`: that many), below
         // normal priority (`VICTORY_DSTORAGE_PRIORITY=<-2..2>`, 0: normal, as before
         // 2026-11-27). While a scene streams in, all of them unpack at once: in a crowded
         // cutscene (timeline tl5, 176 s into a new game, 62 ms a frame) 16 workers ran 10 ms
@@ -641,7 +642,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<i32>().ok());
         let workers = match number("VICTORY_DSTORAGE_WORKERS") {
             Some(n) if n > 0 => n as usize,
-            _ => std::thread::available_parallelism().map_or(4, |n| n.get()),
+            _ => victory_gpu::off_the_frames_cores(),
         };
         let priority = number("VICTORY_DSTORAGE_PRIORITY").map_or(-1, |p| p.clamp(-2, 2));
         let started = (0..workers)
@@ -649,6 +650,8 @@ fn scheduler() -> Option<&'static Scheduler> {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
                     .spawn(move || {
+                        #[cfg(windows)]
+                        victory_gpu::keep_off_the_frames_cores("dstorage");
                         #[cfg(windows)]
                         if priority != 0 {
                             use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};

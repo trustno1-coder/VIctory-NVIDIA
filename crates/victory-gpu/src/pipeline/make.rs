@@ -582,6 +582,9 @@ fn workers() -> bool {
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
                     let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+                    if !screens_only {
+                        crate::cores::keep_off_the_frames_cores("victory-pipelines");
+                    }
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
