@@ -915,8 +915,24 @@ extern "system" fn register_device(
     hub.deliver(found);
     S_OK
 }
-/// Guide button and keyboard layout callbacks: neither ever changes here.
-extern "system" fn register_other(
+/// The system button callback (guide, share and the like): a registration and
+/// its token; no callback ever runs. Its button filter comes between the
+/// device and the context (six arguments), so it cannot share the
+/// keyboard-layout handler below.
+extern "system" fn register_button(
+    _: This,
+    _device: *const c_void,
+    _button: u32,
+    _context: *mut c_void,
+    _callback: *const c_void,
+    out: *mut u64,
+) -> HRESULT {
+    token(out)
+}
+
+/// Keyboard layout callbacks: a registration and its token; the layout never
+/// changes here.
+extern "system" fn register_layout(
     _: This,
     _device: *const c_void,
     _context: *mut c_void,
@@ -1016,8 +1032,8 @@ static INPUT: Table<22> = Table([
     temporal_reading as *const (),    // 0x38
     register_reading as *const (),    // 0x40
     register_device as *const (),     // 0x48
-    register_other as *const (),      // 0x50 guide button
-    register_other as *const (),      // 0x58 keyboard layout
+    register_button as *const (),     // 0x50 guide button
+    register_layout as *const (),     // 0x58 keyboard layout
     stop_callback as *const (),       // 0x60
     unregister_callback as *const (), // 0x68
     create_dispatcher as *const (),   // 0x70
@@ -2019,5 +2035,39 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    /// RegisterSystemButtonCallback (slot 0x50) takes six arguments: the button
+    /// filter comes before the context and the callback. It used to share the
+    /// five-argument keyboard-layout handler, so its fifth argument (the
+    /// title's callback) was taken for the token out: the token was written
+    /// over the title's callback instead of into the title's token.
+    #[test]
+    fn a_system_button_registration_writes_its_token_and_not_the_callback() {
+        let (hub, _host) = fake();
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        let register = slot::<Register, _>(&hub.object, 0x50);
+        // What a title's callback code would be: writable, so the old
+        // handler's stray write is observable here instead of fatal.
+        let callback = [0xa5u8; 8];
+        let mut token = 0;
+        let hr = register(
+            &hub.object,
+            std::ptr::null(),
+            1,
+            std::ptr::null_mut(),
+            callback.as_ptr().cast(),
+            &mut token,
+        );
+        assert_eq!(hr, S_OK);
+        assert_ne!(token, 0, "the token out is written");
+        assert_eq!(callback, [0xa5u8; 8], "the callback is not written over");
     }
 }
