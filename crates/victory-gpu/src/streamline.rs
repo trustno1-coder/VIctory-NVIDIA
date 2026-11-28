@@ -678,16 +678,40 @@ pub fn adapter_name() -> Option<String> {
 /// "NVIDIA RTX PRO 4000 Blackwell SFF Edition", #312). Not the older Quadro RTX
 /// 4000 to 8000 (Turing) or RTX A2000 to A6000 (Ampere).
 pub fn dlss_framegen_card(name: &str) -> bool {
-    let name = name.to_ascii_uppercase();
+    let name = letters_and_digits(name);
     if name.contains("QUADRO") {
         return false;
     }
     if name.contains(" ADA") || name.contains("BLACKWELL") || name.contains("RTX PRO") {
         return true;
     }
-    let Some(at) = name.find("RTX") else { return false };
-    let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
-    model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
+    rtx_model(&name).is_some_and(|model| matches!(model / 100, 40 | 50))
+}
+
+/// A card name's ASCII letters (upper case) and digits, anything else a
+/// space.
+fn letters_and_digits(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { ' ' }).collect()
+}
+
+/// The model number of a GeForce RTX card in its name: the four digits after
+/// "RTX" (4080 in "NVIDIA GeForce RTX 4080 SUPER"); `None` for another name.
+/// It is read on the name's letters and digits alone, past a mark: a name can
+/// carry signs the notice's font leaves out (a trademark sign, a zero-width
+/// space), and the number stopped at them. #1028: "GPU: NVIDIA GEFORCE RTX
+/// 5080" over "DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)".
+pub fn rtx_model(name: &str) -> Option<u32> {
+    let name = letters_and_digits(name);
+    let at = name.find("RTX")?;
+    let mut rest = name[at + 3..].trim_start();
+    // "RTX(TM) 5080", "RTX(R) 5080": the mark's letters come before the number.
+    for mark in ["TM ", "R "] {
+        if let Some(after) = rest.strip_prefix(mark) {
+            rest = after.trim_start();
+        }
+    }
+    let model: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if model.len() == 4 { model.parse().ok() } else { None }
 }
 
 /// The card the host device is made on (`hardware_adapter`; else the first
@@ -2331,6 +2355,41 @@ pub(crate) fn line(frames: f64) {
                 "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::{dlss_framegen_card, rtx_model};
+
+    /// A card's model number is read past signs in its name that the
+    /// notice's font leaves out, so an RTX 5080 named with one is still
+    /// a card of the 50 series (#1028).
+    #[test]
+    fn a_card_name_reads_as_its_model_past_marks() {
+        for (name, model) in [
+            ("NVIDIA GeForce RTX 5080", Some(5080)),
+            ("NVIDIA GeForce RTX\u{2122} 5080", Some(5080)),
+            ("NVIDIA GeForce RTX \u{200b}5080", Some(5080)),
+            ("NVIDIA GeForce RTX\u{a0}5090 Laptop GPU", Some(5090)),
+            ("NVIDIA GeForce RTX(TM) 4070 SUPER", Some(4070)),
+            ("NVIDIA GeForce RTX\u{ae} 3080 Ti", Some(3080)),
+            ("NVIDIA GeForce RTX5060", Some(5060)),
+            ("NVIDIA RTX A4000", None),
+            ("NVIDIA GeForce GTX 1080", None),
+            ("AMD Radeon RX 7900 XTX", None),
+            ("", None),
+        ] {
+            assert_eq!(rtx_model(name), model, "{name:?}");
+        }
+        assert!(dlss_framegen_card("NVIDIA GeForce RTX\u{2122} 5080"));
+        assert!(dlss_framegen_card("NVIDIA GeForce RTX \u{200b}5080"));
+        assert!(dlss_framegen_card("NVIDIA GeForce RTX 4060 Laptop GPU"));
+        assert!(!dlss_framegen_card("NVIDIA GeForce RTX\u{2122} 3080"));
+        assert!(!dlss_framegen_card("Quadro RTX 4000"));
+        assert!(!dlss_framegen_card("NVIDIA RTX A6000"));
+        assert!(dlss_framegen_card("NVIDIA RTX 2000 Ada Generation"));
+        assert!(dlss_framegen_card("NVIDIA RTX PRO 4000 Blackwell SFF Edition"));
     }
 }
 

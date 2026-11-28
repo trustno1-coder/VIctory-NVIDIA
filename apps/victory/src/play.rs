@@ -565,12 +565,10 @@ fn mfg_home() -> Result<PathBuf> {
 }
 
 /// A GeForce RTX of the 20 or 30 series ("NVIDIA GeForce RTX 3080", "... RTX 2060 SUPER"): DLSS
-/// runs, DLSS Frame Generation only with MFG Unlocker.
+/// runs, DLSS Frame Generation only with MFG Unlocker. (Its model number is read as the layer
+/// reads it, past a mark in the name.)
 fn older_rtx(name: &str) -> bool {
-    let name = name.to_ascii_uppercase();
-    let Some(at) = name.find("RTX") else { return false };
-    let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
-    model.len() == 4 && (model.starts_with("20") || model.starts_with("30"))
+    victory_hle::streamline::rtx_model(name).is_some_and(|model| matches!(model / 100, 20 | 30))
 }
 
 /// Runs the fetcher: MFG Unlocker from its author's GitHub release into `to`.
@@ -1186,6 +1184,8 @@ mod tests {
         assert!(older_rtx("NVIDIA GeForce RTX 3080 Ti") && older_rtx("NVIDIA GeForce RTX 2060 SUPER") && older_rtx("NVIDIA GeForce RTX 3050 Laptop GPU"));
         assert!(!older_rtx("NVIDIA GeForce RTX 5070") && !older_rtx("NVIDIA GeForce RTX 4090") && !older_rtx("NVIDIA GeForce GTX 1080"));
         assert!(!older_rtx("NVIDIA RTX A2000") && !older_rtx("AMD Radeon RX 7900 XTX") && !older_rtx(""));
+        // A mark in the name (#1028).
+        assert!(older_rtx("NVIDIA GeForce RTX\u{2122} 3080") && !older_rtx("NVIDIA GeForce RTX\u{2122} 5080"));
     }
 
     /// Settings read again after `prepare` clears the others survive it.
