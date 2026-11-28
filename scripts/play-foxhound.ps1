@@ -148,7 +148,8 @@ $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_CWD = $PWD.ProviderPath
+$settings.VICTORY_MENU_ARGS = "-Exe `$env:VICTORY_MENU_EXE -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
@@ -163,6 +164,8 @@ if (-not (Test-Path $victory)) {
     if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
+$Exe = (Get-Item -LiteralPath $Exe).FullName
+$settings.VICTORY_MENU_EXE = $Exe
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }

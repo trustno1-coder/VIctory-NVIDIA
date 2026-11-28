@@ -763,6 +763,21 @@ fn warmup_mark(home: &Path, program: &Path) -> Option<PathBuf> {
     Some(home.join("warmed").join(&hash.as_str()[..16]))
 }
 
+/// Keep paths as environment values when PowerShell starts the launcher again.
+fn set_restart(settings: &mut BTreeMap<String, String>, program: &Path, exe: &Path, no_framegen_ready: bool) {
+    settings.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
+    settings.insert("VICTORY_MENU_EXE".to_owned(), exe.to_string_lossy().into_owned());
+    // The title can change the process directory. Relative config paths must still
+    // resolve from the directory in which the launcher was started.
+    if let Ok(cwd) = std::env::current_dir() {
+        settings.insert("VICTORY_MENU_CWD".to_owned(), cwd.to_string_lossy().into_owned());
+    }
+    settings.insert(
+        "VICTORY_MENU_ARGS".to_owned(),
+        format!("play $env:VICTORY_MENU_EXE{}", if no_framegen_ready { " --no-framegen-ready" } else { "" }),
+    );
+}
+
 /// What a start needs once its settings are in the environment.
 pub(crate) struct Ready {
     pub(crate) exe: PathBuf,
@@ -851,13 +866,8 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         s.insert("VICTORY_WARMUP_MARK".to_owned(), mark.to_string_lossy().into_owned());
     }
     // Where the menu saves, and how it starts the title again (`--set` is not carried over).
-    let quoted = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "''"));
     s.insert("VICTORY_MENU_FILE".to_owned(), menu_file.to_string_lossy().into_owned());
-    s.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
-    s.insert(
-        "VICTORY_MENU_ARGS".to_owned(),
-        format!("play {}{}", quoted(&exe), if o.no_framegen_ready { " --no-framegen-ready" } else { "" }),
-    );
+    set_restart(&mut s, &program, &exe, o.no_framegen_ready);
     let log = log_file(&home.join("logs"))?;
     let console = if series_s { "series-s" } else { "series-x" };
     let line: Vec<String> = s.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -914,6 +924,20 @@ mod tests {
             fps: 1000,
             more: Vec::new(),
             preload: false,
+        }
+    }
+
+    #[test]
+    fn restart_arguments_keep_the_title_path_out_of_powershell_source() {
+        let launcher = Path::new(r"C:\Player’s files\victory.exe");
+        let title = Path::new(r"D:\Jeux 雪\Player's game.exe");
+        let mut settings = BTreeMap::new();
+        for (flag, args) in [(false, "play $env:VICTORY_MENU_EXE"), (true, "play $env:VICTORY_MENU_EXE --no-framegen-ready")] {
+            set_restart(&mut settings, launcher, title, flag);
+            assert_eq!(Path::new(&settings["VICTORY_MENU_PLAY"]), launcher);
+            assert_eq!(Path::new(&settings["VICTORY_MENU_EXE"]), title);
+            assert_eq!(Path::new(&settings["VICTORY_MENU_CWD"]), std::env::current_dir().unwrap());
+            assert_eq!(settings["VICTORY_MENU_ARGS"], args);
         }
     }
 
