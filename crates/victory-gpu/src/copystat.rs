@@ -357,6 +357,9 @@ fn big(at: *mut u8, size: usize, made: bool) {
     if size < BIG {
         return;
     }
+    if made && size >= 64 << 20 {
+        name_big(size);
+    }
     for (place, bytes) in BIG_AT.iter().zip(&BIG_BYTES) {
         if made {
             if place.compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok() {
@@ -371,6 +374,26 @@ fn big(at: *mut u8, size: usize, made: bool) {
     }
 }
 
+thread_local! {
+    /// Set while [`name_big`] logs: what it allocates is not named again.
+    static NAMING_BIG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Logs where a block of ours of 64 MB or more is made, for the first 24:
+/// the memory census lists their sizes alone (one of 401 MB in run leak3).
+fn name_big(size: usize) {
+    if NAMING_BIG.with(|n| n.replace(true)) {
+        return;
+    }
+    static NAMED: AtomicU64 = AtomicU64::new(0);
+    if NAMED.fetch_add(1, Relaxed) < 24 {
+        let trace = std::backtrace::Backtrace::force_capture();
+        tracing::info!(mb = size >> 20, "a block of ours of 64 MB or more made:
+{trace}");
+    }
+    NAMING_BIG.with(|n| n.set(false));
+}
+
 /// The sizes of our own big blocks alive, largest first, in MB.
 fn big_blocks() -> String {
     let mut sizes: Vec<u64> = BIG_BYTES.iter().map(|b| b.load(Relaxed)).filter(|&b| b != 0).collect();
@@ -381,10 +404,16 @@ fn big_blocks() -> String {
 
 /// The system's allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
+///
+/// A plain release build uses the system allocator directly: before this
+/// gate it was still routed through `Counting`, so every allocation paid
+/// two atomics plus a small-block branch for stats nobody read.
+#[cfg(any(feature = "diagnostics", test))]
 struct Counting;
 
 // SAFETY: every call goes to the system's allocator unchanged; only
 // counters are kept beside it.
+#[cfg(any(feature = "diagnostics", test))]
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
@@ -426,6 +455,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 }
 
+#[cfg(any(feature = "diagnostics", test))]
 #[global_allocator]
 static HEAP: Counting = Counting;
 
@@ -900,7 +930,7 @@ fn log_memory() {
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
          views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
-         made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
+         made by the host, {} preludes made for them ({} alive), private bytes grew {:.0} MB while \
          lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
          them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
@@ -912,6 +942,7 @@ fn log_memory() {
         views[5],
         lists[0],
         lists[1],
+        crate::host::PRELUDES_ALIVE.load(Relaxed),
         lists[2] as i64 as f64 / (1 << 20) as f64,
         mb(census[7]),
         mb(census[8]),
