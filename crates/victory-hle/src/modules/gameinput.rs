@@ -197,6 +197,30 @@ fn apply_mouse_sample(
     *mouse
 }
 
+/// The title listens to pads and the keyboard only (it never asks for the
+/// mouse), so the captured mouse also moves the one pad's right stick: `delta`
+/// counts in `dt_us` microseconds, as a deflection. `FULL` counts a second
+/// are full deflection (`VICTORY_MOUSE_SENSITIVITY` scales it); any motion
+/// starts past the dead zone a title cuts out of a stick.
+/// shortcut: a speed, not a position, so it is coarser than a real mouse look; a
+/// title-side mouse camera would need the title to read the mouse.
+fn mouse_stick(delta: i64, dt_us: u64, sensitivity: f32) -> f32 {
+    const FULL: f32 = 2500.0;
+    const DEAD: f32 = 0.25;
+    if delta == 0 || dt_us == 0 {
+        return 0.0;
+    }
+    let speed = delta as f32 * 1e6 / dt_us as f32 * sensitivity / FULL;
+    speed.signum() * (DEAD + (1.0 - DEAD) * speed.abs().min(1.0))
+}
+
+fn mouse_sensitivity() -> f32 {
+    static ASKED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| {
+        std::env::var("VICTORY_MOUSE_SENSITIVITY").ok().and_then(|v| v.parse().ok()).filter(|s: &f32| *s > 0.0).unwrap_or(1.0)
+    })
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     fn mouse(&mut self) -> Option<MouseState> { None }
@@ -447,6 +471,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// The captured mouse at the last poll and that poll's time ([`mouse_stick`]).
+    mouse_last: Option<(MouseState, u64)>,
 }
 
 pub struct Hub {
@@ -494,6 +520,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                mouse_last: None,
             }),
             returned: Condvar::new(),
         }));
@@ -582,6 +609,18 @@ impl State {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
+        // The captured mouse as the pad's right stick and triggers (left button
+        // the right trigger, right button the left one).
+        let mut aim = PadState::default();
+        if let (Some(m), Some((was, then))) = (mouse, self.mouse_last) {
+            let (dt, s) = (now.saturating_sub(then), mouse_sensitivity());
+            aim.right_x = mouse_stick(m.position_x - was.position_x, dt, s);
+            aim.right_y = mouse_stick(was.position_y - m.position_y, dt, s);
+            aim.right_trigger = (m.buttons & 1) as f32;
+            aim.left_trigger = (m.buttons >> 1 & 1) as f32;
+        }
+        self.mouse_last = mouse.map(|m| (m, now));
+        let fallback = |keys: &[KeyState]| merged(fallback(keys), aim);
         if one_pad {
             let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
@@ -1755,6 +1794,19 @@ mod tests {
             assert_eq!(current(hub, MOUSE_KIND, MOUSE), Err(DEVICE_DISCONNECTED));
             assert_eq!(*log.lock().unwrap(), [(MOUSE, STATUS_CONNECTED, 0), (MOUSE, 0, STATUS_CONNECTED)]);
         }
+    }
+
+    /// The mouse as a stick: still is centred, any motion clears the dead
+    /// zone, fast motion is full deflection, and the sign is the motion's.
+    #[test]
+    fn mouse_motion_deflects_the_stick() {
+        assert_eq!(mouse_stick(0, 16_000, 1.0), 0.0);
+        assert_eq!(mouse_stick(5, 0, 1.0), 0.0);
+        let slow = mouse_stick(1, 16_000, 1.0);
+        assert!(slow > 0.25 && slow < 0.3, "{slow}");
+        assert_eq!(mouse_stick(400, 16_000, 1.0), 1.0);
+        assert_eq!(mouse_stick(-400, 16_000, 1.0), -1.0);
+        assert!(mouse_stick(10, 16_000, 2.0) > mouse_stick(10, 16_000, 1.0));
     }
 
     #[test]
