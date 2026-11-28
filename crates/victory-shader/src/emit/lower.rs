@@ -1711,6 +1711,17 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+fn whole_wave_side_effect(inst: &Inst) -> bool {
+    let name = inst.name();
+    matches!(inst.fields, Fields::Exp { .. } | Fields::Buffer { lds: true, .. } | Fields::Flat { lds: true, .. })
+        || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+        || name.contains("store")
+        || name.contains("atomic")
+        || name == "s_barrier"
+        || matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_read") || name.starts_with("ds_swizzle") || name.contains("permute"))
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -2816,6 +2827,10 @@ impl<'a> Lower<'a> {
                 self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
+                        let inst = &p.blocks[b].insts[j];
+                        if whole_wave_side_effect(inst) {
+                            return Err(unsupported(inst.machine.offset, "a side effect in a whole-wave section"));
+                        }
                         self.section_inst(b, j, i);
                     }
                     i = end;
@@ -13652,6 +13667,9 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 }
 
 #[cfg(test)]
+mod whole_wave_effect_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
@@ -13880,7 +13898,7 @@ mod tests {
     /// Lowers a one-thread compute program that copies four root constants
     /// (s0..s3) into v1..v4, runs `body`, and stores v0 to a raw buffer from a
     /// descriptor table, so the vector instructions in `body` have an effect.
-    fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+    pub(super) fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         let mut words = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
