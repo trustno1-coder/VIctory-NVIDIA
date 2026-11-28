@@ -137,7 +137,7 @@ const KEPT: &[&str] = &[
     "VICTORY_LOG",
 ];
 
-const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
+const FG_TYPES: [&str; 4] = ["auto", "dlss", "fsr", "fsr4"];
 
 const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
 const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
@@ -176,7 +176,8 @@ pub(crate) struct Play {
     #[arg(long)]
     no_framegen_ready: bool,
     /// Which frame generation: auto (DLSS frame generation where the card has
-    /// it, RTX 40 and later, else AMD FSR 3), dlss, or fsr (2X at most). FSR 3
+    /// it, RTX 40 and later, else AMD FSR 3), dlss, fsr, or experimental fsr4 (2X at most).
+    /// FSR 4 can use the SDK's PC FidelityFX upscaler. FSR 3
     /// needs AMD's FidelityFX DLLs (`VICTORY_FIDELITYFX_DIR`, else a
     /// `fidelityfx` folder beside this program) and, on Series X, DLSS.
     #[arg(long, default_value = "auto", value_parser = FG_TYPES)]
@@ -314,6 +315,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         }
     }
     let fg_type = saved("VICTORY_MENU_FG_TYPE").filter(|t| FG_TYPES.contains(t)).unwrap_or(&o.fg_type);
+    let pc_fsr = fg_type == "fsr4";
     let fps = saved("VICTORY_MENU_FPS")
         .and_then(|f| f.parse::<u32>().ok())
         .filter(|f| (1..=1000).contains(f))
@@ -329,7 +331,11 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         }
     }
     let (mut dlss_on, mut framegen_x) = (false, None);
-    if dlss != "off"
+    if pc_fsr {
+        set("VICTORY_PC_FSR", "1");
+        set("VICTORY_DLSS_MODE", "quality");
+    }
+    if !pc_fsr && dlss != "off"
         && let Some(dir) = streamline
     {
         dlss_on = true;
@@ -353,12 +359,13 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     // AMD FSR 3 frame generation, made ready as DLSS frame generation is: auto, the layer uses
     // it only where DLSS frame generation does not run; fsr, DLSS frame generation is not asked.
     // The layer checks the files and the card and says at the start what runs and why not.
-    // Only with DLSS on: it never runs without DLSS's upscaling, and made ready without it (the
-    // title's FidelityFX then left with AMD's files) the title stopped during the boot screens
+    // FSR 3 needs DLSS's upscaling here. With the title's FidelityFX left
+    // with AMD's files, the title stopped during the boot screens
     // (0x80000003 at +0x2219650, or exit code 3; #331, #459: --no-framegen-ready avoided it).
-    if dlss_on && fg_type != "dlss" && (framegen || o.framegen_ready && !o.no_framegen_ready) {
-        set("VICTORY_FSR_FRAMEGEN", "1");
-        if fg_type == "fsr" {
+    let wants_fg = framegen || o.framegen_ready && !o.no_framegen_ready;
+    if (pc_fsr || dlss_on && fg_type != "dlss") && wants_fg {
+        set("VICTORY_FSR_FRAMEGEN", if pc_fsr { "4" } else { "1" });
+        if matches!(fg_type, "fsr" | "fsr4") {
             s.remove("VICTORY_FRAMEGEN");
         }
         let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
@@ -386,7 +393,8 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     set("VICTORY_MENU_RES", res);
     set("VICTORY_MENU_S_RES", if dlss_on { s_res } else { "720" });
     set("VICTORY_MENU_DLSS", if dlss_on { dlss } else { "off" });
-    set("VICTORY_MENU_FRAMEGEN", &framegen_x.unwrap_or(0).to_string());
+    let menu_framegen = if pc_fsr && framegen { times } else { framegen_x.unwrap_or(0) };
+    set("VICTORY_MENU_FRAMEGEN", &menu_framegen.to_string());
     set("VICTORY_MENU_FG_TYPE", fg_type);
     set("VICTORY_MENU_FPS", &fps.to_string());
     (s, series_s)
@@ -852,16 +860,18 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     let menu_file = home.join("victory-settings.txt");
     let menu = parse_menu(&std::fs::read_to_string(&menu_file).unwrap_or_default());
     let picked = menu.iter().rev().find(|(k, _)| k == "VICTORY_MENU_DLSS").map(|(_, v)| v.as_str());
-    if picked.unwrap_or(o.dlss.as_str()) != "off" && streamline_dir(&here).is_none() {
+    let (planned, _) = settings(o, &menu, Some(Path::new(".")));
+    let uses_pc_fsr = planned.get("VICTORY_PC_FSR").is_some_and(|v| v == "1");
+    if !uses_pc_fsr && planned.contains_key("VICTORY_DLSS") && streamline_dir(&here).is_none() {
         offer_dlss(picked.is_some_and(|d| DLSS_MODES.contains(&d)));
     }
     let streamline = streamline_dir(&here);
     let (mut s, series_s) = settings(o, &menu, streamline.as_deref());
     // FSR 3 made ready: AMD's files, asked for only where they would be used (FSR 3 chosen,
     // or a card without DLSS Frame Generation).
-    if s.contains_key("VICTORY_FSR_FRAMEGEN") {
-        if fidelityfx_dir(&here).is_none() {
-            let chosen = s.get("VICTORY_MENU_FG_TYPE").is_some_and(|t| t == "fsr");
+    if s.contains_key("VICTORY_FSR_FRAMEGEN") || uses_pc_fsr {
+        if !uses_pc_fsr && fidelityfx_dir(&here).is_none() {
+            let chosen = s.get("VICTORY_MENU_FG_TYPE").is_some_and(|t| matches!(t.as_str(), "fsr" | "fsr4"));
             let card = victory_hle::streamline::adapter_name().unwrap_or_default();
             if chosen || !victory_hle::streamline::dlss_framegen_card(&card) {
                 offer_fsr(if chosen { "" } else { &card });
@@ -1084,6 +1094,20 @@ mod tests {
         o.framegen_ready = true;
         let (s, _) = settings(&o, &[], None);
         assert!(!s.contains_key("VICTORY_FSR_FRAMEGEN") && !s.contains_key("VICTORY_FRAMEGEN_X"));
+    }
+
+    #[test]
+    fn experimental_fsr4_uses_pc_upscaling_without_streamline() {
+        let mut options = options();
+        options.fg_type = "fsr4".to_owned();
+        options.framegen = Some(2);
+        let (settings, _) = settings(&options, &[], None);
+        assert_eq!(settings["VICTORY_PC_FSR"], "1");
+        assert_eq!(settings["VICTORY_FSR_FRAMEGEN"], "4");
+        assert_eq!(settings["VICTORY_DLSS_MODE"], "quality");
+        assert_eq!(settings["VICTORY_MENU_FRAMEGEN"], "2");
+        assert!(!settings.contains_key("VICTORY_DLSS"));
+        assert!(!settings.contains_key("VICTORY_FRAMEGEN"));
     }
 
     #[test]

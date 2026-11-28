@@ -4817,6 +4817,24 @@ impl State {
         out
     }
 
+    fn record_framegen_camera(&self, list: &HostList) {
+        if !crate::streamline::fsr::ml_active() {
+            return;
+        }
+        let Some(pipeline) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        // The fullscreen velocity pass verified in Marvisak/VIctory PR #2751.
+        if !pipeline.stages.iter().any(|stage| stage.shader.hash == "4adcfeaa24ae6450")
+            || !pipeline.stages.iter().any(|stage| stage.shader.hash == "9ab96b7a002d6ac8")
+        {
+            return;
+        }
+        let Some(Root::Table(table)) = self.roots_ref(false).get(1) else { return };
+        let Some(handle) = table.checked_add(8 * 4) else { return };
+        let Some(View::Constant(address, size)) = crate::descriptor::view(handle) else { return };
+        let Some(viewport) = self.viewports.first() else { return };
+        crate::streamline::fsr::camera::record(list, address, size, [viewport.Width, viewport.Height]);
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -4856,6 +4874,9 @@ impl State {
             };
             if frontend.is_some() {
                 viewports(list, &self.viewports);
+            }
+            if count == 3 && instances == 1 {
+                self.record_framegen_camera(list);
             }
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);

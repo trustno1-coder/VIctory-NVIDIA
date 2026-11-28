@@ -1705,7 +1705,7 @@ fn workers() -> &'static Workers {
                                 std::hint::spin_loop();
                             }
                             turns = turns.wrapping_add(1);
-                            if turns % 16 == 0 {
+                            if turns.is_multiple_of(16) {
                                 std::thread::yield_now();
                             }
                         }

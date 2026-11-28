@@ -41,6 +41,18 @@ const PARAMETER: u32 = 6;
 const CREATE_UPSCALE: u64 = 0x1_0000;
 const DISPATCH_UPSCALE: u64 = 0x1_0001;
 
+
+/// Preflights the signed PC upscaler on the render device before using its path.
+pub fn init_pc(dir: &std::path::Path) -> bool {
+    match pc::init(dir) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "PC FidelityFX is unavailable; retaining the title renderer");
+            false
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct Header {
@@ -130,6 +142,8 @@ macro_rules! once {
     }};
 }
 
+mod pc;
+
 /// Binds the title's imports of [`LOADER_DLL`] to the functions here when
 /// DLSS or frame generation is on, keeping what `inner` binds them to (the
 /// title's own DLL) for them to call; otherwise binds as `inner` does.
@@ -140,7 +154,7 @@ pub struct Interpose<'a> {
 impl ImportResolver for Interpose<'_> {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         let found = self.inner.resolve(dll, symbol);
-        if !dll.eq_ignore_ascii_case(LOADER_DLL) || !streamline::serving() {
+        if !dll.eq_ignore_ascii_case(LOADER_DLL) || !(streamline::serving() || pc::active()) {
             return found;
         }
         match (&found, symbol) {
@@ -205,6 +219,9 @@ extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, mem
     }
     // SAFETY: an upscaler description, by its type.
     let asked = unsafe { desc.cast::<CreateUpscale>().read() };
+    if pc::active() && !streamline::upscaling() {
+        return pc::create(context, asked, memory);
+    }
     // With DLSS taking the upscalings, the title's own context only has to
     // exist (for its queries and our bookkeeping): it is made at a size its
     // shipping tables accept, and DLSS gets the sizes the title asked for.
@@ -259,6 +276,9 @@ extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, mem
 }
 
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
+    if let Some(code) = pc::destroy(context) {
+        return code;
+    }
     let Some(destroy) = original(1) else { return PARAMETER };
     if !context.is_null() {
         // SAFETY: the title passes its context.
@@ -272,12 +292,18 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
 }
 
 extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if let Some(code) = pc::call(context, desc, false) {
+        return code;
+    }
     let Some(configure) = original(2) else { return PARAMETER };
     // SAFETY: the title's own function, with its arguments.
     unsafe { std::mem::transmute::<*const (), Call>(configure)(context, desc) }
 }
 
 extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if let Some(code) = pc::call(context, desc, true) {
+        return code;
+    }
     let Some(query) = original(3) else { return PARAMETER };
     if !desc.is_null() {
         // SAFETY: the title passes a description.
@@ -294,6 +320,9 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if let Some(code) = pc::dispatch(context, desc) {
+        return code;
+    }
     let Some(dispatch) = original(4) else { return PARAMETER };
     // SAFETY: the title's own function, with its arguments.
     let own = || unsafe { std::mem::transmute::<*const (), Call>(dispatch)(context, desc) };
@@ -387,6 +416,7 @@ fn upscale(d: &DispatchUpscale, created: &Created, context: usize) -> Upscale {
         },
         pre_exposure: d.pre_exposure,
         frame_ms: d.frame_time_delta,
+        view_space_to_meters: d.view_space_to_meters_factor,
     }
 }
 

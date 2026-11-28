@@ -31,6 +31,12 @@ use windows::core::Interface;
 
 use super::{Library, plan};
 
+pub(crate) mod camera;
+
+const GET_VERSIONS: u64 = 4;
+const OVERRIDE_VERSION: u64 = 5;
+const GET_PROVIDER_VERSION: u64 = 6;
+
 const LOADER: &str = "amd_fidelityfx_loader_dx12.dll";
 const FRAMEGEN: &str = "amd_fidelityfx_framegeneration_dx12.dll";
 
@@ -87,6 +93,42 @@ impl Header {
     fn new(kind: u64) -> Self {
         Header { kind, next: std::ptr::null_mut() }
     }
+}
+
+// SDK 2.4 ffx_api.h. Provider IDs are scoped to their effect.
+#[repr(C)]
+struct Versions {
+    header: Header,
+    effect: u64,
+    device: *mut c_void,
+    count: *mut u64,
+    ids: *mut u64,
+    names: *mut *const std::ffi::c_char,
+}
+
+#[repr(C)]
+struct ProviderOverride {
+    header: Header,
+    id: u64,
+}
+
+#[repr(C)]
+struct ProviderVersion {
+    header: Header,
+    id: u64,
+    name: *const std::ffi::c_char,
+}
+
+const _: () = {
+    assert!(size_of::<Versions>() == 56);
+    assert!(size_of::<ProviderOverride>() == 24);
+    assert!(size_of::<ProviderVersion>() == 32);
+};
+
+#[derive(Clone, Copy)]
+struct MlProviders {
+    generator: u64,
+    swap_chain: u64,
 }
 
 #[repr(C)]
@@ -248,6 +290,7 @@ type Create = unsafe extern "C" fn(context: *mut Context, desc: *mut Header, mem
 type Destroy = unsafe extern "C" fn(context: *mut Context, memory: *const c_void) -> u32;
 type Configure = unsafe extern "C" fn(context: *mut Context, desc: *const Header) -> u32;
 type Dispatch = unsafe extern "C" fn(context: *mut Context, desc: *const Header) -> u32;
+type Query = unsafe extern "C" fn(context: *mut Context, desc: *mut Header) -> u32;
 
 /// The loader's exports.
 struct Ffx {
@@ -257,11 +300,14 @@ struct Ffx {
     destroy: Destroy,
     configure: Configure,
     dispatch: Dispatch,
+    query: Option<Query>,
 }
 
 static FFX: OnceLock<Ffx> = OnceLock::new();
 /// Our swap chain is FidelityFX's frame interpolation swap chain.
 static SWAP_CHAIN: AtomicBool = AtomicBool::new(false);
+static ML_ACTIVE: AtomicBool = AtomicBool::new(false);
+static GENERATED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 /// Frame generation ran on the last present.
 static ON: AtomicBool = AtomicBool::new(false);
 // Since the last frame-rate line: presents with frame generation on, off,
@@ -287,6 +333,13 @@ struct Live {
     frame_id: u64,
     /// The frame generation context could not be made for these sizes.
     refused: Option<([u32; 2], [u32; 2])>,
+    ml: Option<MlProviders>,
+    missing_camera: camera::MissingCameraWarning,
+    reset_history: bool,
+    first_present_count: Option<u32>,
+    generated_start: u64,
+    prepare_start: u64,
+    reported_presents: bool,
 }
 
 // SAFETY: FidelityFX contexts, used under the lock by one thread at a time.
@@ -300,7 +353,20 @@ fn live() -> std::sync::MutexGuard<'static, Option<Live>> {
 
 /// `VICTORY_FSR_FRAMEGEN=1`.
 pub(crate) fn asked_from_env() -> bool {
-    std::env::var("VICTORY_FSR_FRAMEGEN").is_ok_and(|v| v.trim() == "1")
+    std::env::var("VICTORY_FSR_FRAMEGEN").is_ok_and(|v| matches!(v.trim(), "1" | "4"))
+}
+
+pub(crate) fn ml_requested() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_FSR_FRAMEGEN").is_ok_and(|v| v.trim() == "4"))
+}
+
+pub(crate) fn loaded() -> bool {
+    FFX.get().is_some()
+}
+
+pub(crate) fn ml_active() -> bool {
+    ML_ACTIVE.load(Acquire)
 }
 
 /// `VICTORY_FIDELITYFX_DIR`, or a `fidelityfx` folder beside our exe.
@@ -319,7 +385,7 @@ pub(crate) fn init(dir: &Path) -> bool {
     match load(dir) {
         Ok(ffx) => {
             let _ = FFX.set(ffx);
-            tracing::info!(folder = %dir.display(), "FSR 3 frame generation: AMD's FidelityFX DLLs loaded (signatures valid)");
+            tracing::info!(folder = %dir.display(), ml = ml_requested(), "FidelityFX frame generation: signed SDK libraries loaded");
             true
         }
         Err(why) => {
@@ -371,9 +437,53 @@ fn load(dir: &Path) -> Result<Ffx, String> {
         destroy: get!(c"ffxDestroyContext", Destroy),
         configure: get!(c"ffxConfigure", Configure),
         dispatch: get!(c"ffxDispatch", Dispatch),
+        // SAFETY: the installed SDK's optional query export uses this ABI.
+        query: find(c"ffxQuery").ok().map(|f| unsafe {
+            std::mem::transmute::<*const c_void, Query>(f)
+        }),
         _loader: loader,
         _framegen: framegen,
     })
+}
+
+fn provider(query: Query, device: &ID3D12Device, effect: u64, wanted: &[u8]) -> Option<u64> {
+    let mut count = 0;
+    let mut versions = Versions {
+        header: Header::new(GET_VERSIONS),
+        effect, device: device.as_raw(), count: &mut count,
+        ids: std::ptr::null_mut(), names: std::ptr::null_mut(),
+    };
+    // SAFETY: a null context enumerates versions for the named device.
+    if unsafe { query(std::ptr::null_mut(), &mut versions.header) } != OK || !(1..=64).contains(&count) {
+        return None;
+    }
+    let mut ids = vec![0; count as usize];
+    let mut names = vec![std::ptr::null(); count as usize];
+    versions.ids = ids.as_mut_ptr();
+    versions.names = names.as_mut_ptr();
+    // SAFETY: both output arrays have the input capacity in 'count'.
+    if unsafe { query(std::ptr::null_mut(), &mut versions.header) } != OK || count as usize > ids.len() {
+        return None;
+    }
+    ids.into_iter().zip(names).take(count as usize).find_map(|(id, name)| {
+        if id == 0 || name.is_null() {
+            return None;
+        }
+        // SAFETY: the SDK returns static, nul-terminated version names.
+        (unsafe { CStr::from_ptr(name) }.to_bytes() == wanted).then_some(id)
+    })
+}
+
+fn active_provider(query: Query, context: &mut Context, id: u64, version: &[u8]) -> bool {
+    let mut asked = ProviderVersion {
+        header: Header::new(GET_PROVIDER_VERSION), id: 0, name: std::ptr::null(),
+    };
+    // SAFETY: a live context slot and a writable version descriptor.
+    if unsafe { query(context, &mut asked.header) } != OK || asked.id != id || asked.name.is_null() {
+        return false;
+    }
+    // SAFETY: the query returned a static, nul-terminated name.
+    unsafe { CStr::from_ptr(asked.name) }.to_bytes() == version
 }
 
 /// Whether the title's upscalings are to be noted for us: the DLLs are in and
@@ -399,6 +509,7 @@ pub(crate) fn shown_per_frame() -> Option<u32> {
 /// failed: then logged).
 pub(crate) fn swap_chain(
     factory: &IDXGIFactory2,
+    device: &ID3D12Device,
     queue: &ID3D12CommandQueue,
     hwnd: HWND,
     desc: &DXGI_SWAP_CHAIN_DESC1,
@@ -408,6 +519,25 @@ pub(crate) fn swap_chain(
         tracing::info!("FSR 3 frame generation stays off: DLSS Frame Generation runs on this card");
         return None;
     }
+    let ml = if ml_requested() {
+        let selected = ffx.query.and_then(|query| {
+            Some(MlProviders {
+                generator: provider(query, device, CREATE_FRAMEGENERATION, b"4.0.2")?,
+                swap_chain: provider(query, device, CREATE_SWAPCHAIN_FOR_HWND_DX12, b"4.0.0")?,
+            })
+        });
+        let Some(selected) = selected else {
+            tracing::warn!("FSR 4 frame generation: the adapter does not expose both the 4.0.2 generator and 4.0.0 swap chain; using ordinary presents");
+            return None;
+        };
+        if desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM {
+            tracing::warn!(format = desc.Format.0, "FSR 4 frame generation: only the donor's SDR swap-chain format is supported; using ordinary presents");
+            return None;
+        }
+        Some(selected)
+    } else {
+        None
+    };
     let mut made: *mut c_void = std::ptr::null_mut();
     let mut version = Version { header: Header::new(CREATE_SWAPCHAIN_VERSION_DX12), version: SWAPCHAIN_VERSION };
     let mut create = CreateSwapChainForHwnd {
@@ -419,7 +549,11 @@ pub(crate) fn swap_chain(
         factory: factory.as_raw(),
         queue: queue.as_raw(),
     };
-    create.header.next = (&raw mut version).cast();
+    let mut selected = ProviderOverride {
+        header: Header { kind: OVERRIDE_VERSION, next: &raw mut version.header },
+        id: ml.map_or(0, |providers| providers.swap_chain),
+    };
+    create.header.next = if ml.is_some() { &raw mut selected.header } else { &raw mut version.header };
     let mut context: Box<Context> = Box::new(std::ptr::null_mut());
     // SAFETY: filled descriptions that live through the call.
     let code = unsafe { (ffx.create)(&mut *context, (&raw mut create).cast(), std::ptr::null()) };
@@ -436,7 +570,23 @@ pub(crate) fn swap_chain(
             return None;
         }
     };
-    *live() = Some(Live { swap_chain_context: context, swap_chain: swap_chain.as_raw(), framegen: None, frame_id: 0, refused: None });
+    if let Some(ml) = ml {
+        let valid = ffx.query.is_some_and(|query| active_provider(query, &mut context, ml.swap_chain, b"4.0.0"));
+        if !valid {
+            tracing::warn!("FSR 4 frame generation: the created proxy did not confirm provider 4.0.0; using ordinary presents");
+            // SAFETY: the just-created proxy has no presents or callbacks queued.
+            unsafe { (ffx.destroy)(&mut *context, std::ptr::null()) };
+            return None;
+        }
+        tracing::info!("FSR 4 frame generation: FidelityFX confirmed swap-chain provider 4.0.0");
+    }
+    camera::clear();
+    *live() = Some(Live {
+        swap_chain_context: context, swap_chain: swap_chain.as_raw(), framegen: None,
+        frame_id: 0, refused: None, ml, missing_camera: Default::default(), reset_history: true,
+        first_present_count: None, generated_start: 0, prepare_start: 0, reported_presents: false,
+    });
+    ML_ACTIVE.store(ml.is_some(), Release);
     SWAP_CHAIN.store(true, Release);
     // The colour without the interface is copied in front of the title's interface composite, as for DLSS
     // Frame Generation (`VICTORY_FRAMEGEN_HUDLESS=0`: not).
@@ -455,6 +605,7 @@ pub(crate) fn swap_chain(
 /// run): the frame generation context goes, and is made again for the new
 /// size at the next present with an upscaling.
 pub(crate) fn resizing() {
+    camera::clear();
     let Some(ffx) = FFX.get() else { return };
     let mut live = live();
     if let Some(live) = live.as_mut()
@@ -467,9 +618,11 @@ pub(crate) fn resizing() {
 /// The frame generation context goes: the swap chain is told to stop calling
 /// it and its presents in flight are waited for first. Whether there was one.
 fn retire(ffx: &Ffx, live: &mut Live) -> bool {
-    let Some((mut context, ..)) = live.framegen.take() else { return false };
+    live.reset_history = true;
+    live.first_present_count = None;
+    let Some((context, ..)) = live.framegen.as_mut() else { return false };
     live.frame_id += 1;
-    let mut off = ConfigureFrameGeneration {
+    let off = ConfigureFrameGeneration {
         header: Header::new(CONFIGURE_FRAMEGENERATION),
         swap_chain: live.swap_chain,
         present_callback: std::ptr::null(),
@@ -487,11 +640,17 @@ fn retire(ffx: &Ffx, live: &mut Live) -> bool {
     let mut wait = Header::new(DISPATCH_WAIT_FOR_PRESENTS_DX12);
     // SAFETY: our contexts and filled descriptions; nothing of ours uses the
     // frame generation context after this.
-    unsafe {
-        (ffx.configure)(&mut *context, (&raw mut off).cast());
-        (ffx.dispatch)(&mut *live.swap_chain_context, &raw mut wait);
-        (ffx.destroy)(&mut *context, std::ptr::null());
+    let (disabled, drained) = unsafe {
+        ((ffx.configure)(&mut **context, &off.header),
+         (ffx.dispatch)(&mut *live.swap_chain_context, &raw mut wait))
+    };
+    if disabled != OK || drained != OK {
+        tracing::warn!(disabled, drained, "FidelityFX could not drain generation; keeping its context alive");
+        return false;
     }
+    // SAFETY: the proxy has disabled generation and drained every queued present.
+    unsafe { (ffx.destroy)(&mut **context, std::ptr::null()) };
+    live.framegen = None;
     live.refused = None;
     ON.store(false, Relaxed);
     true
@@ -501,7 +660,11 @@ unsafe extern "C" fn generate(params: *mut Header, user: *mut c_void) -> u32 {
     let Some(ffx) = FFX.get() else { return 1 };
     // SAFETY: `user` is the boxed frame generation context the configuration
     // named; `params` the swap chain's dispatch description.
-    unsafe { (ffx.dispatch)(user.cast(), params) }
+    let code = unsafe { (ffx.dispatch)(user.cast(), params) };
+    if code == OK && ml_active() {
+        GENERATED_DISPATCHES.fetch_add(1, Relaxed);
+    }
+    code
 }
 
 /// Into `list` (the last list before our Present, on the same queue): with a
@@ -559,7 +722,25 @@ pub(crate) fn before_present(
         once!(warn, "FSR 3 frame generation: the line of submissions did not start; frame generation stays off");
     }
     let wanted = super::framegen_wanted() != 0 && line;
-    let fresh = if wanted { super::fresh_inputs() } else { None };
+    // Consume inputs even when toggled off so enabling cannot use an old frame.
+    let mut fresh = super::fresh_inputs().filter(|_| wanted);
+    if live.ml.is_some() {
+        if let Some(inputs) = &fresh {
+            once!(info, pose = inputs.pose.is_some(), view_space_to_meters = inputs.view_space_to_meters,
+                "FSR 4: first submitted upscale reached the presenter");
+        }
+        if let Some(inputs) = &fresh
+            && live.missing_camera.observe(inputs.pose.is_some())
+        {
+            tracing::warn!("FSR 4 frame generation: no matching velocity-pass camera; using ordinary presents");
+        }
+        fresh = fresh.filter(|inputs| inputs.pose.is_some());
+        if fresh.is_none() {
+            camera::clear();
+            live.reset_history = true;
+            live.first_present_count = None;
+        }
+    }
     // The context, made at the first upscaling (its sizes are the title's)
     // and again when they change.
     if let Some(inputs) = &fresh {
@@ -574,11 +755,13 @@ pub(crate) fn before_present(
             // (Everything sent so far is waited for: what was recorded with
             // the old context has run.)
             crate::host::settle_now(crate::host::WHY_SYNC);
-            retire(ffx, live);
+            if !retire(ffx, live) {
+                return;
+            }
             tracing::info!(display = ?size, max_render = ?render, "FSR 3 frame generation: its context is made again for other sizes");
         }
         if live.framegen.is_none() && live.refused != Some((size, render)) {
-            match create_context(ffx, device, size, render, format, flags, hudless_format) {
+            match create_context(ffx, device, size, render, (format, hudless_format), flags, live.ml) {
                 Some(context) => {
                     tracing::info!(
                         display = ?size,
@@ -605,6 +788,11 @@ pub(crate) fn before_present(
     let mut prepared = false;
     if let Some(inputs) = &fresh {
         let camera = inputs.camera;
+        let pose = if live.ml.is_some() {
+            inputs.pose.expect("ML inputs were filtered for a matched pose")
+        } else {
+            camera::Pose::LEGACY
+        };
         let depth = Resource::texture(&inputs.depth.0, inputs.depth.1);
         let motion = Resource::texture(&inputs.motion.0, inputs.motion.1);
         let mut prepare = PrepareV2 {
@@ -616,18 +804,18 @@ pub(crate) fn before_present(
             jitter_offset: Floats { x: camera.jitter[0], y: camera.jitter[1] },
             motion_vector_scale: Floats { x: camera.motion_scale[0], y: camera.motion_scale[1] },
             frame_time_delta: inputs.frame_ms,
-            reset: camera.reset,
+            reset: camera.reset || (live.ml.is_some() && live.reset_history),
             // As the title gives them to its upscaler (FidelityFX's terms).
             camera_near: camera.near,
             camera_far: camera.far,
             camera_fov_angle_vertical: camera.fov_y,
-            view_space_to_meters_factor: 1.0,
+            view_space_to_meters_factor: if live.ml.is_some() { view_scale(inputs.view_space_to_meters) } else { 1.0 },
             depth,
             motion_vectors: motion,
-            camera_position: [0.0; 3],
-            camera_up: [0.0, 1.0, 0.0],
-            camera_right: [1.0, 0.0, 0.0],
-            camera_forward: [0.0, 0.0, 1.0],
+            camera_position: pose.position,
+            camera_up: pose.up,
+            camera_right: pose.right,
+            camera_forward: pose.forward,
         };
         // SAFETY: our context and a filled description of live textures in
         // the states they are in when `list` runs.
@@ -679,6 +867,15 @@ pub(crate) fn before_present(
         once!(warn, code, "FSR 3 frame generation: the configuration failed");
     }
     let on = on && code == OK;
+    if live.ml.is_some() {
+        live.reset_history = !on;
+        if on && live.first_present_count.is_none() && !live.reported_presents {
+            // SAFETY: this is the live swap chain and presents are serialized.
+            live.first_present_count = unsafe { swap_chain.GetLastPresentCount() }.ok();
+            live.generated_start = GENERATED_DISPATCHES.load(Relaxed);
+            live.prepare_start = frame_id;
+        }
+    }
     if ON.swap(on, Relaxed) != on {
         tracing::info!(on, frame_id, "FSR 3 frame generation switched");
     }
@@ -693,15 +890,42 @@ pub(crate) fn before_present(
     }
 }
 
+/// Once the ML generation callback has run, log the proxy's completed present count too.
+pub(crate) fn presented(swap_chain: &IDXGISwapChain3, frame: u64) {
+    if !ml_active() { return; }
+    let Some(ffx) = FFX.get() else { return };
+    let mut guard = live();
+    let Some(live) = guard.as_mut() else { return };
+    let Some(baseline) = live.first_present_count else { return };
+    let generated = GENERATED_DISPATCHES.load(Relaxed).saturating_sub(live.generated_start);
+    if live.reported_presents || generated < 3 {
+        return;
+    }
+    let wait = Header::new(DISPATCH_WAIT_FOR_PRESENTS_DX12);
+    // SAFETY: this proxy belongs to the current presenter and the context is live.
+    let code = unsafe { (ffx.dispatch)(&mut *live.swap_chain_context, &wait) };
+    if code == OK {
+        // SAFETY: this is the live proxy after waiting for its queued presents.
+        if let Ok(presents) = unsafe { swap_chain.GetLastPresentCount() } {
+            let generated_dispatches = GENERATED_DISPATCHES.load(Relaxed).saturating_sub(live.generated_start);
+            let rendered = live.frame_id.saturating_sub(live.prepare_start) + 1;
+            tracing::info!(frame, rendered, generated_dispatches, proxy_presents = presents.saturating_sub(baseline),
+                "FSR 4 frame generation: proxy presentation counters");
+            live.reported_presents = true;
+        }
+    }
+}
+
 fn create_context(
     ffx: &Ffx,
     device: &ID3D12Device,
     size: [u32; 2],
     render: [u32; 2],
-    format: DXGI_FORMAT,
+    formats: (DXGI_FORMAT, DXGI_FORMAT),
     flags: u32,
-    hudless_format: DXGI_FORMAT,
+    ml: Option<MlProviders>,
 ) -> Option<Box<Context>> {
+    let (format, hudless_format) = formats;
     let mut backend = CreateBackend { header: Header::new(CREATE_BACKEND_DX12), device: device.as_raw() };
     // The colour without the interface in a format of its own (else the back buffer's is assumed).
     let mut hudless = Version { header: Header::new(CREATE_FRAMEGENERATION_HUDLESS), version: surface_format(hudless_format) };
@@ -719,7 +943,11 @@ fn create_context(
         back_buffer_format: surface_format(format),
     };
     version.header.next = first_after_version;
-    create.header.next = (&raw mut version).cast();
+    let mut selected = ProviderOverride {
+        header: Header { kind: OVERRIDE_VERSION, next: &raw mut version.header },
+        id: ml.map_or(0, |providers| providers.generator),
+    };
+    create.header.next = if ml.is_some() { &raw mut selected.header } else { &raw mut version.header };
     let mut context: Box<Context> = Box::new(std::ptr::null_mut());
     // SAFETY: filled descriptions that live through the call.
     let code = unsafe { (ffx.create)(&mut *context, (&raw mut create).cast(), std::ptr::null()) };
@@ -727,7 +955,22 @@ fn create_context(
         tracing::warn!(code, display = ?size, max_render = ?render, format = format.0, "FSR 3 frame generation: its context was not made; presents stay plain");
         return None;
     }
+    if let Some(ml) = ml {
+        let valid = ffx.query.is_some_and(|query| active_provider(query, &mut context, ml.generator, b"4.0.2"));
+        if !valid {
+            tracing::warn!("FSR 4 frame generation: the created generator did not confirm provider 4.0.2; using ordinary presents");
+            // SAFETY: no callback has been registered for this new context.
+            unsafe { (ffx.destroy)(&mut *context, std::ptr::null()) };
+            return None;
+        }
+        tracing::info!("FSR 4 frame generation: FidelityFX confirmed generator provider 4.0.2");
+    }
     Some(context)
+}
+
+fn view_scale(scale: f32) -> f32 {
+    // The title leaves this unset. Use FidelityFX's unit-scale default.
+    if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }
 }
 
 /// The frame generation context's flags from the title's upscaler's (the
@@ -855,6 +1098,12 @@ pub(crate) fn line_counts() -> Option<(u64, u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unset_view_scale_uses_the_fidelityfx_default() {
+        assert_eq!(view_scale(0.0), 1.0);
+        assert_eq!(view_scale(0.01), 0.01);
+    }
 
     #[test]
     fn layouts_match_the_headers() {
