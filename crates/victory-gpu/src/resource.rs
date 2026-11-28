@@ -4816,7 +4816,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
-        use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
         use windows::Win32::Graphics::Direct3D12::*;
@@ -4969,11 +4968,10 @@ mod tests {
                 },
             }
         };
-        let (written, source, dest, tested, drawn) = (
+        let (written, source, dest, drawn) = (
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
             D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_DEPTH_WRITE,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
         );
         let moved = crate::host::transition;
@@ -4990,13 +4988,10 @@ mod tests {
         fill.close();
         host.execute(&[&fill]);
 
-        // A list in which a shader writes the twins: closing it draws the
-        // depth plane's twin into the plane.
-        let list = host.new_list().unwrap();
-        assert!(list.twin_use(depth, true, true));
-        list.twins_written();
-        list.close();
-        host.execute(&[&list]);
+        // The lighting draw must see the depth classes before this list closes.
+        let back = host.new_list().unwrap();
+        assert!(back.twin_use(depth, true, true));
+        back.twins_written();
 
         // The draws: a triangle over the target at the depth of a class,
         // as the title's lighting places its rectangles.
@@ -5057,8 +5052,6 @@ float4 lit() : SV_Target { return 1.0; }
                 host.device.CreateGraphicsPipelineState(&desc).unwrap();
             (signature, pipeline)
         };
-        let state = host_copy(depth).unwrap().state.load(Relaxed);
-        let state = D3D12_RESOURCE_STATES(state as i32);
         let colour = host.rtv(Some(&target), None);
         let depth_view = host.dsv(
             host_depth,
@@ -5068,13 +5061,10 @@ float4 lit() : SV_Target { return 1.0; }
                 ..Default::default()
             }),
         );
-        let back = host.new_list().unwrap();
+        crate::list::ensure_state(&back, depth, DEPTH_WRITE);
         // SAFETY: an open list and live resources and views.
         unsafe {
             let l = &back.list;
-            if state != tested {
-                l.ResourceBarrier(&[moved(host_depth, state, tested)]);
-            }
             l.ClearRenderTargetView(colour, &[0.0; 4], None);
             l.SetGraphicsRootSignature(&signature);
             l.SetPipelineState(&pipeline);

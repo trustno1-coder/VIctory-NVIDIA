@@ -1750,12 +1750,8 @@ impl PlanePass {
     }
 }
 
-/// Records into `list` the pass that draws `plane`, the twin of the depth
-/// plane of `depth`, into that plane: `depth` in the depth-write state,
-/// `plane` readable by pixel shaders. The pass sets the list's descriptor
-/// heap, graphics root signature, pipeline, depth target, viewport,
-/// scissor and topology and puts none of them back: it is for a list that
-/// records nothing of the title's after it.
+/// Draws a readable twin into a writable depth plane.
+/// A caller that continues recording must restore the guest's bindings.
 fn record_plane_pass(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
@@ -6833,7 +6829,7 @@ impl HostList {
         let _closing = crate::timeline::span("closing a host list");
         self.left_open[0].store(0, Ordering::Release);
         self.flush_indirect();
-        self.twins_to_depth();
+        self.twins_to_depth(false);
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
@@ -7217,11 +7213,7 @@ impl HostList {
         true
     }
 
-    /// Records the pass that draws the twin of the depth plane of `depth`
-    /// into the plane, if `twin` has one, with the moves to the states the
-    /// pass needs; the twin is left in the unordered access state. Only
-    /// for a list that records nothing of the title's afterwards
-    /// (`record_plane_pass`).
+    /// Updates the depth plane and returns its twin to unordered access.
     fn pass_plane(
         &self,
         depth: &std::sync::Arc<crate::resource::HostTexture>,
@@ -7260,18 +7252,14 @@ impl HostList {
         self.settle(&twin.colour, UNORDERED_ACCESS);
     }
 
-    /// Before the list closes: the depth textures whose twins it wrote last
-    /// are given what was written, and left readable by shaders. Shaders
-    /// that pick a view from the heap by a computed index are not seen by
-    /// `twin_use` and read the depth texture in lists that never name it
-    /// (in a captured frame of the title no table names a shadow
-    /// map for reading but the pass that fills the next one).
-    fn twins_to_depth(&self) {
+    /// Publishes dirty twins to their depth textures for same-list or later reads.
+    /// Closing a list also covers readers that index descriptors dynamically.
+    fn twins_to_depth(&self, depth_planes_only: bool) {
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let written: Vec<_> = twins
             .values_mut()
-            .filter(|u| u.behind[0] == Some(true) || u.late)
+            .filter(|u| (!depth_planes_only || u.twin.plane.is_some()) && (u.behind[0] == Some(true) || u.late))
             .map(|u| {
                 // Not copied again if the list copied since the last write
                 // and only the depth plane's pass is left.
@@ -7286,8 +7274,6 @@ impl HostList {
             if *copy {
                 self.twin_copy(depth, twin, false);
             }
-            // Nothing of the title's is recorded after this: the pass may
-            // leave its own pipeline and target set.
             self.pass_plane(depth, twin);
             self.settle(depth, SHADER_RESOURCE);
         }
@@ -7321,15 +7307,27 @@ impl HostList {
         }
     }
 
-    /// The draw or dispatch just prepared is recorded: the twins it writes
-    /// now hold what their depth textures lack.
-    pub(crate) fn twins_written(&self) {
-        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-        for u in twins.values_mut().filter(|u| u.writing) {
-            u.writing = false;
-            u.behind[0] = Some(true);
-            self.changed_something();
+    /// Publish depth-plane changes before a later command in this list reads them.
+    /// Returns true when the depth pass changed the list's bindings.
+    pub(crate) fn twins_written(&self) -> bool {
+        let mut depth_planes = false;
+        {
+            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            for u in twins.values_mut().filter(|u| u.writing) {
+                u.writing = false;
+                u.behind[0] = Some(true);
+                depth_planes |= u.twin.plane.is_some();
+                self.changed_something();
+            }
         }
+        if depth_planes {
+            self.flush_indirect();
+            if let Some((run, _)) = self.indirect_run().as_mut() {
+                run.settled = false;
+            }
+            self.twins_to_depth(true);
+        }
+        depth_planes
     }
 
     /// At submission: the list that moves each texture this list uses from
