@@ -9,8 +9,7 @@
 //! CPU to a buffer the card writes, words the card has written since the
 //! start of the frame (which are not what was last put there) stay.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::core::s;
 
 use super::*;
 
@@ -55,6 +54,20 @@ pub(super) struct Merger {
 }
 
 const CALLS: u64 = 1 << 16;
+
+fn merge_pipeline(device: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+    let code = crate::host::compile(SOURCE, s!("main"), s!("cs_5_1")).context("compiling the replay merge shader")?;
+    // SAFETY: the code and root live through pipeline creation.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
+        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            ..Default::default()
+        })?;
+        Ok((root, pso))
+    }
+}
 
 impl Player {
     /// The copy of a piece of a card buffer's CPU side to it: its source's
@@ -152,41 +165,7 @@ impl Player {
         if !on || self.merger.is_some() {
             return Ok(());
         }
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the blob's own
-        // bytes.
-        let (root, pso) = unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                None,
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.context("no merge shader")?;
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-            let pso =
-                self.device
-                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                        pRootSignature: std::mem::transmute_copy(&root),
-                        CS: D3D12_SHADER_BYTECODE {
-                            pShaderBytecode: bytes.as_ptr().cast(),
-                            BytecodeLength: bytes.len(),
-                        },
-                        ..Default::default()
-                    })?;
-            (root, pso)
-        };
+        let (root, pso) = merge_pipeline(&self.device)?;
         let mut ids: HashSet<u32> = HashSet::new();
         for c in self.commands.iter().flatten() {
             if let Cmd::CopyBuffer { dst, src, .. } = c
@@ -287,5 +266,47 @@ impl Player {
             ));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a hardware D3D12 adapter"]
+    fn merge_preserves_gpu_writes_and_counts_cpu_changes() -> Result<()> {
+        let host = crate::host::host().context("a hardware D3D12 adapter")?;
+        let (root, pso) = merge_pipeline(&host.device)?;
+        let buffer = |words: [u32; 4]| -> Result<_> {
+            let (resource, data) = host.shared_buffer(16).context("a mapped test buffer")?;
+            // SAFETY: four aligned words, before submission.
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), data.cast(), 4) };
+            Ok((resource, data.cast::<u32>()))
+        };
+        let (from, _) = buffer([2, 5, 8, 9])?;
+        let (to, to_words) = buffer([1, 6, 7, 9])?;
+        let (base, base_words) = buffer([1, 5, 6, 9])?;
+        let (counts, count_words) = buffer([0; 4])?;
+        // SAFETY: the queue and all root views live until the worker's fence completes.
+        let queue = unsafe { host.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())? };
+        let mut worker = Worker::new(&host.device, &queue)?;
+        worker.run(|list| unsafe {
+            list.SetComputeRootSignature(&root);
+            list.SetPipelineState(&pso);
+            list.SetComputeRoot32BitConstants(0, 2, [4u32, 0].as_ptr().cast(), 0);
+            list.SetComputeRootShaderResourceView(1, from.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, to.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(3, base.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(4, counts.GetGPUVirtualAddress());
+            list.Dispatch(1, 1, 1);
+        })?;
+        // SAFETY: Worker::run waited for completion and the buffers remain mapped.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(to_words, 4), &[2, 6, 7, 9]);
+            assert_eq!(std::slice::from_raw_parts(base_words, 4), &[2, 5, 6, 9]);
+            assert_eq!(std::slice::from_raw_parts(count_words, 4), &[1, 2, 1, 0]);
+        }
+        Ok(())
     }
 }
