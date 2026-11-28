@@ -44,12 +44,13 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
-    SPARES.store(limit, Ordering::Relaxed);
+    let texture_limit = texture_spares(memory, limit, spare_scale());
+    SPARES.store(texture_limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
     if let Ok(mut pool) = TEXTURES.try_lock() {
-        pool.reclaim(tick, limit, true);
+        pool.reclaim(tick, texture_limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
@@ -66,6 +67,21 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         if ASKED.fetch_add(1, Ordering::Relaxed).is_multiple_of(5) {
             stats();
         }
+    }
+}
+
+/// `VICTORY_SPARE_SCALE=1` caps empty texture blocks by the DXGI budget.
+fn spare_scale() -> bool {
+    static SCALE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| std::env::var_os("VICTORY_SPARE_SCALE").is_some_and(|v| v == "1"))
+}
+
+fn texture_spares(memory: Option<[u64; 4]>, limit: usize, scale: bool) -> usize {
+    match memory {
+        Some([budget, ..]) if scale => {
+            limit.min((budget / 32 / BLOCK).clamp(SPARE as u64, SPARE_KEPT as u64) as usize)
+        }
+        _ => limit,
     }
 }
 
@@ -931,6 +947,30 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+
+        let budgets = [(1u64, SPARE), (8, 4), (12, 6), (16, 8), (24, 12), (256, SPARE_KEPT)];
+        for (gib, scaled) in budgets {
+            let budget = gib << 30;
+            for (percent, legacy, expected) in [
+                (84, SPARE_KEPT, scaled),
+                (85, SPARE, SPARE),
+                (86, SPARE, SPARE),
+            ] {
+                let memory = Some([budget, (budget * percent).div_ceil(100), 0, 0]);
+                let limit = spares(memory, true);
+                for (scale, expected) in [(false, legacy), (true, expected)] {
+                    assert_eq!(
+                        texture_spares(memory, limit, scale),
+                        expected,
+                        "{gib} GiB at {percent}%, scale={scale}"
+                    );
+                }
+            }
+        }
+
+        let memory = Some([8 << 30, 1 << 30, 0, 0]);
+        assert_eq!(texture_spares(memory, spares(memory, false), true), SPARE);
+        assert_eq!(texture_spares(None, spares(None, true), true), SPARE);
     }
 
     #[test]
