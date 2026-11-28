@@ -360,7 +360,11 @@ fn unzip(bytes: &[u8], to: &Path) -> io::Result<()> {
     let mut placed = Vec::new();
     for (name, data) in zip::read(bytes)? {
         if let Some(at) = place(&name)? {
-            placed.push((name.ends_with('/'), at, data));
+            let folder = name.ends_with('/');
+            if !folder && at.components().count() == 1 {
+                return Err(bad(format!("{name}: expected a save directory")));
+            }
+            placed.push((folder, at, data));
         }
     }
     if !placed.iter().any(|(_, at, _)| at.starts_with(NEEDED)) {
@@ -384,21 +388,47 @@ fn unzip(bytes: &[u8], to: &Path) -> io::Result<()> {
 /// place at the next start ([`start`]).
 pub fn stage(data: &Path, share: &Path, name: &str) -> io::Result<()> {
     let from = share.join(name);
-    let pending = data.join(PENDING);
-    if pending.exists() {
-        std::fs::remove_dir_all(&pending)?;
+    let is_zip = from.is_file();
+    if !is_zip && !from.join(NEEDED).is_dir() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("{} has no save", from.display())));
     }
-    let done = if from.is_file() {
-        std::fs::read(&from).and_then(|bytes| unzip(&bytes, &pending))
-    } else if from.join(NEEDED).is_dir() {
-        PARTS.iter().filter(|p| from.join(p).is_dir()).try_for_each(|p| copy_dir(&from.join(p), &pending.join(p), false))
+
+    // Prepare the replacement alongside the pending import so promotion can use a rename.
+    std::fs::create_dir_all(data)?;
+    let scratch = tempfile::Builder::new().prefix("import-staging-").tempdir_in(data)?;
+    let replacement = scratch.path().join("replacement");
+    if is_zip {
+        unzip(&std::fs::read(&from)?, &replacement)?;
     } else {
-        Err(io::Error::new(io::ErrorKind::NotFound, format!("{} has no save", from.display())))
-    };
-    if done.is_err() {
-        let _ = std::fs::remove_dir_all(&pending);
+        for part in PARTS {
+            let source = from.join(part);
+            if part == NEEDED || source.is_dir() {
+                copy_dir(&source, &replacement.join(part), false)?;
+            }
+        }
     }
-    done
+
+    let pending = data.join(PENDING);
+    let previous = scratch.path().join("previous");
+    let had_previous = match std::fs::rename(&pending, &previous) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = std::fs::rename(&replacement, &pending) {
+        if had_previous && let Err(restore_error) = std::fs::rename(&previous, &pending) {
+            let preserved = scratch.keep().join("previous");
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "could not stage replacement ({error}). Could not restore the previous import ({restore_error}). It is kept at {}",
+                    preserved.display(),
+                ),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Moves the game's settings containers in `old` (the save being replaced) to the same places
@@ -512,6 +542,46 @@ mod tests {
     }
 
     const SLOT: &str = "saves/0009000000000001/00000000-0000-0000-0000-00007952987a/Player~333dc56ddffd8ea0/v34/0";
+
+    #[test]
+    fn a_failed_import_keeps_the_pending_save() {
+        let data = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        put(&share.path().join("first").join(SLOT), "first progress");
+        put(&share.path().join("first/storage/cache"), "first storage");
+        put(&share.path().join("second").join(SLOT), "second progress");
+        let entries = [
+            (SLOT.to_owned(), b"partial progress".to_vec()),
+            (format!("{SLOT}/child"), b"cannot be extracted".to_vec()),
+        ];
+        let bytes = zip::write(&entries, (0, 0)).unwrap();
+        std::fs::write(share.path().join("damaged.zip"), bytes).unwrap();
+
+        stage(data.path(), share.path(), "first").unwrap();
+        assert!(stage(data.path(), share.path(), "damaged.zip").is_err());
+        assert!(staged(data.path()));
+        let pending = data.path().join(PENDING);
+        assert_eq!(read(&pending.join(SLOT)), "first progress");
+        assert_eq!(read(&pending.join("storage/cache")), "first storage");
+
+        stage(data.path(), share.path(), "second").unwrap();
+        apply(data.path(), share.path(), "retry").unwrap().unwrap();
+        assert_eq!(read(&data.path().join(SLOT)), "second progress");
+        assert!(!data.path().join("storage/cache").exists());
+    }
+
+    #[test]
+    fn a_file_named_saves_is_not_a_save_folder() {
+        let data = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let entries = [("saves".to_owned(), b"not a folder".to_vec())];
+        let bytes = zip::write(&entries, (0, 0)).unwrap();
+        std::fs::write(share.path().join("invalid.zip"), bytes).unwrap();
+
+        let error = stage(data.path(), share.path(), "invalid.zip").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!data.path().join(PENDING).exists());
+    }
 
     #[test]
     fn an_exported_zip_imports_on_another_pc_and_the_old_save_is_kept() {

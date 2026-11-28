@@ -12,15 +12,13 @@ blake3.workspace = true
 zlib-rs.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+tempfile.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 
 [build-dependencies]
 blake3.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
