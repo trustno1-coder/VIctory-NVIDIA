@@ -461,6 +461,114 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    say_card_buffers();
+}
+
+/// Card buffers of ours from [`Host::uav_buffer`] alive now, by the size
+/// asked for (up to 4 KiB, up to 64 KiB, larger): each a count and the bytes
+/// asked for rounded up to 64 KiB. What a small one really costs the card is
+/// the driver's: on an RTX 3070 Ti, 2,000 committed buffers of 256 bytes
+/// raised DXGI's CurrentUsage by 73 MB, about 36 KiB each
+/// (`small_buffer_cost` below). No other line counts these buffers alive:
+/// "made so far" counts them made. In a 5-minute run about 4,200 asked for
+/// 4 KiB or less (256-byte budgets per host list, 48-byte hashes per card
+/// copy of a title buffer).
+static UAV_ALIVE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// A COM object of ours, kept as a buffer's private data: its last release
+/// (the buffer's end) takes the buffer out of [`UAV_ALIVE`].
+#[repr(C)]
+struct UavGone {
+    methods: &'static [*const (); 3],
+    references: AtomicU32,
+    class: usize,
+    bytes: u64,
+}
+
+struct UavMethods([*const (); 3]);
+// SAFETY: function addresses only.
+unsafe impl Sync for UavMethods {}
+
+static UAV_GONE: UavMethods = UavMethods([uav_query as *const (), uav_add_ref as *const (), uav_release as *const ()]);
+
+unsafe extern "system" fn uav_query(
+    this: *mut std::ffi::c_void,
+    iid: *const windows::core::GUID,
+    out: *mut *mut std::ffi::c_void,
+) -> windows::core::HRESULT {
+    // SAFETY: COM's arguments.
+    unsafe {
+        if out.is_null() {
+            return windows::core::HRESULT(0x8000_4003_u32 as i32);
+        }
+        if iid.as_ref().is_some_and(|iid| *iid == windows::core::IUnknown::IID) {
+            uav_add_ref(this);
+            *out = this;
+            return windows::core::HRESULT(0);
+        }
+        *out = std::ptr::null_mut();
+    }
+    windows::core::HRESULT(0x8000_4002_u32 as i32)
+}
+
+unsafe extern "system" fn uav_add_ref(this: *mut std::ffi::c_void) -> u32 {
+    // SAFETY: one of ours, alive while a reference to it is.
+    unsafe { (*this.cast::<UavGone>()).references.fetch_add(1, Ordering::Relaxed) + 1 }
+}
+
+unsafe extern "system" fn uav_release(this: *mut std::ffi::c_void) -> u32 {
+    // SAFETY: as above; the last reference frees the box it was made as.
+    unsafe {
+        let left = (*this.cast::<UavGone>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
+        if left == 0 {
+            let gone = Box::from_raw(this.cast::<UavGone>());
+            UAV_ALIVE[gone.class * 2].fetch_sub(1, Ordering::Relaxed);
+            UAV_ALIVE[gone.class * 2 + 1].fetch_sub(gone.bytes, Ordering::Relaxed);
+        }
+        left
+    }
+}
+
+/// Counts `buffer` (asked for `size` bytes) in [`UAV_ALIVE`] until it goes.
+fn count_uav(buffer: &ID3D12Resource, size: u64) {
+    const KEY: windows::core::GUID = windows::core::GUID::from_u128(0x2b7c_51d4_0e6a_4f39_9c1e_83a5_d27f_6b10);
+    let class = match size {
+        0..=4096 => 0,
+        4097..=65536 => 1,
+        _ => 2,
+    };
+    let bytes = size.max(1).next_multiple_of(64 << 10);
+    UAV_ALIVE[class * 2].fetch_add(1, Ordering::Relaxed);
+    UAV_ALIVE[class * 2 + 1].fetch_add(bytes, Ordering::Relaxed);
+    let made = Box::into_raw(Box::new(UavGone { methods: &UAV_GONE.0, references: AtomicU32::new(1), class, bytes }));
+    // SAFETY: a COM object of ours with one reference, which `object` takes
+    // and drops at the end; the buffer takes its own. If the buffer refuses
+    // it, that drop is its last release, which takes the count back.
+    unsafe {
+        let object = windows::core::IUnknown::from_raw(made.cast());
+        let _ = buffer.SetPrivateDataInterface(&KEY, &object);
+    }
+}
+
+/// Every 30 s, the line of [`UAV_ALIVE`].
+fn say_card_buffers() {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 30_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let v = UAV_ALIVE.each_ref().map(|c| c.load(Ordering::Relaxed));
+    tracing::info!(
+        "card buffers of ours alive (made by uav_buffer), by the size asked for, with the bytes asked for rounded \
+         up to 64 KiB: 4 KiB or less {} ({} MB), over 4 KiB up to 64 KiB {} ({} MB), larger {} ({} MB)",
+        v[0],
+        v[1] >> 20,
+        v[2],
+        v[3] >> 20,
+        v[4],
+        v[5] >> 20
+    );
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -4804,8 +4912,8 @@ impl Host {
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
-            if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+            if shadow.card_make_before(|bytes| {
+                let before = self.uav_buffer(bytes)?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
                 Some(before)
             }) {
@@ -4888,7 +4996,7 @@ impl Host {
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(2, before);
                         let joins = rehash_runs() || own.is_some();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
@@ -5012,7 +5120,7 @@ impl Host {
                             continue;
                         };
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(2, before);
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
@@ -11030,6 +11138,11 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            count_uav(b, size);
+        }
         let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
         match made {
             Ok(()) => buffer,
@@ -12152,3 +12265,35 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+#[cfg(test)]
+mod small_buffer_cost {
+    /// By hand only (`cargo test -p victory-gpu small_buffers -- --ignored
+    /// --nocapture`): what card buffers of 256 bytes cost the card as the
+    /// system counts it, against buffers of 1 MiB (2026-11-28: whether the
+    /// driver gives each committed buffer 64 KiB).
+    #[test]
+    #[ignore]
+    fn small_buffers_cost_the_card() {
+        let Some(host) = super::host() else {
+            eprintln!("no device");
+            return;
+        };
+        let used = || host.video_memory().map_or(0, |[_, used, ..]| used);
+        let before = used();
+        let small: Vec<_> = (0..2000).filter_map(|_| host.uav_buffer(256)).collect();
+        let after_small = used();
+        let big: Vec<_> = (0..20).filter_map(|_| host.uav_buffer(1 << 20)).collect();
+        let after_big = used();
+        eprintln!(
+            "{} buffers of 256 B: card in use {} -> {} KiB, {} KiB each; {} of 1 MiB: -> {} KiB, {} KiB each",
+            small.len(),
+            before >> 10,
+            after_small >> 10,
+            ((after_small - before) / small.len().max(1) as u64) >> 10,
+            big.len(),
+            after_big >> 10,
+            ((after_big - after_small) / big.len().max(1) as u64) >> 10
+        );
+    }
+}

@@ -107,6 +107,104 @@ pub(crate) struct Shadow {
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
 }
 
+/// Where a copy's hashes lie in the card's memory
+/// ([`Shadow::card_make_before`]): a buffer of their own, or a slot of a
+/// shared one ([`pack_hashes`]).
+struct HashSlot {
+    buffer: ID3D12Resource,
+    offset: u64,
+    /// Of a shared buffer: its class and slot, given back when the copy goes.
+    shared: Option<(usize, u32)>,
+}
+
+impl HashSlot {
+    fn make(bytes: u64, make: impl FnOnce(u64) -> Option<ID3D12Resource>) -> Option<HashSlot> {
+        match hash_class(bytes) {
+            Some(class) if pack_hashes() => take_hash_slot(class, make),
+            _ => Some(HashSlot { buffer: make(bytes)?, offset: 0, shared: None }),
+        }
+    }
+
+    fn address(&self) -> u64 {
+        // SAFETY: a live buffer.
+        let base = unsafe { self.buffer.GetGPUVirtualAddress() };
+        base + self.offset
+    }
+}
+
+impl Drop for HashSlot {
+    fn drop(&mut self) {
+        if let Some((class, slot)) = self.shared {
+            HASH_SLOTS.lock().unwrap_or_else(|e| e.into_inner())[class].free.push_back((slot, crate::host::now_ms()));
+        }
+    }
+}
+
+/// Whether copies' hashes share buffers (`VICTORY_PACK_HASHES=1`; off: a
+/// buffer of their own each, as before). A copy's hashes are 16 bytes a
+/// piece of 64 KiB and two more: 48 bytes for most, each in a committed
+/// buffer of its own, which costs the card far more than that (about 36 KiB
+/// for 256 bytes on an RTX 3070 Ti, `crate::host` `small_buffer_cost`). In a
+/// 5-minute run about 3,200 such buffers were alive. With this on, hashes of
+/// up to 32 KiB lie in slots of shared buffers of 1 MiB, by class (256 B,
+/// 512 B, ... 32 KiB); larger ones keep a buffer of their own. A slot given
+/// back is taken again only 10 s later.
+fn pack_hashes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PACK_HASHES").is_some_and(|v| v == "1"))
+}
+
+/// Bytes of a shared buffer of hash slots, and how many classes of slots.
+const HASH_SLAB: u64 = 1 << 20;
+const HASH_CLASSES: usize = 8;
+
+/// The class whose slots hold `bytes` (256 bytes, doubled per class).
+fn hash_class(bytes: u64) -> Option<usize> {
+    (0..HASH_CLASSES).find(|&k| bytes <= 256 << k)
+}
+
+/// The shared buffers of one class, the slots cut from them so far, and the
+/// slots given back with when (ms).
+struct HashClass {
+    slabs: Vec<ID3D12Resource>,
+    carved: u32,
+    free: std::collections::VecDeque<(u32, u64)>,
+}
+
+static HASH_SLOTS: Mutex<[HashClass; HASH_CLASSES]> = Mutex::new(
+    [const { HashClass { slabs: Vec::new(), carved: 0, free: std::collections::VecDeque::new() } }; HASH_CLASSES],
+);
+
+/// A slot of `class`: one given back 10 s ago or more (no submission in
+/// flight still writes there: a copy goes only after it has been idle a
+/// while, and the card is never seconds behind), else the next of the last
+/// shared buffer, else one of a new one made with `make`.
+fn take_hash_slot(class: usize, make: impl FnOnce(u64) -> Option<ID3D12Resource>) -> Option<HashSlot> {
+    let size = 256u64 << class;
+    let per = (HASH_SLAB / size) as u32;
+    let mut all = HASH_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let c = &mut all[class];
+    let now = crate::host::now_ms();
+    let slot = match c.free.front() {
+        Some(&(slot, at)) if now >= at + 10_000 => {
+            c.free.pop_front();
+            slot
+        }
+        _ => {
+            if c.carved >= c.slabs.len() as u32 * per {
+                c.slabs.push(make(HASH_SLAB)?);
+            }
+            c.carved += 1;
+            c.carved - 1
+        }
+    };
+    Some(HashSlot {
+        buffer: c.slabs[(slot / per) as usize].clone(),
+        offset: u64::from(slot % per) * size,
+        shared: Some((class, slot)),
+    })
+}
+
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
 struct Card {
@@ -118,7 +216,7 @@ struct Card {
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
     /// the card, after each submission that declares some.
-    before: Mutex<Option<ID3D12Resource>>,
+    before: Mutex<Option<HashSlot>>,
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
@@ -4653,11 +4751,12 @@ impl Shadow {
         self.card.as_ref().map_or_else(Vec::new, |c| c.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
-    /// Of a copy in the card's memory: the CPU's side (PC memory), the
-    /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    /// Of a copy in the card's memory: the CPU's side (PC memory), where
+    /// the card keeps its pieces' hashes if made yet (an address on the
+    /// card, [`HashSlot`]), and the copy's size.
+    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<u64>, u64)> {
         let card = self.card.as_ref()?;
-        let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(HashSlot::address);
         Some((&card.staging, before, card.size))
     }
 
@@ -4674,7 +4773,7 @@ impl Shadow {
         if before.is_some() {
             return false;
         }
-        *before = make(card.size);
+        *before = HashSlot::make(card_hash_bytes(card.size), make);
         if before.is_some() {
             CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
         }
