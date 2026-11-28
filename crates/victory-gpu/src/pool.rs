@@ -61,6 +61,18 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         };
         pool.reclaim(tick, staging_limit, true);
     }
+    let buffers_limit = if crate::residency::critical_commit() {
+        0
+    } else if pressure {
+        1
+    } else {
+        BUFFERS_KEPT
+    };
+    for buffers in [&UPLOADS, &SHARED] {
+        if let Ok(mut pool) = buffers.try_lock() {
+            pool.reclaim(tick, buffers_limit, true);
+        }
+    }
     if stats_on() {
         static ASKED: AtomicU64 = AtomicU64::new(0);
         if ASKED.fetch_add(1, Ordering::Relaxed).is_multiple_of(5) {
@@ -393,6 +405,8 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static UPLOADS: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(BUFFERS_KEPT));
+static SHARED: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(BUFFERS_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -560,6 +574,8 @@ struct Reclaim {
     piece: Piece,
     /// What [`counted`] was told of it.
     small: u64,
+    /// The pool the piece goes back to.
+    to: &'static Mutex<Pool<ID3D12Heap>>,
 }
 
 struct Methods([*const (); 3]);
@@ -596,9 +612,11 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            counted(gone.piece, gone.small, false);
-            lock(&TEXTURES).give(gone.piece, now());
+            if std::ptr::eq(gone.to, &TEXTURES) {
+                HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+                counted(gone.piece, gone.small, false);
+            }
+            lock(gone.to).give(gone.piece, now());
         }
         left
     }
@@ -766,10 +784,27 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
     unseen.get(&raw).copied().filter(|&begun| begun > finished)
 }
 
-/// Makes `texture` give `piece` back when the last reference to it goes.
+/// The private data a resource cut from a block holds ([`Reclaim`]).
+const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+
+/// Whether `resource` was cut from a block of this module's.
+#[cfg(test)]
+fn in_block(resource: &ID3D12Resource) -> bool {
+    let mut size = 0u32;
+    // SAFETY: asks only the size of the private data, if there is any.
+    unsafe { resource.GetPrivateData(&KEY, &mut size, None) }.is_ok() && size > 0
+}
+
+/// Makes `texture` give `piece` back to [`TEXTURES`] when the last
+/// reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece, small: u64) {
-    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, small }));
+    give_back_to(texture, piece, small, &TEXTURES);
+}
+
+/// Makes `texture` (a texture or a buffer) give `piece` back to `to` when
+/// the last reference to it goes.
+fn give_back_to(texture: &ID3D12Resource, piece: Piece, small: u64, to: &'static Mutex<Pool<ID3D12Heap>>) {
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, small, to }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -882,9 +917,304 @@ pub(crate) unsafe fn texture(
     }
 }
 
+/// Whether upload buffers and shared buffers (the PC's memory, which the
+/// CPU maps) of up to [`BUFFER_MOST`] are cut from blocks
+/// (`VICTORY_BUFFER_POOL=0`: each an allocation of its own, as before).
+///
+/// Each was a committed resource made resident on the thread that asked
+/// for it, about a millisecond each and up to 22 ms while the system pages.
+/// A play log of 2026-11-28 02:20
+/// counted in each 5 seconds of play 300 to 441 upload buffers made (355 to
+/// 693 ms of waiting) and 220 to 382 shared buffers (180 to 790 ms), on the
+/// threads that translate and submit the title's lists; the card's own
+/// buffers were 44 to 51 (about 30 ms). Cut from a block, a buffer is one
+/// placement and one mapping; the block's residency is waited for once per
+/// 64 MiB.
+///
+/// A piece used before is zeroed by the CPU before it is handed out: a
+/// committed buffer starts as zeros, and callers count on that (the host
+/// copies of title buffers are compared against their card side, which
+/// began as zeros). The card's own buffers are not pooled: no CPU can zero
+/// them.
+pub(crate) fn buffers_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The largest buffer [`cpu_buffer`] cuts from a block; larger ones are
+/// allocations of their own.
+const BUFFER_MOST: u64 = 4 << 20;
+
+/// Empty blocks of buffers kept ([`room`]): they are the PC's memory, and
+/// commit charge (a log of 2026-11-28 had 674 MB of it left).
+const BUFFERS_KEPT: usize = 2;
+
+/// The piece a buffer of `size` bytes takes in a block: buffers lie at
+/// multiples of 64 KiB. `None`: larger than [`BUFFER_MOST`], not cut from
+/// a block.
+fn buffer_piece(size: u64) -> Option<u64> {
+    (size <= BUFFER_MOST).then(|| size.max(1).next_multiple_of(u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)))
+}
+
+/// Where a buffer of [`cpu_buffer`] lies.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CpuBuffer {
+    /// An upload buffer (`crate::host::Host::upload_buffer`): the card
+    /// reads it, the CPU writes it (write-combined).
+    Upload,
+    /// A shared buffer (`crate::host::Host::shared_buffer_now`): the PC's
+    /// memory, cached, which shaders may read and write.
+    Shared,
+}
+
+/// Buffers cut from blocks since the start, by kind (upload, shared).
+pub(crate) static CUT_BUFFERS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A buffer of `size` bytes in a block of `kind`, mapped, all zeros: what
+/// `Host::upload_buffer` or `Host::shared_buffer_now` would have made.
+/// `None`: not pooled (switched off, or larger than [`BUFFER_MOST`]) or the
+/// host refused; the caller makes an allocation of its own then.
+pub(crate) fn cpu_buffer(device: &ID3D12Device, kind: CpuBuffer, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if !buffers_on() {
+        return None;
+    }
+    const ALIGN: u64 = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+    let len = buffer_piece(size)?;
+    let pool = match kind {
+        CpuBuffer::Upload => &UPLOADS,
+        CpuBuffer::Shared => &SHARED,
+    };
+    let (piece, heap, again) = lock(pool).take(len, ALIGN, now(), || {
+        let properties = match kind {
+            CpuBuffer::Upload => D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+            CpuBuffer::Shared => D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            },
+        };
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: BLOCK,
+            Properties: properties,
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | crate::host::not_resident(),
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain creation.
+        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+            crate::residency::allocation_error(&e);
+            tracing::warn!(error = %e, ?kind, "no block of buffers");
+            return None;
+        }
+        let heap = heap?;
+        let waited = crate::host::resident(device, &heap).and_then(|()| match kind {
+            CpuBuffer::Upload => Ok(()),
+            CpuBuffer::Shared => crate::host::mapped(device),
+        });
+        if let Err(e) = waited {
+            tracing::warn!(error = %e, ?kind, "a block of buffers is not resident");
+            return None;
+        }
+        Some(heap)
+    })?;
+    let (flags, state) = match kind {
+        CpuBuffer::Upload => (D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+        CpuBuffer::Shared => (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size.max(1),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: flags,
+        ..Default::default()
+    };
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: the piece is no one else's; the heap lives while a piece of
+    // it is taken.
+    let placed = unsafe { device.CreatePlacedResource(&heap, piece.start, &desc, state, None, &mut made) };
+    let Some(made) = placed.ok().and(made) else {
+        lock(pool).give(piece, now());
+        return None;
+    };
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the whole of a CPU-visible buffer.
+    if unsafe { made.Map(0, None, Some(&mut data)) }.is_err() || data.is_null() {
+        lock(pool).give(piece, now());
+        return None;
+    }
+    if again {
+        // SAFETY: the mapping holds `size` bytes, ours alone.
+        unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, size as usize) };
+    }
+    give_back_to(&made, piece, 0, pool);
+    CUT_BUFFERS[kind as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    crate::book::made(&made, || match kind {
+        CpuBuffer::Upload => "an upload buffer in a block".into(),
+        CpuBuffer::Shared => "a shared buffer in a block".into(),
+    });
+    Some((made, data.cast()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What size of buffer is cut from a block, and the piece it takes.
+    #[test]
+    fn buffers_up_to_four_mib_are_cut_at_multiples_of_64_kib() {
+        assert_eq!(buffer_piece(0), Some(64 << 10));
+        assert_eq!(buffer_piece(1), Some(64 << 10));
+        assert_eq!(buffer_piece(64 << 10), Some(64 << 10));
+        assert_eq!(buffer_piece((64 << 10) + 1), Some(128 << 10));
+        assert_eq!(buffer_piece(BUFFER_MOST), Some(BUFFER_MOST));
+        assert_eq!(buffer_piece(BUFFER_MOST + 1), None);
+        assert_eq!(buffer_piece(64 << 20), None);
+    }
+
+    /// Upload and shared buffers cut from blocks: apart, mapped, all zeros
+    /// (also a piece used again after its rest), known as cut from a block,
+    /// and their pieces back in the pool once they go.
+    #[test]
+    fn buffers_cut_from_blocks_start_as_zeros_and_come_back() {
+        let Some(host) = crate::host::host() else { return };
+        if !buffers_on() {
+            return;
+        }
+        for kind in [CpuBuffer::Upload, CpuBuffer::Shared] {
+            let a = cpu_buffer(&host.device, kind, 1000).expect("a buffer");
+            let b = cpu_buffer(&host.device, kind, 70_000).expect("a buffer");
+            assert!(in_block(&a.0) && in_block(&b.0));
+            // SAFETY: plain queries of live buffers.
+            let (at_a, at_b) = unsafe { (a.0.GetGPUVirtualAddress(), b.0.GetGPUVirtualAddress()) };
+            assert!(at_a.abs_diff(at_b) >= 1000, "{kind:?}: the buffers overlap");
+            // SAFETY: the buffers' mappings.
+            unsafe {
+                assert!(std::slice::from_raw_parts(a.1, 1000).iter().all(|&x| x == 0));
+                std::ptr::write_bytes(a.1, 0xab, 1000);
+                std::ptr::write_bytes(b.1, 0xcd, 70_000);
+            }
+            drop((a, b));
+            // Past the rest, the same pieces are cut again, and zeroed.
+            std::thread::sleep(std::time::Duration::from_millis(REST + 100));
+            let mut again = Vec::new();
+            for _ in 0..4 {
+                let c = cpu_buffer(&host.device, kind, 70_000).expect("a buffer");
+                // SAFETY: the buffer's mapping.
+                assert!(unsafe { std::slice::from_raw_parts(c.1, 70_000) }.iter().all(|&x| x == 0), "{kind:?}: not zeros");
+                again.push(c);
+            }
+        }
+        // A committed buffer is not one.
+        let (own, _) = host.upload_buffer_own(4096).expect("a buffer");
+        assert!(!in_block(&own));
+    }
+
+    /// The card reads what the CPU wrote into an upload buffer cut from a
+    /// block, and writes a shared buffer cut from a block where the CPU
+    /// reads it: buffers at other places than a block's start, beside
+    /// others in the same block.
+    #[test]
+    fn the_card_reads_and_writes_buffers_cut_from_blocks() {
+        let Some(host) = crate::host::host() else { return };
+        if !buffers_on() {
+            return;
+        }
+        const LEN: usize = 100_000;
+        let device = &host.device;
+        // Two of each, so that the second lies past the first in its block.
+        let _first_upload = cpu_buffer(device, CpuBuffer::Upload, LEN as u64).expect("an upload buffer");
+        let _first_shared = cpu_buffer(device, CpuBuffer::Shared, LEN as u64).expect("a shared buffer");
+        let (from, from_data) = cpu_buffer(device, CpuBuffer::Upload, LEN as u64).expect("an upload buffer");
+        let (to, to_data) = cpu_buffer(device, CpuBuffer::Shared, LEN as u64).expect("a shared buffer");
+        let pattern: Vec<u8> = (0..LEN).map(|i| (i * 7 + i / 251) as u8).collect();
+        // SAFETY: the buffers' mappings, `LEN` bytes each.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), from_data, LEN);
+            std::ptr::write_bytes(to_data, 0xee, LEN);
+        }
+        // SAFETY: plain object creation and a copy between two live
+        // buffers, waited for before they go.
+        unsafe {
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .expect("a queue");
+            let allocator: ID3D12CommandAllocator =
+                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("an allocator");
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).expect("a list");
+            list.CopyBufferRegion(&to, 0, &from, 0, LEN as u64);
+            list.Close().expect("the list closed");
+            queue.ExecuteCommandLists(&[Some(list.cast().expect("a command list"))]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("a fence");
+            queue.Signal(&fence, 1).expect("a signal");
+            let started = std::time::Instant::now();
+            while fence.GetCompletedValue() < 1 {
+                assert!(started.elapsed() < std::time::Duration::from_secs(10), "the copy never ran");
+                std::thread::yield_now();
+            }
+            assert!(std::slice::from_raw_parts(to_data, LEN) == pattern.as_slice(), "the card's copy differs");
+        }
+    }
+
+    /// Acceptance: buffers of 64 KiB, the size most are, cut from a block
+    /// against made each as an allocation of its own (what the threads that
+    /// translate and submit lists made 60 to 90 a second of, each kind, in
+    /// a play log of 2026-11-28). Prints both times; with
+    /// `VICTORY_ACCEPTANCE=1`, in a release build and a run of its own
+    /// (`cargo test --release -p victory-gpu --lib acceptance_buffers --
+    /// --test-threads=1`), fails unless the pool is at least five times as
+    /// fast. Measured 118 to 139 times on an RTX 5070 Ti.
+    #[test]
+    fn acceptance_buffers_cut_from_blocks() {
+        let Some(host) = crate::host::host() else { return };
+        if !buffers_on() {
+            return;
+        }
+        const N: usize = 256;
+        const SIZE: u64 = 64 << 10;
+        let best_of = |work: &mut dyn FnMut()| {
+            (0..3)
+                .map(|_| {
+                    let began = std::time::Instant::now();
+                    work();
+                    began.elapsed()
+                })
+                .min()
+                .unwrap_or_default()
+        };
+        for kind in [CpuBuffer::Upload, CpuBuffer::Shared] {
+            let own = best_of(&mut || {
+                let made: Vec<_> = (0..N)
+                    .map(|_| match kind {
+                        CpuBuffer::Upload => host.upload_buffer_own(SIZE),
+                        CpuBuffer::Shared => host.shared_buffer_own(SIZE),
+                    })
+                    .collect();
+                assert!(made.iter().all(Option::is_some));
+            });
+            // The block is made first, once, as a frame's first buffer
+            // would make it; what is timed is a frame's buffers after it.
+            drop(cpu_buffer(&host.device, kind, SIZE));
+            let cut = best_of(&mut || {
+                let made: Vec<_> = (0..N).map(|_| cpu_buffer(&host.device, kind, SIZE)).collect();
+                assert!(made.iter().all(Option::is_some));
+            });
+            let ratio = own.as_secs_f64() / cut.as_secs_f64().max(1e-9);
+            eprintln!(
+                "acceptance: {N} {kind:?} buffers of 64 KiB: own allocations {:.3} ms, cut from a block {:.3} ms, {ratio:.1} times as fast",
+                own.as_secs_f64() * 1e3,
+                cut.as_secs_f64() * 1e3
+            );
+            let checked = std::env::var_os("VICTORY_ACCEPTANCE").is_some_and(|v| v == "1");
+            assert!(!checked || cfg!(debug_assertions) || ratio >= 5.0, "{kind:?}: {ratio:.2} times as fast, asked for 5");
+        }
+    }
 
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {
